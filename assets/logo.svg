@@ -1,0 +1,28 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Inferno logo</title>
+  <desc id="desc">A centered flame mark inside a minimal chip outline for the Inferno GLM-5.2 Q2 Metal inference engine.</desc>
+
+  <rect x="64" y="64" width="384" height="384" rx="56" fill="#0E1014"/>
+  <rect x="88" y="88" width="336" height="336" rx="36" stroke="#E6E8EE" stroke-opacity="0.18" stroke-width="12"/>
+
+  <path d="M118 164H90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M118 256H90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M118 348H90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M422 164H394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M422 256H394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M422 348H394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+
+  <path d="M164 118V90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M256 118V90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M348 118V90" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M164 422V394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M256 422V394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+  <path d="M348 422V394" stroke="#E6E8EE" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+
+  <g transform="translate(256 256) scale(0.88) translate(-256 -256)">
+    <path d="M230 382C176 382 138 341 138 286C138 247 157 215 181 188C203 163 218 137 218 104C270 142 297 188 293 238C310 223 320 203 322 177C357 210 374 248 374 291C374 344 330 382 274 382H230Z" fill="#FF4A2D"/>
+    <path d="M233 382C200 382 176 358 176 325C176 300 190 279 208 260C224 243 235 224 235 200C269 225 284 254 277 289C290 280 299 267 303 250C325 272 336 298 336 326C336 359 309 382 275 382H233Z" fill="#FFB020"/>
+    <path d="M234 381C214 381 200 367 200 348C200 333 210 321 221 309C232 297 239 284 239 267C261 284 270 303 264 325C273 319 279 311 282 300C295 313 302 329 302 346C302 367 285 381 264 381H234Z" fill="#FFF3C4"/>
+  </g>
+
+</svg>

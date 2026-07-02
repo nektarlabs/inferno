@@ -1,0 +1,17 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+backend = { path = "../backend" }
+cache = { path = "../cache" }
+config = { path = "../config" }
+common = { path = "../common" }
+model = { path = "../model" }
+tracing.workspace = true
+
+[dev-dependencies]
+gguf = { path = "../gguf" }

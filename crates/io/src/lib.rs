@@ -1,0 +1,149 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//! File IO helpers for large GLM weight shards.
+
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
+
+use common::{Error, Result};
+#[cfg(unix)]
+use memmap2::Advice;
+use memmap2::{Mmap, MmapOptions};
+
+#[derive(Debug)]
+pub struct MappedFile {
+    path: PathBuf,
+    mmap: Mmap,
+}
+
+impl MappedFile {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let len = file
+            .metadata()
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        if len == 0 {
+            return Err(Error::weights(format!(
+                "cannot memory-map empty file {}",
+                path.display()
+            )));
+        }
+
+        // SAFETY: The map is read-only and the returned Mmap owns the mapping.
+        // Callers only receive bounds-checked shared byte slices from this wrapper.
+        let mmap = unsafe {
+            MmapOptions::new().map(&file).map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+        };
+        advise_random_access(&mmap);
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            mmap,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+
+    pub fn slice(&self, offset: u64, byte_len: usize) -> Result<&[u8]> {
+        let offset = usize::try_from(offset).map_err(|_| {
+            Error::weights(format!(
+                "mapped file offset does not fit usize for {}",
+                self.path.display()
+            ))
+        })?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            Error::weights(format!(
+                "mapped file slice range overflows for {}",
+                self.path.display()
+            ))
+        })?;
+        if end > self.mmap.len() {
+            return Err(Error::weights(format!(
+                "mapped file slice [{}..{}] exceeds file size {} for {}",
+                offset,
+                end,
+                self.mmap.len(),
+                self.path.display()
+            )));
+        }
+        Ok(&self.mmap[offset..end])
+    }
+}
+
+fn advise_random_access(mmap: &Mmap) {
+    #[cfg(unix)]
+    let _ = mmap.advise(Advice::Random);
+    #[cfg(not(unix))]
+    let _ = mmap;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn mapped_file_returns_checked_slice() {
+        let path = unique_temp_file("slice");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let mapped = MappedFile::open(&path).unwrap();
+
+        assert_eq!(mapped.len(), 6);
+        assert_eq!(mapped.slice(2, 3).unwrap(), b"cde");
+    }
+
+    #[test]
+    fn mapped_file_rejects_out_of_bounds_slice() {
+        let path = unique_temp_file("oob");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let mapped = MappedFile::open(&path).unwrap();
+        let err = mapped
+            .slice(4, 3)
+            .expect_err("out-of-bounds slice should fail");
+
+        assert!(err.to_string().contains("exceeds file size"));
+    }
+
+    #[test]
+    fn mapped_file_rejects_empty_file() {
+        let path = unique_temp_file("empty");
+        fs::write(&path, []).unwrap();
+
+        let err = MappedFile::open(&path).expect_err("empty mmap should fail");
+
+        assert!(err.to_string().contains("empty file"));
+    }
+
+    fn unique_temp_file(label: &str) -> PathBuf {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("io-{label}-{}-{id}", std::process::id()))
+    }
+}

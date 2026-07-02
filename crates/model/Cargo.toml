@@ -1,0 +1,14 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+backend = { path = "../backend" }
+config = { path = "../config" }
+common = { path = "../common" }
+gguf = { path = "../gguf" }
+moe = { path = "../moe" }
+tracing.workspace = true

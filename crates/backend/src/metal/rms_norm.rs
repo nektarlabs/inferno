@@ -1,0 +1,197 @@
+use ::metal::{Buffer, CommandQueue, ComputePipelineState, Device};
+use common::{Error, Result};
+use tracing::trace;
+
+use super::{
+    buffers::{
+        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, u32_scalar_buffer,
+    },
+    command::dispatch_1d,
+    library::MetalLibrary,
+    pipeline::compute_pipeline,
+    validation::validate_rms_norm_f32,
+};
+
+const RMS_NORM_KERNEL: &str = "rms_norm_f32_kernel";
+
+pub(crate) struct MetalRmsNorm {
+    pipeline: ComputePipelineState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetalRmsNormReport {
+    pub values: Vec<f32>,
+    pub rows: usize,
+    pub hidden_size: usize,
+    pub input_len: usize,
+    pub thread_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetalRmsNormBufferReport {
+    pub buffer: Buffer,
+    pub input_len: usize,
+}
+
+impl MetalRmsNorm {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+        Ok(Self {
+            pipeline: compute_pipeline(device, library, RMS_NORM_KERNEL)?,
+        })
+    }
+
+    pub(crate) fn run(
+        &self,
+        device: &Device,
+        queue: &CommandQueue,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<MetalRmsNormReport> {
+        let output = self.run_to_buffer(device, queue, input, weight, rows, hidden_size, eps)?;
+        let values = read_f32_buffer(&output.buffer, input.len())?;
+
+        Ok(MetalRmsNormReport {
+            values,
+            rows,
+            hidden_size,
+            input_len: input.len(),
+            thread_count: rows,
+        })
+    }
+
+    pub(crate) fn run_to_buffer(
+        &self,
+        device: &Device,
+        queue: &CommandQueue,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<MetalRmsNormBufferReport> {
+        validate_rms_norm_f32(input, weight, rows, hidden_size, eps)?;
+
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| Error::backend("RMSNorm rows exceed Metal u32 limit"))?;
+        let hidden_size_u32 = u32::try_from(hidden_size)
+            .map_err(|_| Error::backend("RMSNorm hidden_size exceeds Metal u32 limit"))?;
+
+        let input_buffer = f32_buffer(device, input)?;
+        let weight_buffer = f32_buffer(device, weight)?;
+        let output_buffer = empty_f32_buffer(device, input.len())?;
+        let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
+        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let eps_buffer = f32_scalar_buffer(device, eps)?;
+
+        trace!(
+            target: "inferno::metal",
+            rows,
+            hidden_size,
+            input_len = input.len(),
+            "running native Metal RMSNorm"
+        );
+
+        dispatch_1d(
+            queue,
+            &self.pipeline,
+            &[
+                &input_buffer,
+                &weight_buffer,
+                &output_buffer,
+                &rows_buffer,
+                &hidden_size_buffer,
+                &eps_buffer,
+            ],
+            rows,
+        )?;
+
+        Ok(MetalRmsNormBufferReport {
+            buffer: output_buffer,
+            input_len: input.len(),
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod tests {
+    use crate::metal::Metal;
+
+    #[test]
+    fn matches_cpu_reference_for_small_rows() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let rows = 2;
+        let hidden_size = 4;
+        let input = vec![
+            0.25_f32, -0.50, 0.75, 1.00, //
+            -1.25, 0.50, 0.10, 2.00,
+        ];
+        let weight = vec![1.0_f32, 1.25, 0.75, 1.50];
+        let eps = 1e-5;
+
+        let report = metal
+            .rms_norm_f32_report(&input, &weight, rows, hidden_size, eps)
+            .unwrap();
+        let expected = cpu_rms_norm(&input, &weight, rows, hidden_size, eps);
+
+        assert_eq!(report.rows, rows);
+        assert_eq!(report.hidden_size, hidden_size);
+        assert_eq!(report.input_len, input.len());
+        assert_eq!(report.thread_count, rows);
+        assert_close(&report.values, &expected, 1e-5);
+    }
+
+    #[test]
+    fn rejects_wrong_shape_before_dispatch() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let err = metal
+            .rms_norm_f32(&[1.0, 2.0, 3.0], &[1.0, 1.0], 2, 2, 1e-5)
+            .expect_err("shape mismatch should fail before Metal dispatch");
+
+        assert!(err.to_string().contains("input shape mismatch"));
+    }
+
+    fn native_metal_or_skip() -> Option<Metal> {
+        Metal::new().ok()
+    }
+
+    fn cpu_rms_norm(
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0; input.len()];
+        for row in 0..rows {
+            let base = row * hidden_size;
+            let mut sumsq = 0.0;
+            for col in 0..hidden_size {
+                let value = input[base + col];
+                sumsq += value * value;
+            }
+            let scale = ((sumsq / hidden_size as f32) + eps).sqrt().recip();
+            for col in 0..hidden_size {
+                output[base + col] = input[base + col] * scale * weight[col];
+            }
+        }
+        output
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let delta = (actual - expected).abs();
+            assert!(
+                delta <= tolerance,
+                "value {index} differs: actual={actual}, expected={expected}, delta={delta}"
+            );
+        }
+    }
+}

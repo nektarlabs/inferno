@@ -1,0 +1,4752 @@
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use std::sync::Arc;
+
+#[cfg(test)]
+use common::Shape;
+use common::{
+    validate_exact_shape, BackendKind, DeviceKind, DeviceReport, Error, F32Tensor, PagedKvView,
+    Result,
+};
+use common::{Device, Tensor};
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use crate::metal::Metal;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    pub backend: BackendKind,
+    pub device: DeviceKind,
+    pub custom_kernels: bool,
+    pub supports_f32: bool,
+    pub supports_f16: bool,
+    pub supports_bf16: bool,
+    pub operations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackendMemoryReport {
+    pub metal_current_allocated_bytes: Option<u64>,
+    pub metal_recommended_max_working_set_bytes: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedShape {
+    pub name: String,
+    pub shape: Shape,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+struct BackendOperationReport {
+    pub name: String,
+    pub inputs: Vec<NamedShape>,
+    pub output: Shape,
+    pub checksum: f32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+struct BackendCheckReport {
+    pub capabilities: BackendCapabilities,
+    pub operations: Vec<BackendOperationReport>,
+}
+
+pub trait Backend {
+    fn capabilities(&self) -> BackendCapabilities;
+    fn device(&self) -> &Device;
+    fn memory_report(&self) -> BackendMemoryReport {
+        BackendMemoryReport::default()
+    }
+
+    fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor>;
+    fn linear(&self, input: &Tensor, weight: &Tensor) -> Result<Tensor>;
+    fn add(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor>;
+    fn select_last_token(&self, hidden_states: &Tensor) -> Result<Tensor>;
+    fn heads_to_attention_layout(&self, heads: &Tensor) -> Result<Tensor>;
+    fn merge_attention_heads(&self, context_heads: &Tensor) -> Result<Tensor>;
+    fn split_rope_tail(
+        &self,
+        heads: &Tensor,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<(Tensor, Tensor)>;
+    fn split_kv_mqa(
+        &self,
+        kv_mqa: &Tensor,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+    ) -> Result<(Tensor, Tensor)>;
+    fn combine_rope_tail(&self, no_rope: &Tensor, rope: &Tensor) -> Result<Tensor>;
+    fn swiglu(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor>;
+    fn swiglu_f32_tensor(&self, _gate: &F32Tensor, _up: &F32Tensor) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn attention_scores(&self, q: &Tensor, k: &Tensor, head_dim: usize) -> Result<Tensor>;
+    fn attention_values(&self, probs: &Tensor, values: &Tensor) -> Result<Tensor>;
+    fn attention_causal_softmax(&self, scores: &Tensor, past_tokens: usize) -> Result<Tensor>;
+    fn rope_slice(
+        &self,
+        input: &Tensor,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Tensor>;
+    fn add_f32_tensor(&self, _lhs: &F32Tensor, _rhs: &F32Tensor) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn linear_f32_tensor(
+        &self,
+        _input: &F32Tensor,
+        _weight: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn select_last_token_f32_tensor(
+        &self,
+        _hidden_states: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn heads_to_attention_layout_f32_tensor(
+        &self,
+        _heads: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn merge_attention_heads_f32_tensor(
+        &self,
+        _context_heads: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn split_rope_tail_f32_tensor(
+        &self,
+        _heads: &F32Tensor,
+        _no_rope_dim: usize,
+        _rope_dim: usize,
+    ) -> Result<Option<(F32Tensor, F32Tensor)>> {
+        Ok(None)
+    }
+    fn split_kv_mqa_f32_tensor(
+        &self,
+        _kv_mqa: &F32Tensor,
+        _kv_lora_rank: usize,
+        _rope_dim: usize,
+    ) -> Result<Option<(F32Tensor, F32Tensor)>> {
+        Ok(None)
+    }
+    fn combine_rope_tail_f32_tensor(
+        &self,
+        _no_rope: &F32Tensor,
+        _rope: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn attention_scores_f32_tensor(
+        &self,
+        _q: &F32Tensor,
+        _k: &F32Tensor,
+        _head_dim: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn attention_values_f32_tensor(
+        &self,
+        _probs: &F32Tensor,
+        _values: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn attention_causal_softmax_f32_tensor(
+        &self,
+        _scores: &F32Tensor,
+        _past_tokens: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn decode_attention_f32_tensor(
+        &self,
+        _q: &F32Tensor,
+        _k: &F32Tensor,
+        _v: &F32Tensor,
+        _head_dim: usize,
+        _past_tokens: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn paged_decode_attention_f32_tensor(
+        &self,
+        _q: &F32Tensor,
+        _current_k: &F32Tensor,
+        _current_v: &F32Tensor,
+        _past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn rope_slice_f32_tensor(
+        &self,
+        _input: &F32Tensor,
+        _rope_dim: usize,
+        _position_offset: usize,
+        _theta: f32,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn rms_norm_f32(
+        &self,
+        hidden_states: &F32Tensor,
+        weight: &F32Tensor,
+        eps: f32,
+    ) -> Result<F32Tensor>;
+    fn rms_norm(&self, hidden_states: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor>;
+    fn moe_gather_tokens(&self, flat_tokens: &Tensor, token_indices: &[u32]) -> Result<Tensor>;
+    fn moe_gather_tokens_f32_tensor(
+        &self,
+        _flat_tokens: &F32Tensor,
+        _token_indices: &[u32],
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn moe_weighted_index_add_combine(
+        &self,
+        accumulator: &Tensor,
+        token_indices: &Tensor,
+        expert_outputs: &Tensor,
+        expert_weights: &Tensor,
+    ) -> Result<Tensor>;
+    fn moe_weighted_index_add_combine_f32_tensor(
+        &self,
+        _accumulator: &F32Tensor,
+        _token_indices: &[u32],
+        _expert_outputs: &F32Tensor,
+        _expert_weights: &[f32],
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_matvec_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_matvec_add_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _residual: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_matvec_f32(
+        &self,
+        _weights: &[u8],
+        _input: &Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_gate_up_swiglu_f32_tensor(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_gate_up_swiglu_f32(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _input: &Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_matvec_argmax_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+    fn q2_k_rms_norm_argmax_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _rms_weight: &F32Tensor,
+        _eps: f32,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+    fn q2_k_matvec_argmax_f32(
+        &self,
+        _weights: &[u8],
+        _input: &Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+    fn q2_k_transposed_matvec_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q2_k_transposed_matvec_f32(
+        &self,
+        _weights: &[u8],
+        _input: &Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+    fn q8_0_matvec_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn q8_0_transposed_matvec_f32_tensor(
+        &self,
+        _weights: &[u8],
+        _input: &F32Tensor,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+pub struct MetalBackend {
+    device: Device,
+    device_kind: DeviceKind,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    native_metal: Option<Arc<Metal>>,
+}
+
+impl std::fmt::Debug for MetalBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("MetalBackend");
+        debug
+            .field("device", &self.device)
+            .field("device_kind", &self.device_kind);
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        debug.field("native_metal", &self.native_metal.is_some());
+        debug.finish()
+    }
+}
+
+impl MetalBackend {
+    pub fn new() -> Result<Self> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let native_metal = Metal::new()?;
+            return Ok(Self {
+                device: Device::Cpu,
+                device_kind: DeviceKind::Metal,
+                native_metal: Some(Arc::new(native_metal)),
+            });
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            Err(Error::backend(
+                "Inferno Q2 production backend requires Apple Metal and native Metal kernels",
+            ))
+        }
+    }
+
+    pub fn reference() -> Result<Self> {
+        Ok(Self {
+            device: Device::Cpu,
+            device_kind: DeviceKind::Cpu,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            native_metal: None,
+        })
+    }
+
+    pub fn device_report(&self) -> DeviceReport {
+        if self.has_native_metal() {
+            DeviceReport::metal()
+        } else {
+            DeviceReport::reference(self.device_kind)
+        }
+    }
+
+    pub fn device_debug(&self) -> String {
+        format!("{:?}", self.device)
+    }
+
+    pub fn from_device(device: Device) -> Result<Self> {
+        let device_kind = device_kind(&device);
+        Ok(Self {
+            device,
+            device_kind,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            native_metal: native_metal_for(device_kind),
+        })
+    }
+
+    #[cfg(test)]
+    fn operation_report(
+        name: &str,
+        inputs: Vec<NamedShape>,
+        output: &Tensor,
+    ) -> Result<BackendOperationReport> {
+        Ok(BackendOperationReport {
+            name: name.to_string(),
+            inputs,
+            output: Shape::new(output.dims().to_vec()),
+            checksum: tensor_checksum(output)?,
+        })
+    }
+}
+
+impl Backend for MetalBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend: if self.has_native_metal() {
+                BackendKind::Metal
+            } else {
+                BackendKind::Reference
+            },
+            device: self.device_kind,
+            custom_kernels: self.has_native_metal(),
+            supports_f32: true,
+            supports_f16: self.device_kind == DeviceKind::Metal,
+            supports_bf16: self.device_kind == DeviceKind::Metal,
+            operations: backend_operations(self.has_native_metal()),
+        }
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn memory_report(&self) -> BackendMemoryReport {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return BackendMemoryReport {
+                    metal_current_allocated_bytes: Some(native_metal.current_allocated_bytes()),
+                    metal_recommended_max_working_set_bytes: Some(
+                        native_metal.recommended_max_working_set_bytes(),
+                    ),
+                };
+            }
+        }
+
+        BackendMemoryReport::default()
+    }
+
+    fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        validate_matmul_shapes(lhs, rhs)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let lhs_dims = lhs.dims();
+                let rhs_dims = rhs.dims();
+                let rows = lhs_dims[0];
+                let inner = lhs_dims[1];
+                let cols = rhs_dims[1];
+                let lhs_values = lhs
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let rhs_values = rhs
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values =
+                    native_metal.matmul_f32(&lhs_values, &rhs_values, rows, inner, cols)?;
+                return Tensor::from_vec(output_values, (rows, cols), self.device())
+                    .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal F32 matmul is required on Metal",
+                ));
+            }
+        }
+
+        reference_matmul(lhs, rhs, self.device())
+    }
+
+    fn linear(&self, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        validate_linear_shapes(input, weight)?;
+
+        let (rows, mut output_shape, input_values) = flatten_linear_input(input)?;
+        let in_features = *input
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("linear input has empty shape"))?;
+        let out_features = weight.dims()[0];
+        *output_shape
+            .last_mut()
+            .ok_or_else(|| Error::backend("linear output shape is empty"))? = out_features;
+        let weight_values = weight
+            .to_dtype(common::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.linear_f32(
+                    &input_values,
+                    &weight_values,
+                    rows,
+                    in_features,
+                    out_features,
+                )?;
+                return tensor_from_matvec_output(output_values, &output_shape, self.device());
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal F32 linear is required on Metal",
+                ));
+            }
+        }
+
+        reference_linear_from_values(
+            &input_values,
+            &weight_values,
+            rows,
+            in_features,
+            out_features,
+            &output_shape,
+            self.device(),
+        )
+    }
+
+    fn add(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        validate_add_shapes(lhs, rhs)?;
+        let output_shape = lhs.dims().to_vec();
+        let lhs_values = lhs
+            .to_dtype(common::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let rhs_values = rhs
+            .to_dtype(common::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.add_f32(&lhs_values, &rhs_values)?;
+                return tensor_from_native_values(output_values, &output_shape, self.device());
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal add is required on Metal"));
+            }
+        }
+
+        reference_add_from_values(&lhs_values, &rhs_values, &output_shape, self.device())
+    }
+
+    fn select_last_token(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        validate_select_last_token_shapes(hidden_states)?;
+        let dims = hidden_states.dims();
+        let batch = dims[0];
+        let tokens = dims[1];
+        let hidden_size = dims[2];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = hidden_states
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values =
+                    native_metal.select_last_token_f32(&values, batch, tokens, hidden_size)?;
+                return Tensor::from_vec(output_values, (batch, 1, hidden_size), self.device())
+                    .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal select_last_token is required on Metal",
+                ));
+            }
+        }
+
+        reference_select_last_token(hidden_states, self.device())
+    }
+
+    fn heads_to_attention_layout(&self, heads: &Tensor) -> Result<Tensor> {
+        validate_heads_to_attention_layout_shapes(heads)?;
+        let dims = heads.dims();
+        let batch = dims[0];
+        let tokens = dims[1];
+        let head_count = dims[2];
+        let head_dim = dims[3];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = heads
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal
+                    .heads_to_attention_layout_f32(&values, batch, tokens, head_count, head_dim)?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, head_count, tokens, head_dim),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal heads_to_attention_layout is required on Metal",
+                ));
+            }
+        }
+
+        reference_heads_to_attention_layout(heads, self.device())
+    }
+
+    fn merge_attention_heads(&self, context_heads: &Tensor) -> Result<Tensor> {
+        validate_merge_attention_heads_shapes(context_heads)?;
+        let dims = context_heads.dims();
+        let batch = dims[0];
+        let head_count = dims[1];
+        let tokens = dims[2];
+        let head_dim = dims[3];
+        let merged_width = head_count
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::backend("merge_attention_heads merged width overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = context_heads
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal
+                    .merge_attention_heads_f32(&values, batch, head_count, tokens, head_dim)?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, tokens, merged_width),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal merge_attention_heads is required on Metal",
+                ));
+            }
+        }
+
+        reference_merge_attention_heads(context_heads, self.device())
+    }
+
+    fn split_rope_tail(
+        &self,
+        heads: &Tensor,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        validate_split_rope_tail_shapes(heads, no_rope_dim, rope_dim)?;
+        let dims = heads.dims();
+        let batch = dims[0];
+        let tokens = dims[1];
+        let head_count = dims[2];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = heads
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let (no_rope_values, rope_values) = native_metal.split_rope_tail_f32(
+                    &values,
+                    batch,
+                    tokens,
+                    head_count,
+                    no_rope_dim,
+                    rope_dim,
+                )?;
+                let no_rope = Tensor::from_vec(
+                    no_rope_values,
+                    (batch, tokens, head_count, no_rope_dim),
+                    self.device(),
+                )?;
+                let rope = Tensor::from_vec(
+                    rope_values,
+                    (batch, tokens, head_count, rope_dim),
+                    self.device(),
+                )?;
+                return Ok((no_rope, rope));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal split_rope_tail is required on Metal",
+                ));
+            }
+        }
+
+        reference_split_rope_tail(heads, no_rope_dim, rope_dim, self.device())
+    }
+
+    fn split_kv_mqa(
+        &self,
+        kv_mqa: &Tensor,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        validate_split_kv_mqa_shapes(kv_mqa, kv_lora_rank, rope_dim)?;
+        let dims = kv_mqa.dims();
+        let batch = dims[0];
+        let tokens = dims[1];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = kv_mqa
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let (kv_latent_values, k_rope_values) = native_metal.split_kv_mqa_f32(
+                    &values,
+                    batch,
+                    tokens,
+                    kv_lora_rank,
+                    rope_dim,
+                )?;
+                let kv_latent = Tensor::from_vec(
+                    kv_latent_values,
+                    (batch, tokens, kv_lora_rank),
+                    self.device(),
+                )?;
+                let k_rope =
+                    Tensor::from_vec(k_rope_values, (batch, tokens, 1, rope_dim), self.device())?;
+                return Ok((kv_latent, k_rope));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal split_kv_mqa is required on Metal",
+                ));
+            }
+        }
+
+        reference_split_kv_mqa(kv_mqa, kv_lora_rank, rope_dim, self.device())
+    }
+
+    fn combine_rope_tail(&self, no_rope: &Tensor, rope: &Tensor) -> Result<Tensor> {
+        validate_combine_rope_tail_shapes(no_rope, rope)?;
+        let no_rope_dims = no_rope.dims();
+        let rope_dims = rope.dims();
+        let batch = no_rope_dims[0];
+        let tokens = no_rope_dims[1];
+        let head_count = no_rope_dims[2];
+        let no_rope_dim = no_rope_dims[3];
+        let rope_head_count = rope_dims[2];
+        let rope_dim = rope_dims[3];
+        let total_dim = no_rope_dim
+            .checked_add(rope_dim)
+            .ok_or_else(|| Error::backend("combine_rope_tail total dim overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let no_rope_values = no_rope
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let rope_values = rope
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.combine_rope_tail_f32(
+                    &no_rope_values,
+                    &rope_values,
+                    batch,
+                    tokens,
+                    head_count,
+                    rope_head_count,
+                    no_rope_dim,
+                    rope_dim,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, tokens, head_count, total_dim),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal combine_rope_tail is required on Metal",
+                ));
+            }
+        }
+
+        reference_combine_rope_tail(no_rope, rope, self.device())
+    }
+
+    fn swiglu(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+        validate_swiglu_shapes(gate, up)?;
+        let output_shape = gate.dims().to_vec();
+        let gate_values = gate
+            .to_dtype(common::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let up_values = up
+            .to_dtype(common::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.swiglu_f32(&gate_values, &up_values)?;
+                return tensor_from_native_values(output_values, &output_shape, self.device());
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal SwiGLU is required on Metal"));
+            }
+        }
+
+        reference_swiglu_from_values(&gate_values, &up_values, &output_shape, self.device())
+    }
+
+    fn swiglu_f32_tensor(&self, gate: &F32Tensor, up: &F32Tensor) -> Result<Option<F32Tensor>> {
+        validate_exact_shape("native_swiglu_shape", gate.dims(), up.dims())?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.swiglu_f32(gate.values(), up.values())?;
+                return Ok(Some(F32Tensor::new(output, gate.dims().to_vec())?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal SwiGLU is required on Metal"));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn attention_scores(&self, q: &Tensor, k: &Tensor, head_dim: usize) -> Result<Tensor> {
+        validate_attention_shapes(q, k, head_dim)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let q_dims = q.dims();
+                let k_dims = k.dims();
+                let batch = q_dims[0];
+                let heads = q_dims[1];
+                let query_tokens = q_dims[2];
+                let key_tokens = k_dims[2];
+                let q_values = q
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let k_values = k
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.attention_scores_f32(
+                    &q_values,
+                    &k_values,
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    head_dim,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, heads, query_tokens, key_tokens),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention scores are required on Metal",
+                ));
+            }
+        }
+
+        reference_attention_scores(q, k, head_dim, self.device())
+    }
+
+    fn attention_values(&self, probs: &Tensor, values: &Tensor) -> Result<Tensor> {
+        validate_attention_value_shapes(probs, values)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let probs_dims = probs.dims();
+                let values_dims = values.dims();
+                let batch = probs_dims[0];
+                let heads = probs_dims[1];
+                let query_tokens = probs_dims[2];
+                let key_tokens = probs_dims[3];
+                let value_dim = values_dims[3];
+                let probs_values = probs
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let value_values = values
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.attention_values_f32(
+                    &probs_values,
+                    &value_values,
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    value_dim,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, heads, query_tokens, value_dim),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention value aggregation is required on Metal",
+                ));
+            }
+        }
+
+        reference_attention_values(probs, values, self.device())
+    }
+
+    fn attention_causal_softmax(&self, scores: &Tensor, past_tokens: usize) -> Result<Tensor> {
+        validate_attention_causal_softmax_shapes(scores, past_tokens)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let dims = scores.dims();
+                let batch = dims[0];
+                let heads = dims[1];
+                let query_tokens = dims[2];
+                let key_tokens = dims[3];
+                let input_values = scores
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.attention_causal_softmax_f32(
+                    &input_values,
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    past_tokens,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, heads, query_tokens, key_tokens),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention causal softmax is required on Metal",
+                ));
+            }
+        }
+
+        reference_attention_causal_softmax(scores, past_tokens, self.device())
+    }
+
+    fn rope_slice(
+        &self,
+        input: &Tensor,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Tensor> {
+        validate_rope_slice_shapes(input, rope_dim, position_offset, theta)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let dims = input.dims();
+                let batch = dims[0];
+                let tokens = dims[1];
+                let heads = dims[2];
+                let input_values = input
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.rope_slice_f32(
+                    &input_values,
+                    batch,
+                    tokens,
+                    heads,
+                    rope_dim,
+                    position_offset,
+                    theta,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (batch, tokens, heads, rope_dim),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal RoPE is required on Metal"));
+            }
+        }
+
+        reference_rope_slice(input, rope_dim, position_offset, theta, self.device())
+    }
+
+    fn add_f32_tensor(&self, lhs: &F32Tensor, rhs: &F32Tensor) -> Result<Option<F32Tensor>> {
+        validate_exact_shape("native_add_f32_shape", lhs.dims(), rhs.dims())?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.add_f32(lhs.values(), rhs.values())?;
+                return Ok(Some(F32Tensor::new(output, lhs.dims().to_vec())?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal add is required on Metal"));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn linear_f32_tensor(
+        &self,
+        input: &F32Tensor,
+        weight: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        let input_dims = require_f32_rank("native_linear_input", input, 2)?;
+        let weight_dims = require_f32_rank("native_linear_weight", weight, 2)?;
+        let rows = input_dims[0];
+        let in_features = input_dims[1];
+        let out_features = weight_dims[0];
+        validate_exact_shape(
+            "native_linear_input_weight_features",
+            &[weight_dims[1]],
+            &[in_features],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.linear_f32(
+                    input.values(),
+                    weight.values(),
+                    rows,
+                    in_features,
+                    out_features,
+                )?;
+                return Ok(Some(F32Tensor::new(output, [rows, out_features])?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal linear is required on Metal"));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn select_last_token_f32_tensor(&self, hidden_states: &F32Tensor) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_select_last_token", hidden_states, 3)?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        let hidden_size = dims[2];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.select_last_token_f32(
+                    hidden_states.values(),
+                    batch,
+                    tokens,
+                    hidden_size,
+                )?;
+                return Ok(Some(F32Tensor::new(output, [batch, 1, hidden_size])?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal select_last_token is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn heads_to_attention_layout_f32_tensor(&self, heads: &F32Tensor) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_heads_to_attention_layout", heads, 4)?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        let head_count = dims[2];
+        let head_dim = dims[3];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.heads_to_attention_layout_f32(
+                    heads.values(),
+                    batch,
+                    tokens,
+                    head_count,
+                    head_dim,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, head_count, tokens, head_dim],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal heads_to_attention_layout is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn merge_attention_heads_f32_tensor(
+        &self,
+        context_heads: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_merge_attention_heads", context_heads, 4)?;
+        let batch = dims[0];
+        let head_count = dims[1];
+        let tokens = dims[2];
+        let head_dim = dims[3];
+        let merged_width = head_count
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::backend("native merge_attention_heads width overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.merge_attention_heads_f32(
+                    context_heads.values(),
+                    batch,
+                    head_count,
+                    tokens,
+                    head_dim,
+                )?;
+                return Ok(Some(F32Tensor::new(output, [batch, tokens, merged_width])?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal merge_attention_heads is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn split_rope_tail_f32_tensor(
+        &self,
+        heads: &F32Tensor,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Option<(F32Tensor, F32Tensor)>> {
+        let dims = require_f32_rank("native_split_rope_tail", heads, 4)?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        let head_count = dims[2];
+        let total_dim = no_rope_dim
+            .checked_add(rope_dim)
+            .ok_or_else(|| Error::backend("native split_rope_tail total dim overflow"))?;
+        validate_exact_shape("native_split_rope_tail_last_dim", &[dims[3]], &[total_dim])?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let (no_rope, rope) = native_metal.split_rope_tail_f32(
+                    heads.values(),
+                    batch,
+                    tokens,
+                    head_count,
+                    no_rope_dim,
+                    rope_dim,
+                )?;
+                return Ok(Some((
+                    F32Tensor::new(no_rope, [batch, tokens, head_count, no_rope_dim])?,
+                    F32Tensor::new(rope, [batch, tokens, head_count, rope_dim])?,
+                )));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal split_rope_tail is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn split_kv_mqa_f32_tensor(
+        &self,
+        kv_mqa: &F32Tensor,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+    ) -> Result<Option<(F32Tensor, F32Tensor)>> {
+        let dims = require_f32_rank("native_split_kv_mqa", kv_mqa, 3)?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        let total_dim = kv_lora_rank
+            .checked_add(rope_dim)
+            .ok_or_else(|| Error::backend("native split_kv_mqa total dim overflow"))?;
+        validate_exact_shape("native_split_kv_mqa_last_dim", &[dims[2]], &[total_dim])?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let (kv_latent, k_rope) = native_metal.split_kv_mqa_f32(
+                    kv_mqa.values(),
+                    batch,
+                    tokens,
+                    kv_lora_rank,
+                    rope_dim,
+                )?;
+                return Ok(Some((
+                    F32Tensor::new(kv_latent, [batch, tokens, kv_lora_rank])?,
+                    F32Tensor::new(k_rope, [batch, tokens, 1, rope_dim])?,
+                )));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal split_kv_mqa is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn combine_rope_tail_f32_tensor(
+        &self,
+        no_rope: &F32Tensor,
+        rope: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        let no_rope_dims = require_f32_rank("native_combine_rope_tail_no_rope", no_rope, 4)?;
+        let rope_dims = require_f32_rank("native_combine_rope_tail_rope", rope, 4)?;
+        let batch = no_rope_dims[0];
+        let tokens = no_rope_dims[1];
+        let head_count = no_rope_dims[2];
+        let no_rope_dim = no_rope_dims[3];
+        let rope_head_count = rope_dims[2];
+        let rope_dim = rope_dims[3];
+        validate_exact_shape(
+            "native_combine_rope_tail_batch_tokens",
+            &[rope_dims[0], rope_dims[1]],
+            &[batch, tokens],
+        )?;
+        let total_dim = no_rope_dim
+            .checked_add(rope_dim)
+            .ok_or_else(|| Error::backend("native combine_rope_tail total dim overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.combine_rope_tail_f32(
+                    no_rope.values(),
+                    rope.values(),
+                    batch,
+                    tokens,
+                    head_count,
+                    rope_head_count,
+                    no_rope_dim,
+                    rope_dim,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, tokens, head_count, total_dim],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal combine_rope_tail is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn attention_scores_f32_tensor(
+        &self,
+        q: &F32Tensor,
+        k: &F32Tensor,
+        head_dim: usize,
+    ) -> Result<Option<F32Tensor>> {
+        let q_dims = require_f32_rank("native_attention_scores_q", q, 4)?;
+        let k_dims = require_f32_rank("native_attention_scores_k", k, 4)?;
+        let batch = q_dims[0];
+        let heads = q_dims[1];
+        let query_tokens = q_dims[2];
+        let key_tokens = k_dims[2];
+        validate_exact_shape(
+            "native_attention_scores_batch_heads_dim",
+            &[k_dims[0], k_dims[1], q_dims[3], k_dims[3]],
+            &[batch, heads, head_dim, head_dim],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.attention_scores_f32(
+                    q.values(),
+                    k.values(),
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    head_dim,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, heads, query_tokens, key_tokens],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention scores are required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn attention_values_f32_tensor(
+        &self,
+        probs: &F32Tensor,
+        values: &F32Tensor,
+    ) -> Result<Option<F32Tensor>> {
+        let probs_dims = require_f32_rank("native_attention_values_probs", probs, 4)?;
+        let values_dims = require_f32_rank("native_attention_values_values", values, 4)?;
+        let batch = probs_dims[0];
+        let heads = probs_dims[1];
+        let query_tokens = probs_dims[2];
+        let key_tokens = probs_dims[3];
+        let value_dim = values_dims[3];
+        validate_exact_shape(
+            "native_attention_values_batch_heads_tokens",
+            &[values_dims[0], values_dims[1], values_dims[2]],
+            &[batch, heads, key_tokens],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.attention_values_f32(
+                    probs.values(),
+                    values.values(),
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    value_dim,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, heads, query_tokens, value_dim],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention value aggregation is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn attention_causal_softmax_f32_tensor(
+        &self,
+        scores: &F32Tensor,
+        past_tokens: usize,
+    ) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_attention_causal_softmax", scores, 4)?;
+        let batch = dims[0];
+        let heads = dims[1];
+        let query_tokens = dims[2];
+        let key_tokens = dims[3];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.attention_causal_softmax_f32(
+                    scores.values(),
+                    batch,
+                    heads,
+                    query_tokens,
+                    key_tokens,
+                    past_tokens,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, heads, query_tokens, key_tokens],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal attention causal softmax is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn decode_attention_f32_tensor(
+        &self,
+        q: &F32Tensor,
+        k: &F32Tensor,
+        v: &F32Tensor,
+        head_dim: usize,
+        past_tokens: usize,
+    ) -> Result<Option<F32Tensor>> {
+        let q_dims = require_f32_rank("native_decode_attention_q", q, 4)?;
+        let k_dims = require_f32_rank("native_decode_attention_k", k, 4)?;
+        let v_dims = require_f32_rank("native_decode_attention_v", v, 4)?;
+        let batch = q_dims[0];
+        let heads = q_dims[1];
+        let query_tokens = q_dims[2];
+        let key_tokens = k_dims[2];
+        let value_dim = v_dims[3];
+        validate_exact_shape(
+            "native_decode_attention_query_tokens",
+            &[query_tokens],
+            &[1],
+        )?;
+        validate_exact_shape(
+            "native_decode_attention_k_shape",
+            &[k_dims[0], k_dims[1], k_dims[3]],
+            &[batch, heads, head_dim],
+        )?;
+        validate_exact_shape(
+            "native_decode_attention_v_shape",
+            &[v_dims[0], v_dims[1], v_dims[2]],
+            &[batch, heads, key_tokens],
+        )?;
+        past_tokens
+            .checked_add(1)
+            .filter(|expected| *expected == key_tokens)
+            .ok_or_else(|| {
+                Error::backend(format!(
+                    "native decode attention expects key_tokens == past_tokens + 1, got key_tokens={key_tokens}, past_tokens={past_tokens}"
+                ))
+            })?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.decode_attention_f32(
+                    q.values(),
+                    k.values(),
+                    v.values(),
+                    batch,
+                    heads,
+                    key_tokens,
+                    head_dim,
+                    value_dim,
+                    past_tokens,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, heads, query_tokens, value_dim],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal fused decode attention is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn paged_decode_attention_f32_tensor(
+        &self,
+        q: &F32Tensor,
+        current_k: &F32Tensor,
+        current_v: &F32Tensor,
+        past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<F32Tensor>> {
+        past_kv.validate()?;
+        let q_dims = require_f32_rank("native_paged_decode_attention_q", q, 4)?;
+        let current_k_dims =
+            require_f32_rank("native_paged_decode_attention_current_k", current_k, 4)?;
+        let current_v_dims =
+            require_f32_rank("native_paged_decode_attention_current_v", current_v, 4)?;
+        validate_exact_shape(
+            "native_paged_decode_attention_q_shape",
+            q_dims,
+            &[
+                past_kv.batch,
+                past_kv.attention_heads,
+                1,
+                past_kv.key_head_dim,
+            ],
+        )?;
+        validate_exact_shape(
+            "native_paged_decode_attention_current_k_shape",
+            current_k_dims,
+            &[
+                past_kv.batch,
+                past_kv.attention_heads,
+                1,
+                past_kv.key_head_dim,
+            ],
+        )?;
+        validate_exact_shape(
+            "native_paged_decode_attention_current_v_shape",
+            current_v_dims,
+            &[
+                past_kv.batch,
+                past_kv.attention_heads,
+                1,
+                past_kv.value_head_dim,
+            ],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.paged_decode_attention_f32(
+                    q.values(),
+                    current_k.values(),
+                    current_v.values(),
+                    past_kv,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [
+                        past_kv.batch,
+                        past_kv.attention_heads,
+                        1,
+                        past_kv.value_head_dim,
+                    ],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal paged decode attention is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn rope_slice_f32_tensor(
+        &self,
+        input: &F32Tensor,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_rope_slice", input, 4)?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        let heads = dims[2];
+        validate_exact_shape("native_rope_slice_dim", &[dims[3]], &[rope_dim])?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output = native_metal.rope_slice_f32(
+                    input.values(),
+                    batch,
+                    tokens,
+                    heads,
+                    rope_dim,
+                    position_offset,
+                    theta,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output,
+                    [batch, tokens, heads, rope_dim],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal RoPE is required on Metal"));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn rms_norm(&self, hidden_states: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        validate_rms_norm_shapes(hidden_states, weight)?;
+
+        let input = tensor_to_f32_tensor(hidden_states)?;
+        let weight = tensor_to_f32_tensor(weight)?;
+        let output = self.rms_norm_f32(&input, &weight, eps)?;
+        let (shape, values) = output.into_parts();
+        Tensor::from_vec(values, shape.dims(), self.device()).map_err(Into::into)
+    }
+
+    fn rms_norm_f32(
+        &self,
+        hidden_states: &F32Tensor,
+        weight: &F32Tensor,
+        eps: f32,
+    ) -> Result<F32Tensor> {
+        validate_rms_norm_f32_shapes(hidden_states, weight, eps)?;
+        let dims = hidden_states.dims();
+        let hidden_size = *dims
+            .last()
+            .ok_or_else(|| Error::backend("rms_norm input has empty shape"))?;
+        let rows = hidden_states
+            .values()
+            .len()
+            .checked_div(hidden_size)
+            .ok_or_else(|| Error::backend("rms_norm hidden_size division overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.rms_norm_f32(
+                    hidden_states.values(),
+                    weight.values(),
+                    rows,
+                    hidden_size,
+                    eps,
+                )?;
+                return F32Tensor::new(output_values, dims.to_vec());
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend("native Metal RMSNorm is required on Metal"));
+            }
+        }
+
+        reference_rms_norm_f32(hidden_states, weight, eps)
+    }
+
+    fn moe_gather_tokens(&self, flat_tokens: &Tensor, token_indices: &[u32]) -> Result<Tensor> {
+        validate_moe_gather_shapes(flat_tokens, token_indices)?;
+        let token_count = flat_tokens.dims()[0];
+        let hidden_size = flat_tokens.dims()[1];
+        let assignment_count = token_indices.len();
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let flat_token_values = flat_tokens
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.moe_gather_tokens_f32(
+                    &flat_token_values,
+                    token_indices,
+                    token_count,
+                    hidden_size,
+                    assignment_count,
+                )?;
+                return Tensor::from_vec(
+                    output_values,
+                    (assignment_count, hidden_size),
+                    self.device(),
+                )
+                .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal MoE token gather is required on Metal",
+                ));
+            }
+        }
+
+        reference_moe_gather_tokens(flat_tokens, token_indices, self.device())
+    }
+
+    fn moe_gather_tokens_f32_tensor(
+        &self,
+        flat_tokens: &F32Tensor,
+        token_indices: &[u32],
+    ) -> Result<Option<F32Tensor>> {
+        let dims = require_f32_rank("native_moe_gather_tokens", flat_tokens, 2)?;
+        let token_count = dims[0];
+        let hidden_size = dims[1];
+        let assignment_count = token_indices.len();
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.moe_gather_tokens_f32(
+                    flat_tokens.values(),
+                    token_indices,
+                    token_count,
+                    hidden_size,
+                    assignment_count,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output_values,
+                    [assignment_count, hidden_size],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal MoE token gather is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn moe_weighted_index_add_combine(
+        &self,
+        accumulator: &Tensor,
+        token_indices: &Tensor,
+        expert_outputs: &Tensor,
+        expert_weights: &Tensor,
+    ) -> Result<Tensor> {
+        validate_moe_weighted_index_add_shapes(
+            accumulator,
+            token_indices,
+            expert_outputs,
+            expert_weights,
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let token_count = accumulator.dims()[0];
+                let hidden_size = accumulator.dims()[1];
+                let assignment_count = token_indices.dims()[0];
+                let accumulator_values = accumulator
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let token_index_values = token_indices.to_vec1::<u32>()?;
+                let expert_output_values = expert_outputs
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let expert_weight_values = expert_weights
+                    .to_dtype(common::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let output_values = native_metal.moe_weighted_index_add_combine_f32(
+                    &accumulator_values,
+                    &token_index_values,
+                    &expert_output_values,
+                    &expert_weight_values,
+                    token_count,
+                    hidden_size,
+                    assignment_count,
+                )?;
+                return Tensor::from_vec(output_values, (token_count, hidden_size), self.device())
+                    .map_err(Into::into);
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal weighted MoE combine is required on Metal",
+                ));
+            }
+        }
+
+        reference_moe_weighted_index_add_combine(
+            accumulator,
+            token_indices,
+            expert_outputs,
+            expert_weights,
+            self.device(),
+        )
+    }
+
+    fn moe_weighted_index_add_combine_f32_tensor(
+        &self,
+        accumulator: &F32Tensor,
+        token_indices: &[u32],
+        expert_outputs: &F32Tensor,
+        expert_weights: &[f32],
+    ) -> Result<Option<F32Tensor>> {
+        let accumulator_dims = require_f32_rank("native_moe_combine_accumulator", accumulator, 2)?;
+        let expert_dims = require_f32_rank("native_moe_combine_expert_outputs", expert_outputs, 2)?;
+        let token_count = accumulator_dims[0];
+        let hidden_size = accumulator_dims[1];
+        let assignment_count = token_indices.len();
+        validate_exact_shape(
+            "native_moe_combine_expert_shape",
+            expert_dims,
+            &[assignment_count, hidden_size],
+        )?;
+        validate_exact_shape(
+            "native_moe_combine_weight_count",
+            &[expert_weights.len()],
+            &[assignment_count],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let output_values = native_metal.moe_weighted_index_add_combine_f32(
+                    accumulator.values(),
+                    token_indices,
+                    expert_outputs.values(),
+                    expert_weights,
+                    token_count,
+                    hidden_size,
+                    assignment_count,
+                )?;
+                return Ok(Some(F32Tensor::new(
+                    output_values,
+                    [token_count, hidden_size],
+                )?));
+            }
+            if self.device_kind == DeviceKind::Metal {
+                return Err(Error::backend(
+                    "native Metal weighted MoE combine is required on Metal",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn q2_k_matvec_f32(
+        &self,
+        weights: &[u8],
+        input: &Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let input = tensor_to_f32_tensor(input)?;
+            self.q2_k_matvec_f32_tensor(weights, &input, row_count, in_features, out_features)?
+                .map(|output| tensor_from_f32_tensor(output, self.device()))
+                .transpose()
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape("native_q2_k_matvec_rows", &[actual_rows], &[row_count])?;
+
+            let output_values = native_metal.q2_k_matvec_f32(
+                weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_add_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        residual: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape("native_q2_k_matvec_add_rows", &[actual_rows], &[row_count])?;
+            validate_exact_shape(
+                "native_q2_k_matvec_add_residual",
+                residual.dims(),
+                &output_shape,
+            )?;
+
+            let output_values = native_metal.q2_k_matvec_add_f32(
+                weights,
+                input.values(),
+                residual.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                residual,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_argmax_f32(
+        &self,
+        weights: &[u8],
+        input: &Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let input = tensor_to_f32_tensor(input)?;
+            self.q2_k_matvec_argmax_f32_tensor(
+                weights,
+                &input,
+                row_count,
+                in_features,
+                out_features,
+            )
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_argmax_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, _output_shape) =
+                matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape(
+                "native_q2_k_matvec_argmax_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+            validate_exact_shape("native_q2_k_matvec_argmax_row_count", &[row_count], &[1])?;
+
+            let (token_id, token_score) = native_metal.q2_k_matvec_argmax_f32(
+                weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some((token_id, token_score)))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_rms_norm_argmax_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        rms_weight: &F32Tensor,
+        eps: f32,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, _output_shape) =
+                matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape(
+                "native_q2_k_rms_norm_argmax_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+            validate_exact_shape("native_q2_k_rms_norm_argmax_row_count", &[row_count], &[1])?;
+            validate_exact_shape(
+                "native_q2_k_rms_norm_argmax_weight",
+                rms_weight.dims(),
+                &[in_features],
+            )?;
+            validate_rms_norm_f32_shapes(input, rms_weight, eps)?;
+
+            let (token_id, token_score) = native_metal.q2_k_rms_norm_argmax_f32(
+                weights,
+                input.values(),
+                rms_weight.values(),
+                row_count,
+                in_features,
+                out_features,
+                eps,
+            )?;
+            Ok(Some((token_id, token_score)))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                rms_weight,
+                eps,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_gate_up_swiglu_f32(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let input = tensor_to_f32_tensor(input)?;
+            self.q2_k_gate_up_swiglu_f32_tensor(
+                gate_weights,
+                up_weights,
+                &input,
+                row_count,
+                in_features,
+                out_features,
+            )?
+            .map(|output| tensor_from_f32_tensor(output, self.device()))
+            .transpose()
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_gate_up_swiglu_f32_tensor(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape(
+                "native_q2_k_gate_up_swiglu_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+
+            let output_values = native_metal.q2_k_gate_up_swiglu_f32(
+                gate_weights,
+                up_weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_transposed_matvec_f32(
+        &self,
+        weights: &[u8],
+        input: &Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let input = tensor_to_f32_tensor(input)?;
+            self.q2_k_transposed_matvec_f32_tensor(
+                weights,
+                &input,
+                row_count,
+                in_features,
+                out_features,
+            )?
+            .map(|output| tensor_from_f32_tensor(output, self.device()))
+            .transpose()
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_transposed_matvec_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape(
+                "native_q2_k_transposed_matvec_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+
+            let output_values = native_metal.q2_k_transposed_matvec_f32(
+                weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q8_0_matvec_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape("native_q8_0_matvec_rows", &[actual_rows], &[row_count])?;
+
+            let output_values = native_metal.q8_0_matvec_f32(
+                weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q8_0_transposed_matvec_f32_tensor(
+        &self,
+        weights: &[u8],
+        input: &F32Tensor,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<F32Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+
+            let (actual_rows, output_shape) = matvec_input_shape(input, in_features, out_features)?;
+            validate_exact_shape(
+                "native_q8_0_transposed_matvec_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+
+            let output_values = native_metal.q8_0_transposed_matvec_f32(
+                weights,
+                input.values(),
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(F32Tensor::new(output_values, output_shape)?))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+}
+
+impl MetalBackend {
+    fn has_native_metal(&self) -> bool {
+        self.native_metal().is_some()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn native_metal(&self) -> Option<&Metal> {
+        self.native_metal.as_deref()
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    fn native_metal(&self) -> Option<&()> {
+        None
+    }
+}
+
+fn backend_operations(has_native_metal: bool) -> Vec<&'static str> {
+    let mut operations = vec![
+        "linear",
+        "matmul",
+        "add",
+        "select_last_token",
+        "heads_to_attention_layout",
+        "merge_attention_heads",
+        "split_rope_tail",
+        "split_kv_mqa",
+        "combine_rope_tail",
+        "swiglu",
+        "attention_scores",
+        "attention_values",
+        "attention_causal_softmax",
+        "rope_slice",
+        "rms_norm",
+        "moe_gather_tokens",
+        "moe_weighted_index_add_combine",
+    ];
+    if has_native_metal {
+        operations.push("add_f32_tensor");
+        operations.push("linear_f32_tensor");
+        operations.push("select_last_token_f32_tensor");
+        operations.push("heads_to_attention_layout_f32_tensor");
+        operations.push("merge_attention_heads_f32_tensor");
+        operations.push("split_rope_tail_f32_tensor");
+        operations.push("split_kv_mqa_f32_tensor");
+        operations.push("combine_rope_tail_f32_tensor");
+        operations.push("swiglu_f32_tensor");
+        operations.push("attention_scores_f32_tensor");
+        operations.push("attention_values_f32_tensor");
+        operations.push("attention_causal_softmax_f32_tensor");
+        operations.push("decode_attention_f32_tensor");
+        operations.push("paged_decode_attention_f32_tensor");
+        operations.push("rope_slice_f32_tensor");
+        operations.push("moe_gather_tokens_f32_tensor");
+        operations.push("moe_weighted_index_add_combine_f32_tensor");
+        operations.push("q2_k_matvec_f32_tensor");
+        operations.push("q2_k_matvec_add_f32_tensor");
+        operations.push("q2_k_matvec_f32");
+        operations.push("q2_k_gate_up_swiglu_f32_tensor");
+        operations.push("q2_k_gate_up_swiglu_f32");
+        operations.push("q2_k_matvec_argmax_f32_tensor");
+        operations.push("q2_k_rms_norm_argmax_f32_tensor");
+        operations.push("q2_k_matvec_argmax_f32");
+        operations.push("q2_k_transposed_matvec_f32_tensor");
+        operations.push("q2_k_transposed_matvec_f32");
+        operations.push("q8_0_matvec_f32_tensor");
+        operations.push("q8_0_transposed_matvec_f32_tensor");
+    }
+    operations
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn native_metal_for(device_kind: DeviceKind) -> Option<Arc<Metal>> {
+    if device_kind != DeviceKind::Metal {
+        return None;
+    }
+
+    match Metal::new() {
+        Ok(native_metal) => Some(Arc::new(native_metal)),
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "native Metal kernels unavailable"
+            );
+            None
+        }
+    }
+}
+
+fn matvec_input_shape(
+    input: &F32Tensor,
+    in_features: usize,
+    out_features: usize,
+) -> Result<(usize, Vec<usize>)> {
+    match input.dims() {
+        [rows, features] => {
+            validate_exact_shape("native_q2_k_matvec_input", &[*features], &[in_features])?;
+            Ok((*rows, vec![*rows, out_features]))
+        }
+        [batch, tokens, features] => {
+            validate_exact_shape("native_q2_k_matvec_input", &[*features], &[in_features])?;
+            let row_count = batch
+                .checked_mul(*tokens)
+                .ok_or_else(|| Error::backend("native Q2_K matvec input row count overflow"))?;
+            Ok((row_count, vec![*batch, *tokens, out_features]))
+        }
+        dims => Err(Error::backend(format!(
+            "native Q2_K matvec input rank must be 2 or 3, got {dims:?}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn tensor_from_matvec_output(
+    values: Vec<f32>,
+    output_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    match output_shape {
+        [rows, features] => Ok(Tensor::from_vec(values, (*rows, *features), device)?),
+        [batch, tokens, features] => Ok(Tensor::from_vec(
+            values,
+            (*batch, *tokens, *features),
+            device,
+        )?),
+        other => Err(Error::backend(format!(
+            "native Q2_K matvec output shape must be rank 2 or 3, got {other:?}"
+        ))),
+    }
+}
+
+fn tensor_from_f32_tensor(tensor: F32Tensor, device: &Device) -> Result<Tensor> {
+    let (shape, values) = tensor.into_parts();
+    Ok(Tensor::from_vec(values, shape.dims(), device)?)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn tensor_from_native_values(
+    values: Vec<f32>,
+    output_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    if output_shape.is_empty() {
+        return Err(Error::backend("native tensor output shape is empty"));
+    }
+    Ok(Tensor::from_vec(values, output_shape, device)?)
+}
+
+#[cfg(test)]
+fn run_backend_check_with<B: Backend>(backend: &B) -> Result<BackendCheckReport> {
+    let device = backend.device();
+    let mut operations = Vec::new();
+
+    let linear_input = Tensor::from_vec(
+        vec![
+            0.10_f32, 0.20, -0.10, 0.30, //
+            1.00, -0.50, 0.25, 0.75, //
+            -0.40, 0.60, 0.80, -0.20,
+        ],
+        (3, 4),
+        device,
+    )?;
+    let linear_weight = Tensor::from_vec(
+        vec![
+            0.25_f32, -0.50, 0.75, -1.00, //
+            1.10, 0.20, -0.30, 0.60, //
+            -0.40, 0.90, 0.10, -0.80, //
+            0.05, -0.15, 0.35, 0.70, //
+            -1.25, 0.45, 0.25, -0.05,
+        ],
+        (5, 4),
+        device,
+    )?;
+    let linear_output = backend.linear(&linear_input, &linear_weight)?;
+    operations.push(MetalBackend::operation_report(
+        "linear",
+        vec![
+            shape("input", &linear_input),
+            shape("weight", &linear_weight),
+        ],
+        &linear_output,
+    )?);
+
+    let matmul_lhs = Tensor::from_vec(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), device)?;
+    let matmul_rhs = Tensor::from_vec(vec![0.5_f32, 1.0, -1.0, 1.5, -0.5, 0.25], (3, 2), device)?;
+    let matmul_output = backend.matmul(&matmul_lhs, &matmul_rhs)?;
+    operations.push(MetalBackend::operation_report(
+        "matmul",
+        vec![shape("lhs", &matmul_lhs), shape("rhs", &matmul_rhs)],
+        &matmul_output,
+    )?);
+
+    let add_lhs = Tensor::from_vec(vec![1.0_f32, -2.0, 0.5, 4.0, 3.0, -0.25], (2, 3), device)?;
+    let add_rhs = Tensor::from_vec(vec![0.25_f32, 2.5, -1.5, -0.75, 1.0, 0.5], (2, 3), device)?;
+    let add_output = backend.add(&add_lhs, &add_rhs)?;
+    operations.push(MetalBackend::operation_report(
+        "add",
+        vec![shape("lhs", &add_lhs), shape("rhs", &add_rhs)],
+        &add_output,
+    )?);
+
+    let hidden_for_last = Tensor::from_vec(
+        (0..2 * 3 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (2, 3, 4),
+        device,
+    )?;
+    let last_token = backend.select_last_token(&hidden_for_last)?;
+    operations.push(MetalBackend::operation_report(
+        "select_last_token",
+        vec![shape("hidden_states", &hidden_for_last)],
+        &last_token,
+    )?);
+
+    let heads_bthd = Tensor::from_vec(
+        (0..1 * 3 * 2 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (1, 3, 2, 4),
+        device,
+    )?;
+    let heads_bhtd = backend.heads_to_attention_layout(&heads_bthd)?;
+    operations.push(MetalBackend::operation_report(
+        "heads_to_attention_layout",
+        vec![shape("heads", &heads_bthd)],
+        &heads_bhtd,
+    )?);
+
+    let merged_heads = backend.merge_attention_heads(&heads_bhtd)?;
+    operations.push(MetalBackend::operation_report(
+        "merge_attention_heads",
+        vec![shape("context_heads", &heads_bhtd)],
+        &merged_heads,
+    )?);
+
+    let split_input = Tensor::from_vec(
+        (0..1 * 2 * 2 * 5)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 2, 5),
+        device,
+    )?;
+    let (no_rope, rope) = backend.split_rope_tail(&split_input, 3, 2)?;
+    operations.push(MetalBackend::operation_report(
+        "split_rope_tail",
+        vec![shape("heads", &split_input)],
+        &rope,
+    )?);
+
+    let kv_mqa_input = Tensor::from_vec(
+        (0..1 * 2 * 6)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 6),
+        device,
+    )?;
+    let (_kv_latent, k_rope) = backend.split_kv_mqa(&kv_mqa_input, 4, 2)?;
+    operations.push(MetalBackend::operation_report(
+        "split_kv_mqa",
+        vec![shape("kv_mqa", &kv_mqa_input)],
+        &k_rope,
+    )?);
+
+    let combined_rope = backend.combine_rope_tail(&no_rope, &rope)?;
+    operations.push(MetalBackend::operation_report(
+        "combine_rope_tail",
+        vec![shape("no_rope", &no_rope), shape("rope", &rope)],
+        &combined_rope,
+    )?);
+
+    let swiglu_gate = Tensor::from_vec(vec![-1.0_f32, 0.0, 0.5, 2.0, 1.0, -0.25], (2, 3), device)?;
+    let swiglu_up = Tensor::from_vec(vec![0.25_f32, 0.5, -1.0, 1.5, -0.75, 2.0], (2, 3), device)?;
+    let swiglu_output = backend.swiglu(&swiglu_gate, &swiglu_up)?;
+    operations.push(MetalBackend::operation_report(
+        "swiglu",
+        vec![shape("gate", &swiglu_gate), shape("up", &swiglu_up)],
+        &swiglu_output,
+    )?);
+
+    let q = Tensor::from_vec(
+        (0..1 * 2 * 3 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 3, 4),
+        device,
+    )?;
+    let k = Tensor::from_vec(
+        (0..1 * 2 * 5 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 25.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 5, 4),
+        device,
+    )?;
+    let scores = backend.attention_scores(&q, &k, 4)?;
+    operations.push(MetalBackend::operation_report(
+        "attention_scores",
+        vec![shape("q", &q), shape("k", &k)],
+        &scores,
+    )?);
+
+    let causal_probabilities = backend.attention_causal_softmax(&scores, 2)?;
+    operations.push(MetalBackend::operation_report(
+        "attention_causal_softmax",
+        vec![shape("scores", &scores)],
+        &causal_probabilities,
+    )?);
+
+    let attention_values = Tensor::from_vec(
+        (0..1 * 2 * 5 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 5, 4),
+        device,
+    )?;
+    let attention_context = backend.attention_values(&causal_probabilities, &attention_values)?;
+    operations.push(MetalBackend::operation_report(
+        "attention_values",
+        vec![
+            shape("probabilities", &causal_probabilities),
+            shape("values", &attention_values),
+        ],
+        &attention_context,
+    )?);
+
+    let rope_input = Tensor::from_vec(
+        (0..1 * 2 * 2 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (1, 2, 2, 4),
+        device,
+    )?;
+    let rope_output = backend.rope_slice(&rope_input, 4, 3, 10_000.0)?;
+    operations.push(MetalBackend::operation_report(
+        "rope_slice",
+        vec![shape("input", &rope_input)],
+        &rope_output,
+    )?);
+
+    let hidden_states = Tensor::from_vec(
+        (0..2 * 3 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>(),
+        (2, 3, 4),
+        device,
+    )?;
+    let rms_weight = Tensor::from_vec(vec![1.0_f32, 1.1, 0.9, 1.2], 4, device)?;
+    let normed = backend.rms_norm(&hidden_states, &rms_weight, 1e-5)?;
+    operations.push(MetalBackend::operation_report(
+        "rms_norm",
+        vec![
+            shape("hidden_states", &hidden_states),
+            shape("weight", &rms_weight),
+        ],
+        &normed,
+    )?);
+
+    let flat_tokens = Tensor::from_vec(
+        vec![
+            1.0_f32, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0, //
+            9.0, 10.0, 11.0, 12.0,
+        ],
+        (3, 4),
+        device,
+    )?;
+    let gather_indices = vec![2_u32, 0, 2];
+    let gathered = backend.moe_gather_tokens(&flat_tokens, &gather_indices)?;
+    operations.push(MetalBackend::operation_report(
+        "moe_gather_tokens",
+        vec![shape("flat_tokens", &flat_tokens)],
+        &gathered,
+    )?);
+
+    let accumulator = Tensor::zeros((6, 4))?;
+    let token_indices = Tensor::from_vec(vec![0_u32, 2, 2, 5], 4, device)?;
+    let expert_outputs = Tensor::from_vec(
+        (0..4 * 4)
+            .map(|idx| (idx as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>(),
+        (4, 4),
+        device,
+    )?;
+    let expert_weights = Tensor::from_vec(vec![1.0_f32, 0.5, 2.0, 0.25], 4, device)?;
+    let combined = backend.moe_weighted_index_add_combine(
+        &accumulator,
+        &token_indices,
+        &expert_outputs,
+        &expert_weights,
+    )?;
+    operations.push(MetalBackend::operation_report(
+        "moe_weighted_index_add_combine",
+        vec![
+            shape("accumulator", &accumulator),
+            shape("token_indices", &token_indices),
+            shape("expert_outputs", &expert_outputs),
+            shape("expert_weights", &expert_weights),
+        ],
+        &combined,
+    )?);
+
+    Ok(BackendCheckReport {
+        capabilities: backend.capabilities(),
+        operations,
+    })
+}
+
+fn validate_matmul_shapes(lhs: &Tensor, rhs: &Tensor) -> Result<()> {
+    let lhs_dims = lhs.dims();
+    let rhs_dims = rhs.dims();
+    if lhs_dims.len() != 2 || rhs_dims.len() != 2 {
+        return Err(Error::backend(format!(
+            "matmul inputs must be rank 2 [rows, inner] x [inner, cols], got lhs={lhs_dims:?} rhs={rhs_dims:?}"
+        )));
+    }
+
+    validate_exact_shape("matmul_contract_dim", &[lhs_dims[1]], &[rhs_dims[0]])
+}
+
+fn validate_linear_shapes(input: &Tensor, weight: &Tensor) -> Result<()> {
+    let input_dims = input.dims();
+    let weight_dims = weight.dims();
+    if weight_dims.len() != 2 {
+        return Err(Error::backend(format!(
+            "linear weight rank must be 2 [out_features, in_features], got {weight_dims:?}"
+        )));
+    }
+    if !(input_dims.len() == 2 || input_dims.len() == 3) {
+        return Err(Error::backend(format!(
+            "linear input rank must be 2 or 3, got {input_dims:?}"
+        )));
+    }
+
+    let input_in_features = *input_dims
+        .last()
+        .ok_or_else(|| Error::backend("linear input has empty shape"))?;
+    let weight_in_features = weight_dims[1];
+    validate_exact_shape(
+        "linear_in_features",
+        &[input_in_features],
+        &[weight_in_features],
+    )
+}
+
+fn validate_add_shapes(lhs: &Tensor, rhs: &Tensor) -> Result<()> {
+    let lhs_dims = lhs.dims();
+    let rhs_dims = rhs.dims();
+    if !(lhs_dims.len() == 2 || lhs_dims.len() == 3) {
+        return Err(Error::backend(format!(
+            "add lhs rank must be 2 or 3, got {lhs_dims:?}"
+        )));
+    }
+    if lhs_dims != rhs_dims {
+        return Err(Error::backend(format!(
+            "add lhs/rhs shapes must match, got lhs={lhs_dims:?} rhs={rhs_dims:?}"
+        )));
+    }
+    if lhs_dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "add dimensions must be positive, got {lhs_dims:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_select_last_token_shapes(hidden_states: &Tensor) -> Result<()> {
+    let dims = hidden_states.dims();
+    if dims.len() != 3 {
+        return Err(Error::backend(format!(
+            "select_last_token input must be rank 3 [B,T,H], got {dims:?}"
+        )));
+    }
+    if dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
+        return Err(Error::backend(format!(
+            "select_last_token dimensions must be positive, got {dims:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_heads_to_attention_layout_shapes(heads: &Tensor) -> Result<()> {
+    let dims = heads.dims();
+    if dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "heads_to_attention_layout input must be rank 4 [B,T,H,D], got {dims:?}"
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "heads_to_attention_layout dimensions must be positive, got {dims:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_merge_attention_heads_shapes(context_heads: &Tensor) -> Result<()> {
+    let dims = context_heads.dims();
+    if dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "merge_attention_heads input must be rank 4 [B,H,T,D], got {dims:?}"
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "merge_attention_heads dimensions must be positive, got {dims:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_split_rope_tail_shapes(
+    heads: &Tensor,
+    no_rope_dim: usize,
+    rope_dim: usize,
+) -> Result<()> {
+    let dims = heads.dims();
+    if dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "split_rope_tail input must be rank 4 [B,T,H,D], got {dims:?}"
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) || no_rope_dim == 0 || rope_dim == 0 {
+        return Err(Error::backend(format!(
+            "split_rope_tail dimensions must be positive, got input={dims:?} no_rope_dim={no_rope_dim} rope_dim={rope_dim}"
+        )));
+    }
+    let total_dim = no_rope_dim
+        .checked_add(rope_dim)
+        .ok_or_else(|| Error::backend("split_rope_tail total dim overflow"))?;
+    validate_exact_shape("split_rope_tail_last_dim", &[dims[3]], &[total_dim])
+}
+
+fn validate_split_kv_mqa_shapes(
+    kv_mqa: &Tensor,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+) -> Result<()> {
+    let dims = kv_mqa.dims();
+    if dims.len() != 3 {
+        return Err(Error::backend(format!(
+            "split_kv_mqa input must be rank 3 [B,T,kv_lora+rope], got {dims:?}"
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) || kv_lora_rank == 0 || rope_dim == 0 {
+        return Err(Error::backend(format!(
+            "split_kv_mqa dimensions must be positive, got input={dims:?} kv_lora_rank={kv_lora_rank} rope_dim={rope_dim}"
+        )));
+    }
+    let total_dim = kv_lora_rank
+        .checked_add(rope_dim)
+        .ok_or_else(|| Error::backend("split_kv_mqa total dim overflow"))?;
+    validate_exact_shape("split_kv_mqa_last_dim", &[dims[2]], &[total_dim])
+}
+
+fn validate_combine_rope_tail_shapes(no_rope: &Tensor, rope: &Tensor) -> Result<()> {
+    let no_rope_dims = no_rope.dims();
+    let rope_dims = rope.dims();
+    if no_rope_dims.len() != 4 || rope_dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "combine_rope_tail inputs must be rank 4 [B,T,H,D], got no_rope={no_rope_dims:?} rope={rope_dims:?}"
+        )));
+    }
+    if no_rope_dims.iter().any(|dim| *dim == 0) || rope_dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "combine_rope_tail dimensions must be positive, got no_rope={no_rope_dims:?} rope={rope_dims:?}"
+        )));
+    }
+    validate_exact_shape(
+        "combine_rope_tail_batch",
+        &[no_rope_dims[0]],
+        &[rope_dims[0]],
+    )?;
+    validate_exact_shape(
+        "combine_rope_tail_tokens",
+        &[no_rope_dims[1]],
+        &[rope_dims[1]],
+    )?;
+    if rope_dims[2] != 1 && rope_dims[2] != no_rope_dims[2] {
+        return Err(Error::backend(format!(
+            "combine_rope_tail rope head count must be 1 or {}, got {}",
+            no_rope_dims[2], rope_dims[2]
+        )));
+    }
+    Ok(())
+}
+
+fn validate_swiglu_shapes(gate: &Tensor, up: &Tensor) -> Result<()> {
+    let gate_dims = gate.dims();
+    let up_dims = up.dims();
+    if !(gate_dims.len() == 2 || gate_dims.len() == 3) {
+        return Err(Error::backend(format!(
+            "SwiGLU gate rank must be 2 or 3, got {gate_dims:?}"
+        )));
+    }
+    if gate_dims != up_dims {
+        return Err(Error::backend(format!(
+            "SwiGLU gate/up shapes must match, got gate={gate_dims:?} up={up_dims:?}"
+        )));
+    }
+    if gate_dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "SwiGLU dimensions must be positive, got {gate_dims:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attention_shapes(q: &Tensor, k: &Tensor, head_dim: usize) -> Result<()> {
+    let q_dims = q.dims();
+    let k_dims = k.dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "attention q/k rank must be 4, got q={q_dims:?} k={k_dims:?}"
+        )));
+    }
+
+    validate_exact_shape("attention_batch", &[q_dims[0]], &[k_dims[0]])?;
+    validate_exact_shape("attention_heads", &[q_dims[1]], &[k_dims[1]])?;
+    validate_exact_shape("attention_q_head_dim", &[q_dims[3]], &[head_dim])?;
+    validate_exact_shape("attention_k_head_dim", &[k_dims[3]], &[head_dim])
+}
+
+fn validate_attention_value_shapes(probs: &Tensor, values: &Tensor) -> Result<()> {
+    let probs_dims = probs.dims();
+    let value_dims = values.dims();
+    if probs_dims.len() != 4 || value_dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "attention value aggregation inputs must be rank 4, got probs={probs_dims:?} values={value_dims:?}"
+        )));
+    }
+
+    validate_exact_shape("attention_values_batch", &[probs_dims[0]], &[value_dims[0]])?;
+    validate_exact_shape("attention_values_heads", &[probs_dims[1]], &[value_dims[1]])?;
+    validate_exact_shape(
+        "attention_values_key_tokens",
+        &[probs_dims[3]],
+        &[value_dims[2]],
+    )?;
+    Ok(())
+}
+
+fn validate_attention_causal_softmax_shapes(scores: &Tensor, past_tokens: usize) -> Result<()> {
+    let dims = scores.dims();
+    if dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "attention causal softmax input must be rank 4 [B,H,Q,K], got {dims:?}"
+        )));
+    }
+
+    let query_tokens = dims[2];
+    let key_tokens = dims[3];
+    if past_tokens
+        .checked_add(query_tokens)
+        .filter(|expected_key_tokens| *expected_key_tokens == key_tokens)
+        .is_none()
+    {
+        return Err(Error::backend(format!(
+            "attention causal softmax expects key_tokens == past_tokens + query_tokens, got key_tokens={key_tokens}, past_tokens={past_tokens}, query_tokens={query_tokens}"
+        )));
+    }
+    if query_tokens == 0 || key_tokens == 0 {
+        return Err(Error::backend(
+            "attention causal softmax query_tokens and key_tokens must be positive",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_rope_slice_shapes(
+    input: &Tensor,
+    rope_dim: usize,
+    position_offset: usize,
+    theta: f32,
+) -> Result<()> {
+    let dims = input.dims();
+    if dims.len() != 4 {
+        return Err(Error::backend(format!(
+            "RoPE input must be rank 4 [B,T,H,D], got {dims:?}"
+        )));
+    }
+    if rope_dim == 0 {
+        return Err(Error::backend("RoPE rope_dim must be positive"));
+    }
+    if rope_dim % 2 != 0 {
+        return Err(Error::backend(format!(
+            "RoPE rope_dim must be even, got {rope_dim}"
+        )));
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(Error::backend(
+            "RoPE theta must be finite and greater than zero",
+        ));
+    }
+    if dims[1] == 0 {
+        return Err(Error::backend("RoPE token dimension must be positive"));
+    }
+    position_offset
+        .checked_add(dims[1] - 1)
+        .ok_or_else(|| Error::backend("RoPE position range overflow"))?;
+    validate_exact_shape("rope_dim", &[dims[3]], &[rope_dim])
+}
+
+fn validate_rms_norm_shapes(hidden_states: &Tensor, weight: &Tensor) -> Result<()> {
+    let hidden_dims = hidden_states.dims();
+    let weight_dims = weight.dims();
+    if hidden_dims.is_empty() {
+        return Err(Error::backend("rms_norm hidden_states must have rank >= 1"));
+    }
+    if weight_dims.len() != 1 {
+        return Err(Error::backend(format!(
+            "rms_norm weight rank must be 1 [hidden_size], got {weight_dims:?}"
+        )));
+    }
+
+    validate_exact_shape(
+        "rms_norm_hidden_size",
+        &[*hidden_dims.last().expect("checked non-empty hidden dims")],
+        &[weight_dims[0]],
+    )
+}
+
+fn validate_rms_norm_f32_shapes(
+    hidden_states: &F32Tensor,
+    weight: &F32Tensor,
+    eps: f32,
+) -> Result<()> {
+    let hidden_dims = hidden_states.dims();
+    let weight_dims = weight.dims();
+    if hidden_dims.is_empty() {
+        return Err(Error::backend("rms_norm hidden_states must have rank >= 1"));
+    }
+    if hidden_dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "rms_norm hidden_states dimensions must be positive, got {hidden_dims:?}"
+        )));
+    }
+    if weight_dims.len() != 1 {
+        return Err(Error::backend(format!(
+            "rms_norm weight rank must be 1 [hidden_size], got {weight_dims:?}"
+        )));
+    }
+    if eps <= 0.0 || !eps.is_finite() {
+        return Err(Error::backend(
+            "rms_norm eps must be finite and greater than zero",
+        ));
+    }
+
+    validate_exact_shape(
+        "rms_norm_hidden_size",
+        &[*hidden_dims.last().expect("checked non-empty hidden dims")],
+        &[weight_dims[0]],
+    )
+}
+
+fn require_f32_rank<'a>(context: &str, tensor: &'a F32Tensor, rank: usize) -> Result<&'a [usize]> {
+    let dims = tensor.dims();
+    if dims.len() != rank {
+        return Err(Error::backend(format!(
+            "{context} tensor must have rank {rank}, got {dims:?}"
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "{context} tensor dimensions must be positive, got {dims:?}"
+        )));
+    }
+    Ok(dims)
+}
+
+fn validate_moe_gather_shapes(flat_tokens: &Tensor, token_indices: &[u32]) -> Result<()> {
+    let dims = flat_tokens.dims();
+    if dims.len() != 2 {
+        return Err(Error::backend(format!(
+            "MoE gather flat_tokens must be rank 2 [token_count, hidden_size], got {dims:?}"
+        )));
+    }
+    if dims[0] == 0 || dims[1] == 0 {
+        return Err(Error::backend(format!(
+            "MoE gather dimensions must be positive, got {dims:?}"
+        )));
+    }
+    if token_indices.is_empty() {
+        return Err(Error::backend("MoE gather token_indices must not be empty"));
+    }
+    if let Some(token_index) = token_indices
+        .iter()
+        .copied()
+        .find(|token_index| *token_index as usize >= dims[0])
+    {
+        return Err(Error::backend(format!(
+            "MoE gather token index {token_index} is outside token_count {}",
+            dims[0]
+        )));
+    }
+    Ok(())
+}
+
+fn validate_moe_weighted_index_add_shapes(
+    accumulator: &Tensor,
+    token_indices: &Tensor,
+    expert_outputs: &Tensor,
+    expert_weights: &Tensor,
+) -> Result<()> {
+    let accumulator_dims = accumulator.dims();
+    let token_index_dims = token_indices.dims();
+    let expert_output_dims = expert_outputs.dims();
+    let expert_weight_dims = expert_weights.dims();
+    if accumulator_dims.len() != 2 || expert_output_dims.len() != 2 {
+        return Err(Error::backend(format!(
+            "moe combine accumulator and expert_outputs must be rank 2, got accumulator={accumulator_dims:?} expert_outputs={expert_output_dims:?}"
+        )));
+    }
+    if token_index_dims.len() != 1 {
+        return Err(Error::backend(format!(
+            "moe combine token_indices must be rank 1, got {token_index_dims:?}"
+        )));
+    }
+    if expert_weight_dims.len() != 1 {
+        return Err(Error::backend(format!(
+            "moe combine expert_weights must be rank 1, got {expert_weight_dims:?}"
+        )));
+    }
+
+    validate_exact_shape(
+        "moe_combine_hidden_size",
+        &[accumulator_dims[1]],
+        &[expert_output_dims[1]],
+    )?;
+    validate_exact_shape(
+        "moe_combine_assignment_count",
+        &[token_index_dims[0]],
+        &[expert_output_dims[0]],
+    )?;
+    validate_exact_shape(
+        "moe_combine_weight_count",
+        &[expert_weight_dims[0]],
+        &[expert_output_dims[0]],
+    )
+}
+
+fn flatten_linear_input(input: &Tensor) -> Result<(usize, Vec<usize>, Vec<f32>)> {
+    let input = input.to_dtype(common::DType::F32)?;
+    match input.dims() {
+        [rows, features] => {
+            let values = input
+                .to_vec2::<f32>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Ok((*rows, vec![*rows, *features], values))
+        }
+        [batch, tokens, features] => {
+            let rows = batch
+                .checked_mul(*tokens)
+                .ok_or_else(|| Error::backend("linear input row count overflow"))?;
+            let values = input
+                .to_vec3::<f32>()?
+                .into_iter()
+                .flat_map(|batch_rows| batch_rows.into_iter().flatten())
+                .collect::<Vec<_>>();
+            Ok((rows, vec![*batch, *tokens, *features], values))
+        }
+        dims => Err(Error::backend(format!(
+            "linear input rank must be 2 or 3, got {dims:?}"
+        ))),
+    }
+}
+
+fn reference_matmul(lhs: &Tensor, rhs: &Tensor, device: &Device) -> Result<Tensor> {
+    let lhs_dims = lhs.dims();
+    let rhs_dims = rhs.dims();
+    let rows = lhs_dims[0];
+    let inner = lhs_dims[1];
+    let cols = rhs_dims[1];
+    let lhs_values = lhs
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let rhs_values = rhs
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    if lhs_values.iter().any(|value| !value.is_finite())
+        || rhs_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend("matmul input contains non-finite values"));
+    }
+
+    let mut output = vec![0.0_f32; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut sum = 0.0_f32;
+            for index in 0..inner {
+                sum += lhs_values[row * inner + index] * rhs_values[index * cols + col];
+            }
+            output[row * cols + col] = sum;
+        }
+    }
+
+    Ok(Tensor::from_vec(output, (rows, cols), device)?)
+}
+
+fn reference_linear_from_values(
+    input_values: &[f32],
+    weight_values: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    output_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    if input_values.iter().any(|value| !value.is_finite())
+        || weight_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend(
+            "linear input or weight contains non-finite values",
+        ));
+    }
+
+    let expected_input_len = rows
+        .checked_mul(in_features)
+        .ok_or_else(|| Error::backend("linear input length overflow"))?;
+    validate_exact_shape(
+        "linear_input_values",
+        &[input_values.len()],
+        &[expected_input_len],
+    )?;
+    let expected_weight_len = out_features
+        .checked_mul(in_features)
+        .ok_or_else(|| Error::backend("linear weight length overflow"))?;
+    validate_exact_shape(
+        "linear_weight_values",
+        &[weight_values.len()],
+        &[expected_weight_len],
+    )?;
+
+    let output_len = rows
+        .checked_mul(out_features)
+        .ok_or_else(|| Error::backend("linear output length overflow"))?;
+    let mut output = vec![0.0_f32; output_len];
+    for row in 0..rows {
+        for output_feature in 0..out_features {
+            let mut sum = 0.0_f32;
+            for input_feature in 0..in_features {
+                sum += input_values[row * in_features + input_feature]
+                    * weight_values[output_feature * in_features + input_feature];
+            }
+            output[row * out_features + output_feature] = sum;
+        }
+    }
+
+    tensor_from_values(output, output_shape, device)
+}
+
+fn reference_add_from_values(
+    lhs_values: &[f32],
+    rhs_values: &[f32],
+    output_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    validate_exact_shape("add_value_count", &[lhs_values.len()], &[rhs_values.len()])?;
+    if lhs_values.iter().any(|value| !value.is_finite())
+        || rhs_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend("add input contains non-finite values"));
+    }
+
+    let output = lhs_values
+        .iter()
+        .zip(rhs_values)
+        .map(|(lhs, rhs)| lhs + rhs)
+        .collect::<Vec<_>>();
+
+    tensor_from_values(output, output_shape, device)
+}
+
+fn reference_select_last_token(hidden_states: &Tensor, device: &Device) -> Result<Tensor> {
+    let dims = hidden_states.dims();
+    let batch = dims[0];
+    let tokens = dims[1];
+    let hidden_size = dims[2];
+    let input = hidden_states
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_select_last_token(&input, batch, tokens, hidden_size)?;
+
+    let mut output = Vec::with_capacity(batch * hidden_size);
+    for batch_index in 0..batch {
+        let start = ((batch_index * tokens) + (tokens - 1))
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("select_last_token source offset overflow"))?;
+        let end = start
+            .checked_add(hidden_size)
+            .ok_or_else(|| Error::backend("select_last_token source end overflow"))?;
+        output.extend_from_slice(&input[start..end]);
+    }
+
+    Ok(Tensor::from_vec(output, (batch, 1, hidden_size), device)?)
+}
+
+fn reference_heads_to_attention_layout(heads: &Tensor, device: &Device) -> Result<Tensor> {
+    let dims = heads.dims();
+    let batch = dims[0];
+    let tokens = dims[1];
+    let head_count = dims[2];
+    let head_dim = dims[3];
+    let input = heads
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_layout_values(
+        "heads_to_attention_layout",
+        &input,
+        &[batch, tokens, head_count, head_dim],
+    )?;
+
+    let mut output = vec![0.0_f32; input.len()];
+    for batch_index in 0..batch {
+        for head_index in 0..head_count {
+            for token_index in 0..tokens {
+                for dim_index in 0..head_dim {
+                    let source = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * head_dim)
+                        + dim_index;
+                    let target = (((batch_index * head_count + head_index) * tokens + token_index)
+                        * head_dim)
+                        + dim_index;
+                    output[target] = input[source];
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, head_count, tokens, head_dim),
+        device,
+    )?)
+}
+
+fn reference_merge_attention_heads(context_heads: &Tensor, device: &Device) -> Result<Tensor> {
+    let dims = context_heads.dims();
+    let batch = dims[0];
+    let head_count = dims[1];
+    let tokens = dims[2];
+    let head_dim = dims[3];
+    let merged_width = head_count
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::backend("merge_attention_heads merged width overflow"))?;
+    let input = context_heads
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_layout_values(
+        "merge_attention_heads",
+        &input,
+        &[batch, head_count, tokens, head_dim],
+    )?;
+
+    let mut output = vec![0.0_f32; input.len()];
+    for batch_index in 0..batch {
+        for token_index in 0..tokens {
+            for head_index in 0..head_count {
+                for dim_index in 0..head_dim {
+                    let source = (((batch_index * head_count + head_index) * tokens + token_index)
+                        * head_dim)
+                        + dim_index;
+                    let target = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * head_dim)
+                        + dim_index;
+                    output[target] = input[source];
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, tokens, merged_width),
+        device,
+    )?)
+}
+
+fn reference_split_rope_tail(
+    heads: &Tensor,
+    no_rope_dim: usize,
+    rope_dim: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let dims = heads.dims();
+    let batch = dims[0];
+    let tokens = dims[1];
+    let head_count = dims[2];
+    let total_dim = dims[3];
+    let input = heads
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_layout_values(
+        "split_rope_tail",
+        &input,
+        &[batch, tokens, head_count, total_dim],
+    )?;
+
+    let mut no_rope = vec![0.0_f32; batch * tokens * head_count * no_rope_dim];
+    let mut rope = vec![0.0_f32; batch * tokens * head_count * rope_dim];
+    for batch_index in 0..batch {
+        for token_index in 0..tokens {
+            for head_index in 0..head_count {
+                for dim_index in 0..no_rope_dim {
+                    let source = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * total_dim)
+                        + dim_index;
+                    let target = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * no_rope_dim)
+                        + dim_index;
+                    no_rope[target] = input[source];
+                }
+                for dim_index in 0..rope_dim {
+                    let source = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * total_dim)
+                        + no_rope_dim
+                        + dim_index;
+                    let target = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * rope_dim)
+                        + dim_index;
+                    rope[target] = input[source];
+                }
+            }
+        }
+    }
+
+    let no_rope = Tensor::from_vec(no_rope, (batch, tokens, head_count, no_rope_dim), device)?;
+    let rope = Tensor::from_vec(rope, (batch, tokens, head_count, rope_dim), device)?;
+    Ok((no_rope, rope))
+}
+
+fn reference_split_kv_mqa(
+    kv_mqa: &Tensor,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let dims = kv_mqa.dims();
+    let batch = dims[0];
+    let tokens = dims[1];
+    let total_dim = dims[2];
+    let input = kv_mqa
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_layout_values("split_kv_mqa", &input, &[batch, tokens, total_dim])?;
+
+    let mut kv_latent = vec![0.0_f32; batch * tokens * kv_lora_rank];
+    let mut k_rope = vec![0.0_f32; batch * tokens * rope_dim];
+    for batch_index in 0..batch {
+        for token_index in 0..tokens {
+            for dim_index in 0..kv_lora_rank {
+                let source = ((batch_index * tokens + token_index) * total_dim) + dim_index;
+                let target = ((batch_index * tokens + token_index) * kv_lora_rank) + dim_index;
+                kv_latent[target] = input[source];
+            }
+            for dim_index in 0..rope_dim {
+                let source =
+                    ((batch_index * tokens + token_index) * total_dim) + kv_lora_rank + dim_index;
+                let target = ((batch_index * tokens + token_index) * rope_dim) + dim_index;
+                k_rope[target] = input[source];
+            }
+        }
+    }
+
+    let kv_latent = Tensor::from_vec(kv_latent, (batch, tokens, kv_lora_rank), device)?;
+    let k_rope = Tensor::from_vec(k_rope, (batch, tokens, 1, rope_dim), device)?;
+    Ok((kv_latent, k_rope))
+}
+
+fn reference_combine_rope_tail(no_rope: &Tensor, rope: &Tensor, device: &Device) -> Result<Tensor> {
+    let no_rope_dims = no_rope.dims();
+    let rope_dims = rope.dims();
+    let batch = no_rope_dims[0];
+    let tokens = no_rope_dims[1];
+    let head_count = no_rope_dims[2];
+    let no_rope_dim = no_rope_dims[3];
+    let rope_head_count = rope_dims[2];
+    let rope_dim = rope_dims[3];
+    let total_dim = no_rope_dim
+        .checked_add(rope_dim)
+        .ok_or_else(|| Error::backend("combine_rope_tail total dim overflow"))?;
+    let no_rope_values = no_rope
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let rope_values = rope
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_layout_values(
+        "combine_rope_tail_no_rope",
+        &no_rope_values,
+        &[batch, tokens, head_count, no_rope_dim],
+    )?;
+    validate_reference_layout_values(
+        "combine_rope_tail_rope",
+        &rope_values,
+        &[batch, tokens, rope_head_count, rope_dim],
+    )?;
+
+    let mut output = vec![0.0_f32; batch * tokens * head_count * total_dim];
+    for batch_index in 0..batch {
+        for token_index in 0..tokens {
+            for head_index in 0..head_count {
+                for dim_index in 0..no_rope_dim {
+                    let source = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * no_rope_dim)
+                        + dim_index;
+                    let target = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * total_dim)
+                        + dim_index;
+                    output[target] = no_rope_values[source];
+                }
+                for dim_index in 0..rope_dim {
+                    let rope_head_index = if rope_head_count == 1 { 0 } else { head_index };
+                    let source = (((batch_index * tokens + token_index) * rope_head_count
+                        + rope_head_index)
+                        * rope_dim)
+                        + dim_index;
+                    let target = (((batch_index * tokens + token_index) * head_count + head_index)
+                        * total_dim)
+                        + no_rope_dim
+                        + dim_index;
+                    output[target] = rope_values[source];
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, tokens, head_count, total_dim),
+        device,
+    )?)
+}
+
+fn reference_swiglu_from_values(
+    gate_values: &[f32],
+    up_values: &[f32],
+    output_shape: &[usize],
+    device: &Device,
+) -> Result<Tensor> {
+    validate_exact_shape(
+        "SwiGLU_value_count",
+        &[gate_values.len()],
+        &[up_values.len()],
+    )?;
+    if gate_values.iter().any(|value| !value.is_finite())
+        || up_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend("SwiGLU input contains non-finite values"));
+    }
+
+    let mut output = Vec::with_capacity(gate_values.len());
+    for (gate, up) in gate_values.iter().zip(up_values) {
+        let silu = *gate / (1.0 + (-*gate).exp());
+        output.push(silu * *up);
+    }
+
+    tensor_from_values(output, output_shape, device)
+}
+
+fn reference_attention_causal_softmax(
+    scores: &Tensor,
+    past_tokens: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let dims = scores.dims().to_vec();
+    let batch = dims[0];
+    let heads = dims[1];
+    let query_tokens = dims[2];
+    let key_tokens = dims[3];
+    let input = scores
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_attention_causal_softmax(
+        &input,
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        past_tokens,
+    )?;
+
+    let mut output = vec![0.0_f32; input.len()];
+
+    for batch_index in 0..batch {
+        for head_index in 0..heads {
+            for query_index in 0..query_tokens {
+                let base =
+                    ((batch_index * heads + head_index) * query_tokens + query_index) * key_tokens;
+                let max_visible_key = past_tokens
+                    .checked_add(query_index)
+                    .ok_or_else(|| Error::backend("attention causal softmax key index overflow"))?;
+                let row_values = &input[base..base + max_visible_key + 1];
+                let max_value = row_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0_f32;
+                for key_index in 0..=max_visible_key {
+                    let value = (input[base + key_index] - max_value).exp();
+                    output[base + key_index] = value;
+                    sum += value;
+                }
+                if !sum.is_finite() || sum <= 0.0 {
+                    return Err(Error::backend(
+                        "attention causal softmax normalization sum is invalid",
+                    ));
+                }
+                for key_index in 0..=max_visible_key {
+                    output[base + key_index] /= sum;
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, heads, query_tokens, key_tokens),
+        device,
+    )?)
+}
+
+fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
+    let dims = tensor.dims().to_vec();
+    let values = tensor
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    F32Tensor::new(values, dims)
+}
+
+fn reference_rope_slice(
+    input: &Tensor,
+    rope_dim: usize,
+    position_offset: usize,
+    theta: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let dims = input.dims().to_vec();
+    let batch = dims[0];
+    let tokens = dims[1];
+    let heads = dims[2];
+    let input_values = input
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_rope_slice(
+        &input_values,
+        batch,
+        tokens,
+        heads,
+        rope_dim,
+        position_offset,
+        theta,
+    )?;
+
+    let mut output = vec![0.0_f32; input_values.len()];
+    let half = rope_dim / 2;
+
+    for batch_index in 0..batch {
+        for token_index in 0..tokens {
+            let position = position_offset
+                .checked_add(token_index)
+                .ok_or_else(|| Error::backend("RoPE position overflow"))?;
+            for head_index in 0..heads {
+                let base = ((batch_index * tokens + token_index) * heads + head_index) * rope_dim;
+                for dim_index in 0..rope_dim {
+                    let freq_index = dim_index % half;
+                    let inv_freq = 1.0_f32 / theta.powf(freq_index as f32 / half as f32);
+                    let angle = position as f32 * inv_freq;
+                    let rotated = if dim_index < half {
+                        -input_values[base + dim_index + half]
+                    } else {
+                        input_values[base + dim_index - half]
+                    };
+                    output[base + dim_index] =
+                        input_values[base + dim_index] * angle.cos() + rotated * angle.sin();
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, tokens, heads, rope_dim),
+        device,
+    )?)
+}
+
+fn reference_rms_norm_f32(
+    hidden_states: &F32Tensor,
+    weight: &F32Tensor,
+    eps: f32,
+) -> Result<F32Tensor> {
+    validate_rms_norm_f32_shapes(hidden_states, weight, eps)?;
+    let dims = hidden_states.dims();
+    let hidden_size = *dims
+        .last()
+        .ok_or_else(|| Error::backend("rms_norm input has empty shape"))?;
+    let rows = hidden_states
+        .values()
+        .len()
+        .checked_div(hidden_size)
+        .ok_or_else(|| Error::backend("rms_norm row count division overflow"))?;
+
+    let input = hidden_states.values();
+    let weight = weight.values();
+    let mut output = vec![0.0_f32; input.len()];
+    for row in 0..rows {
+        let start = row
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("rms_norm row offset overflow"))?;
+        let end = start
+            .checked_add(hidden_size)
+            .ok_or_else(|| Error::backend("rms_norm row end overflow"))?;
+        let row_values = &input[start..end];
+        let mut squared_sum = 0.0_f32;
+        for value in row_values {
+            let squared = *value * *value;
+            if !squared.is_finite() {
+                return Err(Error::backend("rms_norm square is non-finite"));
+            }
+            squared_sum += squared;
+        }
+        let mean_square = squared_sum / hidden_size as f32;
+        let scale = (mean_square + eps).sqrt();
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(Error::backend("rms_norm scale is invalid"));
+        }
+        for index in 0..hidden_size {
+            output[start + index] = row_values[index] / scale * weight[index];
+        }
+    }
+
+    F32Tensor::new(output, dims.to_vec())
+}
+
+fn reference_moe_gather_tokens(
+    flat_tokens: &Tensor,
+    token_indices: &[u32],
+    device: &Device,
+) -> Result<Tensor> {
+    let token_count = flat_tokens.dims()[0];
+    let hidden_size = flat_tokens.dims()[1];
+    let flat_values = flat_tokens
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_moe_gather_tokens(
+        &flat_values,
+        token_indices,
+        token_count,
+        hidden_size,
+        token_indices.len(),
+    )?;
+
+    let mut output = vec![0.0_f32; token_indices.len() * hidden_size];
+    for (assignment, token_index) in token_indices.iter().copied().enumerate() {
+        let token_index = token_index as usize;
+        let source_start = token_index
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE gather source offset overflow"))?;
+        let output_start = assignment
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE gather output offset overflow"))?;
+        output[output_start..output_start + hidden_size]
+            .copy_from_slice(&flat_values[source_start..source_start + hidden_size]);
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (token_indices.len(), hidden_size),
+        device,
+    )?)
+}
+
+fn reference_moe_weighted_index_add_combine(
+    accumulator: &Tensor,
+    token_indices: &Tensor,
+    expert_outputs: &Tensor,
+    expert_weights: &Tensor,
+    device: &Device,
+) -> Result<Tensor> {
+    let token_count = accumulator.dims()[0];
+    let hidden_size = accumulator.dims()[1];
+    let assignment_count = token_indices.dims()[0];
+    let mut output = accumulator
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let token_indices = token_indices.to_vec1::<u32>()?;
+    let expert_outputs = expert_outputs
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let expert_weights = expert_weights
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    validate_reference_moe_weighted_index_add_combine(
+        &output,
+        &token_indices,
+        &expert_outputs,
+        &expert_weights,
+        token_count,
+        hidden_size,
+        assignment_count,
+    )?;
+
+    for (assignment, token_index) in token_indices.iter().copied().enumerate() {
+        let token_index = token_index as usize;
+        for hidden in 0..hidden_size {
+            let output_index = token_index
+                .checked_mul(hidden_size)
+                .and_then(|offset| offset.checked_add(hidden))
+                .ok_or_else(|| Error::backend("MoE combine output index overflow"))?;
+            let expert_index = assignment
+                .checked_mul(hidden_size)
+                .and_then(|offset| offset.checked_add(hidden))
+                .ok_or_else(|| Error::backend("MoE combine expert output index overflow"))?;
+            output[output_index] += expert_outputs[expert_index] * expert_weights[assignment];
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (token_count, hidden_size),
+        device,
+    )?)
+}
+
+fn reference_attention_scores(
+    q: &Tensor,
+    k: &Tensor,
+    head_dim: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_dims = q.dims();
+    let k_dims = k.dims();
+    let batch = q_dims[0];
+    let heads = q_dims[1];
+    let query_tokens = q_dims[2];
+    let key_tokens = k_dims[2];
+    let q_values = q
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let k_values = k
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_attention_scores(
+        &q_values,
+        &k_values,
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    )?;
+
+    let output_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(key_tokens))
+        .ok_or_else(|| Error::backend("attention score output length overflow"))?;
+    let mut output = vec![0.0_f32; output_len];
+    let scale = (head_dim as f32).sqrt();
+
+    for batch_index in 0..batch {
+        for head_index in 0..heads {
+            for query_index in 0..query_tokens {
+                for key_index in 0..key_tokens {
+                    let mut sum = 0.0_f32;
+                    for dim in 0..head_dim {
+                        let q_index = (((batch_index * heads + head_index) * query_tokens
+                            + query_index)
+                            * head_dim)
+                            + dim;
+                        let k_index = (((batch_index * heads + head_index) * key_tokens
+                            + key_index)
+                            * head_dim)
+                            + dim;
+                        sum += q_values[q_index] * k_values[k_index];
+                    }
+                    let output_index = (((batch_index * heads + head_index) * query_tokens
+                        + query_index)
+                        * key_tokens)
+                        + key_index;
+                    output[output_index] = sum / scale;
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, heads, query_tokens, key_tokens),
+        device,
+    )?)
+}
+
+fn validate_reference_attention_scores(
+    q: &[f32],
+    k: &[f32],
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if batch == 0 || heads == 0 || query_tokens == 0 || key_tokens == 0 || head_dim == 0 {
+        return Err(Error::backend(
+            "attention batch, heads, tokens, and head_dim must be positive",
+        ));
+    }
+    let expected_q_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| Error::backend("attention q value count overflow"))?;
+    validate_exact_shape("attention_q_values", &[q.len()], &[expected_q_len])?;
+    let expected_k_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(key_tokens))
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| Error::backend("attention k value count overflow"))?;
+    validate_exact_shape("attention_k_values", &[k.len()], &[expected_k_len])?;
+    if q.iter().any(|value| !value.is_finite()) || k.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(
+            "attention q or k contains non-finite values",
+        ));
+    }
+    Ok(())
+}
+
+fn reference_attention_values(probs: &Tensor, values: &Tensor, device: &Device) -> Result<Tensor> {
+    let probs_dims = probs.dims();
+    let value_dims = values.dims();
+    let batch = probs_dims[0];
+    let heads = probs_dims[1];
+    let query_tokens = probs_dims[2];
+    let key_tokens = probs_dims[3];
+    let value_dim = value_dims[3];
+    let probs_values = probs
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let value_values = values
+        .to_dtype(common::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    validate_reference_attention_values(
+        &probs_values,
+        &value_values,
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        value_dim,
+    )?;
+
+    let output_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(value_dim))
+        .ok_or_else(|| Error::backend("attention values output length overflow"))?;
+    let mut output = vec![0.0_f32; output_len];
+
+    for batch_index in 0..batch {
+        for head_index in 0..heads {
+            for query_index in 0..query_tokens {
+                for value_index in 0..value_dim {
+                    let mut sum = 0.0_f32;
+                    for key_index in 0..key_tokens {
+                        let probs_index = (((batch_index * heads + head_index) * query_tokens
+                            + query_index)
+                            * key_tokens)
+                            + key_index;
+                        let value_tensor_index =
+                            (((batch_index * heads + head_index) * key_tokens + key_index)
+                                * value_dim)
+                                + value_index;
+                        sum += probs_values[probs_index] * value_values[value_tensor_index];
+                    }
+                    let output_index = (((batch_index * heads + head_index) * query_tokens
+                        + query_index)
+                        * value_dim)
+                        + value_index;
+                    output[output_index] = sum;
+                }
+            }
+        }
+    }
+
+    Ok(Tensor::from_vec(
+        output,
+        (batch, heads, query_tokens, value_dim),
+        device,
+    )?)
+}
+
+fn validate_reference_attention_values(
+    probs: &[f32],
+    values: &[f32],
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    value_dim: usize,
+) -> Result<()> {
+    if batch == 0 || heads == 0 || query_tokens == 0 || key_tokens == 0 || value_dim == 0 {
+        return Err(Error::backend(
+            "attention value aggregation dimensions must be positive",
+        ));
+    }
+    let expected_probs_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(key_tokens))
+        .ok_or_else(|| Error::backend("attention probabilities value count overflow"))?;
+    validate_exact_shape(
+        "attention_probabilities_values",
+        &[probs.len()],
+        &[expected_probs_len],
+    )?;
+    let expected_values_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(key_tokens))
+        .and_then(|value| value.checked_mul(value_dim))
+        .ok_or_else(|| Error::backend("attention value tensor value count overflow"))?;
+    validate_exact_shape(
+        "attention_value_tensor_values",
+        &[values.len()],
+        &[expected_values_len],
+    )?;
+    if probs.iter().any(|value| !value.is_finite()) || values.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend(
+            "attention probabilities or values contain non-finite values",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reference_attention_causal_softmax(
+    scores: &[f32],
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    past_tokens: usize,
+) -> Result<()> {
+    if batch == 0 || heads == 0 || query_tokens == 0 || key_tokens == 0 {
+        return Err(Error::backend(
+            "attention causal softmax dimensions must be positive",
+        ));
+    }
+    if past_tokens
+        .checked_add(query_tokens)
+        .filter(|expected_key_tokens| *expected_key_tokens == key_tokens)
+        .is_none()
+    {
+        return Err(Error::backend(format!(
+            "attention causal softmax expects key_tokens == past_tokens + query_tokens, got key_tokens={key_tokens}, past_tokens={past_tokens}, query_tokens={query_tokens}"
+        )));
+    }
+    let expected_scores_len = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(key_tokens))
+        .ok_or_else(|| Error::backend("attention causal softmax score value count overflow"))?;
+    validate_exact_shape(
+        "attention_causal_softmax_scores",
+        &[scores.len()],
+        &[expected_scores_len],
+    )?;
+    if scores.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(
+            "attention causal softmax scores contain non-finite values",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reference_rope_slice(
+    input: &[f32],
+    batch: usize,
+    tokens: usize,
+    heads: usize,
+    rope_dim: usize,
+    position_offset: usize,
+    theta: f32,
+) -> Result<()> {
+    if batch == 0 || tokens == 0 || heads == 0 || rope_dim == 0 {
+        return Err(Error::backend("RoPE dimensions must be positive"));
+    }
+    if rope_dim % 2 != 0 {
+        return Err(Error::backend(format!(
+            "RoPE rope_dim must be even, got {rope_dim}"
+        )));
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(Error::backend(
+            "RoPE theta must be finite and greater than zero",
+        ));
+    }
+    position_offset
+        .checked_add(tokens - 1)
+        .ok_or_else(|| Error::backend("RoPE position range overflow"))?;
+    let expected_input_len = batch
+        .checked_mul(tokens)
+        .and_then(|value| value.checked_mul(heads))
+        .and_then(|value| value.checked_mul(rope_dim))
+        .ok_or_else(|| Error::backend("RoPE input value count overflow"))?;
+    validate_exact_shape("rope_input_values", &[input.len()], &[expected_input_len])?;
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend("RoPE input contains non-finite values"));
+    }
+    Ok(())
+}
+
+fn validate_reference_select_last_token(
+    hidden_states: &[f32],
+    batch: usize,
+    tokens: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    if batch == 0 || tokens == 0 || hidden_size == 0 {
+        return Err(Error::backend(
+            "select_last_token batch, tokens, and hidden_size must be positive",
+        ));
+    }
+    let expected_len = batch
+        .checked_mul(tokens)
+        .and_then(|value| value.checked_mul(hidden_size))
+        .ok_or_else(|| Error::backend("select_last_token input value count overflow"))?;
+    validate_exact_shape(
+        "select_last_token_values",
+        &[hidden_states.len()],
+        &[expected_len],
+    )?;
+    if hidden_states.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(
+            "select_last_token input contains non-finite values",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reference_layout_values(name: &str, values: &[f32], dims: &[usize]) -> Result<()> {
+    if dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::backend(format!(
+            "{name} dimensions must be positive, got {dims:?}"
+        )));
+    }
+    let expected_len = dims.iter().try_fold(1_usize, |accumulator, dim| {
+        accumulator
+            .checked_mul(*dim)
+            .ok_or_else(|| Error::backend(format!("{name} input value count overflow")))
+    })?;
+    validate_exact_shape(name, &[values.len()], &[expected_len])?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(format!(
+            "{name} input contains non-finite values"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_reference_moe_gather_tokens(
+    flat_tokens: &[f32],
+    token_indices: &[u32],
+    token_count: usize,
+    hidden_size: usize,
+    assignment_count: usize,
+) -> Result<()> {
+    if token_count == 0 || hidden_size == 0 || assignment_count == 0 {
+        return Err(Error::backend(
+            "MoE gather token_count, hidden_size, and assignment_count must be positive",
+        ));
+    }
+    let expected_flat_len = token_count
+        .checked_mul(hidden_size)
+        .ok_or_else(|| Error::backend("MoE gather flat token value count overflow"))?;
+    validate_exact_shape(
+        "moe_gather_flat_token_values",
+        &[flat_tokens.len()],
+        &[expected_flat_len],
+    )?;
+    validate_exact_shape(
+        "moe_gather_token_indices",
+        &[token_indices.len()],
+        &[assignment_count],
+    )?;
+    if flat_tokens.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(
+            "MoE gather flat_tokens contains non-finite values",
+        ));
+    }
+    if let Some(token_index) = token_indices
+        .iter()
+        .copied()
+        .find(|token_index| *token_index as usize >= token_count)
+    {
+        return Err(Error::backend(format!(
+            "MoE gather token index {token_index} is outside token_count {token_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_reference_moe_weighted_index_add_combine(
+    accumulator: &[f32],
+    token_indices: &[u32],
+    expert_outputs: &[f32],
+    expert_weights: &[f32],
+    token_count: usize,
+    hidden_size: usize,
+    assignment_count: usize,
+) -> Result<()> {
+    if token_count == 0 || hidden_size == 0 || assignment_count == 0 {
+        return Err(Error::backend(
+            "MoE combine token_count, hidden_size, and assignment_count must be positive",
+        ));
+    }
+    let expected_accumulator_len = token_count
+        .checked_mul(hidden_size)
+        .ok_or_else(|| Error::backend("MoE combine accumulator value count overflow"))?;
+    validate_exact_shape(
+        "moe_combine_accumulator_values",
+        &[accumulator.len()],
+        &[expected_accumulator_len],
+    )?;
+    validate_exact_shape(
+        "moe_combine_token_indices_values",
+        &[token_indices.len()],
+        &[assignment_count],
+    )?;
+    validate_exact_shape(
+        "moe_combine_expert_weight_values",
+        &[expert_weights.len()],
+        &[assignment_count],
+    )?;
+    let expected_expert_output_len = assignment_count
+        .checked_mul(hidden_size)
+        .ok_or_else(|| Error::backend("MoE combine expert output value count overflow"))?;
+    validate_exact_shape(
+        "moe_combine_expert_output_values",
+        &[expert_outputs.len()],
+        &[expected_expert_output_len],
+    )?;
+    if accumulator.iter().any(|value| !value.is_finite())
+        || expert_outputs.iter().any(|value| !value.is_finite())
+        || expert_weights.iter().any(|value| !value.is_finite())
+    {
+        return Err(Error::backend(
+            "MoE combine accumulator, expert_outputs, or expert_weights contains non-finite values",
+        ));
+    }
+    if let Some(token_index) = token_indices
+        .iter()
+        .copied()
+        .find(|token_index| *token_index as usize >= token_count)
+    {
+        return Err(Error::backend(format!(
+            "MoE combine token index {token_index} is outside token_count {token_count}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn tensor_from_values(values: Vec<f32>, output_shape: &[usize], device: &Device) -> Result<Tensor> {
+    if output_shape.is_empty() {
+        return Err(Error::backend("tensor output shape is empty"));
+    }
+    Ok(Tensor::from_vec(values, output_shape, device)?)
+}
+
+#[cfg(test)]
+fn shape(name: &str, tensor: &Tensor) -> NamedShape {
+    NamedShape {
+        name: name.to_string(),
+        shape: Shape::new(tensor.dims().to_vec()),
+    }
+}
+
+#[cfg(test)]
+fn tensor_checksum(tensor: &Tensor) -> Result<f32> {
+    Ok(tensor
+        .to_dtype(common::DType::F32)?
+        .sum_all()?
+        .to_vec0::<f32>()?)
+}
+
+pub(crate) fn device_kind(device: &Device) -> DeviceKind {
+    match device {
+        Device::Cpu => DeviceKind::Cpu,
+        Device::Metal => DeviceKind::Metal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_backend() -> MetalBackend {
+        MetalBackend::from_device(Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn capabilities_report_reference_without_custom_kernels() {
+        let backend = cpu_backend();
+        let capabilities = backend.capabilities();
+
+        assert_eq!(capabilities.backend, BackendKind::Reference);
+        assert_eq!(capabilities.device, DeviceKind::Cpu);
+        assert!(!capabilities.custom_kernels);
+        assert!(capabilities.operations.contains(&"attention_scores"));
+    }
+
+    #[test]
+    fn matmul_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let lhs = Tensor::from_vec(
+            vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            (2, 3),
+            backend.device(),
+        )
+        .unwrap();
+        let rhs = Tensor::from_vec(
+            vec![0.5_f32, 1.0, -1.0, 1.5, -0.5, 0.25],
+            (3, 2),
+            backend.device(),
+        )
+        .unwrap();
+
+        let output = backend.matmul(&lhs, &rhs).unwrap();
+
+        assert_eq!(output.dims(), &[2, 2]);
+    }
+
+    #[test]
+    fn linear_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let input = Tensor::from_vec(
+            vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            (2, 3),
+            backend.device(),
+        )
+        .unwrap();
+        let weight = Tensor::from_vec(
+            vec![0.5_f32, 1.0, -1.0, 1.5, -0.5, 0.25],
+            (2, 3),
+            backend.device(),
+        )
+        .unwrap();
+
+        let output = backend.linear(&input, &weight).unwrap();
+
+        assert_eq!(output.dims(), &[2, 2]);
+        let values = output.to_vec2::<f32>().unwrap();
+        assert!((values[0][0] - -0.5).abs() < 1e-6);
+        assert!((values[0][1] - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn add_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let lhs =
+            Tensor::from_vec(vec![1.0_f32, -2.0, 0.5, 4.0], (2, 2), backend.device()).unwrap();
+        let rhs =
+            Tensor::from_vec(vec![0.25_f32, 2.5, -1.5, -0.75], (2, 2), backend.device()).unwrap();
+
+        let output = backend.add(&lhs, &rhs).unwrap();
+
+        assert_eq!(output.dims(), &[2, 2]);
+        let values = output.to_vec2::<f32>().unwrap();
+        assert_eq!(values[0], vec![1.25, 0.5]);
+        assert_eq!(values[1], vec![-1.0, 3.25]);
+    }
+
+    #[test]
+    fn select_last_token_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let hidden_states = Tensor::from_vec(
+            vec![
+                1.0_f32, 2.0, 3.0, 4.0, //
+                5.0, 6.0, 7.0, 8.0, //
+                9.0, 10.0, 11.0, 12.0,
+            ],
+            (1, 3, 4),
+            backend.device(),
+        )
+        .unwrap();
+
+        let output = backend.select_last_token(&hidden_states).unwrap();
+
+        assert_eq!(output.dims(), &[1, 1, 4]);
+        let values = output.to_vec3::<f32>().unwrap();
+        assert_eq!(values[0][0], vec![9.0, 10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn heads_to_attention_layout_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let heads = Tensor::from_vec(
+            (0..1 * 3 * 2 * 2).map(|idx| idx as f32).collect::<Vec<_>>(),
+            (1, 3, 2, 2),
+            backend.device(),
+        )
+        .unwrap();
+
+        let output = backend.heads_to_attention_layout(&heads).unwrap();
+
+        assert_eq!(output.dims(), &[1, 2, 3, 2]);
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            values,
+            vec![0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 2.0, 3.0, 6.0, 7.0, 10.0, 11.0]
+        );
+    }
+
+    #[test]
+    fn merge_attention_heads_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let context_heads = Tensor::from_vec(
+            vec![
+                0.0_f32, 1.0, 4.0, 5.0, 8.0, 9.0, //
+                2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+            ],
+            (1, 2, 3, 2),
+            backend.device(),
+        )
+        .unwrap();
+
+        let output = backend.merge_attention_heads(&context_heads).unwrap();
+
+        assert_eq!(output.dims(), &[1, 3, 4]);
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            values,
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+        );
+    }
+
+    #[test]
+    fn split_rope_tail_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let heads = Tensor::from_vec(
+            (0..1 * 2 * 2 * 5).map(|idx| idx as f32).collect::<Vec<_>>(),
+            (1, 2, 2, 5),
+            backend.device(),
+        )
+        .unwrap();
+
+        let (no_rope, rope) = backend.split_rope_tail(&heads, 3, 2).unwrap();
+
+        assert_eq!(no_rope.dims(), &[1, 2, 2, 3]);
+        assert_eq!(rope.dims(), &[1, 2, 2, 2]);
+        let no_rope_values = no_rope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rope_values = rope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            no_rope_values,
+            vec![0.0, 1.0, 2.0, 5.0, 6.0, 7.0, 10.0, 11.0, 12.0, 15.0, 16.0, 17.0]
+        );
+        assert_eq!(
+            rope_values,
+            vec![3.0, 4.0, 8.0, 9.0, 13.0, 14.0, 18.0, 19.0]
+        );
+    }
+
+    #[test]
+    fn split_kv_mqa_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let kv_mqa = Tensor::from_vec(
+            (0..1 * 3 * 6).map(|idx| idx as f32).collect::<Vec<_>>(),
+            (1, 3, 6),
+            backend.device(),
+        )
+        .unwrap();
+
+        let (kv_latent, k_rope) = backend.split_kv_mqa(&kv_mqa, 4, 2).unwrap();
+
+        assert_eq!(kv_latent.dims(), &[1, 3, 4]);
+        assert_eq!(k_rope.dims(), &[1, 3, 1, 2]);
+        let latent_values = kv_latent.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rope_values = k_rope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            latent_values,
+            vec![0.0, 1.0, 2.0, 3.0, 6.0, 7.0, 8.0, 9.0, 12.0, 13.0, 14.0, 15.0]
+        );
+        assert_eq!(rope_values, vec![4.0, 5.0, 10.0, 11.0, 16.0, 17.0]);
+    }
+
+    #[test]
+    fn combine_rope_tail_reference_broadcasts_shared_rope_head() {
+        let backend = cpu_backend();
+        let no_rope = Tensor::from_vec(
+            vec![
+                0.0_f32, 1.0, //
+                2.0, 3.0, //
+                4.0, 5.0,
+            ],
+            (1, 1, 3, 2),
+            backend.device(),
+        )
+        .unwrap();
+        let rope =
+            Tensor::from_vec(vec![100.0_f32, 101.0], (1, 1, 1, 2), backend.device()).unwrap();
+
+        let combined = backend.combine_rope_tail(&no_rope, &rope).unwrap();
+
+        assert_eq!(combined.dims(), &[1, 1, 3, 4]);
+        let values = combined.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            values,
+            vec![0.0, 1.0, 100.0, 101.0, 2.0, 3.0, 100.0, 101.0, 4.0, 5.0, 100.0, 101.0]
+        );
+    }
+
+    #[test]
+    fn swiglu_reference_validates_and_runs() {
+        let backend = cpu_backend();
+        let gate =
+            Tensor::from_vec(vec![-1.0_f32, 0.0, 2.0, 4.0], (2, 2), backend.device()).unwrap();
+        let up =
+            Tensor::from_vec(vec![0.25_f32, 0.5, 1.5, -0.75], (2, 2), backend.device()).unwrap();
+
+        let output = backend.swiglu(&gate, &up).unwrap();
+
+        assert_eq!(output.dims(), &[2, 2]);
+        let values = output.to_vec2::<f32>().unwrap();
+        let expected = 2.0_f32 / (1.0 + (-2.0_f32).exp()) * 1.5;
+        assert!((values[1][0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn attention_scores_reference_shape_is_bhqk() {
+        let backend = cpu_backend();
+        let q =
+            Tensor::from_vec(vec![1.0_f32; 1 * 2 * 3 * 4], (1, 2, 3, 4), backend.device()).unwrap();
+        let k =
+            Tensor::from_vec(vec![0.5_f32; 1 * 2 * 5 * 4], (1, 2, 5, 4), backend.device()).unwrap();
+
+        let scores = backend.attention_scores(&q, &k, 4).unwrap();
+
+        assert_eq!(scores.dims(), &[1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn attention_values_reference_shape_is_bhqv() {
+        let backend = cpu_backend();
+        let probs =
+            Tensor::from_vec(vec![0.2_f32; 1 * 2 * 3 * 5], (1, 2, 3, 5), backend.device()).unwrap();
+        let values =
+            Tensor::from_vec(vec![0.5_f32; 1 * 2 * 5 * 4], (1, 2, 5, 4), backend.device()).unwrap();
+
+        let context = backend.attention_values(&probs, &values).unwrap();
+
+        assert_eq!(context.dims(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn attention_causal_softmax_masks_future_keys() {
+        let backend = cpu_backend();
+        let scores = Tensor::from_vec(vec![0.0_f32; 9], (1, 1, 3, 3), backend.device()).unwrap();
+
+        let probabilities = backend.attention_causal_softmax(&scores, 0).unwrap();
+        let values = probabilities
+            .reshape((3, 3))
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert!(values[0][0] > 0.999);
+        assert!(values[0][1] < 0.000001);
+        assert!(values[0][2] < 0.000001);
+        assert!((values[1][0] - 0.5).abs() < 0.000001);
+        assert!((values[1][1] - 0.5).abs() < 0.000001);
+        assert!(values[1][2] < 0.000001);
+        assert!((values[2][0] - (1.0 / 3.0)).abs() < 0.000001);
+        assert!((values[2][1] - (1.0 / 3.0)).abs() < 0.000001);
+        assert!((values[2][2] - (1.0 / 3.0)).abs() < 0.000001);
+    }
+
+    #[test]
+    fn rope_slice_reference_uses_position_offset_and_theta() {
+        let backend = cpu_backend();
+        let input = Tensor::new(vec![1.0_f32; 4], (1, 1, 1, 4)).unwrap();
+
+        let at_zero = backend.rope_slice(&input, 4, 0, 10_000.0).unwrap();
+        let at_four = backend.rope_slice(&input, 4, 4, 10_000.0).unwrap();
+        let different_theta = backend.rope_slice(&input, 4, 4, 10_000_000.0).unwrap();
+
+        let zero_values = at_zero.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let four_values = at_four.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let different_theta_values = different_theta
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_ne!(zero_values, four_values);
+        assert_ne!(four_values, different_theta_values);
+    }
+
+    #[test]
+    fn rms_norm_reference_preserves_shape() {
+        let backend = cpu_backend();
+        let hidden_states = Tensor::from_vec(
+            vec![1.0_f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0],
+            (2, 4),
+            backend.device(),
+        )
+        .unwrap();
+        let weight = Tensor::from_vec(vec![1.0_f32, 1.1, 0.9, 1.2], 4, backend.device()).unwrap();
+
+        let output = backend.rms_norm(&hidden_states, &weight, 1e-5).unwrap();
+
+        assert_eq!(output.dims(), &[2, 4]);
+    }
+
+    #[test]
+    fn rms_norm_f32_reference_preserves_shape_and_values() {
+        let backend = cpu_backend();
+        let hidden_states =
+            F32Tensor::new(vec![1.0_f32, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0], [2, 4]).unwrap();
+        let weight = F32Tensor::new(vec![1.0_f32, 1.1, 0.9, 1.2], [4]).unwrap();
+
+        let output = backend.rms_norm_f32(&hidden_states, &weight, 1e-5).unwrap();
+
+        assert_eq!(output.dims(), &[2, 4]);
+        assert_eq!(output.values().len(), 8);
+        assert!(output.values().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn moe_gather_tokens_selects_rows_with_repeats() {
+        let backend = cpu_backend();
+        let flat_tokens = Tensor::from_vec(
+            vec![
+                1.0_f32, 2.0, //
+                3.0, 4.0, //
+                5.0, 6.0,
+            ],
+            (3, 2),
+            backend.device(),
+        )
+        .unwrap();
+
+        let gathered = backend.moe_gather_tokens(&flat_tokens, &[2, 0, 2]).unwrap();
+
+        assert_eq!(gathered.dims(), &[3, 2]);
+        let values = gathered.to_vec2::<f32>().unwrap();
+        assert_eq!(values[0], vec![5.0, 6.0]);
+        assert_eq!(values[1], vec![1.0, 2.0]);
+        assert_eq!(values[2], vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn moe_weighted_index_add_combine_accumulates_repeated_token_indices() {
+        let backend = cpu_backend();
+        let accumulator = Tensor::zeros((4, 2)).unwrap();
+        let token_indices = Tensor::from_vec(vec![0_u32, 2, 2], 3, backend.device()).unwrap();
+        let expert_outputs = Tensor::from_vec(
+            vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            (3, 2),
+            backend.device(),
+        )
+        .unwrap();
+        let expert_weights =
+            Tensor::from_vec(vec![1.0_f32, 0.5, 2.0], 3, backend.device()).unwrap();
+
+        let combined = backend
+            .moe_weighted_index_add_combine(
+                &accumulator,
+                &token_indices,
+                &expert_outputs,
+                &expert_weights,
+            )
+            .unwrap();
+
+        assert_eq!(combined.dims(), &[4, 2]);
+        let values = combined.to_vec2::<f32>().unwrap();
+        assert_eq!(values[0], vec![1.0, 2.0]);
+        assert_eq!(values[2], vec![11.5, 14.0]);
+    }
+
+    #[test]
+    fn backend_check_runs_all_reference_ops() {
+        let backend = cpu_backend();
+        let report = run_backend_check_with(&backend).unwrap();
+
+        assert_eq!(report.operations.len(), 17);
+        assert_eq!(report.operations[0].name, "linear");
+        assert_eq!(report.operations[1].name, "matmul");
+        assert_eq!(report.operations[2].name, "add");
+        assert_eq!(report.operations[2].output.dims(), &[2, 3]);
+        assert_eq!(report.operations[3].name, "select_last_token");
+        assert_eq!(report.operations[3].output.dims(), &[2, 1, 4]);
+        assert_eq!(report.operations[4].name, "heads_to_attention_layout");
+        assert_eq!(report.operations[4].output.dims(), &[1, 2, 3, 4]);
+        assert_eq!(report.operations[5].name, "merge_attention_heads");
+        assert_eq!(report.operations[5].output.dims(), &[1, 3, 8]);
+        assert_eq!(report.operations[6].name, "split_rope_tail");
+        assert_eq!(report.operations[6].output.dims(), &[1, 2, 2, 2]);
+        assert_eq!(report.operations[7].name, "split_kv_mqa");
+        assert_eq!(report.operations[7].output.dims(), &[1, 2, 1, 2]);
+        assert_eq!(report.operations[8].name, "combine_rope_tail");
+        assert_eq!(report.operations[8].output.dims(), &[1, 2, 2, 5]);
+        assert_eq!(report.operations[9].name, "swiglu");
+        assert_eq!(report.operations[9].output.dims(), &[2, 3]);
+        assert_eq!(report.operations[10].output.dims(), &[1, 2, 3, 5]);
+        assert_eq!(report.operations[11].name, "attention_causal_softmax");
+        assert_eq!(report.operations[11].output.dims(), &[1, 2, 3, 5]);
+        assert_eq!(report.operations[12].name, "attention_values");
+        assert_eq!(report.operations[12].output.dims(), &[1, 2, 3, 4]);
+        assert_eq!(report.operations[13].name, "rope_slice");
+        assert_eq!(report.operations[13].output.dims(), &[1, 2, 2, 4]);
+        assert_eq!(report.operations[15].name, "moe_gather_tokens");
+        assert_eq!(report.operations[15].output.dims(), &[3, 4]);
+    }
+}

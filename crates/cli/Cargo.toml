@@ -1,0 +1,22 @@
+[package]
+name = "inferno"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+backend = { path = "../backend" }
+config = { path = "../config" }
+common = { path = "../common" }
+gguf = { path = "../gguf" }
+model = { path = "../model" }
+runtime = { path = "../runtime" }
+tokenizer = { path = "../tokenizer" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
