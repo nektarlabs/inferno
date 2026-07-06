@@ -4,6 +4,16 @@
   <img src="assets/logo.svg" alt="Inferno logo" width="160">
 </p>
 
+> [!WARNING]
+> **Inferno is an experiment, not a product.** It began as a personal
+> engineering challenge: can a very large sparse, long-context GLM-5.2-style
+> model be made to run locally on a 64 GB Apple Silicon machine at all? It is a
+> work in progress, developed in the open, and **results are not guaranteed** —
+> correctness, stability, and performance are all still being worked out. Treat
+> everything here as exploratory. It is not intended for production use, and
+> there is no promise that any given build produces correct output or runs at a
+> usable speed.
+
 Inferno aims to be a super lightweight, highly efficient Rust inference engine
 for running GLM-5.2 Q2 on Apple Silicon with Metal, targeting machines such as a
 MacBook Pro with 64 GB of unified memory.
@@ -15,14 +25,24 @@ tight, the memory budget is unforgiving, and the runtime has to stay narrow to
 be viable. The goal is not comfort or generality. The goal is to build a small,
 direct, auditable runtime that does only what this target needs and does it well.
 
-Inferno is a challenge project and a work in progress. Results are not
-guaranteed yet. The runtime is being shaped around one hard target first: the
-Antirez GLM-5.2 Q2 GGUF artifact, paged KV cache by default, sparse MoE routing,
-and Metal-focused execution for the bottlenecks that matter.
+## Status
+
+Inferno started as an engineering challenge and remains an experiment. It is a
+work in progress, and **results are not guaranteed yet** — the project exists to
+explore whether this hard target is reachable, not to ship a finished tool.
+Expect rough edges, breaking changes, incomplete paths, and the occasional dead
+end. Parts of the design described below are targets and directions, not
+completed guarantees.
+
+The runtime is being shaped around one hard target first: the Antirez GLM-5.2 Q2
+GGUF artifact, paged KV cache by default, sparse MoE routing, and Metal-focused
+execution for the bottlenecks that matter.
 
 This is not a general model zoo. Inferno keeps the inference path small,
 explicit, and optimized for Q2 GLM-5.2-style execution so it can become fast
-enough for real local use while staying simple enough to audit end to end.
+enough for real local use while staying simple enough to audit end to end. That
+is the ambition — whether it gets all the way there is exactly what the
+experiment is testing.
 
 ## Model
 
