@@ -1,10 +1,13 @@
-use ::metal::{CommandQueue, ComputePipelineState, Device};
+use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
 use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{empty_f32_buffer, f32_buffer, read_f32_buffer, u32_buffer, u32_scalar_buffer},
-    command::dispatch_1d,
+    buffers::{
+        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_buffer,
+        u32_scalar_buffer,
+    },
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{validate_moe_gather_tokens_f32, validate_moe_weighted_index_add_combine_f32},
@@ -190,6 +193,100 @@ impl MetalMoe {
             assignment_count,
             thread_count: output_len,
         })
+    }
+
+    /// Encodes the weighted MoE combine into an open batched command buffer.
+    /// The accumulator and stacked expert outputs are device-resident; the
+    /// routing metadata (token indices and expert weights) is host data chosen
+    /// by the CPU router, so it is validated fully and uploaded here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_weighted_index_add_combine(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        accumulator: &Buffer,
+        accumulator_len: usize,
+        token_indices: &[u32],
+        expert_outputs: &Buffer,
+        expert_outputs_len: usize,
+        expert_weights: &[f32],
+        token_count: usize,
+        hidden_size: usize,
+        assignment_count: usize,
+    ) -> Result<Buffer> {
+        if token_count == 0 || hidden_size == 0 || assignment_count == 0 {
+            return Err(Error::backend(
+                "MoE combine requires non-zero token_count, hidden_size and assignment_count",
+            ));
+        }
+        let output_len = token_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE combine output length overflow"))?;
+        if accumulator_len != output_len {
+            return Err(Error::backend(format!(
+                "MoE combine accumulator length mismatch: expected {output_len}, got {accumulator_len}"
+            )));
+        }
+        let expected_expert_len = assignment_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE combine expert output length overflow"))?;
+        if expert_outputs_len != expected_expert_len {
+            return Err(Error::backend(format!(
+                "MoE combine expert outputs length mismatch: expected {expected_expert_len}, got {expert_outputs_len}"
+            )));
+        }
+        if token_indices.len() != assignment_count || expert_weights.len() != assignment_count {
+            return Err(Error::backend(format!(
+                "MoE combine routing metadata mismatch: {} indices and {} weights for {assignment_count} assignments",
+                token_indices.len(),
+                expert_weights.len()
+            )));
+        }
+        for token_index in token_indices {
+            if *token_index as usize >= token_count {
+                return Err(Error::backend(format!(
+                    "MoE combine token index {token_index} is outside token_count {token_count}"
+                )));
+            }
+        }
+        if expert_weights.iter().any(|value| !value.is_finite()) {
+            return Err(Error::backend(
+                "MoE combine expert weights contain non-finite values",
+            ));
+        }
+        require_f32_capacity(accumulator, accumulator_len, "MoE combine accumulator")?;
+        require_f32_capacity(expert_outputs, expert_outputs_len, "MoE combine expert outputs")?;
+
+        let token_count_u32 = u32::try_from(token_count)
+            .map_err(|_| Error::backend("MoE combine token_count exceeds Metal u32 limit"))?;
+        let hidden_size_u32 = u32::try_from(hidden_size)
+            .map_err(|_| Error::backend("MoE combine hidden_size exceeds Metal u32 limit"))?;
+        let assignment_count_u32 = u32::try_from(assignment_count)
+            .map_err(|_| Error::backend("MoE combine assignment_count exceeds Metal u32 limit"))?;
+
+        let token_indices_buffer = u32_buffer(device, token_indices)?;
+        let expert_weights_buffer = f32_buffer(device, expert_weights)?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
+        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let assignment_count_buffer = u32_scalar_buffer(device, assignment_count_u32)?;
+
+        encode_1d(
+            command_buffer,
+            &self.combine_pipeline,
+            &[
+                accumulator,
+                &token_indices_buffer,
+                expert_outputs,
+                &expert_weights_buffer,
+                &output_buffer,
+                &token_count_buffer,
+                &hidden_size_buffer,
+                &assignment_count_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output_buffer)
     }
 }
 

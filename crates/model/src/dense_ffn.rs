@@ -291,6 +291,44 @@ impl<'a> DenseFfn<'a> {
         let down = self.down.forward_f32_tensor(&gated, backend)?;
         require_native("add", backend.add_f32_tensor(hidden_states, &down)?)
     }
+
+    /// Batched device-resident variant of `forward_f32_tensor`: the whole
+    /// dense FFN (norm, gate/up, SwiGLU, down, residual) is encoded into the
+    /// backend's open batch with no synchronization. `Ok(None)` falls back to
+    /// the eager path.
+    pub(crate) fn forward_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF device dense FFN input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape(
+            "gguf_device_dense_ffn_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+
+        let normed =
+            crate::try_device!(self.post_attention_norm.forward_device(hidden_states, backend));
+        let gate = crate::try_device!(self.gate.forward_device(&normed, backend));
+        let up = crate::try_device!(self.up.forward_device(&normed, backend));
+        let gated = crate::try_device!(backend.swiglu_device(&gate, &up));
+        validate_exact_shape(
+            "gguf_device_dense_ffn_gated",
+            gated.dims(),
+            &[batch, tokens, self.intermediate_size],
+        )?;
+        let down = crate::try_device!(self.down.forward_device(&gated, backend));
+        backend.add_device(hidden_states, &down)
+    }
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {

@@ -1,4 +1,4 @@
-use backend::{Backend, BackendCapabilities};
+use backend::{Backend, BackendCapabilities, DeviceValue};
 use common::Tensor;
 use common::{validate_exact_shape, DeviceKind, Error, F32Tensor, PagedKvView, Result, Shape};
 use config::Config;
@@ -48,6 +48,16 @@ pub struct AttentionF32Tensors {
     pub hidden_states: F32Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+}
+
+/// Output of the batched device-resident decode attention path. The hidden
+/// states stay on the GPU for the next op; the current token's K/V are
+/// downloaded because the paged KV cache lives on the host.
+#[derive(Debug)]
+pub(crate) struct AttentionDeviceTensors {
+    pub(crate) hidden_states: DeviceValue,
+    pub(crate) cache_k: F32Tensor,
+    pub(crate) cache_v: F32Tensor,
 }
 
 #[derive(Debug)]
@@ -405,6 +415,189 @@ impl<'a> HeadProjection<'a> {
                 self.tensor_ref.name, other
             ))),
         }
+    }
+
+    /// Batched device-resident variant of `forward_heads_f32`. For the
+    /// transposed (`OutputInputHeads`) layout the per-head outputs are stacked
+    /// with GPU copies, which reproduces the eager path's host scatter only
+    /// when there is a single flat token — so that layout bails out with
+    /// `Ok(None)` outside single-token decode.
+    fn forward_heads_device<B: Backend>(
+        &self,
+        input: &DeviceValue,
+        backend: &B,
+    ) -> Result<Option<DeviceValue>> {
+        let dims = input.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF device head projection input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape(
+            format!(
+                "gguf_device_attention_head_projection_input:{}",
+                self.tensor_ref.name
+            ),
+            dims,
+            &[batch, tokens, self.input_features],
+        )?;
+        let flat_tokens = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| Error::model("GLM device head projection batch*tokens overflow"))?;
+        let flat_input = input.reshape(vec![flat_tokens, self.input_features])?;
+        let merged_output_features = self
+            .heads
+            .checked_mul(self.output_features)
+            .ok_or_else(|| Error::model("GLM device head projection merged width overflow"))?;
+
+        match (self.tensor_ref.ty, self.layout) {
+            (GgmlType::Q2K, HeadProjectionLayout::InputOutputHeads) => {
+                let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q2_K for the device Q2 head projection path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?;
+                let flat_output = crate::try_device!(backend.q2_k_matvec_device(
+                    raw_data,
+                    &flat_input,
+                    flat_tokens,
+                    self.input_features,
+                    merged_output_features,
+                ));
+                Ok(Some(flat_output.reshape(vec![
+                    batch,
+                    tokens,
+                    self.heads,
+                    self.output_features,
+                ])?))
+            }
+            (GgmlType::Q8_0, HeadProjectionLayout::InputOutputHeads) => {
+                let raw_data = self.q8_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q8_0 for the device Q8 head projection path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?;
+                let flat_output = crate::try_device!(backend.q8_0_matvec_device(
+                    raw_data,
+                    &flat_input,
+                    flat_tokens,
+                    self.input_features,
+                    merged_output_features,
+                ));
+                Ok(Some(flat_output.reshape(vec![
+                    batch,
+                    tokens,
+                    self.heads,
+                    self.output_features,
+                ])?))
+            }
+            (GgmlType::Q2K, HeadProjectionLayout::OutputInputHeads)
+            | (GgmlType::Q8_0, HeadProjectionLayout::OutputInputHeads) => {
+                if flat_tokens != 1 {
+                    return Ok(None);
+                }
+                self.forward_transposed_heads_device(backend, &flat_input, batch, tokens)
+            }
+            (other, _) => Err(Error::gguf(format!(
+                "GGUF tensor {} must be Q2_K or Q8_0 for device head projection, got {}",
+                self.tensor_ref.name, other
+            ))),
+        }
+    }
+
+    /// Single-token transposed head projection: one encoded transposed matvec
+    /// per head against that head's payload slice, stacked into `[1, 1, heads,
+    /// output_features]` with GPU copies. No synchronization happens here.
+    fn forward_transposed_heads_device<B: Backend>(
+        &self,
+        backend: &B,
+        flat_input: &DeviceValue,
+        batch: usize,
+        tokens: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let (raw_data, block_bytes) = match self.tensor_ref.ty {
+            GgmlType::Q2K => (
+                self.q2_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q2_K for the device transposed Q2 head projection path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?,
+                GGML_Q2_K_BLOCK_BYTES as usize,
+            ),
+            GgmlType::Q8_0 => (
+                self.q8_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q8_0 for the device transposed Q8 head projection path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?,
+                GGML_Q8_0_BLOCK_BYTES as usize,
+            ),
+            other => {
+                return Err(Error::gguf(format!(
+                    "GGUF tensor {} must be Q2_K or Q8_0 for device transposed head projection, got {other}",
+                    self.tensor_ref.name
+                )))
+            }
+        };
+        let head_byte_len = usize::try_from(self.blocks_per_head)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| {
+                Error::gguf(format!(
+                    "GGUF tensor {} device transposed head byte length overflow",
+                    self.tensor_ref.name
+                ))
+            })?;
+        let expected_payload_len = head_byte_len.checked_mul(self.heads).ok_or_else(|| {
+            Error::gguf(format!(
+                "GGUF tensor {} device transposed payload length overflow",
+                self.tensor_ref.name
+            ))
+        })?;
+        validate_exact_shape(
+            format!(
+                "gguf_device_attention_transposed_head_projection_payload:{}",
+                self.tensor_ref.name
+            ),
+            &[raw_data.len()],
+            &[expected_payload_len],
+        )?;
+
+        let mut head_outputs = Vec::with_capacity(self.heads);
+        for head_index in 0..self.heads {
+            let byte_start = head_index * head_byte_len;
+            let head_bytes = &raw_data[byte_start..byte_start + head_byte_len];
+            let head_output = match self.tensor_ref.ty {
+                GgmlType::Q2K => crate::try_device!(backend.q2_k_transposed_matvec_device(
+                    head_bytes,
+                    flat_input,
+                    1,
+                    self.input_features,
+                    self.output_features,
+                )),
+                _ => crate::try_device!(backend.q8_0_transposed_matvec_device(
+                    head_bytes,
+                    flat_input,
+                    1,
+                    self.input_features,
+                    self.output_features,
+                )),
+            };
+            head_outputs.push(head_output);
+        }
+        let stacked = crate::try_device!(backend.moe_stack_rows_device(&head_outputs));
+        Ok(Some(stacked.reshape(vec![
+            batch,
+            tokens,
+            self.heads,
+            self.output_features,
+        ])?))
     }
 
     fn forward_input_output_heads_q2<B: Backend>(
@@ -1574,6 +1767,129 @@ impl<'a> Attention<'a> {
             cache_k: k_for_cache,
             cache_v: v_for_cache,
         })
+    }
+
+    /// Batched device-resident decode attention: mirrors the native paged
+    /// path above, but every kernel is encoded into the backend's open batch
+    /// and intermediate tensors never leave the GPU. The single
+    /// synchronization is the download of the current token's K/V at the end,
+    /// which the host paged cache needs for its append.
+    ///
+    /// Returns `Ok(None)` when any component has no device path (the caller
+    /// falls back to the eager route); requires a single decode token.
+    pub(crate) fn forward_decode_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &DeviceValue,
+        backend: &B,
+        past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<AttentionDeviceTensors>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF device attention input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        if tokens != 1 {
+            return Ok(None);
+        }
+        validate_exact_shape(
+            "gguf_device_attention_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+        past_kv.validate()?;
+        validate_exact_shape(
+            "gguf_device_attention_paged_past_shape",
+            &[
+                past_kv.batch,
+                past_kv.attention_heads,
+                past_kv.key_head_dim,
+                past_kv.value_head_dim,
+            ],
+            &[
+                batch,
+                config.attention_heads,
+                config.qk_head_dim,
+                config.v_head_dim(),
+            ],
+        )?;
+        let past_tokens = past_kv.cached_tokens;
+
+        let input_norm = crate::try_device!(self.input_norm.forward_device(hidden_states, backend));
+        let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+        let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
+        let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
+        let q_heads = q_b.reshape(vec![
+            batch,
+            tokens,
+            config.attention_heads,
+            config.qk_head_dim,
+        ])?;
+        let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
+            &q_heads,
+            config.qk_no_rope_dim,
+            config.qk_rope_dim,
+        ));
+        let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+            &q_rope,
+            config.qk_rope_dim,
+            past_tokens,
+            config.rope_theta as f32,
+        ));
+        let q_recombined =
+            crate::try_device!(backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope));
+
+        let kv_a_mqa = crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+        let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
+            &kv_a_mqa,
+            self.kv_lora_rank,
+            config.qk_rope_dim,
+        ));
+        let kv_a_norm = crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+        let k_no_rope = crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
+        let v_heads = crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+        let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+            &k_rope_mqa,
+            config.qk_rope_dim,
+            past_tokens,
+            config.rope_theta as f32,
+        ));
+        let k_heads =
+            crate::try_device!(backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope));
+
+        let q_for_attention =
+            crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
+        let k_for_cache = crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
+        let v_for_cache = crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
+
+        let context_heads = crate::try_device!(backend.paged_decode_attention_device(
+            &q_for_attention,
+            &k_for_cache,
+            &v_for_cache,
+            past_kv,
+        ));
+        let merged_attention_output =
+            crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+        let output_hidden_states = crate::try_device!(self.output.forward_device_add_residual(
+            &merged_attention_output,
+            hidden_states,
+            backend,
+        ));
+
+        // The paged KV cache lives on the host, so the current token's K/V
+        // must come back. This download flushes the batch — the one GPU sync
+        // for everything encoded above.
+        let cache_k = backend.device_download_f32_tensor(&k_for_cache)?;
+        let cache_v = backend.device_download_f32_tensor(&v_for_cache)?;
+
+        Ok(Some(AttentionDeviceTensors {
+            hidden_states: output_hidden_states,
+            cache_k,
+            cache_v,
+        }))
     }
 }
 

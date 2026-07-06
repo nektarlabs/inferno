@@ -1,10 +1,12 @@
-use ::metal::{CommandQueue, ComputePipelineState, Device};
+use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
 use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{empty_f32_buffer, f32_buffer, read_f32_buffer, u32_scalar_buffer},
-    command::dispatch_1d,
+    buffers::{
+        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
+    },
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{
@@ -634,6 +636,322 @@ impl MetalLayout {
             thread_count: output_len,
         })
     }
+
+    // ------------------------------------------------------------------
+    // Batched encode variants.
+    //
+    // These mirror the run_* entry points above but read their inputs from
+    // device-resident buffers and encode into an open batched command buffer
+    // instead of dispatching immediately. Inputs are validated by length only
+    // (the values may not have been computed yet); outputs are fresh buffers.
+    // See `BatchSlot` for the batching rules.
+    // ------------------------------------------------------------------
+
+    pub(crate) fn encode_select_last_token(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        hidden_states: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        let expected_input_len = batch_count
+            .checked_mul(token_count)
+            .and_then(|value| value.checked_mul(hidden_size))
+            .ok_or_else(|| Error::backend("select_last_token input length overflow"))?;
+        require_layout_input_len("select_last_token", input_len, expected_input_len)?;
+        require_f32_capacity(hidden_states, input_len, "select_last_token input")?;
+        let output_len = batch_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("select_last_token output length overflow"))?;
+        require_nonzero_output("select_last_token", output_len)?;
+
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let hidden_size_buffer = layout_u32_buffer(device, hidden_size, "hidden_size")?;
+
+        encode_1d(
+            command_buffer,
+            &self.select_last_token_pipeline,
+            &[
+                hidden_states,
+                &output_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &hidden_size_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output_buffer)
+    }
+
+    pub(crate) fn encode_heads_to_attention_layout(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        head_count: usize,
+        head_dim: usize,
+    ) -> Result<Buffer> {
+        let output_len =
+            attention_head_value_count(batch_count, token_count, head_count, head_dim)?;
+        require_layout_input_len("heads_to_attention_layout", input_len, output_len)?;
+        require_f32_capacity(input, input_len, "heads_to_attention_layout input")?;
+        require_nonzero_output("heads_to_attention_layout", output_len)?;
+
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
+        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+
+        encode_1d(
+            command_buffer,
+            &self.heads_to_attention_layout_pipeline,
+            &[
+                input,
+                &output_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &head_count_buffer,
+                &head_dim_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output_buffer)
+    }
+
+    pub(crate) fn encode_merge_attention_heads(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        head_count: usize,
+        token_count: usize,
+        head_dim: usize,
+    ) -> Result<Buffer> {
+        let output_len =
+            attention_head_value_count(batch_count, token_count, head_count, head_dim)?;
+        require_layout_input_len("merge_attention_heads", input_len, output_len)?;
+        require_f32_capacity(input, input_len, "merge_attention_heads input")?;
+        require_nonzero_output("merge_attention_heads", output_len)?;
+
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+
+        encode_1d(
+            command_buffer,
+            &self.merge_attention_heads_pipeline,
+            &[
+                input,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &token_count_buffer,
+                &head_dim_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output_buffer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_split_rope_tail(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        head_count: usize,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        let no_rope_len =
+            attention_head_value_count(batch_count, token_count, head_count, no_rope_dim)?;
+        let rope_len = attention_head_value_count(batch_count, token_count, head_count, rope_dim)?;
+        let thread_count = no_rope_len
+            .checked_add(rope_len)
+            .ok_or_else(|| Error::backend("split_rope_tail thread count overflow"))?;
+        require_layout_input_len("split_rope_tail", input_len, thread_count)?;
+        require_f32_capacity(input, input_len, "split_rope_tail input")?;
+        require_nonzero_output("split_rope_tail", thread_count)?;
+
+        let no_rope_buffer = empty_f32_buffer(device, no_rope_len)?;
+        let rope_buffer = empty_f32_buffer(device, rope_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
+        let no_rope_dim_buffer = layout_u32_buffer(device, no_rope_dim, "no_rope_dim")?;
+        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+
+        encode_1d(
+            command_buffer,
+            &self.split_rope_tail_pipeline,
+            &[
+                input,
+                &no_rope_buffer,
+                &rope_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &head_count_buffer,
+                &no_rope_dim_buffer,
+                &rope_dim_buffer,
+            ],
+            thread_count,
+        )?;
+        Ok((no_rope_buffer, rope_buffer))
+    }
+
+    pub(crate) fn encode_split_kv_mqa(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        let latent_len = batch_count
+            .checked_mul(token_count)
+            .and_then(|value| value.checked_mul(kv_lora_rank))
+            .ok_or_else(|| Error::backend("split_kv_mqa latent length overflow"))?;
+        let rope_len = batch_count
+            .checked_mul(token_count)
+            .and_then(|value| value.checked_mul(rope_dim))
+            .ok_or_else(|| Error::backend("split_kv_mqa rope length overflow"))?;
+        let thread_count = latent_len
+            .checked_add(rope_len)
+            .ok_or_else(|| Error::backend("split_kv_mqa thread count overflow"))?;
+        require_layout_input_len("split_kv_mqa", input_len, thread_count)?;
+        require_f32_capacity(input, input_len, "split_kv_mqa input")?;
+        require_nonzero_output("split_kv_mqa", thread_count)?;
+
+        let latent_buffer = empty_f32_buffer(device, latent_len)?;
+        let rope_buffer = empty_f32_buffer(device, rope_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let kv_lora_rank_buffer = layout_u32_buffer(device, kv_lora_rank, "kv_lora_rank")?;
+        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+
+        encode_1d(
+            command_buffer,
+            &self.split_kv_mqa_pipeline,
+            &[
+                input,
+                &latent_buffer,
+                &rope_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &kv_lora_rank_buffer,
+                &rope_dim_buffer,
+            ],
+            thread_count,
+        )?;
+        Ok((latent_buffer, rope_buffer))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_combine_rope_tail(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        no_rope: &Buffer,
+        no_rope_len: usize,
+        rope: &Buffer,
+        rope_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        head_count: usize,
+        rope_head_count: usize,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Buffer> {
+        if rope_head_count != 1 && rope_head_count != head_count {
+            return Err(Error::backend(format!(
+                "combine_rope_tail rope_head_count must be 1 or {head_count}, got {rope_head_count}"
+            )));
+        }
+        let expected_no_rope_len =
+            attention_head_value_count(batch_count, token_count, head_count, no_rope_dim)?;
+        require_layout_input_len("combine_rope_tail no_rope", no_rope_len, expected_no_rope_len)?;
+        let expected_rope_len =
+            attention_head_value_count(batch_count, token_count, rope_head_count, rope_dim)?;
+        require_layout_input_len("combine_rope_tail rope", rope_len, expected_rope_len)?;
+        require_f32_capacity(no_rope, no_rope_len, "combine_rope_tail no_rope input")?;
+        require_f32_capacity(rope, rope_len, "combine_rope_tail rope input")?;
+
+        let total_dim = no_rope_dim
+            .checked_add(rope_dim)
+            .ok_or_else(|| Error::backend("combine_rope_tail total dim overflow"))?;
+        let output_len =
+            attention_head_value_count(batch_count, token_count, head_count, total_dim)?;
+        require_nonzero_output("combine_rope_tail", output_len)?;
+
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
+        let rope_head_count_buffer = layout_u32_buffer(device, rope_head_count, "rope_head_count")?;
+        let no_rope_dim_buffer = layout_u32_buffer(device, no_rope_dim, "no_rope_dim")?;
+        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+
+        encode_1d(
+            command_buffer,
+            &self.combine_rope_tail_pipeline,
+            &[
+                no_rope,
+                rope,
+                &output_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &head_count_buffer,
+                &rope_head_count_buffer,
+                &no_rope_dim_buffer,
+                &rope_dim_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output_buffer)
+    }
+}
+
+fn layout_u32_buffer(device: &Device, value: usize, label: &str) -> Result<Buffer> {
+    let value = u32::try_from(value)
+        .map_err(|_| Error::backend(format!("layout {label} exceeds Metal u32 limit")))?;
+    u32_scalar_buffer(device, value)
+}
+
+fn require_layout_input_len(name: &str, input_len: usize, expected: usize) -> Result<()> {
+    if input_len != expected {
+        return Err(Error::backend(format!(
+            "{name} input length mismatch: expected {expected} values, got {input_len}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_nonzero_output(name: &str, output_len: usize) -> Result<()> {
+    if output_len == 0 {
+        return Err(Error::backend(format!(
+            "{name} requires a non-empty output (a shape dimension is zero)"
+        )));
+    }
+    Ok(())
 }
 
 fn attention_head_value_count(

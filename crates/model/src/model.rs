@@ -21,6 +21,10 @@ pub struct Model<'a> {
     hidden_size: usize,
     max_context: usize,
     load_report: ModelLoadReport,
+    /// Set after the batched device decode path declines once (a weight or
+    /// backend without a device kernel), so later tokens skip straight to the
+    /// eager path instead of re-encoding work that will be thrown away.
+    device_decode_disabled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -165,7 +169,16 @@ impl<'a> Model<'a> {
             hidden_size: config.hidden_size,
             max_context: config.max_context,
             load_report,
+            device_decode_disabled: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Forces the per-op (eager) decode path by disabling the batched
+    /// device-resident path. Escape hatch for debugging and for A/B
+    /// comparison of the two decode routes.
+    pub fn disable_device_decode(&self) {
+        self.device_decode_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn load_report(&self) -> &ModelLoadReport {
@@ -321,7 +334,7 @@ impl<'a> Model<'a> {
         config: &Config,
         decode_token_ids: &[u32],
         backend: &B,
-        past_kv_for_layer: F,
+        mut past_kv_for_layer: F,
     ) -> Result<ModelTokenOutput>
     where
         B: Backend,
@@ -338,6 +351,36 @@ impl<'a> Model<'a> {
             ));
         }
 
+        // Prefer the batched device-resident path: one shared command buffer
+        // per stretch of GPU work instead of one commit+wait per kernel.
+        if decode_token_ids.len() == 1
+            && backend.device_values_supported()
+            && !self
+                .device_decode_disabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match self.decode_next_token_paged_device(
+                config,
+                decode_token_ids,
+                backend,
+                &mut past_kv_for_layer,
+            )? {
+                Some(output) => return Ok(output),
+                None => {
+                    // Discard any partially encoded work, then permanently
+                    // fall back — the unsupported component will not change
+                    // between tokens.
+                    backend.device_flush()?;
+                    self.device_decode_disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        "device-batched decode path unavailable for this artifact; \
+                         falling back to per-op decode"
+                    );
+                }
+            }
+        }
+
         let hidden = self.forward_hidden_f32_tensors_with_paged_kv_provider(
             config,
             decode_token_ids,
@@ -345,6 +388,54 @@ impl<'a> Model<'a> {
             past_kv_for_layer,
         )?;
         self.last_token_only_f32(hidden, backend)
+    }
+
+    /// Batched device-resident single-token decode. Embeds on the host (a
+    /// table lookup), then runs every layer and the output head with
+    /// GPU-resident hidden states; the fused argmax at the end flushes the
+    /// final batch and yields the token.
+    fn decode_next_token_paged_device<'kv, B, F>(
+        &self,
+        config: &Config,
+        decode_token_ids: &[u32],
+        backend: &B,
+        past_kv_for_layer: &mut F,
+    ) -> Result<Option<ModelTokenOutput>>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<PagedKvView<'kv>>>,
+    {
+        let embedding = self.embedding_table.lookup_f32(decode_token_ids)?;
+        let stack = crate::try_device!(self.layer_stack.forward_decode_device(
+            config,
+            &embedding.hidden_states,
+            backend,
+            past_kv_for_layer,
+        ));
+
+        let token = match self
+            .output_head
+            .decode_token_device(&stack.hidden_states, backend)?
+        {
+            Some(token) => token,
+            None => {
+                // The head has no device path (e.g. a non-Q2_K output
+                // projection): download the final hidden states and finish on
+                // the eager head. The layer stack still ran fully batched.
+                let hidden_states = backend.device_download_f32_tensor(&stack.hidden_states)?;
+                let selected = require_native(
+                    "select_last_token",
+                    backend.select_last_token_f32_tensor(&hidden_states)?,
+                )?;
+                self.output_head.decode_token_f32(&selected, backend)?
+            }
+        };
+
+        Ok(Some(ModelTokenOutput {
+            layer_kv_cache: stack.layer_kv_cache,
+            token_id: token.token_id,
+            token_score: token.token_score,
+        }))
     }
 
     fn forward_hidden_states<B: Backend>(

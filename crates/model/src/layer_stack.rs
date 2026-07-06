@@ -530,6 +530,94 @@ impl<'a> LayerStack<'a> {
             layer_kv_cache,
         })
     }
+
+    /// Batched device-resident decode driver: uploads the embedding once,
+    /// threads GPU-resident hidden states through every layer, and returns
+    /// them still on the device so the output head can consume them without a
+    /// host round-trip. Per layer, the only synchronizations are the K/V
+    /// download for the cache append and the MoE router's top-k download.
+    ///
+    /// Returns `Ok(None)` when any layer lacks a device path or a layer has no
+    /// paged past KV; the caller falls back to the eager route.
+    pub(crate) fn forward_decode_device<'kv, B, F>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+        mut past_kv_for_layer: F,
+    ) -> Result<Option<LayerStackDecodeDeviceTensors>>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<PagedKvView<'kv>>>,
+    {
+        validate_hidden_states_f32(self.hidden_size, hidden_states)?;
+
+        let mut current = crate::try_device!(backend.device_upload_f32_tensor(hidden_states));
+        let mut layer_kv_cache = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            match layer {
+                RuntimeLayer::Dense(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
+                        return Ok(None);
+                    };
+                    let output = crate::try_device!(profile::run_layer_stage(
+                        layer_index,
+                        "dense",
+                        || block.forward_decode_device(config, &current, backend, &past_kv),
+                    ));
+                    debug!(
+                        layer_index,
+                        layer_kind = "dense",
+                        "GLM-5.2 Q2 device-batched layer completed"
+                    );
+                    layer_kv_cache.push(LayerKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::Dense,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                    });
+                    current = output.hidden_states;
+                }
+                RuntimeLayer::Sparse(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
+                        return Ok(None);
+                    };
+                    let output = crate::try_device!(profile::run_layer_stage(
+                        layer_index,
+                        "sparse_moe",
+                        || block.forward_decode_device(config, &current, backend, &past_kv),
+                    ));
+                    debug!(
+                        layer_index,
+                        layer_kind = "sparse_moe",
+                        "GLM-5.2 Q2 device-batched layer completed"
+                    );
+                    layer_kv_cache.push(LayerKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::SparseMoe,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                    });
+                    current = output.hidden_states;
+                }
+            }
+        }
+
+        Ok(Some(LayerStackDecodeDeviceTensors {
+            hidden_states: current,
+            layer_kv_cache,
+        }))
+    }
+}
+
+/// Result of the device-resident decode driver: final hidden states still on
+/// the GPU plus the per-layer K/V tensors for the host cache appends.
+pub(crate) struct LayerStackDecodeDeviceTensors {
+    pub(crate) hidden_states: backend::DeviceValue,
+    pub(crate) layer_kv_cache: Vec<LayerKvCacheTensors>,
 }
 
 fn past_kv_to_host<B: Backend>(

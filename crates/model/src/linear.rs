@@ -197,6 +197,131 @@ impl<'a> QuantizedLinear<'a> {
         Ok(self.run_direct_quantized_linear_f32(input, backend)?.output)
     }
 
+    /// Batched device-resident variant of `forward_f32_tensor`: encodes the
+    /// quantized matvec into the backend's open batch. Returns `Ok(None)` when
+    /// the backend has no device path or this weight's quantization has no
+    /// batched kernel.
+    pub(crate) fn forward_device<B: Backend>(
+        &self,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        let (row_count, expected_output_shape) = validate_input_dims(
+            "GGUF quantized linear device",
+            input.dims(),
+            self.in_features,
+            self.out_features,
+        )?;
+
+        let output = match self.tensor_ref.ty {
+            GgmlType::Q2K => {
+                let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q2_K for the device Q2 matvec path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?;
+                crate::try_device!(backend.q2_k_matvec_device(
+                    raw_data,
+                    input,
+                    row_count,
+                    self.in_features,
+                    self.out_features,
+                ))
+            }
+            GgmlType::Q8_0 => {
+                let storage = self.gguf.tensor_quantized_storage(&self.tensor_ref.name)?;
+                crate::try_device!(backend.q8_0_matvec_device(
+                    storage.bytes,
+                    input,
+                    row_count,
+                    self.in_features,
+                    self.out_features,
+                ))
+            }
+            _ => return Ok(None),
+        };
+        validate_exact_shape(
+            "gguf_device_quantized_linear_output",
+            output.dims(),
+            &expected_output_shape,
+        )?;
+        Ok(Some(output))
+    }
+
+    /// Batched device-resident variant of `forward_f32_tensor_add_residual`
+    /// (matvec fused with residual add). Only the Q2_K kernel supports the
+    /// fused add; other types return `Ok(None)`.
+    pub(crate) fn forward_device_add_residual<B: Backend>(
+        &self,
+        input: &backend::DeviceValue,
+        residual: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        if self.tensor_ref.ty != GgmlType::Q2K {
+            return Ok(None);
+        }
+        let (row_count, expected_output_shape) = validate_input_dims(
+            "GGUF Q2 quantized linear device residual",
+            input.dims(),
+            self.in_features,
+            self.out_features,
+        )?;
+        validate_exact_shape(
+            "gguf_q2_quantized_linear_device_residual",
+            residual.dims(),
+            &expected_output_shape,
+        )?;
+        let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+            Error::gguf(format!(
+                "GGUF tensor {} must be Q2_K for the device Q2 matvec add path, got {}",
+                self.tensor_ref.name, self.tensor_ref.ty
+            ))
+        })?;
+        let output = crate::try_device!(backend.q2_k_matvec_add_device(
+            raw_data,
+            input,
+            residual,
+            row_count,
+            self.in_features,
+            self.out_features,
+        ));
+        validate_exact_shape(
+            "gguf_device_q2_quantized_linear_add_output",
+            output.dims(),
+            &expected_output_shape,
+        )?;
+        Ok(Some(output))
+    }
+
+    /// Batched device-resident greedy decode: encodes the output-head matvec
+    /// plus argmax, then flushes the whole batch. `Ok(None)` when unsupported.
+    pub(crate) fn greedy_token_device<B: Backend>(
+        &self,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<LinearTokenOutput>> {
+        if self.tensor_ref.ty != GgmlType::Q2K {
+            return Ok(None);
+        }
+        let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+            Error::gguf(format!(
+                "GGUF tensor {} must be Q2_K for the device Q2 greedy path, got {}",
+                self.tensor_ref.name, self.tensor_ref.ty
+            ))
+        })?;
+        let (token_id, token_score) = crate::try_device!(backend.q2_k_matvec_argmax_device(
+            raw_data,
+            input,
+            self.in_features,
+            self.out_features,
+        ));
+        Ok(Some(LinearTokenOutput {
+            token_id,
+            token_score,
+        }))
+    }
+
     pub fn forward_f32_tensor_add_residual<B: Backend>(
         &self,
         input: &F32Tensor,
@@ -819,7 +944,16 @@ fn validate_input_shape_f32(
     in_features: usize,
     out_features: usize,
 ) -> Result<(usize, Vec<usize>)> {
-    match input.dims() {
+    validate_input_dims(context, input.dims(), in_features, out_features)
+}
+
+fn validate_input_dims(
+    context: &str,
+    dims: &[usize],
+    in_features: usize,
+    out_features: usize,
+) -> Result<(usize, Vec<usize>)> {
+    match dims {
         [rows, features] => {
             validate_exact_shape(
                 "gguf_quantized_linear_input_features",

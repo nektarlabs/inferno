@@ -9,8 +9,11 @@ use common::{
 };
 use common::{Device, Tensor};
 
+use crate::device_value::DeviceValue;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::metal::Metal;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use crate::metal::QuantMatvecKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendCapabilities {
@@ -347,6 +350,233 @@ pub trait Backend {
         _in_features: usize,
         _out_features: usize,
     ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+
+    // ------------------------------------------------------------------
+    // Batched device-resident ops.
+    //
+    // The *_device methods mirror the native *_f32_tensor ops above but keep
+    // tensors on the GPU as `DeviceValue` handles and defer execution: each
+    // call encodes its kernel into a shared command buffer instead of
+    // committing one command buffer per op and blocking on it. The GPU runs
+    // the accumulated work only when the host actually needs values —
+    // `device_download_f32_tensor`, `device_flush`, or a fused sink such as
+    // `q2_k_matvec_argmax_device`. Chaining `DeviceValue`s through these ops
+    // is what removes the per-kernel synchronization stall from the decode
+    // hot path.
+    //
+    // Backends without device-resident execution keep the `Ok(None)` defaults
+    // and callers fall back to the eager paths.
+    // ------------------------------------------------------------------
+
+    /// Whether this backend executes the `*_device` ops. When false, every
+    /// `*_device` method returns `Ok(None)`.
+    fn device_values_supported(&self) -> bool {
+        false
+    }
+
+    /// Commits and waits for any batched GPU work encoded so far. A no-op
+    /// when nothing is pending or the backend has no device-resident path.
+    fn device_flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Copies a host tensor into GPU memory, returning a handle usable with
+    /// the other `*_device` ops.
+    fn device_upload_f32_tensor(&self, _tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Synchronizes pending batched work, then copies a device value back to
+    /// the host. This is the only way to observe `*_device` results.
+    fn device_download_f32_tensor(&self, _value: &DeviceValue) -> Result<F32Tensor> {
+        Err(Error::backend(
+            "device-resident values are not supported by this backend",
+        ))
+    }
+
+    fn rms_norm_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &F32Tensor,
+        _eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_transposed_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q8_0_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q8_0_transposed_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Q2_K matvec fused with a residual add; the output takes the residual's
+    /// shape.
+    fn q2_k_matvec_add_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _residual: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_gate_up_swiglu_device(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Output-head matvec + greedy argmax over a device-resident hidden state.
+    /// Flushes the batch (this is the end-of-token sink) and returns the
+    /// winning token id and score.
+    fn q2_k_matvec_argmax_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+
+    fn rope_slice_device(
+        &self,
+        _input: &DeviceValue,
+        _rope_dim: usize,
+        _position_offset: usize,
+        _theta: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn split_rope_tail_device(
+        &self,
+        _heads: &DeviceValue,
+        _no_rope_dim: usize,
+        _rope_dim: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
+    fn split_kv_mqa_device(
+        &self,
+        _kv_mqa: &DeviceValue,
+        _kv_lora_rank: usize,
+        _rope_dim: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
+    fn combine_rope_tail_device(
+        &self,
+        _no_rope: &DeviceValue,
+        _rope: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn heads_to_attention_layout_device(
+        &self,
+        _heads: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn merge_attention_heads_device(
+        &self,
+        _context_heads: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn select_last_token_device(
+        &self,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn add_device(&self, _lhs: &DeviceValue, _rhs: &DeviceValue) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn swiglu_device(&self, _gate: &DeviceValue, _up: &DeviceValue) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn paged_decode_attention_device(
+        &self,
+        _q: &DeviceValue,
+        _current_k: &DeviceValue,
+        _current_v: &DeviceValue,
+        _past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Stacks equal-length device rows into one `[rows.len(), row_len]` value
+    /// with GPU-side copies. Used to assemble per-expert outputs for the MoE
+    /// combine without a host round-trip.
+    fn moe_stack_rows_device(&self, _rows: &[DeviceValue]) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn moe_weighted_index_add_combine_device(
+        &self,
+        _accumulator: &DeviceValue,
+        _token_indices: &[u32],
+        _expert_outputs: &DeviceValue,
+        _expert_weights: &[f32],
+    ) -> Result<Option<DeviceValue>> {
         Ok(None)
     }
 }
@@ -2313,12 +2543,795 @@ impl Backend for MetalBackend {
             Ok(None)
         }
     }
+
+    fn device_values_supported(&self) -> bool {
+        self.has_native_metal()
+    }
+
+    fn device_flush(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.batch_flush();
+            }
+        }
+        Ok(())
+    }
+
+    fn device_upload_f32_tensor(&self, tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batch_upload_f32(tensor.values())?;
+            return Ok(Some(DeviceValue::new(tensor.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = tensor;
+            Ok(None)
+        }
+    }
+
+    fn device_download_f32_tensor(&self, value: &DeviceValue) -> Result<F32Tensor> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                let values = native_metal.batch_read_f32(&value.buffer, value.element_count()?)?;
+                return F32Tensor::new(values, value.dims().to_vec());
+            }
+        }
+
+        let _ = value;
+        Err(Error::backend(
+            "device-resident values are not supported by this backend",
+        ))
+    }
+
+    fn rms_norm_device(
+        &self,
+        input: &DeviceValue,
+        weight: &F32Tensor,
+        eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = input.dims();
+            let hidden_size = *dims
+                .last()
+                .ok_or_else(|| Error::backend("rms_norm device input has empty shape"))?;
+            let input_len = input.element_count()?;
+            let rows = if hidden_size == 0 {
+                return Err(Error::backend("rms_norm device hidden_size must be non-zero"));
+            } else {
+                input_len / hidden_size
+            };
+            let buffer = native_metal.batched_rms_norm(
+                &input.buffer,
+                input_len,
+                weight.values(),
+                rows,
+                hidden_size,
+                eps,
+            )?;
+            return Ok(Some(DeviceValue::new(dims.to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, weight, eps);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.quant_matvec_device(
+                QuantMatvecKind::Q2K,
+                weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_transposed_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.quant_matvec_device(
+                QuantMatvecKind::Q2KTransposed,
+                weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q8_0_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.quant_matvec_device(
+                QuantMatvecKind::Q80,
+                weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q8_0_transposed_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.quant_matvec_device(
+                QuantMatvecKind::Q80Transposed,
+                weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_add_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        residual: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape("device_q2_k_matvec_add_rows", &[actual_rows], &[row_count])?;
+            let buffer = native_metal.batched_q2_k_matvec_add(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                &residual.buffer,
+                residual.element_count()?,
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(residual.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, residual, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_gate_up_swiglu_device(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, output_shape) =
+                matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape(
+                "device_q2_k_gate_up_swiglu_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+            let buffer = native_metal.batched_q2_k_gate_up_swiglu(
+                gate_weights,
+                up_weights,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(output_shape, buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_matvec_argmax_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape("device_q2_k_matvec_argmax_rows", &[actual_rows], &[1])?;
+            let (token_id, token_score) = native_metal.batched_q2_k_matvec_argmax(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some((token_id, token_score)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn rope_slice_device(
+        &self,
+        input: &DeviceValue,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_rope_slice", input, 4)?;
+            validate_exact_shape("device_rope_slice_dim", &[dims[3]], &[rope_dim])?;
+            let buffer = native_metal.batched_rope_slice(
+                &input.buffer,
+                input.element_count()?,
+                dims[0],
+                dims[1],
+                dims[2],
+                rope_dim,
+                position_offset,
+                theta,
+            )?;
+            return Ok(Some(DeviceValue::new(dims.to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, rope_dim, position_offset, theta);
+            Ok(None)
+        }
+    }
+
+    fn split_rope_tail_device(
+        &self,
+        heads: &DeviceValue,
+        no_rope_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_split_rope_tail", heads, 4)?;
+            let total_dim = no_rope_dim
+                .checked_add(rope_dim)
+                .ok_or_else(|| Error::backend("device split_rope_tail total dim overflow"))?;
+            validate_exact_shape("device_split_rope_tail_last_dim", &[dims[3]], &[total_dim])?;
+            let (batch, tokens, head_count) = (dims[0], dims[1], dims[2]);
+            let (no_rope_buffer, rope_buffer) = native_metal.batched_split_rope_tail(
+                &heads.buffer,
+                heads.element_count()?,
+                batch,
+                tokens,
+                head_count,
+                no_rope_dim,
+                rope_dim,
+            )?;
+            return Ok(Some((
+                DeviceValue::new(vec![batch, tokens, head_count, no_rope_dim], no_rope_buffer),
+                DeviceValue::new(vec![batch, tokens, head_count, rope_dim], rope_buffer),
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (heads, no_rope_dim, rope_dim);
+            Ok(None)
+        }
+    }
+
+    fn split_kv_mqa_device(
+        &self,
+        kv_mqa: &DeviceValue,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_split_kv_mqa", kv_mqa, 3)?;
+            let total_dim = kv_lora_rank
+                .checked_add(rope_dim)
+                .ok_or_else(|| Error::backend("device split_kv_mqa total dim overflow"))?;
+            validate_exact_shape("device_split_kv_mqa_last_dim", &[dims[2]], &[total_dim])?;
+            let (batch, tokens) = (dims[0], dims[1]);
+            let (latent_buffer, rope_buffer) = native_metal.batched_split_kv_mqa(
+                &kv_mqa.buffer,
+                kv_mqa.element_count()?,
+                batch,
+                tokens,
+                kv_lora_rank,
+                rope_dim,
+            )?;
+            return Ok(Some((
+                DeviceValue::new(vec![batch, tokens, kv_lora_rank], latent_buffer),
+                DeviceValue::new(vec![batch, tokens, 1, rope_dim], rope_buffer),
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (kv_mqa, kv_lora_rank, rope_dim);
+            Ok(None)
+        }
+    }
+
+    fn combine_rope_tail_device(
+        &self,
+        no_rope: &DeviceValue,
+        rope: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let no_rope_dims = require_device_rank("device_combine_rope_tail_no_rope", no_rope, 4)?;
+            let rope_dims = require_device_rank("device_combine_rope_tail_rope", rope, 4)?;
+            let (batch, tokens, head_count, no_rope_dim) = (
+                no_rope_dims[0],
+                no_rope_dims[1],
+                no_rope_dims[2],
+                no_rope_dims[3],
+            );
+            let (rope_head_count, rope_dim) = (rope_dims[2], rope_dims[3]);
+            validate_exact_shape(
+                "device_combine_rope_tail_batch_tokens",
+                &[rope_dims[0], rope_dims[1]],
+                &[batch, tokens],
+            )?;
+            let total_dim = no_rope_dim
+                .checked_add(rope_dim)
+                .ok_or_else(|| Error::backend("device combine_rope_tail total dim overflow"))?;
+            let buffer = native_metal.batched_combine_rope_tail(
+                &no_rope.buffer,
+                no_rope.element_count()?,
+                &rope.buffer,
+                rope.element_count()?,
+                batch,
+                tokens,
+                head_count,
+                rope_head_count,
+                no_rope_dim,
+                rope_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, tokens, head_count, total_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (no_rope, rope);
+            Ok(None)
+        }
+    }
+
+    fn heads_to_attention_layout_device(
+        &self,
+        heads: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_heads_to_attention_layout", heads, 4)?;
+            let (batch, tokens, head_count, head_dim) = (dims[0], dims[1], dims[2], dims[3]);
+            let buffer = native_metal.batched_heads_to_attention_layout(
+                &heads.buffer,
+                heads.element_count()?,
+                batch,
+                tokens,
+                head_count,
+                head_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, head_count, tokens, head_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = heads;
+            Ok(None)
+        }
+    }
+
+    fn merge_attention_heads_device(
+        &self,
+        context_heads: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_merge_attention_heads", context_heads, 4)?;
+            let (batch, head_count, tokens, head_dim) = (dims[0], dims[1], dims[2], dims[3]);
+            let merged_width = head_count
+                .checked_mul(head_dim)
+                .ok_or_else(|| Error::backend("device merge_attention_heads width overflow"))?;
+            let buffer = native_metal.batched_merge_attention_heads(
+                &context_heads.buffer,
+                context_heads.element_count()?,
+                batch,
+                head_count,
+                tokens,
+                head_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, tokens, merged_width],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = context_heads;
+            Ok(None)
+        }
+    }
+
+    fn select_last_token_device(
+        &self,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_select_last_token", hidden_states, 3)?;
+            let (batch, tokens, hidden_size) = (dims[0], dims[1], dims[2]);
+            let buffer = native_metal.batched_select_last_token(
+                &hidden_states.buffer,
+                hidden_states.element_count()?,
+                batch,
+                tokens,
+                hidden_size,
+            )?;
+            return Ok(Some(DeviceValue::new(vec![batch, 1, hidden_size], buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = hidden_states;
+            Ok(None)
+        }
+    }
+
+    fn add_device(&self, lhs: &DeviceValue, rhs: &DeviceValue) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            validate_exact_shape("device_add_shapes", lhs.dims(), rhs.dims())?;
+            let buffer = native_metal.batched_add(
+                &lhs.buffer,
+                lhs.element_count()?,
+                &rhs.buffer,
+                rhs.element_count()?,
+            )?;
+            return Ok(Some(DeviceValue::new(lhs.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (lhs, rhs);
+            Ok(None)
+        }
+    }
+
+    fn swiglu_device(&self, gate: &DeviceValue, up: &DeviceValue) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            validate_exact_shape("device_swiglu_shapes", gate.dims(), up.dims())?;
+            let buffer = native_metal.batched_swiglu(
+                &gate.buffer,
+                gate.element_count()?,
+                &up.buffer,
+                up.element_count()?,
+            )?;
+            return Ok(Some(DeviceValue::new(gate.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (gate, up);
+            Ok(None)
+        }
+    }
+
+    fn paged_decode_attention_device(
+        &self,
+        q: &DeviceValue,
+        current_k: &DeviceValue,
+        current_v: &DeviceValue,
+        past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            past_kv.validate()?;
+            let q_dims = require_device_rank("device_paged_decode_attention_q", q, 4)?;
+            let k_dims = require_device_rank("device_paged_decode_attention_current_k", current_k, 4)?;
+            let v_dims = require_device_rank("device_paged_decode_attention_current_v", current_v, 4)?;
+            let expected_qk = [
+                past_kv.batch,
+                past_kv.attention_heads,
+                1,
+                past_kv.key_head_dim,
+            ];
+            validate_exact_shape("device_paged_decode_attention_q_shape", q_dims, &expected_qk)?;
+            validate_exact_shape(
+                "device_paged_decode_attention_current_k_shape",
+                k_dims,
+                &expected_qk,
+            )?;
+            validate_exact_shape(
+                "device_paged_decode_attention_current_v_shape",
+                v_dims,
+                &[
+                    past_kv.batch,
+                    past_kv.attention_heads,
+                    1,
+                    past_kv.value_head_dim,
+                ],
+            )?;
+            let (buffer, _output_len) = native_metal.batched_paged_decode_attention(
+                &q.buffer,
+                q.element_count()?,
+                &current_k.buffer,
+                current_k.element_count()?,
+                &current_v.buffer,
+                current_v.element_count()?,
+                past_kv,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![
+                    past_kv.batch,
+                    past_kv.attention_heads,
+                    1,
+                    past_kv.value_head_dim,
+                ],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (q, current_k, current_v, past_kv);
+            Ok(None)
+        }
+    }
+
+    fn moe_stack_rows_device(&self, rows: &[DeviceValue]) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let first = rows
+                .first()
+                .ok_or_else(|| Error::backend("device MoE stack requires at least one row"))?;
+            let row_len = first.element_count()?;
+            if row_len == 0 {
+                return Err(Error::backend("device MoE stack rows must be non-empty"));
+            }
+            let total_len = rows
+                .len()
+                .checked_mul(row_len)
+                .ok_or_else(|| Error::backend("device MoE stack length overflow"))?;
+            let stacked = native_metal.batched_alloc_f32(total_len)?;
+            for (index, row) in rows.iter().enumerate() {
+                let count = row.element_count()?;
+                validate_exact_shape("device_moe_stack_row_len", &[count], &[row_len])?;
+                native_metal.batched_f32_copy(&row.buffer, 0, &stacked, index * row_len, row_len)?;
+            }
+            return Ok(Some(DeviceValue::new(vec![rows.len(), row_len], stacked)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = rows;
+            Ok(None)
+        }
+    }
+
+    fn moe_weighted_index_add_combine_device(
+        &self,
+        accumulator: &DeviceValue,
+        token_indices: &[u32],
+        expert_outputs: &DeviceValue,
+        expert_weights: &[f32],
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let accumulator_dims =
+                require_device_rank("device_moe_combine_accumulator", accumulator, 2)?;
+            let expert_dims =
+                require_device_rank("device_moe_combine_expert_outputs", expert_outputs, 2)?;
+            let (token_count, hidden_size) = (accumulator_dims[0], accumulator_dims[1]);
+            let assignment_count = expert_dims[0];
+            validate_exact_shape(
+                "device_moe_combine_hidden_size",
+                &[expert_dims[1]],
+                &[hidden_size],
+            )?;
+            let buffer = native_metal.batched_moe_weighted_index_add_combine(
+                &accumulator.buffer,
+                accumulator.element_count()?,
+                token_indices,
+                &expert_outputs.buffer,
+                expert_outputs.element_count()?,
+                expert_weights,
+                token_count,
+                hidden_size,
+                assignment_count,
+            )?;
+            return Ok(Some(DeviceValue::new(accumulator.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (accumulator, token_indices, expert_outputs, expert_weights);
+            Ok(None)
+        }
+    }
 }
 
 impl MetalBackend {
     fn has_native_metal(&self) -> bool {
         self.native_metal().is_some()
     }
+
+    /// Shared body for the four quantized matvec `*_device` trait methods.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn quant_matvec_device(
+        &self,
+        kind: QuantMatvecKind,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let Some(native_metal) = self.native_metal() else {
+            return Ok(None);
+        };
+        let (actual_rows, output_shape) =
+            matvec_dims_shape(input.dims(), in_features, out_features)?;
+        validate_exact_shape("device_quant_matvec_rows", &[actual_rows], &[row_count])?;
+        let buffer = native_metal.batched_quant_matvec(
+            kind,
+            weights,
+            &input.buffer,
+            input.element_count()?,
+            row_count,
+            in_features,
+            out_features,
+        )?;
+        Ok(Some(DeviceValue::new(output_shape, buffer)))
+    }
+
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn native_metal(&self) -> Option<&Metal> {
@@ -2408,7 +3421,18 @@ fn matvec_input_shape(
     in_features: usize,
     out_features: usize,
 ) -> Result<(usize, Vec<usize>)> {
-    match input.dims() {
+    matvec_dims_shape(input.dims(), in_features, out_features)
+}
+
+/// Derives the matvec row count and output shape from an input's dims,
+/// accepting the `[rows, features]` and `[batch, tokens, features]` layouts
+/// the quantized matvec ops support.
+fn matvec_dims_shape(
+    dims: &[usize],
+    in_features: usize,
+    out_features: usize,
+) -> Result<(usize, Vec<usize>)> {
+    match dims {
         [rows, features] => {
             validate_exact_shape("native_q2_k_matvec_input", &[*features], &[in_features])?;
             Ok((*rows, vec![*rows, out_features]))
@@ -2424,6 +3448,21 @@ fn matvec_input_shape(
             "native Q2_K matvec input rank must be 2 or 3, got {dims:?}"
         ))),
     }
+}
+
+/// `require_f32_rank` for device-resident values.
+fn require_device_rank<'a>(
+    context: &str,
+    value: &'a DeviceValue,
+    rank: usize,
+) -> Result<&'a [usize]> {
+    let dims = value.dims();
+    if dims.len() != rank {
+        return Err(Error::backend(format!(
+            "{context} expects rank {rank}, got {dims:?}"
+        )));
+    }
+    Ok(dims)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

@@ -1152,6 +1152,60 @@ mod tests {
         assert_eq!(memory.storage_kind(), "memory");
     }
 
+    /// The batched device-resident decode path (one shared command buffer,
+    /// sync only at host sinks) must generate exactly the same tokens as the
+    /// eager per-op path on the same native Metal backend. Skipped where no
+    /// Metal device is available.
+    #[test]
+    fn device_batched_decode_matches_eager_decode_on_metal() {
+        let Ok(native_backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_gguf_model_fixture(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = tiny_config();
+
+        let batched_model = Model::open_from_gguf(
+            &gguf,
+            &config,
+            &native_backend,
+            DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+        )
+        .unwrap();
+        let batched_token_ids = run_generate_token_ids_with_stop_tokens(
+            &batched_model,
+            &config,
+            &native_backend,
+            &[1, 2],
+            Some(3),
+            1,
+            &[],
+        )
+        .unwrap();
+
+        let eager_model = Model::open_from_gguf(
+            &gguf,
+            &config,
+            &native_backend,
+            DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+        )
+        .unwrap();
+        eager_model.disable_device_decode();
+        let eager_token_ids = run_generate_token_ids_with_stop_tokens(
+            &eager_model,
+            &config,
+            &native_backend,
+            &[1, 2],
+            Some(3),
+            1,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(batched_token_ids, eager_token_ids);
+        assert_eq!(batched_token_ids.len(), 3);
+    }
+
     #[test]
     fn generate_uses_q2_gguf_model_and_paged_cache() {
         let path = write_gguf_model_fixture(GgmlType::Q2K);

@@ -2,6 +2,20 @@
 
 //! GLM-5.2 model components for quantized inference.
 
+/// Unwraps a `Result<Option<T>>` from a batched `*_device` backend op inside a
+/// function that itself returns `Result<Option<_>>`. `None` means the backend
+/// (or this weight's quantization) has no device-resident path, so the caller
+/// bails out with `Ok(None)` and the eager per-op path runs instead.
+macro_rules! try_device {
+    ($expr:expr) => {
+        match $expr? {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+pub(crate) use try_device;
+
 mod artifact_source;
 mod attention;
 mod attention_math;

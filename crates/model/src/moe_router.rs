@@ -51,6 +51,11 @@ pub struct MoeRoutingTensors {
 }
 
 #[derive(Debug)]
+pub(crate) struct MoeRoutingDeviceTensors {
+    pub(crate) normed_hidden_states: backend::DeviceValue,
+    pub(crate) dispatch_plan: Vec<ExpertDispatch>,
+}
+
 pub struct MoeRoutingF32Tensors {
     pub normed_hidden_states: F32Tensor,
     pub dispatch_plan: Vec<ExpertDispatch>,
@@ -358,6 +363,61 @@ impl<'a> MoeRouter<'a> {
             normed_hidden_states,
             dispatch_plan,
         })
+    }
+
+    /// Batched device-resident routing: the post-attention norm is encoded on
+    /// the GPU, but the top-k expert selection is CPU logic, so the normed
+    /// activations are downloaded here. That download flushes the batch and is
+    /// the MoE block's synchronization point.
+    pub(crate) fn route_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<MoeRoutingDeviceTensors>> {
+        validate_supported_router_config(config)?;
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::moe(format!(
+                "GLM-5.2 GGUF device MoE router input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape(
+            "gguf_device_moe_router_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+        let flat_token_count = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| Error::moe("GGUF device MoE flat token count overflow"))?;
+
+        let normed_hidden_states = crate::try_device!(self
+            .post_attention_norm
+            .forward_device(hidden_states, backend));
+        let flat_tokens =
+            normed_hidden_states.reshape(vec![flat_token_count, config.hidden_size])?;
+        let flat_tokens_host = backend.device_download_f32_tensor(&flat_tokens)?;
+        let router_logits = self.router.forward_f32_tensor(&flat_tokens_host, backend)?;
+        validate_exact_shape(
+            "gguf_device_moe_router_logits",
+            router_logits.dims(),
+            &[flat_token_count, config.num_routed_experts],
+        )?;
+
+        let logits_host = matrix_rows(
+            router_logits.values(),
+            flat_token_count,
+            config.num_routed_experts,
+        )?;
+        let topk_selections = select_topk(config, &logits_host, &self.correction_bias)?;
+        let dispatch_plan = build_dispatch_plan(&topk_selections, config.num_routed_experts)?;
+
+        Ok(Some(MoeRoutingDeviceTensors {
+            normed_hidden_states,
+            dispatch_plan,
+        }))
     }
 }
 

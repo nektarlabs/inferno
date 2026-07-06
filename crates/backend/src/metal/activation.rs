@@ -1,10 +1,12 @@
-use ::metal::{CommandQueue, ComputePipelineState, Device};
+use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
 use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{empty_f32_buffer, f32_buffer, read_f32_buffer, u32_scalar_buffer},
-    command::dispatch_1d,
+    buffers::{
+        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
+    },
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{validate_add_f32, validate_swiglu_f32},
@@ -128,6 +130,79 @@ impl MetalActivation {
             value_count,
             thread_count: value_count,
         })
+    }
+
+    /// Encodes an elementwise add into an open batched command buffer, reading
+    /// both operands from device-resident buffers. See `BatchSlot` for the
+    /// batching rules.
+    pub(crate) fn encode_add(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        lhs: &Buffer,
+        lhs_len: usize,
+        rhs: &Buffer,
+        rhs_len: usize,
+    ) -> Result<Buffer> {
+        if lhs_len == 0 {
+            return Err(Error::backend("add requires a non-empty input"));
+        }
+        if lhs_len != rhs_len {
+            return Err(Error::backend(format!(
+                "add operand length mismatch: lhs has {lhs_len} values, rhs has {rhs_len}"
+            )));
+        }
+        require_f32_capacity(lhs, lhs_len, "add lhs")?;
+        require_f32_capacity(rhs, rhs_len, "add rhs")?;
+
+        let value_count_u32 = u32::try_from(lhs_len)
+            .map_err(|_| Error::backend("add value_count exceeds Metal u32 limit"))?;
+        let output_buffer = empty_f32_buffer(device, lhs_len)?;
+        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+
+        encode_1d(
+            command_buffer,
+            &self.add_pipeline,
+            &[lhs, rhs, &output_buffer, &value_count_buffer],
+            lhs_len,
+        )?;
+        Ok(output_buffer)
+    }
+
+    /// Encodes a SwiGLU activation into an open batched command buffer,
+    /// reading gate and up projections from device-resident buffers.
+    pub(crate) fn encode_swiglu(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        gate: &Buffer,
+        gate_len: usize,
+        up: &Buffer,
+        up_len: usize,
+    ) -> Result<Buffer> {
+        if gate_len == 0 {
+            return Err(Error::backend("SwiGLU requires a non-empty input"));
+        }
+        if gate_len != up_len {
+            return Err(Error::backend(format!(
+                "SwiGLU operand length mismatch: gate has {gate_len} values, up has {up_len}"
+            )));
+        }
+        require_f32_capacity(gate, gate_len, "SwiGLU gate")?;
+        require_f32_capacity(up, up_len, "SwiGLU up")?;
+
+        let value_count_u32 = u32::try_from(gate_len)
+            .map_err(|_| Error::backend("SwiGLU value_count exceeds Metal u32 limit"))?;
+        let output_buffer = empty_f32_buffer(device, gate_len)?;
+        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+
+        encode_1d(
+            command_buffer,
+            &self.swiglu_pipeline,
+            &[gate, up, &output_buffer, &value_count_buffer],
+            gate_len,
+        )?;
+        Ok(output_buffer)
     }
 }
 

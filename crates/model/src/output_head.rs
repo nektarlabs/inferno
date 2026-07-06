@@ -262,6 +262,39 @@ impl<'a> OutputHead<'a> {
         self.decode_token_f32(&hidden_states, backend)
     }
 
+    /// Batched device-resident greedy decode: select-last-token, final norm
+    /// and the fused output matvec + argmax are encoded into the backend's
+    /// open batch; the argmax flushes it and returns the winning token. This
+    /// is the end-of-token synchronization point of the device decode path.
+    pub(crate) fn decode_token_device<B: Backend>(
+        &self,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<TokenOutput>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF device token decode expects hidden states [B, T, H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        validate_exact_shape(
+            "gguf_device_output_head_hidden_size",
+            &[dims[2]],
+            &[self.hidden_size],
+        )?;
+
+        let selected = crate::try_device!(backend.select_last_token_device(hidden_states));
+        let normalized = crate::try_device!(self.final_norm.forward_device(&selected, backend));
+        let flat = normalized.reshape(vec![batch, self.hidden_size])?;
+        let token = crate::try_device!(self.output_projection.greedy_token_device(&flat, backend));
+
+        Ok(Some(TokenOutput {
+            token_id: token.token_id,
+            token_score: token.token_score,
+        }))
+    }
+
     pub fn decode_token_f32<B: Backend>(
         &self,
         hidden_states: &F32Tensor,

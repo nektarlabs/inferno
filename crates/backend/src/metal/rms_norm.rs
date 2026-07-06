@@ -1,15 +1,16 @@
-use ::metal::{Buffer, CommandQueue, ComputePipelineState, Device};
+use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
 use common::{Error, Result};
 use tracing::trace;
 
 use super::{
     buffers::{
-        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, u32_scalar_buffer,
+        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, require_f32_capacity,
+        u32_scalar_buffer,
     },
-    command::dispatch_1d,
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
-    validation::validate_rms_norm_f32,
+    validation::{validate_rms_norm_buffer, validate_rms_norm_f32},
 };
 
 const RMS_NORM_KERNEL: &str = "rms_norm_f32_kernel";
@@ -30,7 +31,16 @@ pub struct MetalRmsNormReport {
 #[derive(Debug)]
 pub(crate) struct MetalRmsNormBufferReport {
     pub buffer: Buffer,
-    pub input_len: usize,
+}
+
+pub(crate) struct MetalRmsNormPrepared {
+    pub(crate) input_buffer: Buffer,
+    pub(crate) weight_buffer: Buffer,
+    pub(crate) output_buffer: Buffer,
+    pub(crate) rows_buffer: Buffer,
+    pub(crate) hidden_size_buffer: Buffer,
+    pub(crate) eps_buffer: Buffer,
+    pub(crate) input_len: usize,
 }
 
 impl MetalRmsNorm {
@@ -72,19 +82,7 @@ impl MetalRmsNorm {
         hidden_size: usize,
         eps: f32,
     ) -> Result<MetalRmsNormBufferReport> {
-        validate_rms_norm_f32(input, weight, rows, hidden_size, eps)?;
-
-        let rows_u32 = u32::try_from(rows)
-            .map_err(|_| Error::backend("RMSNorm rows exceed Metal u32 limit"))?;
-        let hidden_size_u32 = u32::try_from(hidden_size)
-            .map_err(|_| Error::backend("RMSNorm hidden_size exceeds Metal u32 limit"))?;
-
-        let input_buffer = f32_buffer(device, input)?;
-        let weight_buffer = f32_buffer(device, weight)?;
-        let output_buffer = empty_f32_buffer(device, input.len())?;
-        let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
-        let eps_buffer = f32_scalar_buffer(device, eps)?;
+        let prepared = self.prepare_to_buffer(device, input, weight, rows, hidden_size, eps)?;
 
         trace!(
             target: "inferno::metal",
@@ -98,7 +96,90 @@ impl MetalRmsNorm {
             queue,
             &self.pipeline,
             &[
-                &input_buffer,
+                &prepared.input_buffer,
+                &prepared.weight_buffer,
+                &prepared.output_buffer,
+                &prepared.rows_buffer,
+                &prepared.hidden_size_buffer,
+                &prepared.eps_buffer,
+            ],
+            rows,
+        )?;
+
+        Ok(MetalRmsNormBufferReport {
+            buffer: prepared.output_buffer,
+        })
+    }
+
+    pub(crate) fn prepare_to_buffer(
+        &self,
+        device: &Device,
+        input: &[f32],
+        weight: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<MetalRmsNormPrepared> {
+        validate_rms_norm_f32(input, weight, rows, hidden_size, eps)?;
+
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| Error::backend("RMSNorm rows exceed Metal u32 limit"))?;
+        let hidden_size_u32 = u32::try_from(hidden_size)
+            .map_err(|_| Error::backend("RMSNorm hidden_size exceeds Metal u32 limit"))?;
+
+        Ok(MetalRmsNormPrepared {
+            input_buffer: f32_buffer(device, input)?,
+            weight_buffer: f32_buffer(device, weight)?,
+            output_buffer: empty_f32_buffer(device, input.len())?,
+            rows_buffer: u32_scalar_buffer(device, rows_u32)?,
+            hidden_size_buffer: u32_scalar_buffer(device, hidden_size_u32)?,
+            eps_buffer: f32_scalar_buffer(device, eps)?,
+            input_len: input.len(),
+        })
+    }
+
+    /// Encodes an RMSNorm kernel into an open batched command buffer, reading
+    /// its input from a device-resident buffer and returning a fresh output
+    /// buffer. See `BatchSlot` for the batching rules.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        weight: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        validate_rms_norm_buffer(input_len, weight, rows, hidden_size, eps)?;
+        require_f32_capacity(input, input_len, "RMSNorm input")?;
+
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| Error::backend("RMSNorm rows exceed Metal u32 limit"))?;
+        let hidden_size_u32 = u32::try_from(hidden_size)
+            .map_err(|_| Error::backend("RMSNorm hidden_size exceeds Metal u32 limit"))?;
+
+        let weight_buffer = f32_buffer(device, weight)?;
+        let output_buffer = empty_f32_buffer(device, input_len)?;
+        let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
+        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let eps_buffer = f32_scalar_buffer(device, eps)?;
+
+        trace!(
+            target: "inferno::metal",
+            rows,
+            hidden_size,
+            input_len,
+            "encoding batched RMSNorm"
+        );
+
+        encode_1d(
+            command_buffer,
+            &self.pipeline,
+            &[
+                input,
                 &weight_buffer,
                 &output_buffer,
                 &rows_buffer,
@@ -107,11 +188,11 @@ impl MetalRmsNorm {
             ],
             rows,
         )?;
+        Ok(output_buffer)
+    }
 
-        Ok(MetalRmsNormBufferReport {
-            buffer: output_buffer,
-            input_len: input.len(),
-        })
+    pub(crate) fn pipeline(&self) -> &ComputePipelineState {
+        &self.pipeline
     }
 }
 

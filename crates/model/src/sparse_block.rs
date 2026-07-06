@@ -250,6 +250,38 @@ impl<'a> SparseBlock<'a> {
         })
     }
 
+    /// Batched device-resident decode layer: attention and MoE FFN encoded
+    /// into the backend's open batch, hidden states never leaving the GPU
+    /// (the router's top-k download is the layer's second sync point).
+    pub(crate) fn forward_decode_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+        past_kv: &PagedKvView<'_>,
+    ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
+        let attention_output = crate::try_device!(profile::run_layer_stage(
+            self.load_report.layer_index,
+            "sparse_moe.attention",
+            || self
+                .attention
+                .forward_decode_device(config, hidden_states, backend, past_kv),
+        ));
+        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
+            self.load_report.layer_index,
+            "sparse_moe.ffn",
+            || self
+                .ffn
+                .forward_device(config, &attention_output.hidden_states, backend),
+        ));
+
+        Ok(Some(crate::kv_types::BlockDeviceTensors {
+            hidden_states: output_hidden_states,
+            cache_k: attention_output.cache_k,
+            cache_v: attention_output.cache_v,
+        }))
+    }
+
     fn forward_ffn<B: Backend>(
         &self,
         config: &Config,

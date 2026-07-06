@@ -585,6 +585,118 @@ impl<'a> MoeFfn<'a> {
         require_native("add", backend.add_f32_tensor(hidden_states, &ffn_delta)?)
     }
 
+    /// Batched device-resident MoE FFN for single-token decode. The routed
+    /// top-k selection needs the CPU (inside `route_device`, which downloads
+    /// the normed activations and flushes the batch); everything else — shared
+    /// expert, routed experts, combine, residual — is encoded without further
+    /// synchronization. `Ok(None)` falls back to the eager path.
+    pub(crate) fn forward_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::moe(format!(
+                "GLM-5.2 GGUF device MoE FFN input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape(
+            "gguf_device_moe_ffn_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+        let flat_token_count = batch
+            .checked_mul(tokens)
+            .ok_or_else(|| Error::moe("GGUF device MoE FFN flat token count overflow"))?;
+        if flat_token_count != 1 {
+            return Ok(None);
+        }
+
+        let routing = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "sparse_moe.router",
+            || self.router.route_device(config, hidden_states, backend),
+        ));
+        let flat_tokens = routing
+            .normed_hidden_states
+            .reshape(vec![flat_token_count, config.hidden_size])?;
+
+        let shared_gate = crate::try_device!(self.shared_gate.forward_device(&flat_tokens, backend));
+        let shared_up = crate::try_device!(self.shared_up.forward_device(&flat_tokens, backend));
+        let shared_gated = crate::try_device!(backend.swiglu_device(&shared_gate, &shared_up));
+        let shared_down =
+            crate::try_device!(self.shared_down.forward_device(&shared_gated, backend));
+        validate_exact_shape(
+            "gguf_device_moe_ffn_shared_output",
+            shared_down.dims(),
+            &[flat_token_count, config.hidden_size],
+        )?;
+
+        if routing.dispatch_plan.is_empty() {
+            return Err(Error::moe(
+                "GLM-5.2 GGUF device MoE FFN routing produced no expert assignments",
+            ));
+        }
+        let mut token_indices = Vec::<u32>::with_capacity(routing.dispatch_plan.len());
+        let mut expert_weights = Vec::<f32>::with_capacity(routing.dispatch_plan.len());
+        let mut expert_rows = Vec::with_capacity(routing.dispatch_plan.len());
+        for dispatch in &routing.dispatch_plan {
+            validate_exact_shape(
+                "gguf_device_moe_single_token_assignment_count",
+                &[dispatch.assignments.len()],
+                &[1],
+            )?;
+            let assignment = dispatch.assignments.first().ok_or_else(|| {
+                Error::moe("GLM-5.2 GGUF device MoE single-token dispatch has no assignment")
+            })?;
+            validate_exact_shape(
+                "gguf_device_moe_single_token_assignment_index",
+                &[assignment.token_index],
+                &[0],
+            )?;
+            token_indices.push(0);
+            expert_weights.push(assignment.weight);
+
+            let gated = crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "sparse_moe.routed_gate_up_swiglu",
+                || self.routed_gate_up.forward_gated_expert_device(
+                    dispatch.expert_id,
+                    &flat_tokens,
+                    backend,
+                ),
+            ));
+            let down = crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "sparse_moe.routed_down",
+                || self
+                    .routed_down
+                    .forward_expert_device(dispatch.expert_id, &gated, backend),
+            ));
+            expert_rows.push(down);
+        }
+
+        let routed_expert_outputs = crate::try_device!(backend.moe_stack_rows_device(&expert_rows));
+        // Seeding the combine accumulator with the shared-expert output folds
+        // "routed sum + shared" into the one combine kernel; the eager path
+        // combines into zeros and adds the shared output afterwards, which is
+        // arithmetically identical.
+        let ffn_delta_flat = crate::try_device!(backend.moe_weighted_index_add_combine_device(
+            &shared_down,
+            &token_indices,
+            &routed_expert_outputs,
+            &expert_weights,
+        ));
+        let ffn_delta = ffn_delta_flat.reshape(vec![batch, tokens, config.hidden_size])?;
+        Ok(Some(crate::try_device!(
+            backend.add_device(hidden_states, &ffn_delta)
+        )))
+    }
+
     fn forward_single_token_routed_tensors<B: Backend>(
         &self,
         dispatch_plan: &[ExpertDispatch],
@@ -1115,6 +1227,49 @@ impl<'a> PackedExpertLinear<'a> {
         Ok(output)
     }
 
+    /// Batched device-resident expert matvec: encodes this expert's Q2_K
+    /// down-projection into the backend's open batch. `Ok(None)` when the
+    /// weights or backend have no device path.
+    fn forward_expert_device<B: Backend>(
+        &self,
+        expert_id: usize,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        if self.tensor_ref.ty != GgmlType::Q2K {
+            return Ok(None);
+        }
+        if expert_id >= self.expert_count {
+            return Err(Error::moe(format!(
+                "GGUF device packed expert id {expert_id} exceeds expert_count {}",
+                self.expert_count
+            )));
+        }
+        let dims = input.dims();
+        validate_exact_shape("gguf_device_packed_expert_input_rank", &[dims.len()], &[2])?;
+        validate_exact_shape(
+            "gguf_device_packed_expert_input_features",
+            &[dims[1]],
+            &[self.in_features],
+        )?;
+
+        let batch = dims[0];
+        let payload = self.q2_expert_payload(expert_id)?;
+        let output = crate::try_device!(backend.q2_k_matvec_device(
+            payload.bytes,
+            input,
+            batch,
+            self.in_features,
+            self.out_features,
+        ));
+        validate_exact_shape(
+            "gguf_device_packed_expert_q2_output",
+            output.dims(),
+            &[batch, self.out_features],
+        )?;
+        Ok(Some(output))
+    }
+
     fn q2_expert_payload(&self, expert_id: usize) -> Result<&Q2ExpertPayload<'a>> {
         let payloads = self.q2_expert_payloads.as_ref().ok_or_else(|| {
             Error::gguf(format!(
@@ -1355,6 +1510,45 @@ impl<'a> PackedExpertGateUp<'a> {
         let gate = F32Tensor::new(gate_values, [batch, self.out_features])?;
         let up = F32Tensor::new(up_values, [batch, self.out_features])?;
         require_native("SwiGLU", backend.swiglu_f32_tensor(&gate, &up)?)
+    }
+
+    /// Batched device-resident fused gate/up + SwiGLU for one expert. The
+    /// packed gate/up experts are always Q2_K, matching the fused kernel.
+    fn forward_gated_expert_device<B: Backend>(
+        &self,
+        expert_id: usize,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        let dims = input.dims();
+        validate_exact_shape(
+            "gguf_device_packed_expert_gate_up_swiglu_input_rank",
+            &[dims.len()],
+            &[2],
+        )?;
+        validate_exact_shape(
+            "gguf_device_packed_expert_gate_up_swiglu_input_features",
+            &[dims[1]],
+            &[self.in_features],
+        )?;
+
+        let batch = dims[0];
+        let gate = self.gate_payload(expert_id)?;
+        let up = self.up_payload(expert_id)?;
+        let gated = crate::try_device!(backend.q2_k_gate_up_swiglu_device(
+            gate.bytes,
+            up.bytes,
+            input,
+            batch,
+            self.in_features,
+            self.out_features,
+        ));
+        validate_exact_shape(
+            "gguf_device_packed_expert_gate_up_swiglu_output",
+            gated.dims(),
+            &[batch, self.out_features],
+        )?;
+        Ok(Some(gated))
     }
 
     fn gate_payload(&self, expert_id: usize) -> Result<&Q2ExpertPayload<'a>> {

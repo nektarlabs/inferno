@@ -1,15 +1,16 @@
-use ::metal::{CommandQueue, ComputePipelineState, Device};
+use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
 use common::{Error, Result};
 use tracing::trace;
 
 use super::{
     buffers::{
-        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, u32_scalar_buffer,
+        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, require_f32_capacity,
+        u32_scalar_buffer,
     },
-    command::dispatch_1d,
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
-    validation::validate_rope_slice_f32,
+    validation::{validate_rope_slice_buffer, validate_rope_slice_f32},
 };
 
 const ROPE_SLICE_KERNEL: &str = "rope_slice_f32_kernel";
@@ -118,6 +119,82 @@ impl MetalRope {
             theta,
             thread_count: input.len(),
         })
+    }
+
+    /// Encodes a RoPE kernel into an open batched command buffer, reading its
+    /// input from a device-resident buffer. See `BatchSlot` for the batching
+    /// rules.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        batch_count: usize,
+        token_count: usize,
+        head_count: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Buffer> {
+        validate_rope_slice_buffer(
+            input_len,
+            batch_count,
+            token_count,
+            head_count,
+            rope_dim,
+            position_offset,
+            theta,
+        )?;
+        require_f32_capacity(input, input_len, "RoPE input")?;
+
+        let batch_count_u32 = u32::try_from(batch_count)
+            .map_err(|_| Error::backend("RoPE batch_count exceeds Metal u32 limit"))?;
+        let token_count_u32 = u32::try_from(token_count)
+            .map_err(|_| Error::backend("RoPE token_count exceeds Metal u32 limit"))?;
+        let head_count_u32 = u32::try_from(head_count)
+            .map_err(|_| Error::backend("RoPE head_count exceeds Metal u32 limit"))?;
+        let rope_dim_u32 = u32::try_from(rope_dim)
+            .map_err(|_| Error::backend("RoPE rope_dim exceeds Metal u32 limit"))?;
+        let position_offset_u32 = u32::try_from(position_offset)
+            .map_err(|_| Error::backend("RoPE position_offset exceeds Metal u32 limit"))?;
+
+        let output_buffer = empty_f32_buffer(device, input_len)?;
+        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
+        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
+        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
+        let rope_dim_buffer = u32_scalar_buffer(device, rope_dim_u32)?;
+        let position_offset_buffer = u32_scalar_buffer(device, position_offset_u32)?;
+        let theta_buffer = f32_scalar_buffer(device, theta)?;
+
+        trace!(
+            target: "inferno::metal",
+            batch_count,
+            token_count,
+            head_count,
+            rope_dim,
+            position_offset,
+            theta,
+            "encoding batched RoPE"
+        );
+
+        encode_1d(
+            command_buffer,
+            &self.pipeline,
+            &[
+                input,
+                &output_buffer,
+                &batch_count_buffer,
+                &token_count_buffer,
+                &head_count_buffer,
+                &rope_dim_buffer,
+                &position_offset_buffer,
+                &theta_buffer,
+            ],
+            input_len,
+        )?;
+        Ok(output_buffer)
     }
 }
 

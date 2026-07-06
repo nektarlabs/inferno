@@ -3,10 +3,12 @@
 //! Backend selection and operation boundaries for GLM inference.
 
 mod backend;
+mod device_value;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal;
 
 pub use backend::{Backend, BackendCapabilities, BackendMemoryReport, MetalBackend};
+pub use device_value::DeviceValue;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub use metal::{
     Metal, MetalAddReport, MetalAttentionCausalSoftmaxReport, MetalAttentionScoresReport,

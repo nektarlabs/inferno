@@ -36,6 +36,20 @@ pub(crate) fn empty_f32_buffer(device: &Device, len: usize) -> Result<Buffer> {
     Ok(device.new_buffer(bytes as u64, BUFFER_OPTIONS))
 }
 
+/// Checks that `buffer` can hold at least `len` f32 elements. Used to validate
+/// device-resident op inputs, whose lengths are tracked by the caller rather
+/// than by a host slice.
+pub(crate) fn require_f32_capacity(buffer: &Buffer, len: usize, label: &str) -> Result<()> {
+    let bytes = byte_len::<f32>(len)?;
+    if buffer.length() < bytes as u64 {
+        return Err(Error::backend(format!(
+            "Metal {label} buffer is too small: expected at least {bytes} bytes, got {}",
+            buffer.length()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn read_f32_buffer(buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
     let bytes = byte_len::<f32>(len)?;
     if buffer.length() < bytes as u64 {

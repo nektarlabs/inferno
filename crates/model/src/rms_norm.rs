@@ -152,6 +152,25 @@ impl RmsNorm {
         })
     }
 
+    /// Batched device-resident variant of `forward_f32`: encodes the RMSNorm
+    /// kernel into the backend's open batch without synchronizing. Returns
+    /// `Ok(None)` when the backend has no device-resident path.
+    pub(crate) fn forward_device<B: Backend>(
+        &self,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF RMSNorm device input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        validate_exact_shape("gguf_rms_norm_hidden_size", &[dims[2]], &[self.hidden_size])?;
+
+        backend.rms_norm_device(hidden_states, &self.weight, self.eps)
+    }
+
     pub fn load_report(&self) -> &RmsNormLoadReport {
         &self.load_report
     }

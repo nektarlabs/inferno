@@ -393,6 +393,27 @@ pub(crate) fn validate_rms_norm_f32(
     hidden_size: usize,
     eps: f32,
 ) -> Result<()> {
+    validate_rms_norm_buffer(input.len(), weight, rows, hidden_size, eps)?;
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend("RMSNorm input contains non-finite values"));
+    }
+    if weight.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend("RMSNorm weight contains non-finite values"));
+    }
+
+    Ok(())
+}
+
+/// Shape-only RMSNorm validation for a device-resident input. The weight is
+/// still a host slice (norm weights always are), so it is checked fully; the
+/// input is checked by length only.
+pub(crate) fn validate_rms_norm_buffer(
+    input_len: usize,
+    weight: &[f32],
+    rows: usize,
+    hidden_size: usize,
+    eps: f32,
+) -> Result<()> {
     if rows == 0 {
         return Err(Error::backend("RMSNorm rows must be greater than zero"));
     }
@@ -410,10 +431,9 @@ pub(crate) fn validate_rms_norm_f32(
     let expected_input_len = rows
         .checked_mul(hidden_size)
         .ok_or_else(|| Error::backend("RMSNorm input length overflow"))?;
-    if input.len() != expected_input_len {
+    if input_len != expected_input_len {
         return Err(Error::backend(format!(
-            "RMSNorm input shape mismatch: expected [{rows}, {hidden_size}] = {expected_input_len} values, got {}",
-            input.len()
+            "RMSNorm input shape mismatch: expected [{rows}, {hidden_size}] = {expected_input_len} values, got {input_len}"
         )));
     }
     if weight.len() != hidden_size {
@@ -421,12 +441,6 @@ pub(crate) fn validate_rms_norm_f32(
             "RMSNorm weight shape mismatch: expected [{hidden_size}], got [{}]",
             weight.len()
         )));
-    }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RMSNorm input contains non-finite values"));
-    }
-    if weight.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RMSNorm weight contains non-finite values"));
     }
 
     Ok(())
@@ -632,6 +646,42 @@ fn validate_quantized_matvec_shape(
     block_bytes: usize,
     transposed: bool,
 ) -> Result<usize> {
+    let blocks_per_row = validate_quantized_matvec_buffer_shape(
+        name,
+        weights.len(),
+        input.len(),
+        row_count,
+        in_features,
+        out_features,
+        block_values,
+        block_bytes,
+        transposed,
+    )?;
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend(format!(
+            "{name} input contains non-finite values"
+        )));
+    }
+
+    Ok(blocks_per_row)
+}
+
+/// Shape-only validation for quantized matvec ops whose input already lives in
+/// a GPU buffer. Identical to `validate_quantized_matvec_shape` except it takes
+/// lengths instead of slices and cannot (deliberately does not) scan values for
+/// finiteness — device-resident inputs have no host copy to scan.
+#[allow(clippy::too_many_arguments)]
+fn validate_quantized_matvec_buffer_shape(
+    name: &str,
+    weight_bytes: usize,
+    input_len: usize,
+    row_count: usize,
+    in_features: usize,
+    out_features: usize,
+    block_values: usize,
+    block_bytes: usize,
+    transposed: bool,
+) -> Result<usize> {
     if row_count == 0 {
         return Err(Error::backend(format!(
             "{name} row_count must be greater than zero"
@@ -663,10 +713,9 @@ fn validate_quantized_matvec_shape(
     let expected_input_len = row_count
         .checked_mul(in_features)
         .ok_or_else(|| Error::backend(format!("{name} input length overflow")))?;
-    if input.len() != expected_input_len {
+    if input_len != expected_input_len {
         return Err(Error::backend(format!(
-            "{name} input shape mismatch: expected [{row_count}, {in_features}] = {expected_input_len} values, got {}",
-            input.len()
+            "{name} input shape mismatch: expected [{row_count}, {in_features}] = {expected_input_len} values, got {input_len}"
         )));
     }
 
@@ -679,19 +728,73 @@ fn validate_quantized_matvec_shape(
         .checked_mul(blocks_per_row)
         .and_then(|blocks| blocks.checked_mul(block_bytes))
         .ok_or_else(|| Error::backend(format!("{name} weight byte length overflow")))?;
-    if weights.len() != expected_weight_bytes {
+    if weight_bytes != expected_weight_bytes {
         return Err(Error::backend(format!(
-            "{name} weight byte mismatch: expected {expected_weight_bytes} bytes, got {}",
-            weights.len()
-        )));
-    }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(format!(
-            "{name} input contains non-finite values"
+            "{name} weight byte mismatch: expected {expected_weight_bytes} bytes, got {weight_bytes}"
         )));
     }
 
     Ok(blocks_per_row)
+}
+
+pub(crate) fn validate_q2_k_transposed_matvec_buffer(
+    weights: &[u8],
+    input_len: usize,
+    row_count: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<usize> {
+    validate_quantized_matvec_buffer_shape(
+        "Q2_K transposed matvec",
+        weights.len(),
+        input_len,
+        row_count,
+        in_features,
+        out_features,
+        Q2_K_BLOCK_VALUES,
+        Q2_K_BLOCK_BYTES,
+        true,
+    )
+}
+
+pub(crate) fn validate_q8_0_matvec_buffer(
+    weights: &[u8],
+    input_len: usize,
+    row_count: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<usize> {
+    validate_quantized_matvec_buffer_shape(
+        "Q8_0 matvec",
+        weights.len(),
+        input_len,
+        row_count,
+        in_features,
+        out_features,
+        Q8_0_BLOCK_VALUES,
+        Q8_0_BLOCK_BYTES,
+        false,
+    )
+}
+
+pub(crate) fn validate_q8_0_transposed_matvec_buffer(
+    weights: &[u8],
+    input_len: usize,
+    row_count: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<usize> {
+    validate_quantized_matvec_buffer_shape(
+        "Q8_0 transposed matvec",
+        weights.len(),
+        input_len,
+        row_count,
+        in_features,
+        out_features,
+        Q8_0_BLOCK_VALUES,
+        Q8_0_BLOCK_BYTES,
+        true,
+    )
 }
 
 pub(crate) fn validate_moe_gather_tokens_f32(
@@ -1039,6 +1142,33 @@ pub(crate) fn validate_rope_slice_f32(
     position_offset: usize,
     theta: f32,
 ) -> Result<()> {
+    validate_rope_slice_buffer(
+        input.len(),
+        batch_count,
+        token_count,
+        head_count,
+        rope_dim,
+        position_offset,
+        theta,
+    )?;
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(Error::backend("RoPE input contains non-finite values"));
+    }
+
+    Ok(())
+}
+
+/// Shape-only RoPE validation for a device-resident input (length instead of
+/// slice; no finiteness scan — see `validate_quantized_matvec_buffer_shape`).
+pub(crate) fn validate_rope_slice_buffer(
+    input_len: usize,
+    batch_count: usize,
+    token_count: usize,
+    head_count: usize,
+    rope_dim: usize,
+    position_offset: usize,
+    theta: f32,
+) -> Result<()> {
     if batch_count == 0 {
         return Err(Error::backend("RoPE batch_count must be greater than zero"));
     }
@@ -1070,14 +1200,10 @@ pub(crate) fn validate_rope_slice_f32(
         .and_then(|value| value.checked_mul(head_count))
         .and_then(|value| value.checked_mul(rope_dim))
         .ok_or_else(|| Error::backend("RoPE input length overflow"))?;
-    if input.len() != expected_input_len {
+    if input_len != expected_input_len {
         return Err(Error::backend(format!(
-            "RoPE input shape mismatch: expected [{batch_count}, {token_count}, {head_count}, {rope_dim}] = {expected_input_len} values, got {}",
-            input.len()
+            "RoPE input shape mismatch: expected [{batch_count}, {token_count}, {head_count}, {rope_dim}] = {expected_input_len} values, got {input_len}"
         )));
-    }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RoPE input contains non-finite values"));
     }
 
     Ok(())

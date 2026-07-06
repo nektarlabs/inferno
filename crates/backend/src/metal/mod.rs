@@ -1,5 +1,6 @@
 mod activation;
 mod attention;
+mod batch;
 mod buffers;
 mod command;
 mod device;
@@ -18,6 +19,7 @@ pub use attention::MetalAttentionCausalSoftmaxReport;
 pub use attention::MetalPagedDecodeAttentionReport;
 pub use attention::{MetalAttentionScoresReport, MetalAttentionValuesReport};
 pub use device::Metal;
+pub(crate) use q2::QuantMatvecKind;
 pub use layout::{
     MetalCombineRopeTailReport, MetalHeadsToAttentionLayoutReport, MetalMergeAttentionHeadsReport,
     MetalSelectLastTokenReport, MetalSplitKvMqaReport, MetalSplitRopeTailReport,
