@@ -41,12 +41,8 @@ pub(crate) fn validate_matmul_f32(
             rhs.len()
         )));
     }
-    if lhs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("matmul lhs contains non-finite values"));
-    }
-    if rhs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("matmul rhs contains non-finite values"));
-    }
+    debug_assert_finite_values("matmul lhs", lhs);
+    debug_assert_finite_values("matmul rhs", rhs);
 
     Ok(())
 }
@@ -91,12 +87,8 @@ pub(crate) fn validate_linear_f32(
             weight.len()
         )));
     }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("linear input contains non-finite values"));
-    }
-    if weight.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("linear weight contains non-finite values"));
-    }
+    debug_assert_finite_values("linear input", input);
+    debug_assert_finite_values("linear weight", weight);
 
     Ok(())
 }
@@ -119,12 +111,8 @@ pub(crate) fn validate_swiglu_f32(gate: &[f32], up: &[f32], value_count: usize) 
             up.len()
         )));
     }
-    if gate.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("SwiGLU gate contains non-finite values"));
-    }
-    if up.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("SwiGLU up contains non-finite values"));
-    }
+    debug_assert_finite_values("SwiGLU gate", gate);
+    debug_assert_finite_values("SwiGLU up", up);
 
     Ok(())
 }
@@ -145,12 +133,8 @@ pub(crate) fn validate_add_f32(lhs: &[f32], rhs: &[f32], value_count: usize) -> 
             rhs.len()
         )));
     }
-    if lhs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("add lhs contains non-finite values"));
-    }
-    if rhs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("add rhs contains non-finite values"));
-    }
+    debug_assert_finite_values("add lhs", lhs);
+    debug_assert_finite_values("add rhs", rhs);
 
     Ok(())
 }
@@ -186,11 +170,7 @@ pub(crate) fn validate_select_last_token_f32(
             hidden_states.len()
         )));
     }
-    if hidden_states.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "select_last_token input contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("select_last_token input", hidden_states);
 
     Ok(())
 }
@@ -300,11 +280,7 @@ pub(crate) fn validate_split_kv_mqa_f32(
             input.len()
         )));
     }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "split_kv_mqa input contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("split_kv_mqa input", input);
 
     Ok(())
 }
@@ -377,11 +353,7 @@ fn validate_layout_4d(
             input.len()
         )));
     }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(format!(
-            "{name} input contains non-finite values"
-        )));
-    }
+    debug_assert_finite_values(name, input);
 
     Ok(())
 }
@@ -394,12 +366,8 @@ pub(crate) fn validate_rms_norm_f32(
     eps: f32,
 ) -> Result<()> {
     validate_rms_norm_buffer(input.len(), weight, rows, hidden_size, eps)?;
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RMSNorm input contains non-finite values"));
-    }
-    if weight.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RMSNorm weight contains non-finite values"));
-    }
+    debug_assert_finite_values("RMSNorm input", input);
+    debug_assert_finite_values("RMSNorm weight", weight);
 
     Ok(())
 }
@@ -455,11 +423,7 @@ pub(crate) fn validate_q2_k_matvec_f32(
 ) -> Result<usize> {
     let blocks_per_row =
         validate_q2_k_matvec_buffer(weights, input.len(), row_count, in_features, out_features)?;
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "Q2_K matvec input contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("Q2_K matvec input", input);
 
     Ok(blocks_per_row)
 }
@@ -626,11 +590,7 @@ pub(crate) fn validate_q2_k_transposed_matvec_f32(
             weights.len()
         )));
     }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "Q2_K transposed matvec input contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("Q2_K transposed matvec input", input);
 
     Ok(blocks_per_input_row)
 }
@@ -657,11 +617,7 @@ fn validate_quantized_matvec_shape(
         block_bytes,
         transposed,
     )?;
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(format!(
-            "{name} input contains non-finite values"
-        )));
-    }
+    debug_assert_finite_values(name, input);
 
     Ok(blocks_per_row)
 }
@@ -835,11 +791,7 @@ pub(crate) fn validate_moe_gather_tokens_f32(
             token_indices.len()
         )));
     }
-    if flat_tokens.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "MoE gather flat_tokens contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("MoE gather flat_tokens", flat_tokens);
     if let Some(token_index) = token_indices
         .iter()
         .copied()
@@ -909,21 +861,9 @@ pub(crate) fn validate_moe_weighted_index_add_combine_f32(
             expert_outputs.len()
         )));
     }
-    if accumulator.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "MoE combine accumulator contains non-finite values",
-        ));
-    }
-    if expert_outputs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "MoE combine expert_outputs contains non-finite values",
-        ));
-    }
-    if expert_weights.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "MoE combine expert_weights contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("MoE combine accumulator", accumulator);
+    debug_assert_finite_values("MoE combine expert_outputs", expert_outputs);
+    debug_assert_finite_values("MoE combine expert_weights", expert_weights);
     if let Some(token_index) = token_indices
         .iter()
         .copied()
@@ -995,12 +935,8 @@ pub(crate) fn validate_attention_scores_f32(
             k.len()
         )));
     }
-    if q.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("attention q contains non-finite values"));
-    }
-    if k.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("attention k contains non-finite values"));
-    }
+    debug_assert_finite_values("attention q", q);
+    debug_assert_finite_values("attention k", k);
 
     Ok(())
 }
@@ -1063,14 +999,8 @@ pub(crate) fn validate_attention_values_f32(
             values.len()
         )));
     }
-    if probs.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "attention probabilities contain non-finite values",
-        ));
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("attention values contain non-finite values"));
-    }
+    debug_assert_finite_values("attention probabilities", probs);
+    debug_assert_finite_values("attention values", values);
 
     Ok(())
 }
@@ -1124,11 +1054,7 @@ pub(crate) fn validate_attention_causal_softmax_f32(
             scores.len()
         )));
     }
-    if scores.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "attention causal softmax scores contain non-finite values",
-        ));
-    }
+    debug_assert_finite_values("attention causal softmax scores", scores);
 
     Ok(())
 }
@@ -1151,9 +1077,7 @@ pub(crate) fn validate_rope_slice_f32(
         position_offset,
         theta,
     )?;
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RoPE input contains non-finite values"));
-    }
+    debug_assert_finite_values("RoPE input", input);
 
     Ok(())
 }
@@ -1207,6 +1131,13 @@ pub(crate) fn validate_rope_slice_buffer(
     }
 
     Ok(())
+}
+
+pub(crate) fn debug_assert_finite_values(name: &str, values: &[f32]) {
+    debug_assert!(
+        values.iter().all(|value| value.is_finite()),
+        "{name} contains non-finite values"
+    );
 }
 
 #[cfg(test)]
@@ -1345,12 +1276,17 @@ mod tests {
         assert!(err.to_string().contains("input shape mismatch"));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
+    #[should_panic(expected = "RMSNorm weight contains non-finite values")]
     fn rejects_non_finite_weight() {
-        let err = validate_rms_norm_f32(&[1.0, 2.0], &[f32::NAN, 1.0], 1, 2, 1e-5)
-            .expect_err("non-finite weight should fail");
+        let _ = validate_rms_norm_f32(&[1.0, 2.0], &[f32::NAN, 1.0], 1, 2, 1e-5);
+    }
 
-        assert!(err.to_string().contains("non-finite"));
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_builds_do_not_scan_non_finite_weight() {
+        validate_rms_norm_f32(&[1.0, 2.0], &[f32::NAN, 1.0], 1, 2, 1e-5).unwrap();
     }
 
     #[test]

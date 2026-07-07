@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    env,
-    sync::Mutex,
-};
+use std::sync::Mutex;
 
 use ::metal::Buffer;
 use ::metal::{CommandBufferRef, CommandQueue, ComputePipelineState, Device};
@@ -11,17 +7,18 @@ use tracing::trace;
 
 use super::{
     buffers::{
-        empty_f32_buffer, empty_u32_buffer, read_f32_buffer, read_u32_buffer,
-        require_f32_capacity, u32_scalar_buffer, u8_buffer, write_f32_buffer, write_u32_buffer,
+        empty_f32_buffer, empty_u32_buffer, read_f32_buffer, read_u32_buffer, require_f32_capacity,
+        u32_buffer, u32_scalar_buffer, u8_buffer_no_copy, write_f32_buffer, write_u32_buffer,
     },
     command::{dispatch_1d, dispatch_1d_many, encode_1d, Dispatch1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{
-        validate_q2_k_gate_up_swiglu_f32, validate_q2_k_matvec_buffer, validate_q2_k_matvec_f32,
-        validate_q2_k_transposed_matvec_buffer, validate_q2_k_transposed_matvec_f32,
-        validate_q8_0_matvec_buffer, validate_q8_0_matvec_f32,
+        debug_assert_finite_values, validate_q2_k_gate_up_swiglu_f32, validate_q2_k_matvec_buffer,
+        validate_q2_k_matvec_f32, validate_q2_k_transposed_matvec_buffer,
+        validate_q2_k_transposed_matvec_f32, validate_q8_0_matvec_buffer, validate_q8_0_matvec_f32,
         validate_q8_0_transposed_matvec_buffer, validate_q8_0_transposed_matvec_f32,
+        Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES,
     },
 };
 
@@ -37,22 +34,25 @@ pub(crate) enum QuantMatvecKind {
 const Q2_K_MATVEC_KERNEL: &str = "q2_k_matvec_f32_kernel";
 const Q2_K_MATVEC_ADD_KERNEL: &str = "q2_k_matvec_add_f32_kernel";
 const Q2_K_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_gate_up_swiglu_f32_kernel";
+const Q2_K_MULTI_EXPERT_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_multi_expert_gate_up_swiglu_f32_kernel";
+const Q2_K_MULTI_EXPERT_MATVEC_KERNEL: &str = "q2_k_multi_expert_matvec_f32_kernel";
 const Q2_K_TRANSPOSED_MATVEC_KERNEL: &str = "q2_k_transposed_matvec_f32_kernel";
 const Q8_0_MATVEC_KERNEL: &str = "q8_0_matvec_f32_kernel";
 const Q8_0_TRANSPOSED_MATVEC_KERNEL: &str = "q8_0_transposed_matvec_f32_kernel";
 const ARGMAX_F32_KERNEL: &str = "argmax_f32_kernel";
-const Q2_WEIGHT_CACHE_ENV: &str = "INFERNO_Q2_WEIGHT_CACHE_MB";
-const DEFAULT_Q2_WEIGHT_CACHE_MB: usize = 4096;
+const Q2_K_SIMD_LANES: usize = 32;
+const ARGMAX_THREADS_PER_VECTOR: usize = 256;
 
 pub(crate) struct MetalQ2Matvec {
     pipeline: ComputePipelineState,
     add_pipeline: ComputePipelineState,
     gate_up_swiglu_pipeline: ComputePipelineState,
+    multi_expert_gate_up_swiglu_pipeline: ComputePipelineState,
+    multi_expert_matvec_pipeline: ComputePipelineState,
     transposed_pipeline: ComputePipelineState,
     q8_0_pipeline: ComputePipelineState,
     q8_0_transposed_pipeline: ComputePipelineState,
     argmax_pipeline: ComputePipelineState,
-    weight_cache: Mutex<Q2WeightBufferCache>,
     scratch: Mutex<Q2ScratchBuffers>,
 }
 
@@ -110,9 +110,8 @@ pub struct MetalQ2GateUpSwiGluReport {
 }
 
 #[derive(Debug)]
-struct CachedWeightBuffer {
+struct WeightBuffer {
     buffer: Buffer,
-    hit: bool,
 }
 
 #[derive(Debug)]
@@ -142,33 +141,22 @@ struct ScratchBufferRef {
     reused: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Q2WeightCacheKey {
-    ptr: usize,
-    len: usize,
-}
-
-#[derive(Debug)]
-struct Q2WeightCacheEntry {
-    buffer: Buffer,
-    bytes: usize,
-}
-
-#[derive(Debug)]
-struct Q2WeightBufferCache {
-    max_bytes: usize,
-    current_bytes: usize,
-    order: VecDeque<Q2WeightCacheKey>,
-    entries: HashMap<Q2WeightCacheKey, Q2WeightCacheEntry>,
-}
-
 impl MetalQ2Matvec {
     pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
-        let weight_cache_bytes = q2_weight_cache_max_bytes()?;
         Ok(Self {
             pipeline: compute_pipeline(device, library, Q2_K_MATVEC_KERNEL)?,
             add_pipeline: compute_pipeline(device, library, Q2_K_MATVEC_ADD_KERNEL)?,
             gate_up_swiglu_pipeline: compute_pipeline(device, library, Q2_K_GATE_UP_SWIGLU_KERNEL)?,
+            multi_expert_gate_up_swiglu_pipeline: compute_pipeline(
+                device,
+                library,
+                Q2_K_MULTI_EXPERT_GATE_UP_SWIGLU_KERNEL,
+            )?,
+            multi_expert_matvec_pipeline: compute_pipeline(
+                device,
+                library,
+                Q2_K_MULTI_EXPERT_MATVEC_KERNEL,
+            )?,
             transposed_pipeline: compute_pipeline(device, library, Q2_K_TRANSPOSED_MATVEC_KERNEL)?,
             q8_0_pipeline: compute_pipeline(device, library, Q8_0_MATVEC_KERNEL)?,
             q8_0_transposed_pipeline: compute_pipeline(
@@ -177,7 +165,6 @@ impl MetalQ2Matvec {
                 Q8_0_TRANSPOSED_MATVEC_KERNEL,
             )?,
             argmax_pipeline: compute_pipeline(device, library, ARGMAX_F32_KERNEL)?,
-            weight_cache: Mutex::new(Q2WeightBufferCache::new(weight_cache_bytes)),
             scratch: Mutex::new(Q2ScratchBuffers::default()),
         })
     }
@@ -197,6 +184,7 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K matvec output length overflow"))?;
+        let physical_threads = q2_k_cooperative_threads(&self.pipeline, output_len, "Q2_K matvec")?;
 
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| Error::backend("Q2_K matvec row_count exceeds Metal u32 limit"))?;
@@ -207,7 +195,7 @@ impl MetalQ2Matvec {
         let blocks_per_row_u32 = u32::try_from(blocks_per_row)
             .map_err(|_| Error::backend("Q2_K matvec blocks_per_row exceeds Metal u32 limit"))?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -226,7 +214,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             output_buffer_reused = output_buffer.reused,
             "running native Metal Q2_K matvec"
@@ -244,7 +232,7 @@ impl MetalQ2Matvec {
                 &out_features_buffer.buffer,
                 &blocks_per_row_buffer.buffer,
             ],
-            output_len,
+            physical_threads,
         )?;
 
         let values = read_f32_buffer(&output_buffer.buffer, output_len)?;
@@ -257,7 +245,7 @@ impl MetalQ2Matvec {
             blocks_per_row,
             input_len: input.len(),
             weight_bytes: weights.len(),
-            thread_count: output_len,
+            thread_count: physical_threads,
             transposed: false,
         })
     }
@@ -278,17 +266,15 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K matvec add output length overflow"))?;
+        let physical_threads =
+            q2_k_cooperative_threads(&self.add_pipeline, output_len, "Q2_K matvec add")?;
         if residual.len() != output_len {
             return Err(Error::backend(format!(
                 "Q2_K matvec add residual length mismatch: expected {output_len}, got {}",
                 residual.len()
             )));
         }
-        if residual.iter().any(|value| !value.is_finite()) {
-            return Err(Error::backend(
-                "Q2_K matvec add residual contains non-finite values",
-            ));
-        }
+        debug_assert_finite_values("Q2_K matvec add residual", residual);
 
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| Error::backend("Q2_K matvec add row_count exceeds Metal u32 limit"))?;
@@ -300,7 +286,7 @@ impl MetalQ2Matvec {
             Error::backend("Q2_K matvec add blocks_per_row exceeds Metal u32 limit")
         })?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -320,7 +306,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             residual_buffer_reused = residual_buffer.reused,
             output_buffer_reused = output_buffer.reused,
@@ -340,7 +326,7 @@ impl MetalQ2Matvec {
                 &out_features_buffer.buffer,
                 &blocks_per_row_buffer.buffer,
             ],
-            output_len,
+            physical_threads,
         )?;
 
         let values = read_f32_buffer(&output_buffer.buffer, output_len)?;
@@ -354,7 +340,7 @@ impl MetalQ2Matvec {
             input_len: input.len(),
             residual_len: residual.len(),
             weight_bytes: weights.len(),
-            thread_count: output_len,
+            thread_count: physical_threads,
         })
     }
 
@@ -380,6 +366,11 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K gate/up SwiGLU output length overflow"))?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.gate_up_swiglu_pipeline,
+            output_len,
+            "Q2_K gate/up SwiGLU",
+        )?;
 
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| Error::backend("Q2_K gate/up SwiGLU row_count exceeds Metal u32 limit"))?;
@@ -393,8 +384,8 @@ impl MetalQ2Matvec {
             Error::backend("Q2_K gate/up SwiGLU blocks_per_row exceeds Metal u32 limit")
         })?;
 
-        let gate_weight_buffer = self.cached_weight_buffer(device, gate_weights)?;
-        let up_weight_buffer = self.cached_weight_buffer(device, up_weights)?;
+        let gate_weight_buffer = self.weight_buffer(device, gate_weights)?;
+        let up_weight_buffer = self.weight_buffer(device, up_weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -414,8 +405,8 @@ impl MetalQ2Matvec {
             blocks_per_row,
             gate_weight_bytes = gate_weights.len(),
             up_weight_bytes = up_weights.len(),
-            gate_weight_cache_hit = gate_weight_buffer.hit,
-            up_weight_cache_hit = up_weight_buffer.hit,
+            gate_weight_zero_copy = true,
+            up_weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             output_buffer_reused = output_buffer.reused,
             "running native Metal Q2_K gate/up SwiGLU"
@@ -434,7 +425,7 @@ impl MetalQ2Matvec {
                 &out_features_buffer.buffer,
                 &blocks_per_row_buffer.buffer,
             ],
-            output_len,
+            physical_threads,
         )?;
 
         let values = read_f32_buffer(&output_buffer.buffer, output_len)?;
@@ -448,7 +439,7 @@ impl MetalQ2Matvec {
             input_len: input.len(),
             gate_weight_bytes: gate_weights.len(),
             up_weight_bytes: up_weights.len(),
-            thread_count: output_len,
+            thread_count: physical_threads,
         })
     }
 
@@ -472,6 +463,8 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K argmax matvec output length overflow"))?;
+        let matvec_threads =
+            q2_k_cooperative_threads(&self.pipeline, output_len, "Q2_K argmax matvec")?;
 
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| Error::backend("Q2_K argmax row_count exceeds Metal u32 limit"))?;
@@ -483,8 +476,9 @@ impl MetalQ2Matvec {
             .map_err(|_| Error::backend("Q2_K argmax blocks_per_row exceeds Metal u32 limit"))?;
         let output_len_u32 = u32::try_from(output_len)
             .map_err(|_| Error::backend("Q2_K argmax output length exceeds Metal u32 limit"))?;
+        let argmax_threads = argmax_threads(&self.argmax_pipeline, "Q2_K greedy argmax")?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -503,7 +497,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             logits_buffer_reused = logits_buffer.reused,
             "running native Metal Q2_K matvec for greedy argmax"
@@ -542,12 +536,12 @@ impl MetalQ2Matvec {
                 Dispatch1d {
                     pipeline: &self.pipeline,
                     buffers: &matvec_buffers,
-                    threads: output_len,
+                    threads: matvec_threads,
                 },
                 Dispatch1d {
                     pipeline: &self.argmax_pipeline,
                     buffers: &argmax_buffers,
-                    threads: 1,
+                    threads: argmax_threads,
                 },
             ],
         )?;
@@ -570,8 +564,8 @@ impl MetalQ2Matvec {
             blocks_per_row,
             input_len: input.len(),
             weight_bytes: weights.len(),
-            matvec_thread_count: output_len,
-            argmax_thread_count: 1,
+            matvec_thread_count: matvec_threads,
+            argmax_thread_count: argmax_threads,
         })
     }
 
@@ -597,6 +591,8 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K argmax matvec output length overflow"))?;
+        let matvec_threads =
+            q2_k_cooperative_threads(&self.pipeline, output_len, "Q2_K argmax matvec")?;
 
         let row_count_u32 = u32::try_from(row_count)
             .map_err(|_| Error::backend("Q2_K argmax row_count exceeds Metal u32 limit"))?;
@@ -608,8 +604,9 @@ impl MetalQ2Matvec {
             .map_err(|_| Error::backend("Q2_K argmax blocks_per_row exceeds Metal u32 limit"))?;
         let output_len_u32 = u32::try_from(output_len)
             .map_err(|_| Error::backend("Q2_K argmax output length exceeds Metal u32 limit"))?;
+        let argmax_threads = argmax_threads(&self.argmax_pipeline, "Q2_K greedy argmax")?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -627,7 +624,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             logits_buffer_reused = logits_buffer.reused,
             "running native Metal Q2_K argmax from resident input buffer"
         );
@@ -658,12 +655,12 @@ impl MetalQ2Matvec {
                 Dispatch1d {
                     pipeline: &self.pipeline,
                     buffers: &matvec_buffers,
-                    threads: output_len,
+                    threads: matvec_threads,
                 },
                 Dispatch1d {
                     pipeline: &self.argmax_pipeline,
                     buffers: &argmax_buffers,
-                    threads: 1,
+                    threads: argmax_threads,
                 },
             ],
         )?;
@@ -686,8 +683,8 @@ impl MetalQ2Matvec {
             blocks_per_row,
             input_len,
             weight_bytes: weights.len(),
-            matvec_thread_count: output_len,
-            argmax_thread_count: 1,
+            matvec_thread_count: matvec_threads,
+            argmax_thread_count: argmax_threads,
         })
     }
 
@@ -716,7 +713,7 @@ impl MetalQ2Matvec {
         let blocks_per_row_u32 = u32::try_from(blocks_per_row)
             .map_err(|_| Error::backend("Q8_0 matvec blocks_per_row exceeds Metal u32 limit"))?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -735,7 +732,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             output_buffer_reused = output_buffer.reused,
             "running native Metal Q8_0 matvec"
@@ -805,7 +802,7 @@ impl MetalQ2Matvec {
             Error::backend("Q8_0 transposed matvec blocks_per_input_row exceeds Metal u32 limit")
         })?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -825,7 +822,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_input_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             output_buffer_reused = output_buffer.reused,
             "running native Metal transposed Q8_0 matvec"
@@ -895,7 +892,7 @@ impl MetalQ2Matvec {
             Error::backend("Q2_K transposed matvec blocks_per_input_row exceeds Metal u32 limit")
         })?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let mut scratch = self
             .scratch
             .lock()
@@ -915,7 +912,7 @@ impl MetalQ2Matvec {
             out_features,
             blocks_per_input_row,
             weight_bytes = weights.len(),
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             input_buffer_reused = input_buffer.reused,
             output_buffer_reused = output_buffer.reused,
             "running native Metal transposed Q2_K matvec"
@@ -972,9 +969,13 @@ impl MetalQ2Matvec {
         out_features: usize,
     ) -> Result<Buffer> {
         let blocks_per_row = match kind {
-            QuantMatvecKind::Q2K => {
-                validate_q2_k_matvec_buffer(weights, input_len, row_count, in_features, out_features)?
-            }
+            QuantMatvecKind::Q2K => validate_q2_k_matvec_buffer(
+                weights,
+                input_len,
+                row_count,
+                in_features,
+                out_features,
+            )?,
             QuantMatvecKind::Q2KTransposed => validate_q2_k_transposed_matvec_buffer(
                 weights,
                 input_len,
@@ -1008,7 +1009,15 @@ impl MetalQ2Matvec {
             QuantMatvecKind::Q80 => &self.q8_0_pipeline,
             QuantMatvecKind::Q80Transposed => &self.q8_0_transposed_pipeline,
         };
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let dispatch_threads = match kind {
+            QuantMatvecKind::Q2K => {
+                q2_k_cooperative_threads(pipeline, output_len, "batched Q2_K matvec")?
+            }
+            QuantMatvecKind::Q2KTransposed
+            | QuantMatvecKind::Q80
+            | QuantMatvecKind::Q80Transposed => output_len,
+        };
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
         let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
         let in_features_buffer =
@@ -1024,7 +1033,7 @@ impl MetalQ2Matvec {
             row_count,
             in_features,
             out_features,
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             "encoding batched quantized matvec"
         );
 
@@ -1040,7 +1049,7 @@ impl MetalQ2Matvec {
                 &out_features_buffer,
                 &blocks_per_row_buffer,
             ],
-            output_len,
+            dispatch_threads,
         )?;
         Ok(output_buffer)
     }
@@ -1067,6 +1076,8 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K matvec add output length overflow"))?;
+        let physical_threads =
+            q2_k_cooperative_threads(&self.add_pipeline, output_len, "batched Q2_K matvec add")?;
         if residual_len != output_len {
             return Err(Error::backend(format!(
                 "Q2_K matvec add residual length mismatch: expected {output_len}, got {residual_len}"
@@ -1074,7 +1085,7 @@ impl MetalQ2Matvec {
         }
         require_f32_capacity(residual, residual_len, "Q2_K matvec add residual")?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
         let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
         let in_features_buffer =
@@ -1089,7 +1100,7 @@ impl MetalQ2Matvec {
             row_count,
             in_features,
             out_features,
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             "encoding batched Q2_K matvec plus residual"
         );
 
@@ -1106,15 +1117,13 @@ impl MetalQ2Matvec {
                 &out_features_buffer,
                 &blocks_per_row_buffer,
             ],
-            output_len,
+            physical_threads,
         )?;
         Ok(output_buffer)
     }
 
-    /// Encodes the fused Q2_K gate/up matvec + SwiGLU kernel into an open
-    /// batched command buffer. See `encode_matvec` for the batching rules.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_gate_up_swiglu(
+    pub(crate) fn encode_multi_expert_gate_up_swiglu(
         &self,
         command_buffer: &CommandBufferRef,
         device: &Device,
@@ -1122,69 +1131,197 @@ impl MetalQ2Matvec {
         up_weights: &[u8],
         input: &Buffer,
         input_len: usize,
-        row_count: usize,
+        token_indices: &[u32],
+        expert_ids: &[u32],
+        token_count: usize,
         in_features: usize,
         out_features: usize,
     ) -> Result<Buffer> {
-        let gate_blocks = validate_q2_k_matvec_buffer(
-            gate_weights,
-            input_len,
-            row_count,
-            in_features,
-            out_features,
+        let assignment_count = validate_multi_expert_routing(
+            token_indices,
+            expert_ids,
+            token_count,
+            "Q2_K multi-expert gate/up SwiGLU",
         )?;
-        let up_blocks = validate_q2_k_matvec_buffer(
-            up_weights,
-            input_len,
-            row_count,
+        let (gate_blocks, gate_experts, expert_stride_bytes) = validate_q2_k_packed_experts(
+            gate_weights,
             in_features,
             out_features,
+            "Q2_K multi-expert gate",
+        )?;
+        let (up_blocks, up_experts, up_expert_stride_bytes) = validate_q2_k_packed_experts(
+            up_weights,
+            in_features,
+            out_features,
+            "Q2_K multi-expert up",
         )?;
         if gate_blocks != up_blocks {
             return Err(Error::backend(format!(
-                "Q2_K gate/up SwiGLU block mismatch: gate has {gate_blocks}, up has {up_blocks}"
+                "Q2_K multi-expert gate/up block mismatch: gate has {gate_blocks}, up has {up_blocks}"
             )));
         }
-        require_f32_capacity(input, input_len, "Q2_K gate/up SwiGLU input")?;
-        let output_len = row_count
-            .checked_mul(out_features)
-            .ok_or_else(|| Error::backend("Q2_K gate/up SwiGLU output length overflow"))?;
+        if gate_experts != up_experts || expert_stride_bytes != up_expert_stride_bytes {
+            return Err(Error::backend(format!(
+                "Q2_K multi-expert gate/up packed layout mismatch: gate experts={gate_experts} stride={expert_stride_bytes}, up experts={up_experts} stride={up_expert_stride_bytes}"
+            )));
+        }
+        validate_expert_ids(expert_ids, gate_experts, "Q2_K multi-expert gate/up SwiGLU")?;
 
-        let gate_weight_buffer = self.cached_weight_buffer(device, gate_weights)?;
-        let up_weight_buffer = self.cached_weight_buffer(device, up_weights)?;
+        let expected_input_len = token_count
+            .checked_mul(in_features)
+            .ok_or_else(|| Error::backend("Q2_K multi-expert gate/up input length overflow"))?;
+        if input_len != expected_input_len {
+            return Err(Error::backend(format!(
+                "Q2_K multi-expert gate/up input length mismatch: expected {expected_input_len}, got {input_len}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Q2_K multi-expert gate/up input")?;
+
+        let output_len = assignment_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("Q2_K multi-expert gate/up output length overflow"))?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.multi_expert_gate_up_swiglu_pipeline,
+            output_len,
+            "batched Q2_K multi-expert gate/up SwiGLU",
+        )?;
+
+        let gate_weight_buffer = self.weight_buffer(device, gate_weights)?;
+        let up_weight_buffer = self.weight_buffer(device, up_weights)?;
+        let token_indices_buffer = u32_buffer(device, token_indices)?;
+        let expert_ids_buffer = u32_buffer(device, expert_ids)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
+        let token_count_buffer =
+            u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
+        let assignment_count_buffer =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
         let in_features_buffer =
             u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
         let out_features_buffer =
             u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row_buffer =
             u32_scalar_buffer(device, matvec_u32(gate_blocks, "blocks_per_row")?)?;
+        let expert_stride_buffer = u32_scalar_buffer(
+            device,
+            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
+        )?;
 
         trace!(
             target: "inferno::metal",
-            row_count,
+            token_count,
+            assignment_count,
             in_features,
             out_features,
-            gate_weight_cache_hit = gate_weight_buffer.hit,
-            up_weight_cache_hit = up_weight_buffer.hit,
-            "encoding batched Q2_K gate/up SwiGLU"
+            expert_count = gate_experts,
+            "encoding batched Q2_K multi-expert gate/up SwiGLU"
         );
 
         encode_1d(
             command_buffer,
-            &self.gate_up_swiglu_pipeline,
+            &self.multi_expert_gate_up_swiglu_pipeline,
             &[
                 &gate_weight_buffer.buffer,
                 &up_weight_buffer.buffer,
                 input,
+                &token_indices_buffer,
+                &expert_ids_buffer,
                 &output_buffer,
-                &row_count_buffer,
+                &token_count_buffer,
+                &assignment_count_buffer,
                 &in_features_buffer,
                 &out_features_buffer,
                 &blocks_per_row_buffer,
+                &expert_stride_buffer,
             ],
+            physical_threads,
+        )?;
+        Ok(output_buffer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_multi_expert_matvec(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        expert_ids: &[u32],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        if expert_ids.is_empty() {
+            return Err(Error::backend(
+                "Q2_K multi-expert matvec requires at least one assignment",
+            ));
+        }
+        let assignment_count = expert_ids.len();
+        let (blocks_per_row, expert_count, expert_stride_bytes) = validate_q2_k_packed_experts(
+            weights,
+            in_features,
+            out_features,
+            "Q2_K multi-expert matvec",
+        )?;
+        validate_expert_ids(expert_ids, expert_count, "Q2_K multi-expert matvec")?;
+        let expected_input_len = assignment_count
+            .checked_mul(in_features)
+            .ok_or_else(|| Error::backend("Q2_K multi-expert matvec input length overflow"))?;
+        if input_len != expected_input_len {
+            return Err(Error::backend(format!(
+                "Q2_K multi-expert matvec input length mismatch: expected {expected_input_len}, got {input_len}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Q2_K multi-expert matvec input")?;
+
+        let output_len = assignment_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("Q2_K multi-expert matvec output length overflow"))?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.multi_expert_matvec_pipeline,
             output_len,
+            "batched Q2_K multi-expert matvec",
+        )?;
+
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        let expert_ids_buffer = u32_buffer(device, expert_ids)?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let assignment_count_buffer =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
+        let in_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let expert_stride_buffer = u32_scalar_buffer(
+            device,
+            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
+        )?;
+
+        trace!(
+            target: "inferno::metal",
+            assignment_count,
+            in_features,
+            out_features,
+            expert_count,
+            "encoding batched Q2_K multi-expert matvec"
+        );
+
+        encode_1d(
+            command_buffer,
+            &self.multi_expert_matvec_pipeline,
+            &[
+                &weight_buffer.buffer,
+                input,
+                &expert_ids_buffer,
+                &output_buffer,
+                &assignment_count_buffer,
+                &in_features_buffer,
+                &out_features_buffer,
+                &blocks_per_row_buffer,
+                &expert_stride_buffer,
+            ],
+            physical_threads,
         )?;
         Ok(output_buffer)
     }
@@ -1215,8 +1352,11 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Q2_K argmax matvec output length overflow"))?;
+        let matvec_threads =
+            q2_k_cooperative_threads(&self.pipeline, output_len, "batched Q2_K argmax matvec")?;
+        let argmax_threads = argmax_threads(&self.argmax_pipeline, "batched Q2_K greedy argmax")?;
 
-        let weight_buffer = self.cached_weight_buffer(device, weights)?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
         let logits_buffer = empty_f32_buffer(device, output_len)?;
         let token_id_buffer = empty_u32_buffer(device, 1)?;
         let token_score_buffer = empty_f32_buffer(device, 1)?;
@@ -1233,7 +1373,7 @@ impl MetalQ2Matvec {
             target: "inferno::metal",
             in_features,
             out_features,
-            weight_cache_hit = weight_buffer.hit,
+            weight_zero_copy = true,
             "encoding batched Q2_K matvec plus greedy argmax"
         );
 
@@ -1249,7 +1389,7 @@ impl MetalQ2Matvec {
                 &out_features_buffer,
                 &blocks_per_row_buffer,
             ],
-            output_len,
+            matvec_threads,
         )?;
         encode_1d(
             command_buffer,
@@ -1260,16 +1400,15 @@ impl MetalQ2Matvec {
                 &token_score_buffer,
                 &output_len_buffer,
             ],
-            1,
+            argmax_threads,
         )?;
         Ok((token_id_buffer, token_score_buffer))
     }
 
-    fn cached_weight_buffer(&self, device: &Device, weights: &[u8]) -> Result<CachedWeightBuffer> {
-        self.weight_cache
-            .lock()
-            .map_err(|_| Error::backend("Q2 weight buffer cache lock poisoned"))?
-            .get_or_insert(device, weights)
+    fn weight_buffer(&self, device: &Device, weights: &[u8]) -> Result<WeightBuffer> {
+        Ok(WeightBuffer {
+            buffer: u8_buffer_no_copy(device, weights)?,
+        })
     }
 }
 
@@ -1278,100 +1417,125 @@ fn matvec_u32(value: usize, label: &str) -> Result<u32> {
         .map_err(|_| Error::backend(format!("quantized matvec {label} exceeds Metal u32 limit")))
 }
 
-fn q2_weight_cache_max_bytes() -> Result<usize> {
-    match env::var(Q2_WEIGHT_CACHE_ENV) {
-        Ok(value) => parse_q2_weight_cache_mb(&value),
-        Err(env::VarError::NotPresent) => mb_to_bytes(DEFAULT_Q2_WEIGHT_CACHE_MB),
-        Err(error) => Err(Error::backend(format!(
-            "{Q2_WEIGHT_CACHE_ENV} is not valid UTF-8: {error}"
-        ))),
-    }
-}
-
-fn parse_q2_weight_cache_mb(value: &str) -> Result<usize> {
-    let mb = value.trim().parse::<usize>().map_err(|error| {
-        Error::backend(format!(
-            "{Q2_WEIGHT_CACHE_ENV} must be a positive integer number of MiB: {error}"
-        ))
-    })?;
-    if mb == 0 {
+fn validate_q2_k_packed_experts(
+    weights: &[u8],
+    in_features: usize,
+    out_features: usize,
+    context: &str,
+) -> Result<(usize, usize, usize)> {
+    if in_features == 0 || out_features == 0 {
         return Err(Error::backend(format!(
-            "{Q2_WEIGHT_CACHE_ENV} must be greater than zero"
+            "{context} requires non-zero in_features and out_features"
         )));
     }
-    mb_to_bytes(mb)
+    if in_features % Q2_K_BLOCK_VALUES != 0 {
+        return Err(Error::backend(format!(
+            "{context} in_features {in_features} must be divisible by {Q2_K_BLOCK_VALUES}"
+        )));
+    }
+    let blocks_per_row = in_features / Q2_K_BLOCK_VALUES;
+    let expert_stride_bytes = out_features
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(Q2_K_BLOCK_BYTES))
+        .ok_or_else(|| Error::backend(format!("{context} expert byte stride overflow")))?;
+    if expert_stride_bytes == 0 {
+        return Err(Error::backend(format!(
+            "{context} expert byte stride must be non-zero"
+        )));
+    }
+    if weights.len() % expert_stride_bytes != 0 {
+        return Err(Error::backend(format!(
+            "{context} packed weight byte length {} is not divisible by expert stride {expert_stride_bytes}",
+            weights.len()
+        )));
+    }
+    let expert_count = weights.len() / expert_stride_bytes;
+    if expert_count == 0 {
+        return Err(Error::backend(format!(
+            "{context} requires at least one packed expert"
+        )));
+    }
+    matvec_u32(expert_stride_bytes, "expert_stride_bytes")?;
+    Ok((blocks_per_row, expert_count, expert_stride_bytes))
 }
 
-fn mb_to_bytes(mb: usize) -> Result<usize> {
-    mb.checked_mul(1024)
-        .and_then(|value| value.checked_mul(1024))
-        .ok_or_else(|| Error::backend("Q2 weight cache byte size overflow"))
+fn validate_multi_expert_routing(
+    token_indices: &[u32],
+    expert_ids: &[u32],
+    token_count: usize,
+    context: &str,
+) -> Result<usize> {
+    if token_count == 0 {
+        return Err(Error::backend(format!(
+            "{context} requires non-zero token_count"
+        )));
+    }
+    if token_indices.is_empty() {
+        return Err(Error::backend(format!(
+            "{context} requires at least one routed assignment"
+        )));
+    }
+    if token_indices.len() != expert_ids.len() {
+        return Err(Error::backend(format!(
+            "{context} routing length mismatch: {} token indices and {} expert ids",
+            token_indices.len(),
+            expert_ids.len()
+        )));
+    }
+    for token_index in token_indices {
+        if *token_index as usize >= token_count {
+            return Err(Error::backend(format!(
+                "{context} token index {token_index} is outside token_count {token_count}"
+            )));
+        }
+    }
+    Ok(token_indices.len())
 }
 
-impl Q2WeightBufferCache {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            max_bytes,
-            current_bytes: 0,
-            order: VecDeque::new(),
-            entries: HashMap::new(),
+fn validate_expert_ids(expert_ids: &[u32], expert_count: usize, context: &str) -> Result<()> {
+    for expert_id in expert_ids {
+        if *expert_id as usize >= expert_count {
+            return Err(Error::backend(format!(
+                "{context} expert id {expert_id} is outside expert_count {expert_count}"
+            )));
         }
     }
+    Ok(())
+}
 
-    fn get_or_insert(&mut self, device: &Device, weights: &[u8]) -> Result<CachedWeightBuffer> {
-        // Production callers pass mmap-backed GGUF slices whose addresses stay stable
-        // for the model lifetime. This avoids hashing multi-megabyte Q2 payloads.
-        let key = Q2WeightCacheKey {
-            ptr: weights.as_ptr() as usize,
-            len: weights.len(),
-        };
-
-        if self.entries.contains_key(&key) {
-            self.touch(key);
-            let entry = self
-                .entries
-                .get(&key)
-                .ok_or_else(|| Error::backend("Q2 weight cache entry disappeared after touch"))?;
-            return Ok(CachedWeightBuffer {
-                buffer: entry.buffer.clone(),
-                hit: true,
-            });
-        }
-
-        let buffer = u8_buffer(device, weights)?;
-        let bytes = weights.len();
-        if bytes > self.max_bytes {
-            return Ok(CachedWeightBuffer { buffer, hit: false });
-        }
-
-        while self.current_bytes.saturating_add(bytes) > self.max_bytes {
-            let Some(evicted_key) = self.order.pop_front() else {
-                break;
-            };
-            if let Some(evicted) = self.entries.remove(&evicted_key) {
-                self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
-            }
-        }
-
-        self.order.push_back(key);
-        self.entries.insert(
-            key,
-            Q2WeightCacheEntry {
-                buffer: buffer.clone(),
-                bytes,
-            },
-        );
-        self.current_bytes = self.current_bytes.saturating_add(bytes);
-
-        Ok(CachedWeightBuffer { buffer, hit: false })
+fn q2_k_cooperative_threads(
+    pipeline: &ComputePipelineState,
+    output_len: usize,
+    context: &str,
+) -> Result<usize> {
+    let thread_execution_width = pipeline.thread_execution_width() as usize;
+    if thread_execution_width != Q2_K_SIMD_LANES {
+        return Err(Error::backend(format!(
+            "{context} requires {Q2_K_SIMD_LANES}-lane Apple Metal SIMD groups, got {thread_execution_width}"
+        )));
     }
+    output_len
+        .checked_mul(Q2_K_SIMD_LANES)
+        .ok_or_else(|| Error::backend(format!("{context} physical thread count overflow")))
+}
 
-    fn touch(&mut self, key: Q2WeightCacheKey) {
-        if let Some(position) = self.order.iter().position(|candidate| *candidate == key) {
-            self.order.remove(position);
-        }
-        self.order.push_back(key);
+fn argmax_threads(pipeline: &ComputePipelineState, context: &str) -> Result<usize> {
+    let thread_execution_width = pipeline.thread_execution_width() as usize;
+    let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+    if thread_execution_width == 0
+        || thread_execution_width > ARGMAX_THREADS_PER_VECTOR
+        || ARGMAX_THREADS_PER_VECTOR % thread_execution_width != 0
+    {
+        return Err(Error::backend(format!(
+            "{context} requires a thread execution width that divides {ARGMAX_THREADS_PER_VECTOR}, got {thread_execution_width}"
+        )));
     }
+    if max_threads < ARGMAX_THREADS_PER_VECTOR {
+        return Err(Error::backend(format!(
+            "{context} requires {ARGMAX_THREADS_PER_VECTOR} threads per threadgroup, pipeline allows {max_threads}"
+        )));
+    }
+    Ok(ARGMAX_THREADS_PER_VECTOR)
 }
 
 impl Q2ScratchBuffers {
@@ -1477,27 +1641,6 @@ fn scratch_buffer_with(
         buffer,
         reused: false,
     })
-}
-
-#[cfg(test)]
-mod cache_config_tests {
-    use super::{parse_q2_weight_cache_mb, DEFAULT_Q2_WEIGHT_CACHE_MB};
-
-    #[test]
-    fn parses_q2_weight_cache_size_in_mib() {
-        assert_eq!(parse_q2_weight_cache_mb("64").unwrap(), 64 * 1024 * 1024);
-        assert_eq!(
-            parse_q2_weight_cache_mb(&DEFAULT_Q2_WEIGHT_CACHE_MB.to_string()).unwrap(),
-            DEFAULT_Q2_WEIGHT_CACHE_MB * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn rejects_zero_q2_weight_cache_size() {
-        let error = parse_q2_weight_cache_mb("0").expect_err("zero cache must be rejected");
-
-        assert!(error.to_string().contains("greater than zero"));
-    }
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
@@ -1660,6 +1803,126 @@ mod tests {
         assert_eq!(report.gate_weight_bytes, Q2_K_BLOCK_BYTES * 2);
         assert_eq!(report.up_weight_bytes, Q2_K_BLOCK_BYTES * 2);
         assert_close(&report.values, &expected, 1e-4);
+    }
+
+    #[test]
+    fn multi_expert_gate_up_and_matvec_match_cpu_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let hidden_features = 2;
+        let intermediate_features = Q2_K_BLOCK_VALUES;
+        let expert_count = 2;
+        let gate_expert_stride = intermediate_features * Q2_K_BLOCK_BYTES;
+        let down_expert_stride = hidden_features * Q2_K_BLOCK_BYTES;
+        let mut gate_weights = Vec::new();
+        let mut up_weights = Vec::new();
+        for expert in 0..expert_count {
+            for row in 0..intermediate_features {
+                let quant = if (expert + row) % 2 == 0 { 0xe4 } else { 0x1b };
+                gate_weights.extend(q2_k_block(
+                    if expert == 0 { 0x3c00 } else { 0x4000 },
+                    0x0000,
+                    0x01 + expert as u8,
+                    quant,
+                ));
+                up_weights.extend(q2_k_block(
+                    if expert == 0 { 0x4000 } else { 0x3c00 },
+                    0x0000,
+                    0x02 + expert as u8,
+                    quant ^ 0xff,
+                ));
+            }
+        }
+        let mut down_weights = Vec::new();
+        for expert in 0..expert_count {
+            for row in 0..hidden_features {
+                down_weights.extend(q2_k_block(
+                    if expert == 0 { 0x3c00 } else { 0x4000 },
+                    0x0000,
+                    0x03 + row as u8,
+                    if expert == row { 0xe4 } else { 0x1b },
+                ));
+            }
+        }
+        let token_count = 2;
+        let input = (0..token_count * Q2_K_BLOCK_VALUES)
+            .map(|index| (index as f32 % 19.0) * 0.05 - 0.20)
+            .collect::<Vec<_>>();
+        let token_indices = vec![1_u32, 0, 1];
+        let expert_ids = vec![1_u32, 0, 1];
+
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let gated_buffer = metal
+            .batched_q2_k_multi_expert_gate_up_swiglu(
+                &gate_weights,
+                &up_weights,
+                &input_buffer,
+                input.len(),
+                &token_indices,
+                &expert_ids,
+                token_count,
+                Q2_K_BLOCK_VALUES,
+                intermediate_features,
+            )
+            .unwrap();
+        let down_buffer = metal
+            .batched_q2_k_multi_expert_matvec(
+                &down_weights,
+                &gated_buffer,
+                token_indices.len() * intermediate_features,
+                &expert_ids,
+                intermediate_features,
+                hidden_features,
+            )
+            .unwrap();
+        let gated = metal
+            .batch_read_f32(&gated_buffer, token_indices.len() * intermediate_features)
+            .unwrap();
+        let down = metal
+            .batch_read_f32(&down_buffer, token_indices.len() * hidden_features)
+            .unwrap();
+
+        let mut expected_gated = Vec::new();
+        for (&token, &expert) in token_indices.iter().zip(&expert_ids) {
+            let token = token as usize;
+            let expert = expert as usize;
+            let token_input = &input[token * Q2_K_BLOCK_VALUES..(token + 1) * Q2_K_BLOCK_VALUES];
+            let expert_start = expert * gate_expert_stride;
+            let expert_end = expert_start + gate_expert_stride;
+            let gate = cpu_q2_k_matvec(
+                &gate_weights[expert_start..expert_end],
+                token_input,
+                1,
+                Q2_K_BLOCK_VALUES,
+                intermediate_features,
+            );
+            let up = cpu_q2_k_matvec(
+                &up_weights[expert_start..expert_end],
+                token_input,
+                1,
+                Q2_K_BLOCK_VALUES,
+                intermediate_features,
+            );
+            expected_gated.extend(cpu_swiglu(&gate, &up));
+        }
+        let mut expected_down = Vec::new();
+        for (assignment, expert) in expert_ids.iter().copied().enumerate() {
+            let expert = expert as usize;
+            let expert_start = expert * down_expert_stride;
+            let expert_end = expert_start + down_expert_stride;
+            expected_down.extend(cpu_q2_k_matvec(
+                &down_weights[expert_start..expert_end],
+                &expected_gated
+                    [assignment * intermediate_features..(assignment + 1) * intermediate_features],
+                1,
+                intermediate_features,
+                hidden_features,
+            ));
+        }
+
+        assert_close(&gated, &expected_gated, 1e-4);
+        assert_close(&down, &expected_down, 1e-4);
     }
 
     #[test]

@@ -2,11 +2,19 @@
 
 //! Paged KV cache primitives for the GLM runtime.
 
-mod disk_paged;
+mod cold_kv;
+mod dsa_index;
 mod layered_paged;
 mod paged;
 
-pub use disk_paged::{LayerDiskPageStats, LayerDiskPagedKvView, LayeredDiskPagedKvCache};
+pub use cold_kv::{
+    ColdKvBlockKey, ColdKvBlockMeta, ColdKvBlockStore, ColdKvCodec, ColdKvSelectedQ8LayerRows,
+    ColdKvSelectedQ8TensorRows, ColdKvStoreSpec, ColdKvTensorKind, ColdKvWriteReport,
+    LayeredColdKvBlockStore, LayeredColdKvWriteReport,
+};
+pub use dsa_index::{
+    DsaIndexBlockMeta, DsaIndexLayerAppend, DsaIndexStoreSpec, LayeredDsaIndexBlockStore,
+};
 pub use layered_paged::{
     LayerKvCacheAppend, LayerPageStats, LayerPagedCacheAppendReport, LayerPagedKvView,
     LayeredPagedCacheAppendReport, LayeredPagedKvCache, LayeredPagedKvCacheSpec,

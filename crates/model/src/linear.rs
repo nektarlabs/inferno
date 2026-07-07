@@ -249,20 +249,17 @@ impl<'a> QuantizedLinear<'a> {
         Ok(Some(output))
     }
 
-    /// Batched device-resident variant of `forward_f32_tensor_add_residual`
-    /// (matvec fused with residual add). Only the Q2_K kernel supports the
-    /// fused add; other types return `Ok(None)`.
+    /// Batched device-resident variant of `forward_f32_tensor_add_residual`.
+    /// Q2_K uses the fused matvec+add kernel; Q8_0 uses native matvec followed
+    /// by a native add so the path remains GPU-resident.
     pub(crate) fn forward_device_add_residual<B: Backend>(
         &self,
         input: &backend::DeviceValue,
         residual: &backend::DeviceValue,
         backend: &B,
     ) -> Result<Option<backend::DeviceValue>> {
-        if self.tensor_ref.ty != GgmlType::Q2K {
-            return Ok(None);
-        }
         let (row_count, expected_output_shape) = validate_input_dims(
-            "GGUF Q2 quantized linear device residual",
+            "GGUF quantized linear device residual",
             input.dims(),
             self.in_features,
             self.out_features,
@@ -272,20 +269,29 @@ impl<'a> QuantizedLinear<'a> {
             residual.dims(),
             &expected_output_shape,
         )?;
-        let raw_data = self.q2_payload_bytes.ok_or_else(|| {
-            Error::gguf(format!(
-                "GGUF tensor {} must be Q2_K for the device Q2 matvec add path, got {}",
-                self.tensor_ref.name, self.tensor_ref.ty
-            ))
-        })?;
-        let output = crate::try_device!(backend.q2_k_matvec_add_device(
-            raw_data,
-            input,
-            residual,
-            row_count,
-            self.in_features,
-            self.out_features,
-        ));
+        let output = match self.tensor_ref.ty {
+            GgmlType::Q2K => {
+                let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q2_K for the device Q2 matvec add path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?;
+                crate::try_device!(backend.q2_k_matvec_add_device(
+                    raw_data,
+                    input,
+                    residual,
+                    row_count,
+                    self.in_features,
+                    self.out_features,
+                ))
+            }
+            GgmlType::Q8_0 => {
+                let projected = crate::try_device!(self.forward_device(input, backend));
+                crate::try_device!(backend.add_device(residual, &projected))
+            }
+            _ => return Ok(None),
+        };
         validate_exact_shape(
             "gguf_device_q2_quantized_linear_add_output",
             output.dims(),

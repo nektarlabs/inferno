@@ -14,6 +14,8 @@ use super::{
 };
 
 const RMS_NORM_KERNEL: &str = "rms_norm_f32_kernel";
+const RMS_NORM_THREADS_PER_ROW: usize = 256;
+const RMS_NORM_SIMD_LANES: usize = 32;
 
 pub(crate) struct MetalRmsNorm {
     pipeline: ComputePipelineState,
@@ -62,13 +64,14 @@ impl MetalRmsNorm {
     ) -> Result<MetalRmsNormReport> {
         let output = self.run_to_buffer(device, queue, input, weight, rows, hidden_size, eps)?;
         let values = read_f32_buffer(&output.buffer, input.len())?;
+        let physical_threads = rms_norm_threads(&self.pipeline, rows)?;
 
         Ok(MetalRmsNormReport {
             values,
             rows,
             hidden_size,
             input_len: input.len(),
-            thread_count: rows,
+            thread_count: physical_threads,
         })
     }
 
@@ -83,12 +86,14 @@ impl MetalRmsNorm {
         eps: f32,
     ) -> Result<MetalRmsNormBufferReport> {
         let prepared = self.prepare_to_buffer(device, input, weight, rows, hidden_size, eps)?;
+        let physical_threads = rms_norm_threads(&self.pipeline, rows)?;
 
         trace!(
             target: "inferno::metal",
             rows,
             hidden_size,
             input_len = input.len(),
+            physical_threads,
             "running native Metal RMSNorm"
         );
 
@@ -103,7 +108,7 @@ impl MetalRmsNorm {
                 &prepared.hidden_size_buffer,
                 &prepared.eps_buffer,
             ],
-            rows,
+            physical_threads,
         )?;
 
         Ok(MetalRmsNormBufferReport {
@@ -166,12 +171,14 @@ impl MetalRmsNorm {
         let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
         let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
         let eps_buffer = f32_scalar_buffer(device, eps)?;
+        let physical_threads = rms_norm_threads(&self.pipeline, rows)?;
 
         trace!(
             target: "inferno::metal",
             rows,
             hidden_size,
             input_len,
+            physical_threads,
             "encoding batched RMSNorm"
         );
 
@@ -186,7 +193,7 @@ impl MetalRmsNorm {
                 &hidden_size_buffer,
                 &eps_buffer,
             ],
-            rows,
+            physical_threads,
         )?;
         Ok(output_buffer)
     }
@@ -196,8 +203,26 @@ impl MetalRmsNorm {
     }
 }
 
+fn rms_norm_threads(pipeline: &ComputePipelineState, rows: usize) -> Result<usize> {
+    let thread_execution_width = pipeline.thread_execution_width() as usize;
+    if thread_execution_width != RMS_NORM_SIMD_LANES {
+        return Err(Error::backend(format!(
+            "RMSNorm requires {RMS_NORM_SIMD_LANES}-lane Apple Metal SIMD groups, got {thread_execution_width}"
+        )));
+    }
+    let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+    if max_threads < RMS_NORM_THREADS_PER_ROW {
+        return Err(Error::backend(format!(
+            "RMSNorm requires {RMS_NORM_THREADS_PER_ROW} threads per row, pipeline allows {max_threads}"
+        )));
+    }
+    rows.checked_mul(RMS_NORM_THREADS_PER_ROW)
+        .ok_or_else(|| Error::backend("RMSNorm physical thread count overflow"))
+}
+
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod tests {
+    use super::RMS_NORM_THREADS_PER_ROW;
     use crate::metal::Metal;
 
     #[test]
@@ -222,7 +247,7 @@ mod tests {
         assert_eq!(report.rows, rows);
         assert_eq!(report.hidden_size, hidden_size);
         assert_eq!(report.input_len, input.len());
-        assert_eq!(report.thread_count, rows);
+        assert_eq!(report.thread_count, rows * RMS_NORM_THREADS_PER_ROW);
         assert_close(&report.values, &expected, 1e-5);
     }
 

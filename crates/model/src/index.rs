@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
+
 use common::{Error, Result};
 use config::Config;
-use gguf::{GgmlType, GgufFile, GgufTensorInfo};
+use gguf::{GgmlType, GgufFile, GgufTensorAdvice, GgufTensorInfo};
 
 use crate::LayerKind;
 
@@ -9,6 +11,7 @@ pub struct Index {
     pub architecture: String,
     pub root: RootIndex,
     pub layers: Vec<LayerIndex>,
+    pub mtp: Option<MtpIndex>,
     pub summary: IndexSummary,
 }
 
@@ -27,6 +30,15 @@ pub struct LayerIndex {
     pub post_attention_norm: TensorRef,
     pub attention: AttentionIndex,
     pub ffn: FfnIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpIndex {
+    pub layer: LayerIndex,
+    pub eh_proj: TensorRef,
+    pub enorm: TensorRef,
+    pub hnorm: TensorRef,
+    pub shared_head_norm: TensorRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,10 +111,19 @@ pub struct IndexSummary {
     pub dense_layer_count: usize,
     pub sparse_layer_count: usize,
     pub dsa_indexer_layer_count: usize,
+    pub mtp_layer_count: usize,
     pub split_kv_b_projection_count: usize,
     pub packed_expert_tensor_count: usize,
     pub quantized_tensor_count: usize,
     pub raw_tensor_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAdviceReport {
+    pub hot_tensor_count: usize,
+    pub hot_bytes: u64,
+    pub random_tensor_count: usize,
+    pub random_bytes: u64,
 }
 
 impl Index {
@@ -135,6 +156,7 @@ impl Index {
         let layers = (0..config.num_layers)
             .map(|layer_index| build_layer(gguf, config, layer_index))
             .collect::<Result<Vec<_>>>()?;
+        let mtp = build_mtp(gguf, config)?;
 
         let dense_layer_count = layers
             .iter()
@@ -145,6 +167,7 @@ impl Index {
             .iter()
             .filter(|layer| layer.attention.indexer.is_some())
             .count();
+        let mtp_layer_count = usize::from(mtp.is_some());
         let split_kv_b_projection_count = layers.len() * 2;
         let packed_expert_tensor_count = layers
             .iter()
@@ -162,17 +185,88 @@ impl Index {
             architecture: architecture.to_string(),
             root,
             layers,
+            mtp,
             summary: IndexSummary {
                 tensor_count: gguf.tensors().len(),
                 metadata_kv_count: summary.metadata_kv_count,
                 dense_layer_count,
                 sparse_layer_count,
                 dsa_indexer_layer_count,
+                mtp_layer_count,
                 split_kv_b_projection_count,
                 packed_expert_tensor_count,
                 quantized_tensor_count,
                 raw_tensor_count,
             },
+        })
+    }
+
+    pub fn advise_gguf_memory(&self, gguf: &GgufFile) -> Result<MemoryAdviceReport> {
+        let mut hot = BTreeSet::<String>::new();
+        let mut random = BTreeSet::<String>::new();
+
+        insert_tensor(&mut hot, &self.root.token_embedding);
+        insert_tensor(&mut hot, &self.root.final_norm);
+        insert_tensor(&mut hot, &self.root.output);
+
+        for layer in &self.layers {
+            insert_tensor(&mut hot, &layer.input_norm);
+            insert_tensor(&mut hot, &layer.post_attention_norm);
+            insert_attention_hot_tensors(&mut hot, &layer.attention);
+
+            match &layer.ffn {
+                FfnIndex::Dense(dense) => {
+                    insert_tensor(&mut hot, &dense.gate);
+                    insert_tensor(&mut hot, &dense.up);
+                    insert_tensor(&mut hot, &dense.down);
+                }
+                FfnIndex::SparseMoe {
+                    router,
+                    router_correction_bias,
+                    shared_experts,
+                    packed_experts,
+                } => {
+                    insert_tensor(&mut hot, router);
+                    insert_tensor(&mut hot, router_correction_bias);
+                    insert_shared_expert_hot_tensors(&mut hot, shared_experts);
+                    insert_packed_expert_random_tensors(&mut random, packed_experts);
+                }
+            }
+        }
+        if let Some(mtp) = self.mtp.as_ref() {
+            insert_tensor(&mut hot, &mtp.eh_proj);
+            insert_tensor(&mut hot, &mtp.enorm);
+            insert_tensor(&mut hot, &mtp.hnorm);
+            insert_tensor(&mut hot, &mtp.shared_head_norm);
+            insert_tensor(&mut hot, &mtp.layer.input_norm);
+            insert_tensor(&mut hot, &mtp.layer.post_attention_norm);
+            insert_attention_hot_tensors(&mut hot, &mtp.layer.attention);
+            if let FfnIndex::SparseMoe {
+                router,
+                router_correction_bias,
+                shared_experts,
+                packed_experts,
+            } = &mtp.layer.ffn
+            {
+                insert_tensor(&mut hot, router);
+                insert_tensor(&mut hot, router_correction_bias);
+                insert_shared_expert_hot_tensors(&mut hot, shared_experts);
+                insert_packed_expert_random_tensors(&mut random, packed_experts);
+            }
+        }
+
+        for name in &random {
+            hot.remove(name);
+        }
+
+        let hot_bytes = advise_tensor_names(gguf, &hot, GgufTensorAdvice::WillNeed)?;
+        let random_bytes = advise_tensor_names(gguf, &random, GgufTensorAdvice::Random)?;
+
+        Ok(MemoryAdviceReport {
+            hot_tensor_count: hot.len(),
+            hot_bytes,
+            random_tensor_count: random.len(),
+            random_bytes,
         })
     }
 }
@@ -216,6 +310,46 @@ fn build_layer(gguf: &GgufFile, config: &Config, layer_index: usize) -> Result<L
     } else {
         LayerKind::SparseMoe
     };
+    let prefix = format!("blk.{layer_index}");
+
+    Ok(LayerIndex {
+        layer_index,
+        kind,
+        input_norm: required(gguf, format!("{prefix}.attn_norm.weight"))?,
+        post_attention_norm: required(gguf, format!("{prefix}.ffn_norm.weight"))?,
+        attention: build_attention(gguf, &prefix)?,
+        ffn: build_ffn(gguf, &prefix, kind)?,
+    })
+}
+
+fn build_mtp(gguf: &GgufFile, config: &Config) -> Result<Option<MtpIndex>> {
+    match config.num_nextn_predict_layers {
+        0 => Ok(None),
+        1 => {
+            let layer_index = config.num_layers;
+            let prefix = format!("blk.{layer_index}");
+            Ok(Some(MtpIndex {
+                layer: build_layer_with_kind(gguf, layer_index, LayerKind::SparseMoe)?,
+                eh_proj: required(gguf, format!("{prefix}.nextn.eh_proj.weight"))?,
+                enorm: required(gguf, format!("{prefix}.nextn.enorm.weight"))?,
+                hnorm: required(gguf, format!("{prefix}.nextn.hnorm.weight"))?,
+                shared_head_norm: required(
+                    gguf,
+                    format!("{prefix}.nextn.shared_head_norm.weight"),
+                )?,
+            }))
+        }
+        other => Err(Error::gguf(format!(
+            "unsupported GLM-5.2 nextn predict layer count {other}; expected 0 or 1"
+        ))),
+    }
+}
+
+fn build_layer_with_kind(
+    gguf: &GgufFile,
+    layer_index: usize,
+    kind: LayerKind,
+) -> Result<LayerIndex> {
     let prefix = format!("blk.{layer_index}");
 
     Ok(LayerIndex {
@@ -305,6 +439,62 @@ fn required(gguf: &GgufFile, name: impl AsRef<str>) -> Result<TensorRef> {
     Ok(TensorRef::from_info(tensor))
 }
 
+fn insert_tensor(target: &mut BTreeSet<String>, tensor: &TensorRef) {
+    target.insert(tensor.name.clone());
+}
+
+fn insert_attention_hot_tensors(target: &mut BTreeSet<String>, attention: &AttentionIndex) {
+    insert_tensor(target, &attention.q_a);
+    insert_tensor(target, &attention.q_a_norm);
+    insert_tensor(target, &attention.q_b);
+    insert_tensor(target, &attention.kv_a_mqa);
+    insert_tensor(target, &attention.kv_a_norm);
+    insert_tensor(target, &attention.k_b);
+    insert_tensor(target, &attention.v_b);
+    insert_tensor(target, &attention.output);
+
+    if let Some(indexer) = &attention.indexer {
+        insert_tensor(target, &indexer.k_norm_bias);
+        insert_tensor(target, &indexer.k_norm_weight);
+        insert_tensor(target, &indexer.proj);
+        insert_tensor(target, &indexer.attn_k);
+        insert_tensor(target, &indexer.attn_q_b);
+    }
+}
+
+fn insert_shared_expert_hot_tensors(target: &mut BTreeSet<String>, experts: &SharedExpertIndex) {
+    insert_tensor(target, &experts.gate);
+    insert_tensor(target, &experts.up);
+    insert_tensor(target, &experts.down);
+}
+
+fn insert_packed_expert_random_tensors(
+    target: &mut BTreeSet<String>,
+    experts: &PackedExpertsIndex,
+) {
+    insert_tensor(target, &experts.gate);
+    insert_tensor(target, &experts.up);
+    insert_tensor(target, &experts.down);
+}
+
+fn advise_tensor_names(
+    gguf: &GgufFile,
+    names: &BTreeSet<String>,
+    advice: GgufTensorAdvice,
+) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for name in names {
+        let tensor = gguf
+            .tensor(name)
+            .ok_or_else(|| Error::gguf(format!("missing GGUF tensor {name}")))?;
+        gguf.advise_tensor_by_info(tensor, advice)?;
+        bytes = bytes
+            .checked_add(tensor.storage_byte_len)
+            .ok_or_else(|| Error::gguf("GGUF memory advice byte count overflow"))?;
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -384,6 +574,20 @@ mod tests {
         assert!(err.to_string().contains("Q2 GGUF"));
         assert!(err.to_string().contains("token_embd.weight"));
         assert!(err.to_string().contains("UNSUPPORTED_GGML_TYPE_12"));
+    }
+
+    #[test]
+    fn advises_hot_tensors_separately_from_routed_experts() {
+        let path = write_tiny_gguf(false);
+        let gguf = GgufFile::open(&path).unwrap();
+        let index = Index::from_gguf(&gguf, &tiny_config()).unwrap();
+
+        let report = index.advise_gguf_memory(&gguf).unwrap();
+
+        assert_eq!(report.hot_tensor_count, 36);
+        assert_eq!(report.random_tensor_count, 3);
+        assert_eq!(report.hot_bytes, 36 * 32);
+        assert_eq!(report.random_bytes, 128);
     }
 
     fn write_tiny_gguf(omit_v_b: bool) -> PathBuf {
@@ -672,11 +876,17 @@ mod tests {
             qk_head_dim: 4,
             qk_no_rope_dim: 2,
             qk_rope_dim: 2,
+            kv_lora_rank: 2,
             v_head_dim: Some(4),
             num_routed_experts: 2,
             experts_per_token: 1,
             max_context: 16,
             dsa_index_topk: 4,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
             moe_intermediate_size: 3,
             num_shared_experts: 1,
             moe_groups: 1,
@@ -685,6 +895,7 @@ mod tests {
             routed_scaling_factor: 2.5,
             scoring_func: "sigmoid".to_string(),
             topk_method: "noaux_tc".to_string(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
         }

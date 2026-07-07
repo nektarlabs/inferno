@@ -44,6 +44,31 @@ enough for real local use while staying simple enough to audit end to end. That
 is the ambition — whether it gets all the way there is exactly what the
 experiment is testing.
 
+## Memory Strategy
+
+Inferno treats SSD as part of the runtime memory hierarchy for KV cache.
+
+The native Metal decode path stores request KV in an append-only SSD block
+store and streams the current layer's past K/V into a reusable Metal hot window
+before attention. The cold store is indexed by:
+
+```txt
+layer_index + tensor_kind(key/value) + token_start + token_count
+```
+
+The current policy is deliberately narrow:
+
+```txt
+cold tier: append-only Q8 row-compressed SSD block store
+hot tier:  one reusable Metal layer window
+prefetch:  next layer's full past K/V range
+eviction:  overwrite the hot layer window when the next layer is loaded
+```
+
+This keeps all layer histories out of resident Metal memory while preserving
+full dense attention correctness. Older K/V is not dropped; it is streamed from
+the cold store when that layer needs it.
+
 ## Model
 
 Inferno currently targets one model:
@@ -133,6 +158,12 @@ Validate the workspace:
 cargo fmt --all --check
 cargo check --workspace
 cargo test --workspace
+```
+
+Measure SSD KV bandwidth and Metal hot-load latency:
+
+```bash
+cargo bench -p runtime --bench ssd_kv
 ```
 
 ## License

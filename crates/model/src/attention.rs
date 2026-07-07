@@ -1,4 +1,4 @@
-use backend::{Backend, BackendCapabilities, DeviceValue};
+use backend::{Backend, BackendCapabilities, DevicePagedKvView, DeviceSelectedKvView, DeviceValue};
 use common::Tensor;
 use common::{validate_exact_shape, DeviceKind, Error, F32Tensor, PagedKvView, Result, Shape};
 use config::Config;
@@ -8,8 +8,8 @@ use gguf::{
 };
 
 use crate::{
-    attention_math, AttentionIndex, LayerIndex, QuantizedLinear, RmsNorm, RmsNormLoadReport,
-    TensorRef,
+    attention_math, profile, AttentionIndex, DsaIndexer, DsaIndexerLoadReport, LayerIndex,
+    QuantizedLinear, RmsNorm, RmsNormLoadReport, TensorRef,
 };
 
 #[derive(Debug)]
@@ -24,6 +24,7 @@ pub struct Attention<'a> {
     k_b: HeadProjection<'a>,
     v_b: HeadProjection<'a>,
     output: QuantizedLinear<'a>,
+    indexer: Option<DsaIndexer<'a>>,
     kv_lora_rank: usize,
     load_report: AttentionLoadReport,
 }
@@ -41,6 +42,7 @@ pub struct AttentionTensors {
     pub hidden_states: Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug)]
@@ -48,16 +50,29 @@ pub struct AttentionF32Tensors {
     pub hidden_states: F32Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
+}
+
+#[derive(Debug)]
+pub struct SparseAttentionF32Tensors {
+    pub tensors: AttentionF32Tensors,
+    pub next_shared_selection: Option<Vec<u32>>,
 }
 
 /// Output of the batched device-resident decode attention path. The hidden
-/// states stay on the GPU for the next op; the current token's K/V are
-/// downloaded because the paged KV cache lives on the host.
+/// states and current token K/V stay on the GPU.
 #[derive(Debug)]
 pub(crate) struct AttentionDeviceTensors {
     pub(crate) hidden_states: DeviceValue,
-    pub(crate) cache_k: F32Tensor,
-    pub(crate) cache_v: F32Tensor,
+    pub(crate) cache_k: DeviceValue,
+    pub(crate) cache_v: DeviceValue,
+    pub(crate) index_key: Option<F32Tensor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SparseAttentionDeviceTensors {
+    pub(crate) tensors: AttentionDeviceTensors,
+    pub(crate) next_shared_selection: Option<Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -66,7 +81,19 @@ pub enum AttentionPastKv<'a> {
         cache_k: &'a F32Tensor,
         cache_v: &'a F32Tensor,
     },
-    Paged(PagedKvView<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SparseAttentionContext<'a> {
+    cached_index_keys: Option<&'a F32Tensor>,
+    shared_selection: Option<&'a [u32]>,
+}
+
+#[derive(Debug)]
+struct SparsePastSelection {
+    selected_past_tokens: Option<Vec<u32>>,
+    next_shared_selection: Option<Vec<u32>>,
+    current_index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +111,7 @@ pub struct AttentionLoadReport {
     pub k_b_weight_shape: Shape,
     pub v_b_weight_shape: Shape,
     pub output_weight_shape: Shape,
+    pub indexer: Option<DsaIndexerLoadReport>,
     pub projection_tensor_type: GgmlType,
     pub output_chunk_rows: usize,
     pub limitations: Vec<String>,
@@ -157,6 +185,12 @@ struct HeadProjectionOutput {
 
 struct HeadProjectionF32Output {
     output_heads: F32Tensor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevicePastKvLayout {
+    ExpandedHeads,
+    MlaLatent,
 }
 
 impl<'a> HeadProjection<'a> {
@@ -417,11 +451,7 @@ impl<'a> HeadProjection<'a> {
         }
     }
 
-    /// Batched device-resident variant of `forward_heads_f32`. For the
-    /// transposed (`OutputInputHeads`) layout the per-head outputs are stacked
-    /// with GPU copies, which reproduces the eager path's host scatter only
-    /// when there is a single flat token — so that layout bails out with
-    /// `Ok(None)` outside single-token decode.
+    /// Batched device-resident variant of `forward_heads_f32`.
     fn forward_heads_device<B: Backend>(
         &self,
         input: &DeviceValue,
@@ -497,9 +527,6 @@ impl<'a> HeadProjection<'a> {
             }
             (GgmlType::Q2K, HeadProjectionLayout::OutputInputHeads)
             | (GgmlType::Q8_0, HeadProjectionLayout::OutputInputHeads) => {
-                if flat_tokens != 1 {
-                    return Ok(None);
-                }
                 self.forward_transposed_heads_device(backend, &flat_input, batch, tokens)
             }
             (other, _) => Err(Error::gguf(format!(
@@ -509,9 +536,10 @@ impl<'a> HeadProjection<'a> {
         }
     }
 
-    /// Single-token transposed head projection: one encoded transposed matvec
-    /// per head against that head's payload slice, stacked into `[1, 1, heads,
-    /// output_features]` with GPU copies. No synchronization happens here.
+    /// Transposed head projection: one encoded transposed matvec per head
+    /// against that head's payload slice, then token-major stacking into
+    /// `[batch, tokens, heads, output_features]`. This is required by MLA/DSA:
+    /// selected latent rows contain many tokens, not only the decode token.
     fn forward_transposed_heads_device<B: Backend>(
         &self,
         backend: &B,
@@ -577,21 +605,32 @@ impl<'a> HeadProjection<'a> {
                 GgmlType::Q2K => crate::try_device!(backend.q2_k_transposed_matvec_device(
                     head_bytes,
                     flat_input,
-                    1,
+                    batch.checked_mul(tokens).ok_or_else(|| {
+                        Error::model("GLM device transposed head projection row count overflow")
+                    })?,
                     self.input_features,
                     self.output_features,
                 )),
                 _ => crate::try_device!(backend.q8_0_transposed_matvec_device(
                     head_bytes,
                     flat_input,
-                    1,
+                    batch.checked_mul(tokens).ok_or_else(|| {
+                        Error::model("GLM device transposed head projection row count overflow")
+                    })?,
                     self.input_features,
                     self.output_features,
                 )),
             };
             head_outputs.push(head_output);
         }
-        let stacked = crate::try_device!(backend.moe_stack_rows_device(&head_outputs));
+        let flat_tokens = batch.checked_mul(tokens).ok_or_else(|| {
+            Error::model("GLM device transposed head projection row count overflow")
+        })?;
+        let stacked = crate::try_device!(backend.stack_head_outputs_device(
+            &head_outputs,
+            flat_tokens,
+            self.output_features,
+        ));
         Ok(Some(stacked.reshape(vec![
             batch,
             tokens,
@@ -1132,7 +1171,9 @@ impl<'a> Attention<'a> {
         backend: &B,
         output_chunk_rows: usize,
     ) -> Result<Self> {
-        if layer_index >= config.num_layers {
+        let is_single_mtp_layer =
+            layer_index == config.num_layers && config.num_nextn_predict_layers == 1;
+        if layer_index >= config.num_layers && !is_single_mtp_layer {
             return Err(Error::gguf(format!(
                 "GLM-5.2 GGUF attention layer {layer_index} exceeds num_layers {}",
                 config.num_layers
@@ -1214,6 +1255,18 @@ impl<'a> Attention<'a> {
             config.hidden_size,
             output_chunk_rows,
         )?;
+        let indexer = match attention.indexer.as_ref() {
+            Some(indexer) => DsaIndexer::open(
+                gguf,
+                config,
+                layer_index,
+                indexer,
+                q_lora_rank,
+                backend,
+                output_chunk_rows,
+            )?,
+            None => None,
+        };
 
         let load_report = AttentionLoadReport {
             backend: backend.capabilities(),
@@ -1237,13 +1290,14 @@ impl<'a> Attention<'a> {
                 kv_lora_rank,
             ),
             output_weight_shape: logical_weight_shape(&attention.output)?,
+            indexer: indexer.as_ref().map(|indexer| indexer.load_report().clone()),
             projection_tensor_type: attention.q_a.ty,
             output_chunk_rows,
             limitations: vec![
                 "GGUF attention uses split k_b and v_b tensors as stored by Antirez GLM-5.2 GGUF"
                     .to_string(),
                 "non-Q2 projection tensors still use chunked reference decoding".to_string(),
-                "paged attention and DSA sparse attention are not active in this component yet"
+                "DSA indexer top-k currently uses the host reference path before selected Metal attention"
                     .to_string(),
             ],
         };
@@ -1259,6 +1313,7 @@ impl<'a> Attention<'a> {
             k_b,
             v_b,
             output,
+            indexer,
             kv_lora_rank,
             load_report,
         })
@@ -1266,6 +1321,10 @@ impl<'a> Attention<'a> {
 
     pub fn load_report(&self) -> &AttentionLoadReport {
         &self.load_report
+    }
+
+    pub fn has_dsa_indexer(&self) -> bool {
+        self.indexer.is_some()
     }
 
     pub fn forward<B: Backend>(
@@ -1307,13 +1366,13 @@ impl<'a> Attention<'a> {
             &[batch, tokens, config.hidden_size],
         )?;
         let past_tokens = match past_kv {
-            Some((past_k, past_v)) => validate_past_kv(
+            Some((past_k, past_v)) => validate_mla_past_kv(
+                "gguf_attention",
                 past_k,
                 past_v,
                 batch,
-                config.attention_heads,
-                config.qk_head_dim,
-                config.v_head_dim(),
+                self.kv_lora_rank,
+                config.qk_rope_dim,
             )?,
             None => 0,
         };
@@ -1339,29 +1398,35 @@ impl<'a> Attention<'a> {
         let kv_a_mqa = self.kv_a_mqa.forward(&input_norm.hidden_states, backend)?;
         let (kv_latent, k_rope_mqa) =
             backend.split_kv_mqa(&kv_a_mqa.output, self.kv_lora_rank, config.qk_rope_dim)?;
-        let kv_a_norm = self.kv_a_norm.forward(&kv_latent, backend)?;
-        let k_b = self.k_b.forward_heads(&kv_a_norm.hidden_states, backend)?;
-        let v_b = self.v_b.forward_heads(&kv_a_norm.hidden_states, backend)?;
-        let k_no_rope = k_b.output_heads;
-        let v_heads = v_b.output_heads;
         let k_rope_after_rope = backend.rope_slice(
             &k_rope_mqa,
             config.qk_rope_dim,
             past_tokens,
             config.rope_theta as f32,
         )?;
-        let k_heads = backend.combine_rope_tail(&k_no_rope, &k_rope_after_rope)?;
+        let current_cache_k = mla_latent_cache(&kv_latent)?;
+        let current_cache_v = backend.heads_to_attention_layout(&k_rope_after_rope)?;
+        let (attention_latent, attention_rope) = mla_attention_sequences(
+            past_kv,
+            &kv_latent,
+            &k_rope_after_rope,
+            batch,
+            past_tokens,
+            self.kv_lora_rank,
+            config.qk_rope_dim,
+        )?;
+        let kv_a_norm = self.kv_a_norm.forward(&attention_latent, backend)?;
+        let k_b = self.k_b.forward_heads(&kv_a_norm.hidden_states, backend)?;
+        let v_b = self.v_b.forward_heads(&kv_a_norm.hidden_states, backend)?;
+        let k_no_rope = k_b.output_heads;
+        let v_heads = v_b.output_heads;
+        let k_heads = backend.combine_rope_tail(&k_no_rope, &attention_rope)?;
 
         let q_for_attention = backend.heads_to_attention_layout(&q_recombined)?;
         let k_for_attention = backend.heads_to_attention_layout(&k_heads)?;
         let v_for_attention = backend.heads_to_attention_layout(&v_heads)?;
-        let (attention_k, attention_v) = match past_kv {
-            Some((past_k, past_v)) => (
-                Tensor::cat(&[past_k, &k_for_attention], 2)?,
-                Tensor::cat(&[past_v, &v_for_attention], 2)?,
-            ),
-            None => (k_for_attention.clone(), v_for_attention.clone()),
-        };
+        let attention_k = k_for_attention;
+        let attention_v = v_for_attention;
 
         let raw_attention_scores =
             backend.attention_scores(&q_for_attention, &attention_k, config.qk_head_dim)?;
@@ -1397,8 +1462,8 @@ impl<'a> Attention<'a> {
             k_rope_after_rope_shape: Shape::new(k_rope_after_rope.dims().to_vec()),
             k_heads_shape: Shape::new(k_heads.dims().to_vec()),
             v_heads_shape: Shape::new(v_heads.dims().to_vec()),
-            cache_k_shape: Shape::new(k_for_attention.dims().to_vec()),
-            cache_v_shape: Shape::new(v_for_attention.dims().to_vec()),
+            cache_k_shape: Shape::new(current_cache_k.dims().to_vec()),
+            cache_v_shape: Shape::new(current_cache_v.dims().to_vec()),
             attention_k_shape: Shape::new(attention_k.dims().to_vec()),
             attention_v_shape: Shape::new(attention_v.dims().to_vec()),
             raw_attention_scores_shape: Shape::new(raw_attention_scores.dims().to_vec()),
@@ -1413,8 +1478,8 @@ impl<'a> Attention<'a> {
 
         Ok(AttentionOutput {
             hidden_states: output_hidden_states,
-            cache_k: k_for_attention,
-            cache_v: v_for_attention,
+            cache_k: current_cache_k,
+            cache_v: current_cache_v,
             report,
         })
     }
@@ -1459,13 +1524,13 @@ impl<'a> Attention<'a> {
             &[batch, tokens, config.hidden_size],
         )?;
         let past_tokens = match past_kv {
-            Some((past_k, past_v)) => validate_past_kv(
+            Some((past_k, past_v)) => validate_mla_past_kv(
+                "gguf_attention",
                 past_k,
                 past_v,
                 batch,
-                config.attention_heads,
-                config.qk_head_dim,
-                config.v_head_dim(),
+                self.kv_lora_rank,
+                config.qk_rope_dim,
             )?,
             None => 0,
         };
@@ -1488,27 +1553,33 @@ impl<'a> Attention<'a> {
         let kv_a_mqa = self.kv_a_mqa.forward_tensor(&input_norm, backend)?;
         let (kv_latent, k_rope_mqa) =
             backend.split_kv_mqa(&kv_a_mqa, self.kv_lora_rank, config.qk_rope_dim)?;
-        let kv_a_norm = self.kv_a_norm.forward_tensor(&kv_latent, backend)?;
-        let k_no_rope = self.k_b.forward_heads(&kv_a_norm, backend)?.output_heads;
-        let v_heads = self.v_b.forward_heads(&kv_a_norm, backend)?.output_heads;
         let k_rope_after_rope = backend.rope_slice(
             &k_rope_mqa,
             config.qk_rope_dim,
             past_tokens,
             config.rope_theta as f32,
         )?;
-        let k_heads = backend.combine_rope_tail(&k_no_rope, &k_rope_after_rope)?;
+        let current_cache_k = mla_latent_cache(&kv_latent)?;
+        let current_cache_v = backend.heads_to_attention_layout(&k_rope_after_rope)?;
+        let (attention_latent, attention_rope) = mla_attention_sequences(
+            past_kv,
+            &kv_latent,
+            &k_rope_after_rope,
+            batch,
+            past_tokens,
+            self.kv_lora_rank,
+            config.qk_rope_dim,
+        )?;
+        let kv_a_norm = self.kv_a_norm.forward_tensor(&attention_latent, backend)?;
+        let k_no_rope = self.k_b.forward_heads(&kv_a_norm, backend)?.output_heads;
+        let v_heads = self.v_b.forward_heads(&kv_a_norm, backend)?.output_heads;
+        let k_heads = backend.combine_rope_tail(&k_no_rope, &attention_rope)?;
 
         let q_for_attention = backend.heads_to_attention_layout(&q_recombined)?;
         let k_for_attention = backend.heads_to_attention_layout(&k_heads)?;
         let v_for_attention = backend.heads_to_attention_layout(&v_heads)?;
-        let (attention_k, attention_v) = match past_kv {
-            Some((past_k, past_v)) => (
-                Tensor::cat(&[past_k, &k_for_attention], 2)?,
-                Tensor::cat(&[past_v, &v_for_attention], 2)?,
-            ),
-            None => (k_for_attention.clone(), v_for_attention.clone()),
-        };
+        let attention_k = k_for_attention;
+        let attention_v = v_for_attention;
 
         let raw_attention_scores =
             backend.attention_scores(&q_for_attention, &attention_k, config.qk_head_dim)?;
@@ -1523,8 +1594,9 @@ impl<'a> Attention<'a> {
 
         Ok(AttentionTensors {
             hidden_states: output_hidden_states,
-            cache_k: tensor_to_f32_tensor(&k_for_attention)?,
-            cache_v: tensor_to_f32_tensor(&v_for_attention)?,
+            cache_k: tensor_to_f32_tensor(&current_cache_k)?,
+            cache_v: tensor_to_f32_tensor(&current_cache_v)?,
+            index_key: None,
         })
     }
 
@@ -1543,6 +1615,7 @@ impl<'a> Attention<'a> {
             hidden_states: tensor_from_f32_tensor(output.hidden_states, backend.device())?,
             cache_k: output.cache_k,
             cache_v: output.cache_v,
+            index_key: output.index_key,
         })
     }
 
@@ -1561,6 +1634,27 @@ impl<'a> Attention<'a> {
         )
     }
 
+    pub fn forward_sparse_f32_tensors_with_past_kv<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+        past_kv: Option<(&F32Tensor, &F32Tensor)>,
+        cached_index_keys: Option<&F32Tensor>,
+        shared_selection: Option<&[u32]>,
+    ) -> Result<SparseAttentionF32Tensors> {
+        self.forward_f32_tensors_with_sparse_context(
+            config,
+            hidden_states,
+            backend,
+            past_kv.map(|(cache_k, cache_v)| AttentionPastKv::Contiguous { cache_k, cache_v }),
+            Some(SparseAttentionContext {
+                cached_index_keys,
+                shared_selection,
+            }),
+        )
+    }
+
     pub fn forward_f32_tensors_with_paged_past_kv<B: Backend>(
         &self,
         config: &Config,
@@ -1568,12 +1662,12 @@ impl<'a> Attention<'a> {
         backend: &B,
         past_kv: Option<PagedKvView<'_>>,
     ) -> Result<AttentionF32Tensors> {
-        self.forward_f32_tensors_with_attention_past_kv(
-            config,
-            hidden_states,
-            backend,
-            past_kv.map(AttentionPastKv::Paged),
-        )
+        if past_kv.is_some() {
+            return Err(Error::backend(
+                "paged native attention still expects expanded K/V; MLA latent paged attention requires an absorbed Metal kernel",
+            ));
+        }
+        self.forward_f32_tensors_with_attention_past_kv(config, hidden_states, backend, None)
     }
 
     fn forward_f32_tensors_with_attention_past_kv<B: Backend>(
@@ -1583,6 +1677,19 @@ impl<'a> Attention<'a> {
         backend: &B,
         past_kv: Option<AttentionPastKv<'_>>,
     ) -> Result<AttentionF32Tensors> {
+        Ok(self
+            .forward_f32_tensors_with_sparse_context(config, hidden_states, backend, past_kv, None)?
+            .tensors)
+    }
+
+    fn forward_f32_tensors_with_sparse_context<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+        past_kv: Option<AttentionPastKv<'_>>,
+        sparse_context: Option<SparseAttentionContext<'_>>,
+    ) -> Result<SparseAttentionF32Tensors> {
         let dims = hidden_states.dims();
         if dims.len() != 3 {
             return Err(Error::model(format!(
@@ -1597,33 +1704,14 @@ impl<'a> Attention<'a> {
             &[batch, tokens, config.hidden_size],
         )?;
         let past_tokens = match past_kv.as_ref() {
-            Some(AttentionPastKv::Contiguous { cache_k, cache_v }) => validate_past_kv_f32(
+            Some(AttentionPastKv::Contiguous { cache_k, cache_v }) => validate_mla_past_kv(
+                "gguf_native_attention",
                 cache_k,
                 cache_v,
                 batch,
-                config.attention_heads,
-                config.qk_head_dim,
-                config.v_head_dim(),
+                self.kv_lora_rank,
+                config.qk_rope_dim,
             )?,
-            Some(AttentionPastKv::Paged(paged)) => {
-                paged.validate()?;
-                validate_exact_shape(
-                    "gguf_native_attention_paged_past_shape",
-                    &[
-                        paged.batch,
-                        paged.attention_heads,
-                        paged.key_head_dim,
-                        paged.value_head_dim,
-                    ],
-                    &[
-                        batch,
-                        config.attention_heads,
-                        config.qk_head_dim,
-                        config.v_head_dim(),
-                    ],
-                )?;
-                paged.cached_tokens
-            }
             None => 0,
         };
 
@@ -1662,18 +1750,6 @@ impl<'a> Attention<'a> {
             "split_kv_mqa",
             backend.split_kv_mqa_f32_tensor(&kv_a_mqa, self.kv_lora_rank, config.qk_rope_dim)?,
         )?;
-        let kv_a_norm = self
-            .kv_a_norm
-            .forward_f32(&kv_latent, backend)?
-            .hidden_states;
-        let k_no_rope = self
-            .k_b
-            .forward_heads_f32(&kv_a_norm, backend)?
-            .output_heads;
-        let v_for_cache = self
-            .v_b
-            .forward_heads_f32(&kv_a_norm, backend)?
-            .output_heads;
         let k_rope_after_rope = require_native(
             "rope_slice",
             backend.rope_slice_f32_tensor(
@@ -1683,74 +1759,120 @@ impl<'a> Attention<'a> {
                 config.rope_theta as f32,
             )?,
         )?;
+        let current_cache_k = mla_latent_cache(&kv_latent)?;
+        let current_cache_v = require_native(
+            "heads_to_attention_layout",
+            backend.heads_to_attention_layout_f32_tensor(&k_rope_after_rope)?,
+        )?;
+        let contiguous_past = match past_kv.as_ref() {
+            Some(AttentionPastKv::Contiguous { cache_k, cache_v }) => Some((*cache_k, *cache_v)),
+            None => None,
+        };
+        let sparse_selection = self.select_sparse_past_tokens(
+            config,
+            hidden_states,
+            &q_a_norm,
+            contiguous_past,
+            sparse_context,
+            past_tokens,
+            backend,
+        )?;
+        let mut index_key = sparse_selection.current_index_key.clone();
+        if index_key.is_none() {
+            index_key = match self.indexer.as_ref() {
+                Some(indexer) => {
+                    Some(indexer.key_f32(config, hidden_states, past_tokens, backend)?)
+                }
+                None => None,
+            };
+        }
+        let (attention_latent, attention_rope, attention_past_tokens) =
+            match sparse_selection.selected_past_tokens.as_ref() {
+                Some(selected_past_tokens) => mla_selected_attention_sequences(
+                    contiguous_past.ok_or_else(|| {
+                        Error::model("DSA sparse attention requires past MLA cache")
+                    })?,
+                    selected_past_tokens,
+                    &kv_latent,
+                    &k_rope_after_rope,
+                    batch,
+                    past_tokens,
+                    self.kv_lora_rank,
+                    config.qk_rope_dim,
+                )?,
+                None => {
+                    let (attention_latent, attention_rope) = mla_attention_sequences(
+                        contiguous_past,
+                        &kv_latent,
+                        &k_rope_after_rope,
+                        batch,
+                        past_tokens,
+                        self.kv_lora_rank,
+                        config.qk_rope_dim,
+                    )?;
+                    (attention_latent, attention_rope, past_tokens)
+                }
+            };
+        let kv_a_norm = self
+            .kv_a_norm
+            .forward_f32(&attention_latent, backend)?
+            .hidden_states;
+        let k_no_rope = self
+            .k_b
+            .forward_heads_f32(&kv_a_norm, backend)?
+            .output_heads;
+        let v_heads = self
+            .v_b
+            .forward_heads_f32(&kv_a_norm, backend)?
+            .output_heads;
         let k_heads = require_native(
             "combine_rope_tail",
-            backend.combine_rope_tail_f32_tensor(&k_no_rope, &k_rope_after_rope)?,
+            backend.combine_rope_tail_f32_tensor(&k_no_rope, &attention_rope)?,
         )?;
 
         let q_for_attention = require_native(
             "heads_to_attention_layout",
             backend.heads_to_attention_layout_f32_tensor(&q_recombined)?,
         )?;
-        let k_for_cache = require_native(
+        let attention_k = require_native(
             "heads_to_attention_layout",
             backend.heads_to_attention_layout_f32_tensor(&k_heads)?,
         )?;
-        let v_for_cache = require_native(
+        let attention_v = require_native(
             "heads_to_attention_layout",
-            backend.heads_to_attention_layout_f32_tensor(&v_for_cache)?,
+            backend.heads_to_attention_layout_f32_tensor(&v_heads)?,
         )?;
-        let context_heads = if let Some(AttentionPastKv::Paged(paged)) = past_kv.as_ref() {
-            validate_exact_shape("paged_decode_attention_tokens", &[tokens], &[1])?;
+        let context_heads = if tokens == 1 {
             require_native(
-                "paged_decode_attention",
-                backend.paged_decode_attention_f32_tensor(
+                "decode_attention",
+                backend.decode_attention_f32_tensor(
                     &q_for_attention,
-                    &k_for_cache,
-                    &v_for_cache,
-                    paged,
+                    &attention_k,
+                    &attention_v,
+                    config.qk_head_dim,
+                    attention_past_tokens,
                 )?,
             )?
         } else {
-            let (attention_k, attention_v) = match past_kv.as_ref() {
-                Some(AttentionPastKv::Contiguous { cache_k, cache_v }) => (
-                    concat_attention_kv_f32("K", cache_k, &k_for_cache)?,
-                    concat_attention_kv_f32("V", cache_v, &v_for_cache)?,
-                ),
-                Some(AttentionPastKv::Paged(_)) => unreachable!("paged attention handled above"),
-                None => (k_for_cache.clone(), v_for_cache.clone()),
-            };
-
-            if tokens == 1 {
-                require_native(
-                    "decode_attention",
-                    backend.decode_attention_f32_tensor(
-                        &q_for_attention,
-                        &attention_k,
-                        &attention_v,
-                        config.qk_head_dim,
-                        past_tokens,
-                    )?,
-                )?
-            } else {
-                let raw_attention_scores = require_native(
-                    "attention_scores",
-                    backend.attention_scores_f32_tensor(
-                        &q_for_attention,
-                        &attention_k,
-                        config.qk_head_dim,
-                    )?,
-                )?;
-                let attention_probs = require_native(
-                    "attention_causal_softmax",
-                    backend
-                        .attention_causal_softmax_f32_tensor(&raw_attention_scores, past_tokens)?,
-                )?;
-                require_native(
-                    "attention_values",
-                    backend.attention_values_f32_tensor(&attention_probs, &attention_v)?,
-                )?
-            }
+            let raw_attention_scores = require_native(
+                "attention_scores",
+                backend.attention_scores_f32_tensor(
+                    &q_for_attention,
+                    &attention_k,
+                    config.qk_head_dim,
+                )?,
+            )?;
+            let attention_probs = require_native(
+                "attention_causal_softmax",
+                backend.attention_causal_softmax_f32_tensor(
+                    &raw_attention_scores,
+                    attention_past_tokens,
+                )?,
+            )?;
+            require_native(
+                "attention_values",
+                backend.attention_values_f32_tensor(&attention_probs, &attention_v)?,
+            )?
         };
         let merged_attention_output = require_native(
             "merge_attention_heads",
@@ -1762,18 +1884,88 @@ impl<'a> Attention<'a> {
             backend,
         )?;
 
-        Ok(AttentionF32Tensors {
-            hidden_states: output_hidden_states,
-            cache_k: k_for_cache,
-            cache_v: v_for_cache,
+        Ok(SparseAttentionF32Tensors {
+            tensors: AttentionF32Tensors {
+                hidden_states: output_hidden_states,
+                cache_k: current_cache_k,
+                cache_v: current_cache_v,
+                index_key,
+            },
+            next_shared_selection: sparse_selection.next_shared_selection,
         })
     }
 
-    /// Batched device-resident decode attention: mirrors the native paged
-    /// path above, but every kernel is encoded into the backend's open batch
-    /// and intermediate tensors never leave the GPU. The single
-    /// synchronization is the download of the current token's K/V at the end,
-    /// which the host paged cache needs for its append.
+    fn select_sparse_past_tokens<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        q_resid: &F32Tensor,
+        past_kv: Option<(&F32Tensor, &F32Tensor)>,
+        sparse_context: Option<SparseAttentionContext<'_>>,
+        past_tokens: usize,
+        backend: &B,
+    ) -> Result<SparsePastSelection> {
+        let Some(context) = sparse_context else {
+            return Ok(SparsePastSelection {
+                selected_past_tokens: None,
+                next_shared_selection: None,
+                current_index_key: None,
+            });
+        };
+        if hidden_states.dims()[1] != 1 || past_tokens == 0 || past_kv.is_none() {
+            return Ok(SparsePastSelection {
+                selected_past_tokens: None,
+                next_shared_selection: None,
+                current_index_key: None,
+            });
+        }
+
+        if let Some(indexer) = self.indexer.as_ref() {
+            let cached_index_keys = context.cached_index_keys.ok_or_else(|| {
+                Error::model(format!(
+                    "DSA index keys missing for sparse attention layer {}",
+                    self.layer_index
+                ))
+            })?;
+            let selection = indexer.select_decode_topk(
+                config,
+                hidden_states,
+                q_resid,
+                cached_index_keys,
+                past_tokens,
+                backend,
+            )?;
+            let selected_past_tokens =
+                past_only_selected_indices(&selection.token_indices, past_tokens)?;
+            return Ok(SparsePastSelection {
+                selected_past_tokens: Some(selected_past_tokens),
+                next_shared_selection: Some(selection.token_indices),
+                current_index_key: Some(selection.current_key),
+            });
+        }
+
+        if let Some(shared_selection) = context.shared_selection {
+            return Ok(SparsePastSelection {
+                selected_past_tokens: Some(past_only_selected_indices(
+                    shared_selection,
+                    past_tokens,
+                )?),
+                next_shared_selection: None,
+                current_index_key: None,
+            });
+        }
+
+        Ok(SparsePastSelection {
+            selected_past_tokens: None,
+            next_shared_selection: None,
+            current_index_key: None,
+        })
+    }
+
+    /// Batched device-resident decode attention: every kernel is encoded into
+    /// the backend's open batch and intermediate tensors never leave the GPU.
+    /// Past K/V is read from the resident Metal cache, and the current
+    /// token's K/V is returned as device handles for append.
     ///
     /// Returns `Ok(None)` when any component has no device path (the caller
     /// falls back to the eager route); requires a single decode token.
@@ -1782,7 +1974,7 @@ impl<'a> Attention<'a> {
         config: &Config,
         hidden_states: &DeviceValue,
         backend: &B,
-        past_kv: &PagedKvView<'_>,
+        past_kv: &DevicePagedKvView,
     ) -> Result<Option<AttentionDeviceTensors>> {
         let dims = hidden_states.dims();
         if dims.len() != 3 {
@@ -1801,96 +1993,591 @@ impl<'a> Attention<'a> {
             &[batch, tokens, config.hidden_size],
         )?;
         past_kv.validate()?;
-        validate_exact_shape(
-            "gguf_device_attention_paged_past_shape",
-            &[
-                past_kv.batch,
-                past_kv.attention_heads,
-                past_kv.key_head_dim,
-                past_kv.value_head_dim,
-            ],
-            &[
-                batch,
-                config.attention_heads,
-                config.qk_head_dim,
-                config.v_head_dim(),
-            ],
-        )?;
+        let past_layout =
+            validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
         let past_tokens = past_kv.cached_tokens;
 
-        let input_norm = crate::try_device!(self.input_norm.forward_device(hidden_states, backend));
-        let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
-        let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
-        let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
-        let q_heads = q_b.reshape(vec![
-            batch,
-            tokens,
-            config.attention_heads,
-            config.qk_head_dim,
-        ])?;
-        let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
-            &q_heads,
-            config.qk_no_rope_dim,
-            config.qk_rope_dim,
+        let input_norm = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.input_norm",
+            || self.input_norm.forward_device(hidden_states, backend),
         ));
-        let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-            &q_rope,
-            config.qk_rope_dim,
-            past_tokens,
-            config.rope_theta as f32,
-        ));
-        let q_recombined =
-            crate::try_device!(backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope));
-
-        let kv_a_mqa = crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-        let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
-            &kv_a_mqa,
-            self.kv_lora_rank,
-            config.qk_rope_dim,
-        ));
-        let kv_a_norm = crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-        let k_no_rope = crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
-        let v_heads = crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
-        let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-            &k_rope_mqa,
-            config.qk_rope_dim,
-            past_tokens,
-            config.rope_theta as f32,
-        ));
-        let k_heads =
-            crate::try_device!(backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope));
-
-        let q_for_attention =
-            crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
-        let k_for_cache = crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
-        let v_for_cache = crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
-
-        let context_heads = crate::try_device!(backend.paged_decode_attention_device(
-            &q_for_attention,
-            &k_for_cache,
-            &v_for_cache,
-            past_kv,
-        ));
-        let merged_attention_output =
-            crate::try_device!(backend.merge_attention_heads_device(&context_heads));
-        let output_hidden_states = crate::try_device!(self.output.forward_device_add_residual(
-            &merged_attention_output,
-            hidden_states,
-            backend,
+        let q_recombined = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.q_projection",
+            || {
+                let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+                let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
+                let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
+                let q_heads = q_b.reshape(vec![
+                    batch,
+                    tokens,
+                    config.attention_heads,
+                    config.qk_head_dim,
+                ])?;
+                let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
+                    &q_heads,
+                    config.qk_no_rope_dim,
+                    config.qk_rope_dim,
+                ));
+                let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                    &q_rope,
+                    config.qk_rope_dim,
+                    past_tokens,
+                    config.rope_theta as f32,
+                ));
+                let q_recombined = crate::try_device!(
+                    backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                );
+                Ok(Some(q_recombined))
+            },
         ));
 
-        // The paged KV cache lives on the host, so the current token's K/V
-        // must come back. This download flushes the batch — the one GPU sync
-        // for everything encoded above.
-        let cache_k = backend.device_download_f32_tensor(&k_for_cache)?;
-        let cache_v = backend.device_download_f32_tensor(&v_for_cache)?;
+        let (kv_latent, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
+            profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
+                let kv_a_mqa =
+                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
+                    &kv_a_mqa,
+                    self.kv_lora_rank,
+                    config.qk_rope_dim,
+                ));
+                let kv_a_norm =
+                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+                let k_no_rope =
+                    crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
+                let v_heads =
+                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                    &k_rope_mqa,
+                    config.qk_rope_dim,
+                    past_tokens,
+                    config.rope_theta as f32,
+                ));
+                let k_heads = crate::try_device!(
+                    backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
+                );
+                Ok(Some((kv_latent, k_rope_after_rope, k_heads, v_heads)))
+            },)
+        );
+
+        let (q_for_attention, current_k_for_attention, current_v_for_attention) = crate::try_device!(
+            profile::run_layer_stage(self.layer_index, "attention.cache_layout", || {
+                let q_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
+                let current_k_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
+                let current_v_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
+                Ok(Some((
+                    q_for_attention,
+                    current_k_for_attention,
+                    current_v_for_attention,
+                )))
+            },)
+        );
+
+        let (k_for_cache, v_for_cache) = match past_layout {
+            DevicePastKvLayout::ExpandedHeads => (
+                current_k_for_attention.clone(),
+                current_v_for_attention.clone(),
+            ),
+            DevicePastKvLayout::MlaLatent => {
+                let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
+                let cache_v = crate::try_device!(
+                    backend.heads_to_attention_layout_device(&k_rope_after_rope)
+                );
+                (cache_k, cache_v)
+            }
+        };
+
+        let context_heads = match past_layout {
+            DevicePastKvLayout::ExpandedHeads => crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "attention.dense_paged_decode",
+                || backend.paged_decode_attention_resident_device(
+                    &q_for_attention,
+                    &current_k_for_attention,
+                    &current_v_for_attention,
+                    past_kv,
+                ),
+            )),
+            DevicePastKvLayout::MlaLatent => crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "attention.dense_mla_decode",
+                || {
+                    let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
+                    validate_exact_shape(
+                        "dense_mla_past_device_kv_shape",
+                        &[
+                            past.batch,
+                            past.attention_heads,
+                            past.key_head_dim,
+                            past.value_head_dim,
+                        ],
+                        &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
+                    )?;
+                    let past_latent =
+                        past.k
+                            .reshape(vec![batch, past.selected_tokens, self.kv_lora_rank])?;
+                    let past_rope =
+                        past.v
+                            .reshape(vec![batch, past.selected_tokens, 1, config.qk_rope_dim])?;
+                    let past_latent_norm =
+                        crate::try_device!(self.kv_a_norm.forward_device(&past_latent, backend));
+                    let past_k_no_rope = crate::try_device!(self
+                        .k_b
+                        .forward_heads_device(&past_latent_norm, backend));
+                    let past_v_heads = crate::try_device!(self
+                        .v_b
+                        .forward_heads_device(&past_latent_norm, backend));
+                    let past_k_heads = crate::try_device!(
+                        backend.combine_rope_tail_device(&past_k_no_rope, &past_rope)
+                    );
+                    let past_k_for_attention =
+                        crate::try_device!(backend.heads_to_attention_layout_device(&past_k_heads));
+                    let past_v_for_attention =
+                        crate::try_device!(backend.heads_to_attention_layout_device(&past_v_heads));
+                    backend.selected_decode_attention_device(
+                        &q_for_attention,
+                        &past_k_for_attention,
+                        &past_v_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                    )
+                },
+            )),
+        };
+        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.output_projection",
+            || {
+                let merged_attention_output =
+                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+                self.output.forward_device_add_residual(
+                    &merged_attention_output,
+                    hidden_states,
+                    backend,
+                )
+            },
+        ));
+
+        Ok(Some(AttentionDeviceTensors {
+            hidden_states: output_hidden_states,
+            cache_k: k_for_cache,
+            cache_v: v_for_cache,
+            index_key: None,
+        }))
+    }
+
+    pub(crate) fn forward_seed_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &DeviceValue,
+        backend: &B,
+    ) -> Result<Option<AttentionDeviceTensors>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF seed device attention input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        if tokens != 1 {
+            return Ok(None);
+        }
+        validate_exact_shape(
+            "gguf_seed_device_attention_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+
+        let input_norm = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.input_norm.seed_device",
+            || self.input_norm.forward_device(hidden_states, backend),
+        ));
+        let (kv_latent, k_rope_after_rope, v_heads) = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.kv_projection.seed_device",
+            || {
+                let kv_a_mqa =
+                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
+                    &kv_a_mqa,
+                    self.kv_lora_rank,
+                    config.qk_rope_dim,
+                ));
+                let kv_a_norm =
+                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+                let v_heads =
+                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                    &k_rope_mqa,
+                    config.qk_rope_dim,
+                    0,
+                    config.rope_theta as f32,
+                ));
+                Ok(Some((kv_latent, k_rope_after_rope, v_heads)))
+            },
+        ));
+
+        let context_heads = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.single_token_context.seed_device",
+            || backend.heads_to_attention_layout_device(&v_heads),
+        ));
+        let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
+        let cache_v =
+            crate::try_device!(backend.heads_to_attention_layout_device(&k_rope_after_rope));
+
+        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.output_projection.seed_device",
+            || {
+                let merged_attention_output =
+                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+                self.output.forward_device_add_residual(
+                    &merged_attention_output,
+                    hidden_states,
+                    backend,
+                )
+            },
+        ));
+
+        let index_key = if let Some(indexer) = self.indexer.as_ref() {
+            let index_key_device =
+                crate::try_device!(indexer.key_device(config, hidden_states, 0, backend));
+            Some(backend.device_download_f32_tensor(&index_key_device)?)
+        } else {
+            None
+        };
 
         Ok(Some(AttentionDeviceTensors {
             hidden_states: output_hidden_states,
             cache_k,
             cache_v,
+            index_key,
         }))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_sparse_decode_device<B, S, I>(
+        &self,
+        config: &Config,
+        hidden_states: &DeviceValue,
+        backend: &B,
+        past_kv: &DevicePagedKvView,
+        selected_kv_for_tokens: &mut S,
+        index_keys_for_layer: &mut I,
+        shared_selection: Option<&[u32]>,
+    ) -> Result<Option<SparseAttentionDeviceTensors>>
+    where
+        B: Backend,
+        S: FnMut(usize, &[u32]) -> Result<Option<DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<DeviceValue>>,
+    {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF sparse device attention input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        if tokens != 1 {
+            return Ok(None);
+        }
+        validate_exact_shape(
+            "gguf_sparse_device_attention_hidden_states",
+            dims,
+            &[batch, tokens, config.hidden_size],
+        )?;
+        past_kv.validate()?;
+        let past_layout =
+            validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
+        let past_tokens = past_kv.cached_tokens;
+
+        let input_norm = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.input_norm",
+            || self.input_norm.forward_device(hidden_states, backend),
+        ));
+        let (q_recombined, q_resid) = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.q_projection",
+            || {
+                let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+                let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
+                let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
+                let q_heads = q_b.reshape(vec![
+                    batch,
+                    tokens,
+                    config.attention_heads,
+                    config.qk_head_dim,
+                ])?;
+                let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
+                    &q_heads,
+                    config.qk_no_rope_dim,
+                    config.qk_rope_dim,
+                ));
+                let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                    &q_rope,
+                    config.qk_rope_dim,
+                    past_tokens,
+                    config.rope_theta as f32,
+                ));
+                let q_recombined = crate::try_device!(
+                    backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                );
+                Ok(Some((q_recombined, q_a_norm)))
+            },
+        ));
+
+        let (kv_latent, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
+            profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
+                let kv_a_mqa =
+                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
+                    &kv_a_mqa,
+                    self.kv_lora_rank,
+                    config.qk_rope_dim,
+                ));
+                let kv_a_norm =
+                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+                let k_no_rope =
+                    crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
+                let v_heads =
+                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                    &k_rope_mqa,
+                    config.qk_rope_dim,
+                    past_tokens,
+                    config.rope_theta as f32,
+                ));
+                let k_heads = crate::try_device!(
+                    backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
+                );
+                Ok(Some((kv_latent, k_rope_after_rope, k_heads, v_heads)))
+            },)
+        );
+
+        let (q_for_attention, current_k_for_attention, current_v_for_attention) = crate::try_device!(
+            profile::run_layer_stage(self.layer_index, "attention.cache_layout", || {
+                let q_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
+                let current_k_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
+                let current_v_for_attention =
+                    crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
+                Ok(Some((
+                    q_for_attention,
+                    current_k_for_attention,
+                    current_v_for_attention,
+                )))
+            },)
+        );
+
+        let (k_for_cache, v_for_cache) = match past_layout {
+            DevicePastKvLayout::ExpandedHeads => (
+                current_k_for_attention.clone(),
+                current_v_for_attention.clone(),
+            ),
+            DevicePastKvLayout::MlaLatent => {
+                let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
+                let cache_v = crate::try_device!(
+                    backend.heads_to_attention_layout_device(&k_rope_after_rope)
+                );
+                (cache_k, cache_v)
+            }
+        };
+
+        let mut index_key = None;
+        let mut next_shared_selection = None;
+        let selected_past_tokens = if let Some(indexer) = self.indexer.as_ref() {
+            let cached_index_keys = index_keys_for_layer(self.layer_index)?.ok_or_else(|| {
+                Error::model(format!(
+                    "DSA index keys missing for full sparse attention layer {}",
+                    self.layer_index
+                ))
+            })?;
+            let selection = crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "dsa_indexer.topk_device",
+                || indexer.select_decode_topk_device(
+                    config,
+                    hidden_states,
+                    &q_resid,
+                    &cached_index_keys,
+                    past_tokens,
+                    backend,
+                ),
+            ));
+            let current_key = profile::run_layer_stage(
+                self.layer_index,
+                "dsa_indexer.download_current_key",
+                || backend.device_download_f32_tensor(&selection.current_key_device),
+            )?;
+            index_key = Some(current_key);
+            next_shared_selection = Some(selection.token_indices.clone());
+            past_only_selected_indices(&selection.token_indices, past_tokens)?
+        } else if let Some(shared_selection) = shared_selection {
+            past_only_selected_indices(shared_selection, past_tokens)?
+        } else {
+            Vec::new()
+        };
+
+        let context_heads = if selected_past_tokens.is_empty() {
+            match past_layout {
+                DevicePastKvLayout::ExpandedHeads => crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.dense_paged_decode",
+                    || backend.paged_decode_attention_resident_device(
+                        &q_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                        past_kv,
+                    ),
+                )),
+                DevicePastKvLayout::MlaLatent => current_v_for_attention.clone(),
+            }
+        } else {
+            let selected_kv = selected_kv_for_tokens(self.layer_index, &selected_past_tokens)?
+                .ok_or_else(|| {
+                    Error::cache(format!(
+                        "selected device KV missing for sparse attention layer {}",
+                        self.layer_index
+                    ))
+                })?;
+            selected_kv.validate()?;
+            match past_layout {
+                DevicePastKvLayout::ExpandedHeads => {
+                    validate_exact_shape(
+                        "sparse_selected_device_kv_shape",
+                        &[
+                            selected_kv.batch,
+                            selected_kv.attention_heads,
+                            selected_kv.key_head_dim,
+                            selected_kv.value_head_dim,
+                        ],
+                        &[
+                            batch,
+                            config.attention_heads,
+                            config.qk_head_dim,
+                            config.v_head_dim(),
+                        ],
+                    )?;
+                    crate::try_device!(profile::run_layer_stage(
+                        self.layer_index,
+                        "attention.selected_decode",
+                        || backend.selected_decode_attention_device(
+                            &q_for_attention,
+                            &selected_kv.k,
+                            &selected_kv.v,
+                            &current_k_for_attention,
+                            &current_v_for_attention,
+                        ),
+                    ))
+                }
+                DevicePastKvLayout::MlaLatent => {
+                    validate_exact_shape(
+                        "sparse_selected_mla_device_kv_shape",
+                        &[
+                            selected_kv.batch,
+                            selected_kv.attention_heads,
+                            selected_kv.key_head_dim,
+                            selected_kv.value_head_dim,
+                        ],
+                        &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
+                    )?;
+                    let selected_tokens = selected_kv.selected_tokens;
+                    let context = crate::try_device!(profile::run_layer_stage(
+                        self.layer_index,
+                        "attention.selected_mla_decode",
+                        || {
+                            let selected_latent = selected_kv.k.reshape(vec![
+                                batch,
+                                selected_tokens,
+                                self.kv_lora_rank,
+                            ])?;
+                            let selected_rope = selected_kv.v.reshape(vec![
+                                batch,
+                                selected_tokens,
+                                1,
+                                config.qk_rope_dim,
+                            ])?;
+                            let selected_latent_norm = crate::try_device!(self
+                                .kv_a_norm
+                                .forward_device(&selected_latent, backend));
+                            let selected_k_no_rope = crate::try_device!(self
+                                .k_b
+                                .forward_heads_device(&selected_latent_norm, backend));
+                            let selected_v_heads = crate::try_device!(self
+                                .v_b
+                                .forward_heads_device(&selected_latent_norm, backend));
+                            let selected_k_heads = crate::try_device!(backend
+                                .combine_rope_tail_device(&selected_k_no_rope, &selected_rope,));
+                            let selected_k_for_attention = crate::try_device!(
+                                backend.heads_to_attention_layout_device(&selected_k_heads)
+                            );
+                            let selected_v_for_attention = crate::try_device!(
+                                backend.heads_to_attention_layout_device(&selected_v_heads)
+                            );
+                            backend.selected_decode_attention_device(
+                                &q_for_attention,
+                                &selected_k_for_attention,
+                                &selected_v_for_attention,
+                                &current_k_for_attention,
+                                &current_v_for_attention,
+                            )
+                        },
+                    ));
+                    context
+                }
+            }
+        };
+
+        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "attention.output_projection",
+            || {
+                let merged_attention_output =
+                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+                self.output.forward_device_add_residual(
+                    &merged_attention_output,
+                    hidden_states,
+                    backend,
+                )
+            },
+        ));
+
+        Ok(Some(SparseAttentionDeviceTensors {
+            tensors: AttentionDeviceTensors {
+                hidden_states: output_hidden_states,
+                cache_k: k_for_cache,
+                cache_v: v_for_cache,
+                index_key,
+            },
+            next_shared_selection,
+        }))
+    }
+}
+
+fn past_only_selected_indices(token_indices: &[u32], past_tokens: usize) -> Result<Vec<u32>> {
+    let mut selected = Vec::with_capacity(token_indices.len());
+    for token in token_indices {
+        let token_usize = usize::try_from(*token)
+            .map_err(|_| Error::model("DSA selected token index does not fit usize"))?;
+        if token_usize < past_tokens {
+            selected.push(*token);
+        } else if token_usize > past_tokens {
+            return Err(Error::model(format!(
+                "DSA selected future token {token_usize}; current decode position is {past_tokens}"
+            )));
+        }
+    }
+    Ok(selected)
 }
 
 fn validate_q_a(config: &Config, tensor_ref: &TensorRef) -> Result<usize> {
@@ -1919,6 +2606,12 @@ fn validate_kv_a(config: &Config, tensor_ref: &TensorRef) -> Result<usize> {
         })?;
     if kv_lora_rank == 0 {
         return Err(Error::gguf("GGUF kv_lora_rank must be positive"));
+    }
+    if kv_lora_rank != config.kv_lora_rank {
+        return Err(Error::gguf(format!(
+            "GGUF kv_lora_rank {kv_lora_rank} does not match config kv_lora_rank {}",
+            config.kv_lora_rank
+        )));
     }
     validate_linear_ref(
         "gguf_attention_kv_a_mqa",
@@ -2055,62 +2748,198 @@ fn validate_tensor_ref(tensor_ref: &TensorRef, info: &gguf::GgufTensorInfo) -> R
     Ok(())
 }
 
-fn validate_past_kv(
+fn validate_mla_past_kv(
+    context: &str,
     past_k: &Tensor,
     past_v: &Tensor,
     batch: usize,
-    attention_heads: usize,
-    qk_head_dim: usize,
-    v_head_dim: usize,
+    kv_lora_rank: usize,
+    qk_rope_dim: usize,
 ) -> Result<usize> {
     let k_dims = past_k.dims();
     let v_dims = past_v.dims();
     if k_dims.len() != 4 || v_dims.len() != 4 {
         return Err(Error::model(format!(
-            "GGUF attention past K/V must be rank 4 [B,H,T,D], got k={k_dims:?} v={v_dims:?}"
+            "{context} MLA past cache must be rank 4; latent={k_dims:?} rope={v_dims:?}"
         )));
     }
     let past_tokens = k_dims[2];
     validate_exact_shape(
-        "gguf_attention_past_k",
+        format!("{context}_mla_past_latent"),
         k_dims,
-        &[batch, attention_heads, past_tokens, qk_head_dim],
+        &[batch, 1, past_tokens, kv_lora_rank],
     )?;
     validate_exact_shape(
-        "gguf_attention_past_v",
+        format!("{context}_mla_past_rope"),
         v_dims,
-        &[batch, attention_heads, past_tokens, v_head_dim],
+        &[batch, 1, past_tokens, qk_rope_dim],
     )?;
     Ok(past_tokens)
 }
 
-fn validate_past_kv_f32(
-    past_k: &F32Tensor,
-    past_v: &F32Tensor,
+fn validate_device_past_kv_layout(
+    past_kv: &DevicePagedKvView,
     batch: usize,
-    attention_heads: usize,
-    qk_head_dim: usize,
-    v_head_dim: usize,
-) -> Result<usize> {
-    let k_dims = past_k.dims();
-    let v_dims = past_v.dims();
-    if k_dims.len() != 4 || v_dims.len() != 4 {
+    config: &Config,
+    kv_lora_rank: usize,
+) -> Result<DevicePastKvLayout> {
+    let layout = [
+        past_kv.batch,
+        past_kv.attention_heads,
+        past_kv.key_head_dim,
+        past_kv.value_head_dim,
+    ];
+    let expanded = [
+        batch,
+        config.attention_heads,
+        config.qk_head_dim,
+        config.v_head_dim(),
+    ];
+    if layout == expanded {
+        return Ok(DevicePastKvLayout::ExpandedHeads);
+    }
+
+    let latent = [batch, 1, kv_lora_rank, config.qk_rope_dim];
+    if layout == latent {
+        return Ok(DevicePastKvLayout::MlaLatent);
+    }
+
+    Err(Error::model(format!(
+        "GLM sparse device attention requires expanded K/V {:?} or MLA latent K/V {:?}, got {:?}",
+        expanded, latent, layout
+    )))
+}
+
+fn mla_latent_cache(kv_latent: &Tensor) -> Result<Tensor> {
+    let dims = kv_latent.dims();
+    if dims.len() != 3 {
         return Err(Error::model(format!(
-            "GGUF native attention past K/V must be rank 4 [B,H,T,D], got k={k_dims:?} v={v_dims:?}"
+            "GLM MLA latent cache source must be rank 3 [B,T,R], got {dims:?}"
         )));
     }
-    let past_tokens = k_dims[2];
+    kv_latent.unsqueeze(1)
+}
+
+fn mla_attention_sequences(
+    past_kv: Option<(&Tensor, &Tensor)>,
+    current_latent: &Tensor,
+    current_rope: &Tensor,
+    batch: usize,
+    past_tokens: usize,
+    kv_lora_rank: usize,
+    qk_rope_dim: usize,
+) -> Result<(Tensor, Tensor)> {
+    let current_latent_dims = current_latent.dims();
+    if current_latent_dims.len() != 3 {
+        return Err(Error::model(format!(
+            "GLM MLA current latent must be rank 3 [B,T,R], got {current_latent_dims:?}"
+        )));
+    }
+    let current_tokens = current_latent_dims[1];
     validate_exact_shape(
-        "gguf_native_attention_past_k",
-        k_dims,
-        &[batch, attention_heads, past_tokens, qk_head_dim],
+        "glm_mla_current_latent",
+        current_latent_dims,
+        &[batch, current_tokens, kv_lora_rank],
     )?;
     validate_exact_shape(
-        "gguf_native_attention_past_v",
-        v_dims,
-        &[batch, attention_heads, past_tokens, v_head_dim],
+        "glm_mla_current_rope",
+        current_rope.dims(),
+        &[batch, current_tokens, 1, qk_rope_dim],
     )?;
-    Ok(past_tokens)
+
+    match past_kv {
+        Some((past_k, past_v)) => {
+            let past_latent = past_k.clone().reshape((batch, past_tokens, kv_lora_rank))?;
+            let past_rope = past_v
+                .clone()
+                .reshape((batch, past_tokens, 1, qk_rope_dim))?;
+            Ok((
+                Tensor::cat(&[&past_latent, current_latent], 1)?,
+                Tensor::cat(&[&past_rope, current_rope], 1)?,
+            ))
+        }
+        None => Ok((current_latent.clone(), current_rope.clone())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mla_selected_attention_sequences(
+    past_kv: (&Tensor, &Tensor),
+    selected_past_tokens: &[u32],
+    current_latent: &Tensor,
+    current_rope: &Tensor,
+    batch: usize,
+    past_tokens: usize,
+    kv_lora_rank: usize,
+    qk_rope_dim: usize,
+) -> Result<(Tensor, Tensor, usize)> {
+    validate_exact_shape(
+        "glm_mla_selected_current_latent",
+        current_latent.dims(),
+        &[batch, 1, kv_lora_rank],
+    )?;
+    validate_exact_shape(
+        "glm_mla_selected_current_rope",
+        current_rope.dims(),
+        &[batch, 1, 1, qk_rope_dim],
+    )?;
+    validate_mla_past_kv(
+        "glm_mla_selected",
+        past_kv.0,
+        past_kv.1,
+        batch,
+        kv_lora_rank,
+        qk_rope_dim,
+    )?;
+
+    let selected_tokens = selected_past_tokens.len();
+    let total_tokens = selected_tokens
+        .checked_add(1)
+        .ok_or_else(|| Error::model("GLM MLA selected attention token count overflow"))?;
+    let mut latent = vec![0.0_f32; batch * total_tokens * kv_lora_rank];
+    let mut rope = vec![0.0_f32; batch * total_tokens * qk_rope_dim];
+
+    for (selected_index, token) in selected_past_tokens.iter().copied().enumerate() {
+        let token = usize::try_from(token)
+            .map_err(|_| Error::model("DSA selected token index does not fit usize"))?;
+        if token >= past_tokens {
+            return Err(Error::model(format!(
+                "DSA selected past token {token} exceeds cached past token count {past_tokens}"
+            )));
+        }
+        for batch_index in 0..batch {
+            let latent_source = ((batch_index * past_tokens + token) * kv_lora_rank) as usize;
+            let latent_target =
+                ((batch_index * total_tokens + selected_index) * kv_lora_rank) as usize;
+            latent[latent_target..latent_target + kv_lora_rank]
+                .copy_from_slice(&past_kv.0.values()[latent_source..latent_source + kv_lora_rank]);
+
+            let rope_source = ((batch_index * past_tokens + token) * qk_rope_dim) as usize;
+            let rope_target =
+                ((batch_index * total_tokens + selected_index) * qk_rope_dim) as usize;
+            rope[rope_target..rope_target + qk_rope_dim]
+                .copy_from_slice(&past_kv.1.values()[rope_source..rope_source + qk_rope_dim]);
+        }
+    }
+
+    for batch_index in 0..batch {
+        let latent_source = batch_index * kv_lora_rank;
+        let latent_target =
+            ((batch_index * total_tokens + selected_tokens) * kv_lora_rank) as usize;
+        latent[latent_target..latent_target + kv_lora_rank]
+            .copy_from_slice(&current_latent.values()[latent_source..latent_source + kv_lora_rank]);
+
+        let rope_source = batch_index * qk_rope_dim;
+        let rope_target = ((batch_index * total_tokens + selected_tokens) * qk_rope_dim) as usize;
+        rope[rope_target..rope_target + qk_rope_dim]
+            .copy_from_slice(&current_rope.values()[rope_source..rope_source + qk_rope_dim]);
+    }
+
+    Ok((
+        Tensor::new(latent, [batch, total_tokens, kv_lora_rank])?,
+        Tensor::new(rope, [batch, total_tokens, 1, qk_rope_dim])?,
+        selected_tokens,
+    ))
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
@@ -2133,56 +2962,6 @@ fn require_native<T>(operation: &str, value: Option<T>) -> Result<T> {
             "native Metal {operation} is required for the GLM-5.2 Q2 attention path"
         ))
     })
-}
-
-fn concat_attention_kv_f32(name: &str, past: &F32Tensor, current: &F32Tensor) -> Result<F32Tensor> {
-    let past_dims = past.dims();
-    let current_dims = current.dims();
-    if past_dims.len() != 4 || current_dims.len() != 4 {
-        return Err(Error::model(format!(
-            "native attention {name} concat expects rank 4 [B,H,T,D], got past={past_dims:?} current={current_dims:?}"
-        )));
-    }
-    validate_exact_shape(
-        format!("native_attention_{name}_concat_batch_heads_dim"),
-        &[current_dims[0], current_dims[1], current_dims[3]],
-        &[past_dims[0], past_dims[1], past_dims[3]],
-    )?;
-    let batch = past_dims[0];
-    let heads = past_dims[1];
-    let past_tokens = past_dims[2];
-    let current_tokens = current_dims[2];
-    let dim = past_dims[3];
-    let total_tokens = past_tokens.checked_add(current_tokens).ok_or_else(|| {
-        Error::model(format!(
-            "native attention {name} concat token count overflow"
-        ))
-    })?;
-
-    let mut output = vec![0.0_f32; batch * heads * total_tokens * dim];
-    for batch_index in 0..batch {
-        for head_index in 0..heads {
-            for token_index in 0..past_tokens {
-                let source = (((batch_index * heads + head_index) * past_tokens + token_index)
-                    * dim) as usize;
-                let target = (((batch_index * heads + head_index) * total_tokens + token_index)
-                    * dim) as usize;
-                output[target..target + dim].copy_from_slice(&past.values()[source..source + dim]);
-            }
-            for token_index in 0..current_tokens {
-                let source = (((batch_index * heads + head_index) * current_tokens + token_index)
-                    * dim) as usize;
-                let target = (((batch_index * heads + head_index) * total_tokens
-                    + past_tokens
-                    + token_index)
-                    * dim) as usize;
-                output[target..target + dim]
-                    .copy_from_slice(&current.values()[source..source + dim]);
-            }
-        }
-    }
-
-    F32Tensor::new(output, [batch, heads, total_tokens, dim])
 }
 
 fn reject_missing_native_q2_kernel_on_metal<B: Backend>(
@@ -2212,6 +2991,8 @@ mod tests {
         GgmlType, GgufFile, GgufMetadataValueType, GGML_Q2_K_BLOCK_BYTES, GGML_Q8_0_BLOCK_BYTES,
         GGUF_MAGIC, GGUF_VERSION_V3,
     };
+
+    use crate::IndexerIndex;
 
     use super::*;
 
@@ -2257,8 +3038,8 @@ mod tests {
             GgmlType::Q2K
         );
         assert_eq!(decode.hidden_states.dims(), &[1, 1, 256]);
-        assert_eq!(decode.cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode.cache_v.dims(), &[1, 2, 1, 256]);
+        assert_eq!(decode.cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode.cache_v.dims(), &[1, 1, 1, 128]);
         assert_eq!(decode.report.past_tokens, 3);
         assert_eq!(decode.report.attention_scores_shape.dims(), &[1, 2, 1, 4]);
         assert_eq!(decode.report.attention_k_shape.dims(), &[1, 2, 4, 256]);
@@ -2288,6 +3069,78 @@ mod tests {
         assert!(err.to_string().contains("gguf_attention_k_b"));
     }
 
+    #[test]
+    fn loads_full_dsa_indexer_when_tensor_refs_are_present() {
+        let path = write_attention_fixture_with_indexer(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = tiny_config();
+        let attention_index = attention_index_with_indexer(&gguf);
+        let input_norm = tensor_ref(&gguf, "blk.0.attn_norm.weight");
+        let backend = MetalBackend::from_device(Device::Cpu).unwrap();
+
+        let attention = Attention::open_from_parts(
+            &gguf,
+            &config,
+            0,
+            &input_norm,
+            &attention_index,
+            &backend,
+            256,
+        )
+        .unwrap();
+
+        let indexer = attention
+            .load_report()
+            .indexer
+            .as_ref()
+            .expect("full indexer layer should load DSA indexer");
+        assert!(attention.has_dsa_indexer());
+        assert_eq!(indexer.n_heads, 32);
+        assert_eq!(indexer.head_dim, 128);
+        assert_eq!(indexer.wq_b_shape.dims(), &[4096, 256]);
+        assert_eq!(indexer.wk_shape.dims(), &[128, 256]);
+    }
+
+    #[test]
+    fn mla_selected_attention_sequences_preserve_sparse_order() {
+        let past_k = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [1, 1, 3, 2]).unwrap();
+        let past_v = Tensor::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], [1, 1, 3, 2]).unwrap();
+        let current_k = Tensor::new(vec![9.0, 10.0], [1, 1, 2]).unwrap();
+        let current_v = Tensor::new(vec![90.0, 100.0], [1, 1, 1, 2]).unwrap();
+
+        let (latent, rope, selected_tokens) = mla_selected_attention_sequences(
+            (&past_k, &past_v),
+            &[2, 0, 2],
+            &current_k,
+            &current_v,
+            1,
+            3,
+            2,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(selected_tokens, 3);
+        assert_eq!(latent.dims(), &[1, 4, 2]);
+        assert_eq!(rope.dims(), &[1, 4, 1, 2]);
+        assert_eq!(latent.values(), &[5.0, 6.0, 1.0, 2.0, 5.0, 6.0, 9.0, 10.0]);
+        assert_eq!(
+            rope.values(),
+            &[50.0, 60.0, 10.0, 20.0, 50.0, 60.0, 90.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn dsa_selected_indices_drop_current_token_only() {
+        assert_eq!(
+            past_only_selected_indices(&[0, 3, 2], 3).unwrap(),
+            vec![0, 2]
+        );
+
+        let err = past_only_selected_indices(&[4], 3).unwrap_err();
+        assert!(err.to_string().contains("future token"));
+    }
+
     fn attention_index(gguf: &GgufFile) -> AttentionIndex {
         AttentionIndex {
             q_a: tensor_ref(gguf, "blk.0.attn_q_a.weight"),
@@ -2300,6 +3153,18 @@ mod tests {
             output: tensor_ref(gguf, "blk.0.attn_output.weight"),
             indexer: None,
         }
+    }
+
+    fn attention_index_with_indexer(gguf: &GgufFile) -> AttentionIndex {
+        let mut index = attention_index(gguf);
+        index.indexer = Some(IndexerIndex {
+            k_norm_bias: tensor_ref(gguf, "blk.0.indexer.k_norm.bias"),
+            k_norm_weight: tensor_ref(gguf, "blk.0.indexer.k_norm.weight"),
+            proj: tensor_ref(gguf, "blk.0.indexer.proj.weight"),
+            attn_k: tensor_ref(gguf, "blk.0.indexer.attn_k.weight"),
+            attn_q_b: tensor_ref(gguf, "blk.0.indexer.attn_q_b.weight"),
+        });
+        index
     }
 
     fn tensor_ref(gguf: &GgufFile, name: &str) -> TensorRef {
@@ -2325,6 +3190,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 1,
             experts_per_token: 1,
@@ -2338,6 +3204,12 @@ mod tests {
             topk_method: "greedy".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }
@@ -2349,6 +3221,35 @@ mod tests {
 
     fn write_attention_fixture_with_bad_k_b() -> PathBuf {
         write_attention_fixture_with_k_b_dims(GgmlType::Q2K, &[256, 256, 2])
+    }
+
+    fn write_attention_fixture_with_indexer(ty: GgmlType) -> PathBuf {
+        let path = unique_temp_file("attention-indexer");
+        let specs = vec![
+            TensorSpec::f32("blk.0.attn_norm.weight", vec![256]),
+            TensorSpec::quant("blk.0.attn_q_a.weight", vec![256, 256], ty),
+            TensorSpec::f32("blk.0.attn_q_a_norm.weight", vec![256]),
+            TensorSpec::quant("blk.0.attn_q_b.weight", vec![256, 512], ty),
+            TensorSpec::quant("blk.0.attn_kv_a_mqa.weight", vec![256, 384], ty),
+            TensorSpec::f32("blk.0.attn_kv_a_norm.weight", vec![256]),
+            TensorSpec::quant("blk.0.attn_k_b.weight", vec![128, 256, 2], GgmlType::Q8_0),
+            TensorSpec::quant("blk.0.attn_v_b.weight", vec![256, 256, 2], ty),
+            TensorSpec::quant("blk.0.attn_output.weight", vec![512, 256], ty),
+            TensorSpec::f32("blk.0.indexer.k_norm.bias", vec![128]),
+            TensorSpec::f32("blk.0.indexer.k_norm.weight", vec![128]),
+            TensorSpec::f32("blk.0.indexer.proj.weight", vec![256, 32]),
+            TensorSpec::quant(
+                "blk.0.indexer.attn_k.weight",
+                vec![256, 128],
+                GgmlType::Q8_0,
+            ),
+            TensorSpec::quant(
+                "blk.0.indexer.attn_q_b.weight",
+                vec![256, 4096],
+                GgmlType::Q8_0,
+            ),
+        ];
+        write_gguf(path, &specs)
     }
 
     fn write_attention_fixture_with_k_b_dims(ty: GgmlType, k_b_dims: &[u64]) -> PathBuf {

@@ -15,3 +15,15 @@ tracing.workspace = true
 
 [dev-dependencies]
 gguf = { path = "../gguf" }
+
+[[bench]]
+name = "ssd_kv"
+harness = false
+
+[[bench]]
+name = "dsa_attention"
+harness = false
+
+[[bench]]
+name = "moe_experts"
+harness = false

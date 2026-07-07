@@ -1,13 +1,16 @@
+use crate::DevicePagedKvView;
 use ::metal::{Buffer, CommandQueue, Device};
-use common::{DeviceKind, Error, PagedKvView, Result};
+use common::{DType, DeviceKind, Error, PagedKvView, Result};
 
 use super::activation::MetalActivation;
 use super::attention::{
     MetalAttentionCausalSoftmax, MetalAttentionScores, MetalAttentionValues, MetalDecodeAttention,
 };
 use super::batch::BatchSlot;
-use super::buffers::{f32_buffer, read_f32_buffer, read_u32_buffer};
-use super::command::{encode_f32_copy, Dispatch1d};
+use super::buffers::{empty_f16_buffer, f32_buffer, read_f32_buffer, read_u32_buffer, u8_buffer};
+use super::cast::MetalCast;
+use super::command::{encode_element_copy, encode_f32_copy, Dispatch1d};
+use super::dsa::MetalDsa;
 use super::layout::MetalLayout;
 use super::library::MetalLibrary;
 use super::matmul::MetalMatmul;
@@ -24,12 +27,14 @@ pub struct Metal {
     attention_causal_softmax: MetalAttentionCausalSoftmax,
     decode_attention: MetalDecodeAttention,
     activation: MetalActivation,
+    cast: MetalCast,
     layout: MetalLayout,
     matmul: MetalMatmul,
     q2_matvec: MetalQ2Matvec,
     rms_norm: MetalRmsNorm,
     rope: MetalRope,
     moe: MetalMoe,
+    dsa: MetalDsa,
     batch: BatchSlot,
 }
 
@@ -43,12 +48,14 @@ impl Metal {
         let attention_causal_softmax = MetalAttentionCausalSoftmax::new(&device, &library)?;
         let decode_attention = MetalDecodeAttention::new(&device, &library)?;
         let activation = MetalActivation::new(&device, &library)?;
+        let cast = MetalCast::new(&device, &library)?;
         let layout = MetalLayout::new(&device, &library)?;
         let matmul = MetalMatmul::new(&device, &library)?;
         let q2_matvec = MetalQ2Matvec::new(&device, &library)?;
         let rms_norm = MetalRmsNorm::new(&device, &library)?;
         let rope = MetalRope::new(&device, &library)?;
         let moe = MetalMoe::new(&device, &library)?;
+        let dsa = MetalDsa::new(&device, &library)?;
 
         Ok(Self {
             device,
@@ -58,12 +65,14 @@ impl Metal {
             attention_causal_softmax,
             decode_attention,
             activation,
+            cast,
             layout,
             matmul,
             q2_matvec,
             rms_norm,
             rope,
             moe,
+            dsa,
             batch: BatchSlot::new(),
         })
     }
@@ -452,6 +461,45 @@ impl Metal {
             rope_head_count,
             no_rope_dim,
             rope_dim,
+        )
+    }
+
+    pub fn stack_head_outputs_f32_report(
+        &self,
+        head_outputs: &[Vec<f32>],
+        row_count: usize,
+        head_dim: usize,
+    ) -> Result<super::layout::MetalStackHeadOutputsReport> {
+        self.layout.stack_head_outputs(
+            self.device(),
+            self.queue(),
+            head_outputs,
+            row_count,
+            head_dim,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn linearize_paged_cache_f32_report(
+        &self,
+        paged: &[f32],
+        batch_count: usize,
+        head_count: usize,
+        cached_tokens: usize,
+        capacity_tokens: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<super::layout::MetalLinearizePagedCacheReport> {
+        self.layout.linearize_paged_cache(
+            self.device(),
+            self.queue(),
+            paged,
+            batch_count,
+            head_count,
+            cached_tokens,
+            capacity_tokens,
+            page_size,
+            head_dim,
         )
     }
 
@@ -1137,11 +1185,52 @@ impl Metal {
         f32_buffer(&self.device, values)
     }
 
+    /// Uploads host f32 values and converts them to a fresh f16 device buffer.
+    /// The f32 staging buffer is short-lived; subsequent kernels consume only
+    /// the half-precision output.
+    pub(crate) fn batch_upload_f32_as_f16(&self, values: &[f32]) -> Result<Buffer> {
+        let input = f32_buffer(&self.device, values)?;
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.cast
+                .encode_f32_to_f16(command_buffer, &self.device, &input, values.len())
+        })
+    }
+
+    /// Uploads compressed Q8 cold-cache rows and decodes them into f32 on the
+    /// GPU. MLA selected-row expansion uses this path because RMSNorm and Q2
+    /// projections consume f32 device values today.
+    pub(crate) fn batch_upload_q8_rows_as_f32(
+        &self,
+        payload: &[u8],
+        row_count: usize,
+        dim: usize,
+    ) -> Result<Buffer> {
+        let input = u8_buffer(&self.device, payload)?;
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.cast.encode_q8_rows_to_f32(
+                command_buffer,
+                &self.device,
+                &input,
+                payload.len(),
+                row_count,
+                dim,
+            )
+        })
+    }
+
     /// Reads values out of a device buffer, synchronizing the open batch
     /// first so every encoded kernel that may write the buffer has completed.
     pub(crate) fn batch_read_f32(&self, buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
         self.batch.flush()?;
-        read_f32_buffer(buffer, len)
+        self.cast.read_f32(buffer, len)
+    }
+
+    /// Reads f16 values out of a device buffer and expands them to f32 on the
+    /// CPU side. This is for validation/cold-tier serialization, not the hot
+    /// decode path.
+    pub(crate) fn batch_read_f16_as_f32(&self, buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
+        self.batch.flush()?;
+        self.cast.read_f16_as_f32(buffer, len)
     }
 
     pub(crate) fn batched_rms_norm(
@@ -1163,6 +1252,29 @@ impl Metal {
                 rows,
                 hidden_size,
                 eps,
+            )
+        })
+    }
+
+    pub(crate) fn batched_linear_f32(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &[f32],
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.matmul.encode_linear(
+                command_buffer,
+                &self.device,
+                input,
+                input_len,
+                weight,
+                rows,
+                in_features,
+                out_features,
             )
         })
     }
@@ -1222,25 +1334,53 @@ impl Metal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn batched_q2_k_gate_up_swiglu(
+    pub(crate) fn batched_q2_k_multi_expert_gate_up_swiglu(
         &self,
         gate_weights: &[u8],
         up_weights: &[u8],
         input: &Buffer,
         input_len: usize,
-        row_count: usize,
+        token_indices: &[u32],
+        expert_ids: &[u32],
+        token_count: usize,
         in_features: usize,
         out_features: usize,
     ) -> Result<Buffer> {
         self.batch.encode(&self.queue, |command_buffer| {
-            self.q2_matvec.encode_gate_up_swiglu(
+            self.q2_matvec.encode_multi_expert_gate_up_swiglu(
                 command_buffer,
                 &self.device,
                 gate_weights,
                 up_weights,
                 input,
                 input_len,
-                row_count,
+                token_indices,
+                expert_ids,
+                token_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q2_k_multi_expert_matvec(
+        &self,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        expert_ids: &[u32],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_multi_expert_matvec(
+                command_buffer,
+                &self.device,
+                weights,
+                input,
+                input_len,
+                expert_ids,
                 in_features,
                 out_features,
             )
@@ -1441,6 +1581,51 @@ impl Metal {
         })
     }
 
+    pub(crate) fn batched_stack_head_outputs(
+        &self,
+        head_outputs: &[&Buffer],
+        row_count: usize,
+        head_dim: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.layout.encode_stack_head_outputs(
+                command_buffer,
+                &self.device,
+                head_outputs,
+                row_count,
+                head_dim,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_linearize_paged_cache(
+        &self,
+        paged: &Buffer,
+        paged_len: usize,
+        batch_count: usize,
+        head_count: usize,
+        cached_tokens: usize,
+        capacity_tokens: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.layout.encode_linearize_paged_cache(
+                command_buffer,
+                &self.device,
+                paged,
+                paged_len,
+                batch_count,
+                head_count,
+                cached_tokens,
+                capacity_tokens,
+                page_size,
+                head_dim,
+            )
+        })
+    }
+
     pub(crate) fn batched_select_last_token(
         &self,
         input: &Buffer,
@@ -1518,6 +1703,120 @@ impl Metal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_moe_router_topk(
+        &self,
+        router_logits: &Buffer,
+        router_logits_len: usize,
+        correction_bias: &[f32],
+        token_count: usize,
+        expert_count: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let buffers = self.batch.encode(&self.queue, |command_buffer| {
+            self.moe.encode_router_topk(
+                command_buffer,
+                &self.device,
+                router_logits,
+                router_logits_len,
+                correction_bias,
+                token_count,
+                expert_count,
+                top_k,
+                norm_topk_prob,
+                routed_scaling_factor,
+            )
+        })?;
+        self.batch.flush()?;
+        let expert_ids = read_u32_buffer(&buffers.expert_ids, buffers.output_len)?;
+        let expert_weights = read_f32_buffer(&buffers.expert_weights, buffers.output_len)?;
+        Ok((expert_ids, expert_weights))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dsa_index_key(
+        &self,
+        raw_key: &Buffer,
+        raw_key_len: usize,
+        weight: &[f32],
+        bias: &[f32],
+        batch: usize,
+        tokens: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.dsa.encode_key_norm_rope(
+                command_buffer,
+                &self.device,
+                raw_key,
+                raw_key_len,
+                weight,
+                bias,
+                batch,
+                tokens,
+                head_dim,
+                rope_dim,
+                position_offset,
+                theta,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dsa_decode_topk(
+        &self,
+        hidden_states: &Buffer,
+        hidden_states_len: usize,
+        q_raw: &Buffer,
+        q_raw_len: usize,
+        past_index_keys: &Buffer,
+        past_index_keys_len: usize,
+        current_index_key: &Buffer,
+        current_index_key_len: usize,
+        weights_proj: &[f32],
+        batch: usize,
+        hidden_size: usize,
+        past_tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+        top_k: usize,
+    ) -> Result<Vec<u32>> {
+        let buffers = self.batch.encode(&self.queue, |command_buffer| {
+            self.dsa.encode_decode_topk(
+                command_buffer,
+                &self.device,
+                hidden_states,
+                hidden_states_len,
+                q_raw,
+                q_raw_len,
+                past_index_keys,
+                past_index_keys_len,
+                current_index_key,
+                current_index_key_len,
+                weights_proj,
+                batch,
+                hidden_size,
+                past_tokens,
+                heads,
+                head_dim,
+                rope_dim,
+                position_offset,
+                theta,
+                top_k,
+            )
+        })?;
+        self.batch.flush()?;
+        MetalDsa::read_token_ids(&buffers.token_ids, buffers.output_len)
+    }
+
     /// Encodes a GPU buffer-to-buffer copy (element offsets/length in f32).
     /// Used to stack per-expert outputs into one combine input without a host
     /// round-trip.
@@ -1541,10 +1840,36 @@ impl Metal {
         })
     }
 
+    pub(crate) fn batched_element_copy(
+        &self,
+        source: &Buffer,
+        source_offset: usize,
+        destination: &Buffer,
+        destination_offset: usize,
+        len: usize,
+        element_size: usize,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            encode_element_copy(
+                command_buffer,
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                len,
+                element_size,
+            )
+        })
+    }
+
     /// Allocates an uninitialized device buffer for `len` f32 elements, e.g.
     /// as the destination for `batched_f32_copy` stacking.
     pub(crate) fn batched_alloc_f32(&self, len: usize) -> Result<Buffer> {
         super::buffers::empty_f32_buffer(&self.device, len)
+    }
+
+    pub(crate) fn batched_alloc_f16(&self, len: usize) -> Result<Buffer> {
+        empty_f16_buffer(&self.device, len)
     }
 
     /// Encodes fused paged decode attention. Returns the output buffer and
@@ -1571,6 +1896,78 @@ impl Metal {
                 current_v,
                 current_v_len,
                 past_kv,
+            )
+        })
+    }
+
+    /// Encodes fused paged decode attention using append-only resident K/V
+    /// buffers. Returns the output buffer and its element count.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_paged_decode_attention_resident(
+        &self,
+        q: &Buffer,
+        q_len: usize,
+        current_k: &Buffer,
+        current_k_len: usize,
+        current_v: &Buffer,
+        current_v_len: usize,
+        past_kv: &DevicePagedKvView,
+    ) -> Result<(Buffer, usize)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.decode_attention.encode_paged_resident(
+                command_buffer,
+                &self.device,
+                q,
+                q_len,
+                current_k,
+                current_k_len,
+                current_v,
+                current_v_len,
+                past_kv,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_selected_decode_attention(
+        &self,
+        q: &Buffer,
+        q_len: usize,
+        selected_k: &Buffer,
+        selected_k_len: usize,
+        selected_v: &Buffer,
+        selected_v_len: usize,
+        selected_kv_dtype: DType,
+        current_k: &Buffer,
+        current_k_len: usize,
+        current_v: &Buffer,
+        current_v_len: usize,
+        batch_count: usize,
+        head_count: usize,
+        selected_tokens: usize,
+        head_dim: usize,
+        value_dim: usize,
+    ) -> Result<(Buffer, usize)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.decode_attention.encode_selected(
+                command_buffer,
+                &self.device,
+                q,
+                q_len,
+                selected_k,
+                selected_k_len,
+                selected_v,
+                selected_v_len,
+                selected_kv_dtype,
+                current_k,
+                current_k_len,
+                current_v,
+                current_v_len,
+                batch_count,
+                head_count,
+                selected_tokens,
+                head_dim,
+                value_dim,
             )
         })
     }
@@ -1608,4 +2005,47 @@ fn select_native_device() -> Result<Device> {
         .into_iter()
         .next()
         .ok_or_else(|| Error::backend("native Metal device is not available"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q8_rows_upload_decode_matches_cpu_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = 3;
+        let dim = 4;
+        let payload = q8_payload(&[
+            (0.5, [2_i8, -2, 4, -4]),
+            (0.25, [1_i8, 2, 3, 4]),
+            (1.0, [-1_i8, 0, 1, 2]),
+        ]);
+        let buffer = metal
+            .batch_upload_q8_rows_as_f32(&payload, row_count, dim)
+            .unwrap();
+        let actual = metal.batch_read_f32(&buffer, row_count * dim).unwrap();
+        let expected = vec![
+            1.0, -1.0, 2.0, -2.0, 0.25, 0.5, 0.75, 1.0, -1.0, 0.0, 1.0, 2.0,
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    fn native_metal_or_skip() -> Option<Metal> {
+        Metal::new().ok()
+    }
+
+    fn q8_payload(rows: &[(f32, [i8; 4])]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(rows.len() * 8);
+        for (scale, values) in rows {
+            payload.extend(scale.to_le_bytes());
+            for value in values {
+                payload.push(*value as u8);
+            }
+        }
+        payload
+    }
 }

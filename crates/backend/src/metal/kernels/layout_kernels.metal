@@ -181,3 +181,52 @@ kernel void combine_rope_tail_f32_kernel(
         + (dim - no_rope_dim);
     output[gid] = rope[rope_index];
 }
+
+kernel void stack_head_output_f32_kernel(
+    const device float* head_input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& row_count [[buffer(2)]],
+    constant uint& head_count [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& output_head_index [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint input_values = row_count * head_dim;
+    if (gid >= input_values) {
+        return;
+    }
+
+    uint row = gid / head_dim;
+    uint dim = gid - (row * head_dim);
+    uint output_index = ((row * head_count + output_head_index) * head_dim) + dim;
+    output[output_index] = head_input[gid];
+}
+
+kernel void linearize_paged_cache_f32_kernel(
+    const device float* paged [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch_count [[buffer(2)]],
+    constant uint& head_count [[buffer(3)]],
+    constant uint& cached_tokens [[buffer(4)]],
+    constant uint& page_size [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint output_values = batch_count * head_count * cached_tokens * head_dim;
+    if (gid >= output_values) {
+        return;
+    }
+
+    uint dim = gid % head_dim;
+    uint token_index = (gid / head_dim) % cached_tokens;
+    uint head = (gid / (head_dim * cached_tokens)) % head_count;
+    uint batch = gid / (head_dim * cached_tokens * head_count);
+    uint page = token_index / page_size;
+    uint page_offset = token_index - (page * page_size);
+
+    uint source_index =
+        ((((page * batch_count + batch) * head_count + head) * page_size + page_offset)
+        * head_dim)
+        + dim;
+    output[gid] = paged[source_index];
+}

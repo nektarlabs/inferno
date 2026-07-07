@@ -3,12 +3,12 @@ use common::Tensor;
 use common::{validate_exact_shape, Error, F32Tensor, PagedKvView, Result, Shape};
 use config::Config;
 use gguf::GgufFile;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     kv_types::{cache_tensor_from_host, cache_tensor_to_host},
-    profile, DenseBlock, DenseBlockLoadReport, Index, LayerKind, LayerKvCacheTensors, SparseBlock,
-    SparseBlockLoadReport,
+    profile, DenseBlock, DenseBlockLoadReport, Index, LayerDeviceKvCacheTensors, LayerKind,
+    LayerKvCacheTensors, SparseBlock, SparseBlockLoadReport,
 };
 
 #[derive(Debug)]
@@ -152,7 +152,7 @@ impl<'a> LayerStack<'a> {
                         .to_string(),
                     "native Metal kernels are required for the GLM-5.2 Q2 generation path"
                         .to_string(),
-                    "DSA sparse attention is not active yet".to_string(),
+                    "DSA sparse decode is active for native sparse layers; absorbed MLA Metal attention is still pending".to_string(),
                 ],
             },
         })
@@ -219,6 +219,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::Dense,
                         cache_k: cache_tensor_from_host(&output.cache_k)?,
                         cache_v: cache_tensor_from_host(&output.cache_v)?,
+                        index_key: None,
                     });
                     current = output.hidden_states;
                 }
@@ -249,6 +250,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::SparseMoe,
                         cache_k: cache_tensor_from_host(&output.cache_k)?,
                         cache_v: cache_tensor_from_host(&output.cache_v)?,
+                        index_key: None,
                     });
                     current = output.hidden_states;
                 }
@@ -330,6 +332,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::Dense,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -352,6 +355,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::SparseMoe,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -428,6 +432,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::Dense,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -450,6 +455,99 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::SparseMoe,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
+                    });
+                    current = output.hidden_states;
+                }
+            }
+        }
+
+        Ok(LayerStackForwardF32Tensors {
+            hidden_states: current,
+            layer_kv_cache,
+        })
+    }
+
+    pub fn forward_sparse_f32_input_with_past_kv_provider<B, F, I>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+        mut past_kv_for_layer: F,
+        mut index_keys_for_layer: I,
+    ) -> Result<LayerStackForwardF32Tensors>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<(F32Tensor, F32Tensor)>>,
+        I: FnMut(usize) -> Result<Option<F32Tensor>>,
+    {
+        validate_hidden_states_f32(self.hidden_size, hidden_states)?;
+
+        let mut current = hidden_states.clone();
+        let mut layer_kv_cache = Vec::with_capacity(self.layers.len());
+        let mut last_dsa_selection: Option<Vec<u32>> = None;
+
+        for layer in &self.layers {
+            match layer {
+                RuntimeLayer::Dense(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let past_kv = past_kv_for_layer(layer_index)?;
+                    let past_kv = past_kv
+                        .as_ref()
+                        .map(|(cache_k, cache_v)| (cache_k, cache_v));
+                    let output = profile::run_layer_stage(layer_index, "dense", || {
+                        block.forward_f32_tensors_with_past_kv(config, &current, backend, past_kv)
+                    })?;
+                    debug!(
+                        layer_index,
+                        layer_kind = "dense",
+                        "GLM-5.2 Q2 native layer completed"
+                    );
+                    layer_kv_cache.push(LayerKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::Dense,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                        index_key: output.index_key,
+                    });
+                    current = output.hidden_states;
+                }
+                RuntimeLayer::Sparse(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let past_kv = past_kv_for_layer(layer_index)?;
+                    let past_kv = past_kv
+                        .as_ref()
+                        .map(|(cache_k, cache_v)| (cache_k, cache_v));
+                    let cached_index_keys = if block.has_dsa_indexer() {
+                        index_keys_for_layer(layer_index)?
+                    } else {
+                        None
+                    };
+                    let (output, next_shared_selection) =
+                        profile::run_layer_stage(layer_index, "sparse_moe", || {
+                            block.forward_sparse_f32_tensors_with_past_kv(
+                                config,
+                                &current,
+                                backend,
+                                past_kv,
+                                cached_index_keys.as_ref(),
+                                last_dsa_selection.as_deref(),
+                            )
+                        })?;
+                    if let Some(selection) = next_shared_selection {
+                        last_dsa_selection = Some(selection);
+                    }
+                    debug!(
+                        layer_index,
+                        layer_kind = "sparse_moe",
+                        "GLM-5.2 Q2 native sparse layer completed"
+                    );
+                    layer_kv_cache.push(LayerKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::SparseMoe,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -498,6 +596,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::Dense,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -519,6 +618,7 @@ impl<'a> LayerStack<'a> {
                         layer_kind: LayerKind::SparseMoe,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -538,18 +638,128 @@ impl<'a> LayerStack<'a> {
     /// download for the cache append and the MoE router's top-k download.
     ///
     /// Returns `Ok(None)` when any layer lacks a device path or a layer has no
-    /// paged past KV; the caller falls back to the eager route.
-    pub(crate) fn forward_decode_device<'kv, B, F>(
+    /// resident paged past KV; the caller falls back to the eager route.
+    pub(crate) fn forward_decode_device<B, F, S, I>(
         &self,
         config: &Config,
         hidden_states: &F32Tensor,
         backend: &B,
         mut past_kv_for_layer: F,
+        mut selected_kv_for_tokens: S,
+        mut index_keys_for_layer: I,
     ) -> Result<Option<LayerStackDecodeDeviceTensors>>
     where
         B: Backend,
-        F: FnMut(usize) -> Result<Option<PagedKvView<'kv>>>,
+        F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
+        validate_hidden_states_f32(self.hidden_size, hidden_states)?;
+
+        let mut current = crate::try_device!(backend.device_upload_f32_tensor(hidden_states));
+        let mut layer_kv_cache = Vec::with_capacity(self.layers.len());
+        let mut last_dsa_selection: Option<Vec<u32>> = None;
+
+        for layer in &self.layers {
+            match layer {
+                RuntimeLayer::Dense(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
+                        return Ok(None);
+                    };
+                    let output = match profile::run_layer_stage(layer_index, "dense", || {
+                        block.forward_decode_device(config, &current, backend, &past_kv)
+                    })? {
+                        Some(output) => output,
+                        None => {
+                            warn!(
+                                layer_index,
+                                layer_kind = "dense",
+                                "device-batched layer path unavailable"
+                            );
+                            return Err(Error::backend(format!(
+                                "device-batched dense layer {layer_index} has no complete native path"
+                            )));
+                        }
+                    };
+                    debug!(
+                        layer_index,
+                        layer_kind = "dense",
+                        "GLM-5.2 Q2 device-batched layer completed"
+                    );
+                    layer_kv_cache.push(LayerDeviceKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::Dense,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                        index_key: output.index_key,
+                    });
+                    current = output.hidden_states;
+                }
+                RuntimeLayer::Sparse(block) => {
+                    let layer_index = block.load_report().layer_index;
+                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
+                        return Ok(None);
+                    };
+                    let (output, next_shared_selection) = match profile::run_layer_stage(
+                        layer_index,
+                        "sparse_moe",
+                        || {
+                            block.forward_sparse_decode_device(
+                                config,
+                                &current,
+                                backend,
+                                &past_kv,
+                                &mut selected_kv_for_tokens,
+                                &mut index_keys_for_layer,
+                                last_dsa_selection.as_deref(),
+                            )
+                        },
+                    )? {
+                        Some(output) => output,
+                        None => {
+                            warn!(
+                                layer_index,
+                                layer_kind = "sparse_moe",
+                                "device-batched layer path unavailable"
+                            );
+                            return Err(Error::backend(format!(
+                                    "device-batched sparse layer {layer_index} has no complete native path"
+                                )));
+                        }
+                    };
+                    if let Some(selection) = next_shared_selection {
+                        last_dsa_selection = Some(selection);
+                    }
+                    debug!(
+                        layer_index,
+                        layer_kind = "sparse_moe",
+                        "GLM-5.2 Q2 device-batched layer completed"
+                    );
+                    layer_kv_cache.push(LayerDeviceKvCacheTensors {
+                        layer_index,
+                        layer_kind: LayerKind::SparseMoe,
+                        cache_k: output.cache_k,
+                        cache_v: output.cache_v,
+                        index_key: output.index_key,
+                    });
+                    current = output.hidden_states;
+                }
+            }
+        }
+
+        Ok(Some(LayerStackDecodeDeviceTensors {
+            hidden_states: current,
+            layer_kv_cache,
+        }))
+    }
+
+    pub(crate) fn forward_seed_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+    ) -> Result<Option<LayerStackDecodeDeviceTensors>> {
         validate_hidden_states_f32(self.hidden_size, hidden_states)?;
 
         let mut current = crate::try_device!(backend.device_upload_f32_tensor(hidden_states));
@@ -559,47 +769,47 @@ impl<'a> LayerStack<'a> {
             match layer {
                 RuntimeLayer::Dense(block) => {
                     let layer_index = block.load_report().layer_index;
-                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
-                        return Ok(None);
+                    let output = match profile::run_layer_stage(
+                        layer_index,
+                        "dense.seed_device",
+                        || block.forward_seed_device(config, &current, backend),
+                    )? {
+                        Some(output) => output,
+                        None => {
+                            return Err(Error::backend(format!(
+                                    "device-batched dense seed layer {layer_index} has no complete native path"
+                                )));
+                        }
                     };
-                    let output = crate::try_device!(profile::run_layer_stage(
-                        layer_index,
-                        "dense",
-                        || block.forward_decode_device(config, &current, backend, &past_kv),
-                    ));
-                    debug!(
-                        layer_index,
-                        layer_kind = "dense",
-                        "GLM-5.2 Q2 device-batched layer completed"
-                    );
-                    layer_kv_cache.push(LayerKvCacheTensors {
+                    layer_kv_cache.push(LayerDeviceKvCacheTensors {
                         layer_index,
                         layer_kind: LayerKind::Dense,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
                 RuntimeLayer::Sparse(block) => {
                     let layer_index = block.load_report().layer_index;
-                    let Some(past_kv) = past_kv_for_layer(layer_index)? else {
-                        return Ok(None);
+                    let output = match profile::run_layer_stage(
+                        layer_index,
+                        "sparse_moe.seed_device",
+                        || block.forward_seed_device(config, &current, backend),
+                    )? {
+                        Some(output) => output,
+                        None => {
+                            return Err(Error::backend(format!(
+                                    "device-batched sparse seed layer {layer_index} has no complete native path"
+                                )));
+                        }
                     };
-                    let output = crate::try_device!(profile::run_layer_stage(
-                        layer_index,
-                        "sparse_moe",
-                        || block.forward_decode_device(config, &current, backend, &past_kv),
-                    ));
-                    debug!(
-                        layer_index,
-                        layer_kind = "sparse_moe",
-                        "GLM-5.2 Q2 device-batched layer completed"
-                    );
-                    layer_kv_cache.push(LayerKvCacheTensors {
+                    layer_kv_cache.push(LayerDeviceKvCacheTensors {
                         layer_index,
                         layer_kind: LayerKind::SparseMoe,
                         cache_k: output.cache_k,
                         cache_v: output.cache_v,
+                        index_key: output.index_key,
                     });
                     current = output.hidden_states;
                 }
@@ -617,7 +827,7 @@ impl<'a> LayerStack<'a> {
 /// the GPU plus the per-layer K/V tensors for the host cache appends.
 pub(crate) struct LayerStackDecodeDeviceTensors {
     pub(crate) hidden_states: backend::DeviceValue,
-    pub(crate) layer_kv_cache: Vec<LayerKvCacheTensors>,
+    pub(crate) layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
 }
 
 fn past_kv_to_host<B: Backend>(
@@ -740,11 +950,11 @@ mod tests {
         assert_eq!(output.report.kv_cache_layer_count, 2);
         assert_eq!(
             output.report.layer_k_cache_shape.as_ref().unwrap().dims(),
-            &[1, 2, 2, 256]
+            &[1, 1, 2, 256]
         );
         assert_eq!(
             output.report.layer_v_cache_shape.as_ref().unwrap().dims(),
-            &[1, 2, 2, 256]
+            &[1, 1, 2, 128]
         );
         assert_eq!(output.layer_kv_cache.len(), 2);
         assert_eq!(tensors.layer_kv_cache.len(), 2);
@@ -752,10 +962,10 @@ mod tests {
         assert_eq!(output.layer_kv_cache[1].layer_index, 1);
         assert_eq!(tensors.layer_kv_cache[0].layer_index, 0);
         assert_eq!(tensors.layer_kv_cache[1].layer_index, 1);
-        assert_eq!(output.layer_kv_cache[0].cache_k.dims(), &[1, 2, 2, 256]);
-        assert_eq!(output.layer_kv_cache[1].cache_k.dims(), &[1, 2, 2, 256]);
-        assert_eq!(tensors.layer_kv_cache[0].cache_k.dims(), &[1, 2, 2, 256]);
-        assert_eq!(tensors.layer_kv_cache[1].cache_k.dims(), &[1, 2, 2, 256]);
+        assert_eq!(output.layer_kv_cache[0].cache_k.dims(), &[1, 1, 2, 256]);
+        assert_eq!(output.layer_kv_cache[1].cache_k.dims(), &[1, 1, 2, 256]);
+        assert_eq!(tensors.layer_kv_cache[0].cache_k.dims(), &[1, 1, 2, 256]);
+        assert_eq!(tensors.layer_kv_cache[1].cache_k.dims(), &[1, 1, 2, 256]);
         assert_eq!(output.report.loaded_expert_requests, 2);
         assert!(output.report.routed_source_payload_bytes_read > 0);
         assert!(output.report.routed_peak_decoded_f32_bytes > 0);
@@ -808,15 +1018,15 @@ mod tests {
         assert_eq!(decode.report.executed_layer_count, 2);
         assert_eq!(decode.layer_kv_cache.len(), 2);
         assert_eq!(decode_tensors.layer_kv_cache.len(), 2);
-        assert_eq!(decode.layer_kv_cache[0].cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode.layer_kv_cache[1].cache_k.dims(), &[1, 2, 1, 256]);
+        assert_eq!(decode.layer_kv_cache[0].cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode.layer_kv_cache[1].cache_k.dims(), &[1, 1, 1, 256]);
         assert_eq!(
             decode_tensors.layer_kv_cache[0].cache_k.dims(),
-            &[1, 2, 1, 256]
+            &[1, 1, 1, 256]
         );
         assert_eq!(
             decode_tensors.layer_kv_cache[1].cache_k.dims(),
-            &[1, 2, 1, 256]
+            &[1, 1, 1, 256]
         );
         assert_eq!(decode.report.max_attention_past_tokens, 2);
     }
@@ -833,6 +1043,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 4,
             experts_per_token: 2,
@@ -846,6 +1057,12 @@ mod tests {
             topk_method: "noaux_tc".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

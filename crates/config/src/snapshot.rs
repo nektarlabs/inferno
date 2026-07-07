@@ -9,6 +9,7 @@ pub const GLM52_LIKE_CONFIG_JSON: &str = r#"{
   "qk_head_dim": 256,
   "qk_no_rope_dim": 192,
   "qk_rope_dim": 64,
+  "kv_lora_rank": 512,
   "v_head_dim": 256,
   "num_routed_experts": 256,
   "experts_per_token": 8,
@@ -22,6 +23,11 @@ pub const GLM52_LIKE_CONFIG_JSON: &str = r#"{
   "topk_method": "noaux_tc",
   "max_context": 1048576,
   "dsa_index_topk": 2048,
+  "index_head_dim": 128,
+  "index_n_heads": 32,
+  "index_topk_freq": 4,
+  "indexer_rope_interleave": true,
+  "num_nextn_predict_layers": 1,
   "rms_norm_eps": 0.00001,
   "rope_theta": 10000000.0
 }"#;

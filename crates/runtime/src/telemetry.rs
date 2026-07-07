@@ -43,6 +43,12 @@ pub(crate) fn memory_telemetry_enabled() -> bool {
     MEMORY_TELEMETRY_ENABLED.load(Ordering::Acquire)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RuntimeKvMemoryBytes {
+    pub hot_bytes: Option<u64>,
+    pub cold_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimeMemorySnapshot {
     pub process_rss_bytes: Option<u64>,
@@ -55,20 +61,21 @@ pub(crate) struct RuntimeMemorySnapshot {
     pub swap_used_bytes: Option<u64>,
     pub metal_current_allocated_bytes: Option<u64>,
     pub metal_recommended_max_working_set_bytes: Option<u64>,
-    pub ssd_kv_bytes: Option<u64>,
+    pub runtime_kv_hot_bytes: Option<u64>,
+    pub runtime_kv_cold_bytes: Option<u64>,
 }
 
 pub(crate) fn log_memory_snapshot<B: Backend>(
     stage: &'static str,
     step_index: Option<usize>,
     backend: &B,
-    ssd_kv_bytes: Option<u64>,
+    runtime_kv: RuntimeKvMemoryBytes,
 ) {
     if !MEMORY_TELEMETRY_ENABLED.load(Ordering::Acquire) {
         return;
     }
 
-    let snapshot = memory_snapshot(backend, ssd_kv_bytes);
+    let snapshot = memory_snapshot(backend, runtime_kv);
     if write_memory_snapshot_to_file(stage, step_index, snapshot).is_some() {
         return;
     }
@@ -87,7 +94,8 @@ pub(crate) fn log_memory_snapshot<B: Backend>(
         swap_used_gb = %format_gb(snapshot.swap_used_bytes),
         metal_current_allocated_gb = %format_gb(snapshot.metal_current_allocated_bytes),
         metal_recommended_max_working_set_gb = %format_gb(snapshot.metal_recommended_max_working_set_bytes),
-        ssd_kv_gb = %format_gb(snapshot.ssd_kv_bytes),
+        runtime_kv_hot_gb = %format_gb(snapshot.runtime_kv_hot_bytes),
+        runtime_kv_cold_gb = %format_gb(snapshot.runtime_kv_cold_bytes),
         "runtime memory snapshot"
     );
 }
@@ -101,7 +109,7 @@ fn write_memory_snapshot_to_file(
     let writer = writer.as_mut()?;
     writeln!(
         writer,
-        "runtime memory snapshot stage=\"{}\" step_index={} process_rss_gb={} process_virtual_gb={} system_free_gb={} system_active_gb={} system_inactive_gb={} system_wired_gb={} system_compressed_gb={} swap_used_gb={} metal_current_allocated_gb={} metal_recommended_max_working_set_gb={} ssd_kv_gb={}",
+        "runtime memory snapshot stage=\"{}\" step_index={} process_rss_gb={} process_virtual_gb={} system_free_gb={} system_active_gb={} system_inactive_gb={} system_wired_gb={} system_compressed_gb={} swap_used_gb={} metal_current_allocated_gb={} metal_recommended_max_working_set_gb={} runtime_kv_hot_gb={} runtime_kv_cold_gb={}",
         stage,
         step_index
             .map(|value| value.to_string())
@@ -116,7 +124,8 @@ fn write_memory_snapshot_to_file(
         format_gb(snapshot.swap_used_bytes),
         format_gb(snapshot.metal_current_allocated_bytes),
         format_gb(snapshot.metal_recommended_max_working_set_bytes),
-        format_gb(snapshot.ssd_kv_bytes),
+        format_gb(snapshot.runtime_kv_hot_bytes),
+        format_gb(snapshot.runtime_kv_cold_bytes),
     )
     .ok()?;
     writer.flush().ok()?;
@@ -130,7 +139,10 @@ fn format_gb(bytes: Option<u64>) -> String {
     }
 }
 
-fn memory_snapshot<B: Backend>(backend: &B, ssd_kv_bytes: Option<u64>) -> RuntimeMemorySnapshot {
+fn memory_snapshot<B: Backend>(
+    backend: &B,
+    runtime_kv: RuntimeKvMemoryBytes,
+) -> RuntimeMemorySnapshot {
     let os = os_memory_snapshot();
     let backend = backend.memory_report();
     RuntimeMemorySnapshot {
@@ -144,7 +156,8 @@ fn memory_snapshot<B: Backend>(backend: &B, ssd_kv_bytes: Option<u64>) -> Runtim
         swap_used_bytes: os.swap_used_bytes,
         metal_current_allocated_bytes: backend.metal_current_allocated_bytes,
         metal_recommended_max_working_set_bytes: backend.metal_recommended_max_working_set_bytes,
-        ssd_kv_bytes,
+        runtime_kv_hot_bytes: runtime_kv.hot_bytes,
+        runtime_kv_cold_bytes: runtime_kv.cold_bytes,
     }
 }
 

@@ -29,6 +29,7 @@ pub struct SparseBlockTensors {
     pub hidden_states: Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,7 @@ pub struct SparseBlockF32Tensors {
     pub hidden_states: F32Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +106,10 @@ impl<'a> SparseBlock<'a> {
         &self.load_report
     }
 
+    pub fn has_dsa_indexer(&self) -> bool {
+        self.attention.has_dsa_indexer()
+    }
+
     pub fn forward<B: Backend>(
         &self,
         config: &Config,
@@ -168,6 +174,7 @@ impl<'a> SparseBlock<'a> {
             hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
     }
 
@@ -187,6 +194,7 @@ impl<'a> SparseBlock<'a> {
             hidden_states: tensor_from_f32_tensor(output.hidden_states, backend.device())?,
             cache_k: output.cache_k,
             cache_v: output.cache_v,
+            index_key: output.index_key,
         })
     }
 
@@ -217,7 +225,49 @@ impl<'a> SparseBlock<'a> {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
+    }
+
+    pub fn forward_sparse_f32_tensors_with_past_kv<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &F32Tensor,
+        backend: &B,
+        past_kv: Option<(&F32Tensor, &F32Tensor)>,
+        cached_index_keys: Option<&F32Tensor>,
+        shared_selection: Option<&[u32]>,
+    ) -> Result<(SparseBlockF32Tensors, Option<Vec<u32>>)> {
+        validate_hidden_states_f32(config, hidden_states)?;
+        let attention_output =
+            profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.attention", || {
+                self.attention.forward_sparse_f32_tensors_with_past_kv(
+                    config,
+                    hidden_states,
+                    backend,
+                    past_kv,
+                    cached_index_keys,
+                    shared_selection,
+                )
+            })?;
+        let output_hidden_states =
+            profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
+                self.ffn.forward_f32_tensor(
+                    config,
+                    &attention_output.tensors.hidden_states,
+                    backend,
+                )
+            })?;
+
+        Ok((
+            SparseBlockF32Tensors {
+                hidden_states: output_hidden_states,
+                cache_k: attention_output.tensors.cache_k,
+                cache_v: attention_output.tensors.cache_v,
+                index_key: attention_output.tensors.index_key,
+            },
+            attention_output.next_shared_selection,
+        ))
     }
 
     pub fn forward_f32_tensors_with_paged_past_kv<B: Backend>(
@@ -247,38 +297,115 @@ impl<'a> SparseBlock<'a> {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
     }
 
-    /// Batched device-resident decode layer: attention and MoE FFN encoded
-    /// into the backend's open batch, hidden states never leaving the GPU
-    /// (the router's top-k download is the layer's second sync point).
-    pub(crate) fn forward_decode_device<B: Backend>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_sparse_decode_device<B, S, I>(
         &self,
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
-        past_kv: &PagedKvView<'_>,
-    ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
-        let attention_output = crate::try_device!(profile::run_layer_stage(
+        past_kv: &backend::DevicePagedKvView,
+        selected_kv_for_tokens: &mut S,
+        index_keys_for_layer: &mut I,
+        shared_selection: Option<&[u32]>,
+    ) -> Result<Option<(crate::kv_types::BlockDeviceTensors, Option<Vec<u32>>)>>
+    where
+        B: Backend,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        let attention_output = match profile::run_layer_stage(
             self.load_report.layer_index,
             "sparse_moe.attention",
-            || self
-                .attention
-                .forward_decode_device(config, hidden_states, backend, past_kv),
-        ));
-        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
+            || {
+                self.attention.forward_sparse_decode_device(
+                    config,
+                    hidden_states,
+                    backend,
+                    past_kv,
+                    selected_kv_for_tokens,
+                    index_keys_for_layer,
+                    shared_selection,
+                )
+            },
+        )? {
+            Some(output) => output,
+            None => {
+                return Err(Error::backend(format!(
+                    "sparse layer {} attention has no complete native device path",
+                    self.load_report.layer_index
+                )));
+            }
+        };
+        let output_hidden_states =
+            match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
+                self.ffn
+                    .forward_device(config, &attention_output.tensors.hidden_states, backend)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "sparse layer {} MoE FFN has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
+
+        Ok(Some((
+            crate::kv_types::BlockDeviceTensors {
+                hidden_states: output_hidden_states,
+                cache_k: attention_output.tensors.cache_k,
+                cache_v: attention_output.tensors.cache_v,
+                index_key: attention_output.tensors.index_key,
+            },
+            attention_output.next_shared_selection,
+        )))
+    }
+
+    pub(crate) fn forward_seed_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
+        let attention_output = match profile::run_layer_stage(
             self.load_report.layer_index,
-            "sparse_moe.ffn",
-            || self
-                .ffn
-                .forward_device(config, &attention_output.hidden_states, backend),
-        ));
+            "sparse_moe.attention",
+            || {
+                self.attention
+                    .forward_seed_device(config, hidden_states, backend)
+            },
+        )? {
+            Some(output) => output,
+            None => {
+                return Err(Error::backend(format!(
+                    "sparse layer {} seed attention has no complete native device path",
+                    self.load_report.layer_index
+                )));
+            }
+        };
+        let output_hidden_states =
+            match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
+                self.ffn
+                    .forward_device(config, &attention_output.hidden_states, backend)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "sparse layer {} seed MoE FFN has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
 
         Ok(Some(crate::kv_types::BlockDeviceTensors {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         }))
     }
 
@@ -331,7 +458,9 @@ fn block_output(
 }
 
 fn validate_sparse_layer(config: &Config, layer: &LayerIndex) -> Result<()> {
-    if layer.layer_index >= config.num_layers {
+    let is_single_mtp_layer =
+        layer.layer_index == config.num_layers && config.num_nextn_predict_layers == 1;
+    if layer.layer_index >= config.num_layers && !is_single_mtp_layer {
         return Err(Error::gguf(format!(
             "GLM-5.2 GGUF sparse block layer {} exceeds num_layers {}",
             layer.layer_index, config.num_layers
@@ -436,10 +565,10 @@ mod tests {
         assert_eq!(block.load_report().ffn.routed_expert_count, 4);
         assert_eq!(output.hidden_states.dims(), &[2, 3, 256]);
         assert_eq!(tensors.hidden_states.dims(), &[2, 3, 256]);
-        assert_eq!(output.cache_k.dims(), &[2, 2, 3, 256]);
-        assert_eq!(output.cache_v.dims(), &[2, 2, 3, 256]);
-        assert_eq!(tensors.cache_k.dims(), &[2, 2, 3, 256]);
-        assert_eq!(tensors.cache_v.dims(), &[2, 2, 3, 256]);
+        assert_eq!(output.cache_k.dims(), &[2, 1, 3, 256]);
+        assert_eq!(output.cache_v.dims(), &[2, 1, 3, 128]);
+        assert_eq!(tensors.cache_k.dims(), &[2, 1, 3, 256]);
+        assert_eq!(tensors.cache_v.dims(), &[2, 1, 3, 128]);
         assert_eq!(output.report.attention_scores_shape.dims(), &[2, 2, 3, 3]);
         assert_eq!(output.report.ffn_flat_tokens_shape.dims(), &[6, 256]);
         assert_eq!(output.report.routed_expert_outputs_shape.dims(), &[12, 256]);
@@ -486,10 +615,10 @@ mod tests {
         );
         assert_eq!(decode.hidden_states.dims(), &[1, 1, 256]);
         assert_eq!(decode_tensors.hidden_states.dims(), &[1, 1, 256]);
-        assert_eq!(decode.cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode.cache_v.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode_tensors.cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode_tensors.cache_v.dims(), &[1, 2, 1, 256]);
+        assert_eq!(decode.cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode.cache_v.dims(), &[1, 1, 1, 128]);
+        assert_eq!(decode_tensors.cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode_tensors.cache_v.dims(), &[1, 1, 1, 128]);
         assert_eq!(decode.report.attention_past_tokens, 3);
         assert_eq!(decode.report.attention_scores_shape.dims(), &[1, 2, 1, 4]);
         assert_eq!(decode.report.routed_expert_outputs_shape.dims(), &[2, 256]);
@@ -522,6 +651,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 4,
             experts_per_token: 2,
@@ -535,6 +665,12 @@ mod tests {
             topk_method: "noaux_tc".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

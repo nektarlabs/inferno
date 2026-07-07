@@ -55,6 +55,36 @@ pub(crate) fn dispatch_1d_many(queue: &CommandQueue, dispatches: &[Dispatch1d<'_
     }
 }
 
+pub(crate) fn dispatch_2d(
+    queue: &CommandQueue,
+    pipeline: &ComputePipelineState,
+    buffers: &[&Buffer],
+    width: usize,
+    height: usize,
+    threads_per_group_width: usize,
+    threads_per_group_height: usize,
+) -> Result<()> {
+    let command_buffer = queue.new_command_buffer();
+    encode_2d(
+        command_buffer,
+        pipeline,
+        buffers,
+        width,
+        height,
+        threads_per_group_width,
+        threads_per_group_height,
+    )?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    match command_buffer.status() {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        status => Err(Error::backend(format!(
+            "Metal command buffer did not complete: {status:?}"
+        ))),
+    }
+}
+
 /// Encodes a GPU-side buffer-to-buffer copy (blit) into the command buffer.
 /// Offsets and length are in f32 elements.
 pub(crate) fn encode_f32_copy(
@@ -65,15 +95,41 @@ pub(crate) fn encode_f32_copy(
     destination_offset: usize,
     len: usize,
 ) -> Result<()> {
-    let element = std::mem::size_of::<f32>();
+    encode_element_copy(
+        command_buffer,
+        source,
+        source_offset,
+        destination,
+        destination_offset,
+        len,
+        std::mem::size_of::<f32>(),
+    )
+}
+
+/// Encodes a GPU-side buffer-to-buffer copy for values of `element_size`
+/// bytes. Offsets and length are in logical elements.
+pub(crate) fn encode_element_copy(
+    command_buffer: &CommandBufferRef,
+    source: &Buffer,
+    source_offset: usize,
+    destination: &Buffer,
+    destination_offset: usize,
+    len: usize,
+    element_size: usize,
+) -> Result<()> {
+    if element_size == 0 {
+        return Err(Error::backend(
+            "Metal blit copy element size must be positive",
+        ));
+    }
     let byte_len = len
-        .checked_mul(element)
+        .checked_mul(element_size)
         .ok_or_else(|| Error::backend("Metal blit copy byte length overflow"))?;
     let source_bytes = source_offset
-        .checked_mul(element)
+        .checked_mul(element_size)
         .ok_or_else(|| Error::backend("Metal blit copy source offset overflow"))?;
     let destination_bytes = destination_offset
-        .checked_mul(element)
+        .checked_mul(element_size)
         .ok_or_else(|| Error::backend("Metal blit copy destination offset overflow"))?;
     let source_end = source_bytes
         .checked_add(byte_len)
@@ -125,9 +181,7 @@ pub(crate) fn encode_1d(
         encoder.set_buffer(index as NSUInteger, Some(buffer), 0);
     }
 
-    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1);
-    let execution_width = pipeline.thread_execution_width().max(1);
-    let threads_per_group = max_threads.min(execution_width.max(1));
+    let threads_per_group = preferred_1d_threadgroup_size(pipeline);
 
     trace!(
         target: "inferno::metal",
@@ -142,4 +196,80 @@ pub(crate) fn encode_1d(
     );
     encoder.end_encoding();
     Ok(())
+}
+
+pub(crate) fn encode_2d(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    buffers: &[&Buffer],
+    width: usize,
+    height: usize,
+    threads_per_group_width: usize,
+    threads_per_group_height: usize,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(Error::backend(
+            "Metal 2D dispatch requires non-zero width and height",
+        ));
+    }
+    if threads_per_group_width == 0 || threads_per_group_height == 0 {
+        return Err(Error::backend(
+            "Metal 2D dispatch requires non-zero threadgroup dimensions",
+        ));
+    }
+
+    let threads_per_group = threads_per_group_width
+        .checked_mul(threads_per_group_height)
+        .ok_or_else(|| Error::backend("Metal 2D threadgroup size overflow"))?;
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1) as usize;
+    if threads_per_group > max_threads {
+        return Err(Error::backend(format!(
+            "Metal 2D threadgroup has {threads_per_group} threads but pipeline allows {max_threads}"
+        )));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+
+    for (index, buffer) in buffers.iter().enumerate() {
+        encoder.set_buffer(index as NSUInteger, Some(buffer), 0);
+    }
+
+    trace!(
+        target: "inferno::metal",
+        width,
+        height,
+        threads_per_group_width,
+        threads_per_group_height,
+        threadgroup_count_width = ceil_div(width, threads_per_group_width),
+        threadgroup_count_height = ceil_div(height, threads_per_group_height),
+        "dispatching native Metal 2D kernel"
+    );
+
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            ceil_div(width, threads_per_group_width) as NSUInteger,
+            ceil_div(height, threads_per_group_height) as NSUInteger,
+            1,
+        ),
+        MTLSize::new(
+            threads_per_group_width as NSUInteger,
+            threads_per_group_height as NSUInteger,
+            1,
+        ),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+fn preferred_1d_threadgroup_size(pipeline: &ComputePipelineState) -> NSUInteger {
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1);
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let target = max_threads.min(256).max(execution_width);
+    let aligned = (target / execution_width) * execution_width;
+    aligned.max(1).min(max_threads)
+}
+
+fn ceil_div(value: usize, divisor: usize) -> usize {
+    value.div_ceil(divisor)
 }

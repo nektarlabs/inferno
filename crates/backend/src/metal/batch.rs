@@ -74,7 +74,6 @@ impl BatchSlot {
             ))),
         }
     }
-
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]

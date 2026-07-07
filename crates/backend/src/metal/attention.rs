@@ -1,28 +1,37 @@
 use std::sync::Mutex;
 
+use crate::DevicePagedKvView;
 use ::metal::{Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device};
-use common::{validate_exact_shape, Error, PagedKvView, Result};
+use common::{validate_exact_shape, DType, Error, PagedKvView, Result};
 use tracing::trace;
 
 use super::{
     buffers::{
-        empty_f32_buffer, empty_u32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity,
-        u32_scalar_buffer, write_f32_buffer, write_f32_buffer_at, write_u32_buffer,
+        empty_f32_buffer, empty_u32_buffer, f32_buffer, read_f32_buffer, require_f16_capacity,
+        require_f32_capacity, u32_scalar_buffer, write_f32_buffer, write_f32_buffer_at,
+        write_u32_buffer,
     },
-    command::{dispatch_1d, dispatch_1d_many, encode_1d, Dispatch1d},
+    command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{
-        validate_attention_causal_softmax_f32, validate_attention_scores_f32,
-        validate_attention_values_f32,
+        debug_assert_finite_values, validate_attention_causal_softmax_f32,
+        validate_attention_scores_f32, validate_attention_values_f32,
     },
 };
 
 const ATTENTION_SCORES_KERNEL: &str = "attention_scores_f32_kernel";
 const ATTENTION_VALUES_KERNEL: &str = "attention_values_f32_kernel";
 const ATTENTION_CAUSAL_SOFTMAX_KERNEL: &str = "attention_causal_softmax_f32_kernel";
-const PAGED_DECODE_ATTENTION_SCORES_KERNEL: &str = "paged_decode_attention_scores_f32_kernel";
-const PAGED_DECODE_ATTENTION_VALUES_KERNEL: &str = "paged_decode_attention_values_f32_kernel";
+const FUSED_DECODE_ATTENTION_KERNEL: &str = "fused_decode_attention_f32_kernel";
+const FUSED_PAGED_DECODE_ATTENTION_KERNEL: &str = "fused_paged_decode_attention_f32_kernel";
+const FUSED_SELECTED_DECODE_ATTENTION_KERNEL: &str = "fused_selected_decode_attention_f32_kernel";
+const FUSED_PAGED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
+    "fused_paged_decode_attention_f16_kv_kernel";
+const FUSED_SELECTED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
+    "fused_selected_decode_attention_f16_kv_kernel";
+const FUSED_DECODE_ATTENTION_THREADS_PER_ROW: usize = 256;
+const FUSED_DECODE_ATTENTION_MAX_KEYS: usize = 4096;
 
 pub(crate) struct MetalAttentionScores {
     pipeline: ComputePipelineState,
@@ -37,11 +46,11 @@ pub(crate) struct MetalAttentionCausalSoftmax {
 }
 
 pub(crate) struct MetalDecodeAttention {
-    scores_pipeline: ComputePipelineState,
-    paged_scores_pipeline: ComputePipelineState,
-    softmax_pipeline: ComputePipelineState,
-    values_pipeline: ComputePipelineState,
-    paged_values_pipeline: ComputePipelineState,
+    fused_pipeline: ComputePipelineState,
+    fused_paged_pipeline: ComputePipelineState,
+    fused_selected_pipeline: ComputePipelineState,
+    fused_paged_f16_kv_pipeline: ComputePipelineState,
+    fused_selected_f16_kv_pipeline: ComputePipelineState,
     workspace: Mutex<DecodeAttentionWorkspace>,
 }
 
@@ -124,15 +133,12 @@ pub struct MetalPagedDecodeAttentionReport {
 
 #[derive(Debug, Default)]
 struct DecodeAttentionWorkspace {
-    scores: Option<WorkspaceBuffer>,
-    probs: Option<WorkspaceBuffer>,
     output: Option<WorkspaceBuffer>,
     q: Option<WorkspaceBuffer>,
     k: Option<WorkspaceBuffer>,
     v: Option<WorkspaceBuffer>,
     batch_count: Option<WorkspaceBuffer>,
     head_count: Option<WorkspaceBuffer>,
-    query_tokens: Option<WorkspaceBuffer>,
     key_tokens: Option<WorkspaceBuffer>,
     page_size: Option<WorkspaceBuffer>,
     head_dim: Option<WorkspaceBuffer>,
@@ -434,18 +440,26 @@ impl MetalAttentionCausalSoftmax {
 impl MetalDecodeAttention {
     pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
         Ok(Self {
-            scores_pipeline: compute_pipeline(device, library, ATTENTION_SCORES_KERNEL)?,
-            paged_scores_pipeline: compute_pipeline(
+            fused_pipeline: compute_pipeline(device, library, FUSED_DECODE_ATTENTION_KERNEL)?,
+            fused_paged_pipeline: compute_pipeline(
                 device,
                 library,
-                PAGED_DECODE_ATTENTION_SCORES_KERNEL,
+                FUSED_PAGED_DECODE_ATTENTION_KERNEL,
             )?,
-            softmax_pipeline: compute_pipeline(device, library, ATTENTION_CAUSAL_SOFTMAX_KERNEL)?,
-            values_pipeline: compute_pipeline(device, library, ATTENTION_VALUES_KERNEL)?,
-            paged_values_pipeline: compute_pipeline(
+            fused_selected_pipeline: compute_pipeline(
                 device,
                 library,
-                PAGED_DECODE_ATTENTION_VALUES_KERNEL,
+                FUSED_SELECTED_DECODE_ATTENTION_KERNEL,
+            )?,
+            fused_paged_f16_kv_pipeline: compute_pipeline(
+                device,
+                library,
+                FUSED_PAGED_DECODE_ATTENTION_F16_KV_KERNEL,
+            )?,
+            fused_selected_f16_kv_pipeline: compute_pipeline(
+                device,
+                library,
+                FUSED_SELECTED_DECODE_ATTENTION_F16_KV_KERNEL,
             )?,
             workspace: Mutex::new(DecodeAttentionWorkspace::default()),
         })
@@ -484,11 +498,6 @@ impl MetalDecodeAttention {
             past_tokens,
         )?;
 
-        let scores_len = batch_count
-            .checked_mul(head_count)
-            .and_then(|value| value.checked_mul(query_tokens))
-            .and_then(|value| value.checked_mul(key_tokens))
-            .ok_or_else(|| Error::backend("fused decode attention score length overflow"))?;
         let output_len = batch_count
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(query_tokens))
@@ -498,15 +507,18 @@ impl MetalDecodeAttention {
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(query_tokens))
             .ok_or_else(|| Error::backend("fused decode attention row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            &self.fused_pipeline,
+            key_tokens,
+            row_count,
+            "fused decode attention",
+        )?;
 
         let batch_count_u32 = u32::try_from(batch_count).map_err(|_| {
             Error::backend("fused decode attention batch_count exceeds Metal u32 limit")
         })?;
         let head_count_u32 = u32::try_from(head_count).map_err(|_| {
             Error::backend("fused decode attention head_count exceeds Metal u32 limit")
-        })?;
-        let query_tokens_u32 = u32::try_from(query_tokens).map_err(|_| {
-            Error::backend("fused decode attention query_tokens exceeds Metal u32 limit")
         })?;
         let key_tokens_u32 = u32::try_from(key_tokens).map_err(|_| {
             Error::backend("fused decode attention key_tokens exceeds Metal u32 limit")
@@ -516,9 +528,6 @@ impl MetalDecodeAttention {
         })?;
         let value_dim_u32 = u32::try_from(value_dim).map_err(|_| {
             Error::backend("fused decode attention value_dim exceeds Metal u32 limit")
-        })?;
-        let past_tokens_u32 = u32::try_from(past_tokens).map_err(|_| {
-            Error::backend("fused decode attention past_tokens exceeds Metal u32 limit")
         })?;
 
         let mut workspace = self
@@ -531,9 +540,6 @@ impl MetalDecodeAttention {
         let (head_count_buffer, _) = workspace
             .head_count_buffer(device, head_count_u32)?
             .clone_for_dispatch();
-        let (query_tokens_buffer, _) = workspace
-            .query_tokens_buffer(device, query_tokens_u32)?
-            .clone_for_dispatch();
         let (key_tokens_buffer, _) = workspace
             .key_tokens_buffer(device, key_tokens_u32)?
             .clone_for_dispatch();
@@ -542,15 +548,6 @@ impl MetalDecodeAttention {
             .clone_for_dispatch();
         let (value_dim_buffer, _) = workspace
             .value_dim_buffer(device, value_dim_u32)?
-            .clone_for_dispatch();
-        let (past_tokens_buffer, _) = workspace
-            .past_tokens_buffer(device, past_tokens_u32)?
-            .clone_for_dispatch();
-        let (scores_buffer, reused_scores_buffer) = workspace
-            .scores_buffer(device, scores_len)?
-            .clone_for_dispatch();
-        let (probs_buffer, reused_probs_buffer) = workspace
-            .probs_buffer(device, scores_len)?
             .clone_for_dispatch();
         let (output_buffer, reused_output_buffer) = workspace
             .output_buffer(device, output_len)?
@@ -568,57 +565,24 @@ impl MetalDecodeAttention {
             head_dim,
             value_dim,
             past_tokens,
-            "running fused native Metal decode attention"
+            "running flash-style native Metal decode attention"
         );
 
-        let scores_buffers = [
-            &q_buffer,
-            &k_buffer,
-            &scores_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &query_tokens_buffer,
-            &key_tokens_buffer,
-            &head_dim_buffer,
-        ];
-        let softmax_buffers = [
-            &scores_buffer,
-            &probs_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &query_tokens_buffer,
-            &key_tokens_buffer,
-            &past_tokens_buffer,
-        ];
-        let values_buffers = [
-            &probs_buffer,
-            &v_buffer,
-            &output_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &query_tokens_buffer,
-            &key_tokens_buffer,
-            &value_dim_buffer,
-        ];
-        dispatch_1d_many(
+        dispatch_1d(
             queue,
+            &self.fused_pipeline,
             &[
-                Dispatch1d {
-                    pipeline: &self.scores_pipeline,
-                    buffers: &scores_buffers,
-                    threads: scores_len,
-                },
-                Dispatch1d {
-                    pipeline: &self.softmax_pipeline,
-                    buffers: &softmax_buffers,
-                    threads: row_count,
-                },
-                Dispatch1d {
-                    pipeline: &self.values_pipeline,
-                    buffers: &values_buffers,
-                    threads: output_len,
-                },
+                &q_buffer,
+                &k_buffer,
+                &v_buffer,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &key_tokens_buffer,
+                &head_dim_buffer,
+                &value_dim_buffer,
             ],
+            dispatch_threads,
         )?;
 
         let values = read_f32_buffer(&output_buffer, output_len)?;
@@ -632,11 +596,11 @@ impl MetalDecodeAttention {
             head_dim,
             value_dim,
             past_tokens,
-            scores_len,
-            probs_len: scores_len,
+            scores_len: 0,
+            probs_len: 0,
             output_len,
-            reused_scores_buffer,
-            reused_probs_buffer,
+            reused_scores_buffer: false,
+            reused_probs_buffer: false,
             reused_output_buffer,
             reused_q_buffer,
             reused_k_buffer,
@@ -673,11 +637,7 @@ impl MetalDecodeAttention {
             .and_then(|value| value.checked_mul(head_dim))
             .ok_or_else(|| Error::backend("paged decode attention q length overflow"))?;
         validate_exact_shape("paged_decode_attention_q_values", &[q.len()], &[q_len])?;
-        if q.iter().any(|value| !value.is_finite()) {
-            return Err(Error::backend(
-                "paged decode attention query contains non-finite values",
-            ));
-        }
+        debug_assert_finite_values("paged decode attention query", q);
         let current_k_len = batch_count
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(head_dim))
@@ -696,30 +656,28 @@ impl MetalDecodeAttention {
             &[current_v.len()],
             &[current_v_len],
         )?;
-        if current_k.iter().any(|value| !value.is_finite())
-            || current_v.iter().any(|value| !value.is_finite())
-        {
-            return Err(Error::backend(
-                "paged decode attention current K/V contains non-finite values",
-            ));
-        }
+        debug_assert_finite_values("paged decode attention current K", current_k);
+        debug_assert_finite_values("paged decode attention current V", current_v);
 
-        let scores_len = batch_count
-            .checked_mul(head_count)
-            .and_then(|value| value.checked_mul(key_tokens))
-            .ok_or_else(|| Error::backend("paged decode attention score length overflow"))?;
         let output_len = batch_count
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(value_dim))
             .ok_or_else(|| Error::backend("paged decode attention output length overflow"))?;
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .ok_or_else(|| Error::backend("paged decode attention row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            &self.fused_paged_pipeline,
+            key_tokens,
+            row_count,
+            "fused paged decode attention",
+        )?;
         let page_k_len = page_buffer_len(page_count, batch_count, head_count, page_size, head_dim)?;
         let page_v_len =
             page_buffer_len(page_count, batch_count, head_count, page_size, value_dim)?;
 
         let batch_count_u32 = checked_u32("paged decode attention batch_count", batch_count)?;
         let head_count_u32 = checked_u32("paged decode attention head_count", head_count)?;
-        let query_tokens_u32 = 1_u32;
-        let key_tokens_u32 = checked_u32("paged decode attention key_tokens", key_tokens)?;
         let page_size_u32 = checked_u32("paged decode attention page_size", page_size)?;
         let head_dim_u32 = checked_u32("paged decode attention head_dim", head_dim)?;
         let value_dim_u32 = checked_u32("paged decode attention value_dim", value_dim)?;
@@ -735,12 +693,6 @@ impl MetalDecodeAttention {
         let (head_count_buffer, _) = workspace
             .head_count_buffer(device, head_count_u32)?
             .clone_for_dispatch();
-        let (query_tokens_buffer, _) = workspace
-            .query_tokens_buffer(device, query_tokens_u32)?
-            .clone_for_dispatch();
-        let (key_tokens_buffer, _) = workspace
-            .key_tokens_buffer(device, key_tokens_u32)?
-            .clone_for_dispatch();
         let (page_size_buffer, _) = workspace
             .page_size_buffer(device, page_size_u32)?
             .clone_for_dispatch();
@@ -752,12 +704,6 @@ impl MetalDecodeAttention {
             .clone_for_dispatch();
         let (past_tokens_buffer, _) = workspace
             .past_tokens_buffer(device, past_tokens_u32)?
-            .clone_for_dispatch();
-        let (scores_buffer, reused_scores_buffer) = workspace
-            .scores_buffer(device, scores_len)?
-            .clone_for_dispatch();
-        let (probs_buffer, reused_probs_buffer) = workspace
-            .probs_buffer(device, scores_len)?
             .clone_for_dispatch();
         let (output_buffer, reused_output_buffer) = workspace
             .output_buffer(device, output_len)?
@@ -781,59 +727,27 @@ impl MetalDecodeAttention {
             page_size,
             head_dim,
             value_dim,
-            "running native Metal paged decode attention"
+            "running flash-style native Metal paged decode attention"
         );
 
-        let scores_buffers = [
-            &q_buffer,
-            &page_k_buffer,
-            &current_k_buffer,
-            &scores_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &past_tokens_buffer,
-            &page_size_buffer,
-            &head_dim_buffer,
-        ];
-        let softmax_buffers = [
-            &scores_buffer,
-            &probs_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &query_tokens_buffer,
-            &key_tokens_buffer,
-            &past_tokens_buffer,
-        ];
-        let values_buffers = [
-            &probs_buffer,
-            &page_v_buffer,
-            &current_v_buffer,
-            &output_buffer,
-            &batch_count_buffer,
-            &head_count_buffer,
-            &past_tokens_buffer,
-            &page_size_buffer,
-            &value_dim_buffer,
-        ];
-        dispatch_1d_many(
+        dispatch_1d(
             queue,
+            &self.fused_paged_pipeline,
             &[
-                Dispatch1d {
-                    pipeline: &self.paged_scores_pipeline,
-                    buffers: &scores_buffers,
-                    threads: scores_len,
-                },
-                Dispatch1d {
-                    pipeline: &self.softmax_pipeline,
-                    buffers: &softmax_buffers,
-                    threads: batch_count * head_count,
-                },
-                Dispatch1d {
-                    pipeline: &self.paged_values_pipeline,
-                    buffers: &values_buffers,
-                    threads: output_len,
-                },
+                &q_buffer,
+                &page_k_buffer,
+                &current_k_buffer,
+                &page_v_buffer,
+                &current_v_buffer,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &past_tokens_buffer,
+                &page_size_buffer,
+                &head_dim_buffer,
+                &value_dim_buffer,
             ],
+            dispatch_threads,
         )?;
 
         let values = read_f32_buffer(&output_buffer, output_len)?;
@@ -848,11 +762,11 @@ impl MetalDecodeAttention {
             page_size,
             head_dim,
             value_dim,
-            scores_len,
-            probs_len: scores_len,
+            scores_len: 0,
+            probs_len: 0,
             output_len,
-            reused_scores_buffer,
-            reused_probs_buffer,
+            reused_scores_buffer: false,
+            reused_probs_buffer: false,
             reused_output_buffer,
             reused_q_buffer,
             transient_kv_buffers: true,
@@ -861,12 +775,9 @@ impl MetalDecodeAttention {
         })
     }
 
-    /// Encodes the fused paged decode attention (scores -> causal softmax ->
-    /// values) into an open batched command buffer. The query and the current
-    /// token's K/V are device-resident buffers produced by earlier encoded
-    /// kernels; the past K/V pages are host data and are uploaded into fresh
-    /// buffers here (fresh, not pooled: the workspace pool must not be
-    /// CPU-written while earlier encoded kernels may still read it).
+    /// Encodes flash-style paged decode attention into an open batched command
+    /// buffer. Scores, softmax, and value aggregation stay inside one Metal
+    /// kernel; no global score/probability buffers are materialized.
     ///
     /// Returns the attention output buffer and its element count.
     #[allow(clippy::too_many_arguments)]
@@ -899,7 +810,11 @@ impl MetalDecodeAttention {
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(head_dim))
             .ok_or_else(|| Error::backend("paged decode attention q length overflow"))?;
-        validate_exact_shape("paged_decode_attention_q_values", &[q_len], &[expected_q_len])?;
+        validate_exact_shape(
+            "paged_decode_attention_q_values",
+            &[q_len],
+            &[expected_q_len],
+        )?;
         let expected_k_len = expected_q_len;
         let expected_v_len = batch_count
             .checked_mul(head_count)
@@ -919,14 +834,19 @@ impl MetalDecodeAttention {
         require_f32_capacity(current_k, current_k_len, "paged decode attention current K")?;
         require_f32_capacity(current_v, current_v_len, "paged decode attention current V")?;
 
-        let scores_len = batch_count
-            .checked_mul(head_count)
-            .and_then(|value| value.checked_mul(key_tokens))
-            .ok_or_else(|| Error::backend("paged decode attention score length overflow"))?;
         let output_len = batch_count
             .checked_mul(head_count)
             .and_then(|value| value.checked_mul(value_dim))
             .ok_or_else(|| Error::backend("paged decode attention output length overflow"))?;
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .ok_or_else(|| Error::backend("paged decode attention row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            &self.fused_paged_pipeline,
+            key_tokens,
+            row_count,
+            "fused paged decode attention",
+        )?;
         let page_k_len = page_buffer_len(page_count, batch_count, head_count, page_size, head_dim)?;
         let page_v_len =
             page_buffer_len(page_count, batch_count, head_count, page_size, value_dim)?;
@@ -938,11 +858,6 @@ impl MetalDecodeAttention {
         let head_count_buffer = u32_scalar_buffer(
             device,
             checked_u32("paged decode attention head_count", head_count)?,
-        )?;
-        let query_tokens_buffer = u32_scalar_buffer(device, 1_u32)?;
-        let key_tokens_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention key_tokens", key_tokens)?,
         )?;
         let page_size_buffer = u32_scalar_buffer(
             device,
@@ -960,8 +875,6 @@ impl MetalDecodeAttention {
             device,
             checked_u32("paged decode attention past_tokens", past_tokens)?,
         )?;
-        let scores_buffer = empty_f32_buffer(device, scores_len)?;
-        let probs_buffer = empty_f32_buffer(device, scores_len)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
         let page_k_buffer = empty_f32_buffer(device, page_k_len)?;
         let page_v_buffer = empty_f32_buffer(device, page_v_len)?;
@@ -977,46 +890,16 @@ impl MetalDecodeAttention {
             page_size,
             head_dim,
             value_dim,
-            "encoding batched paged decode attention"
+            "encoding flash-style batched paged decode attention"
         );
 
         encode_1d(
             command_buffer,
-            &self.paged_scores_pipeline,
+            &self.fused_paged_pipeline,
             &[
                 q,
                 &page_k_buffer,
                 current_k,
-                &scores_buffer,
-                &batch_count_buffer,
-                &head_count_buffer,
-                &past_tokens_buffer,
-                &page_size_buffer,
-                &head_dim_buffer,
-            ],
-            scores_len,
-        )?;
-        encode_1d(
-            command_buffer,
-            &self.softmax_pipeline,
-            &[
-                &scores_buffer,
-                &probs_buffer,
-                &batch_count_buffer,
-                &head_count_buffer,
-                &query_tokens_buffer,
-                &key_tokens_buffer,
-                &past_tokens_buffer,
-            ],
-            batch_count
-                .checked_mul(head_count)
-                .ok_or_else(|| Error::backend("paged decode attention row count overflow"))?,
-        )?;
-        encode_1d(
-            command_buffer,
-            &self.paged_values_pipeline,
-            &[
-                &probs_buffer,
                 &page_v_buffer,
                 current_v,
                 &output_buffer,
@@ -1024,9 +907,367 @@ impl MetalDecodeAttention {
                 &head_count_buffer,
                 &past_tokens_buffer,
                 &page_size_buffer,
+                &head_dim_buffer,
                 &value_dim_buffer,
             ],
-            output_len,
+            dispatch_threads,
+        )?;
+        Ok((output_buffer, output_len))
+    }
+
+    /// Encodes fused paged decode attention against append-only resident K/V
+    /// buffers. This is the production Metal path: no host `PagedKvView`
+    /// upload happens per token.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_paged_resident(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        q: &Buffer,
+        q_len: usize,
+        current_k: &Buffer,
+        current_k_len: usize,
+        current_v: &Buffer,
+        current_v_len: usize,
+        past_kv: &DevicePagedKvView,
+    ) -> Result<(Buffer, usize)> {
+        past_kv.validate()?;
+
+        let batch_count = past_kv.batch;
+        let head_count = past_kv.attention_heads;
+        let past_tokens = past_kv.cached_tokens;
+        let key_tokens = past_tokens.checked_add(1).ok_or_else(|| {
+            Error::backend("resident paged decode attention key token count overflow")
+        })?;
+        let page_size = past_kv.page_size;
+        let head_dim = past_kv.key_head_dim;
+        let value_dim = past_kv.value_head_dim;
+        let expected_q_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::backend("resident paged decode attention q length overflow"))?;
+        validate_exact_shape(
+            "resident_paged_decode_attention_q_values",
+            &[q_len],
+            &[expected_q_len],
+        )?;
+        let expected_k_len = expected_q_len;
+        let expected_v_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| {
+                Error::backend("resident paged decode attention current V length overflow")
+            })?;
+        validate_exact_shape(
+            "resident_paged_decode_attention_current_k_values",
+            &[current_k_len],
+            &[expected_k_len],
+        )?;
+        validate_exact_shape(
+            "resident_paged_decode_attention_current_v_values",
+            &[current_v_len],
+            &[expected_v_len],
+        )?;
+        require_f32_capacity(q, q_len, "resident paged decode attention q")?;
+        require_f32_capacity(
+            current_k,
+            current_k_len,
+            "resident paged decode attention current K",
+        )?;
+        require_f32_capacity(
+            current_v,
+            current_v_len,
+            "resident paged decode attention current V",
+        )?;
+        match past_kv.k.dtype() {
+            DType::F32 => {
+                require_f32_capacity(
+                    &past_kv.k.buffer,
+                    past_kv.k.element_count()?,
+                    "resident paged decode attention K cache",
+                )?;
+                require_f32_capacity(
+                    &past_kv.v.buffer,
+                    past_kv.v.element_count()?,
+                    "resident paged decode attention V cache",
+                )?;
+            }
+            DType::F16 => {
+                require_f16_capacity(
+                    &past_kv.k.buffer,
+                    past_kv.k.element_count()?,
+                    "resident paged decode attention K cache",
+                )?;
+                require_f16_capacity(
+                    &past_kv.v.buffer,
+                    past_kv.v.element_count()?,
+                    "resident paged decode attention V cache",
+                )?;
+            }
+            DType::BF16 => {
+                return Err(Error::backend(
+                    "resident paged decode attention does not support BF16 KV yet",
+                ))
+            }
+        }
+
+        let output_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| {
+                Error::backend("resident paged decode attention output length overflow")
+            })?;
+        let pipeline = match past_kv.k.dtype() {
+            DType::F32 => &self.fused_paged_pipeline,
+            DType::F16 => &self.fused_paged_f16_kv_pipeline,
+            DType::BF16 => unreachable!("BF16 rejected above"),
+        };
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .ok_or_else(|| Error::backend("resident paged decode attention row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            pipeline,
+            key_tokens,
+            row_count,
+            "fused resident paged decode attention",
+        )?;
+
+        let batch_count_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention batch_count", batch_count)?,
+        )?;
+        let head_count_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention head_count", head_count)?,
+        )?;
+        let page_size_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention page_size", page_size)?,
+        )?;
+        let value_dim_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention value_dim", value_dim)?,
+        )?;
+        let head_dim_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention head_dim", head_dim)?,
+        )?;
+        let past_tokens_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("resident paged decode attention past_tokens", past_tokens)?,
+        )?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+
+        trace!(
+            target: "inferno::metal",
+            batch_count,
+            head_count,
+            past_tokens,
+            key_tokens,
+            capacity_tokens = past_kv.capacity_tokens,
+            page_size,
+            head_dim,
+            value_dim,
+            kv_dtype = ?past_kv.k.dtype(),
+            "encoding flash-style resident paged decode attention"
+        );
+
+        encode_1d(
+            command_buffer,
+            pipeline,
+            &[
+                q,
+                &past_kv.k.buffer,
+                current_k,
+                &past_kv.v.buffer,
+                current_v,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &past_tokens_buffer,
+                &page_size_buffer,
+                &head_dim_buffer,
+                &value_dim_buffer,
+            ],
+            dispatch_threads,
+        )?;
+        Ok((output_buffer, output_len))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_selected(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        q: &Buffer,
+        q_len: usize,
+        selected_k: &Buffer,
+        selected_k_len: usize,
+        selected_v: &Buffer,
+        selected_v_len: usize,
+        selected_kv_dtype: DType,
+        current_k: &Buffer,
+        current_k_len: usize,
+        current_v: &Buffer,
+        current_v_len: usize,
+        batch_count: usize,
+        head_count: usize,
+        selected_tokens: usize,
+        head_dim: usize,
+        value_dim: usize,
+    ) -> Result<(Buffer, usize)> {
+        if selected_tokens == 0 {
+            return Err(Error::backend(
+                "selected decode attention requires at least one selected token",
+            ));
+        }
+        let key_tokens = selected_tokens
+            .checked_add(1)
+            .ok_or_else(|| Error::backend("selected decode attention key token count overflow"))?;
+        let expected_q_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::backend("selected decode attention q length overflow"))?;
+        let expected_selected_k_len =
+            expected_q_len.checked_mul(selected_tokens).ok_or_else(|| {
+                Error::backend("selected decode attention selected K length overflow")
+            })?;
+        let expected_selected_v_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(selected_tokens))
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| {
+                Error::backend("selected decode attention selected V length overflow")
+            })?;
+        let expected_v_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| Error::backend("selected decode attention current V length overflow"))?;
+        validate_exact_shape(
+            "selected_decode_attention_q_values",
+            &[q_len],
+            &[expected_q_len],
+        )?;
+        validate_exact_shape(
+            "selected_decode_attention_selected_k_values",
+            &[selected_k_len],
+            &[expected_selected_k_len],
+        )?;
+        validate_exact_shape(
+            "selected_decode_attention_selected_v_values",
+            &[selected_v_len],
+            &[expected_selected_v_len],
+        )?;
+        validate_exact_shape(
+            "selected_decode_attention_current_k_values",
+            &[current_k_len],
+            &[expected_q_len],
+        )?;
+        validate_exact_shape(
+            "selected_decode_attention_current_v_values",
+            &[current_v_len],
+            &[expected_v_len],
+        )?;
+        require_f32_capacity(q, q_len, "selected decode attention q")?;
+        match selected_kv_dtype {
+            DType::F32 => {
+                require_f32_capacity(
+                    selected_k,
+                    selected_k_len,
+                    "selected decode attention selected K",
+                )?;
+                require_f32_capacity(
+                    selected_v,
+                    selected_v_len,
+                    "selected decode attention selected V",
+                )?;
+            }
+            DType::F16 => {
+                require_f16_capacity(
+                    selected_k,
+                    selected_k_len,
+                    "selected decode attention selected K",
+                )?;
+                require_f16_capacity(
+                    selected_v,
+                    selected_v_len,
+                    "selected decode attention selected V",
+                )?;
+            }
+            DType::BF16 => {
+                return Err(Error::backend(
+                    "selected decode attention does not support BF16 KV yet",
+                ))
+            }
+        }
+        require_f32_capacity(
+            current_k,
+            current_k_len,
+            "selected decode attention current K",
+        )?;
+        require_f32_capacity(
+            current_v,
+            current_v_len,
+            "selected decode attention current V",
+        )?;
+
+        let output_len = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| Error::backend("selected decode attention output length overflow"))?;
+        let pipeline = match selected_kv_dtype {
+            DType::F32 => &self.fused_selected_pipeline,
+            DType::F16 => &self.fused_selected_f16_kv_pipeline,
+            DType::BF16 => unreachable!("BF16 rejected above"),
+        };
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .ok_or_else(|| Error::backend("selected decode attention row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            pipeline,
+            key_tokens,
+            row_count,
+            "fused selected decode attention",
+        )?;
+        let batch_count_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("selected decode attention batch_count", batch_count)?,
+        )?;
+        let head_count_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("selected decode attention head_count", head_count)?,
+        )?;
+        let selected_tokens_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("selected decode attention selected_tokens", selected_tokens)?,
+        )?;
+        let head_dim_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("selected decode attention head_dim", head_dim)?,
+        )?;
+        let value_dim_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("selected decode attention value_dim", value_dim)?,
+        )?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+
+        encode_1d(
+            command_buffer,
+            pipeline,
+            &[
+                q,
+                selected_k,
+                current_k,
+                selected_v,
+                current_v,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &selected_tokens_buffer,
+                &head_dim_buffer,
+                &value_dim_buffer,
+            ],
+            dispatch_threads,
         )?;
         Ok((output_buffer, output_len))
     }
@@ -1082,14 +1323,9 @@ fn validate_decode_attention_f32(
     validate_exact_shape("fused_decode_attention_q_values", &[q.len()], &[q_len])?;
     validate_exact_shape("fused_decode_attention_k_values", &[k.len()], &[k_len])?;
     validate_exact_shape("fused_decode_attention_v_values", &[v.len()], &[v_len])?;
-    if q.iter().any(|value| !value.is_finite())
-        || k.iter().any(|value| !value.is_finite())
-        || v.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend(
-            "fused decode attention q/k/v contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("fused decode attention q", q);
+    debug_assert_finite_values("fused decode attention k", k);
+    debug_assert_finite_values("fused decode attention v", v);
     Ok(())
 }
 
@@ -1145,11 +1381,7 @@ fn write_page_values_to_buffer(
     page_size: usize,
     dim: usize,
 ) -> Result<()> {
-    if source.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(format!(
-            "paged decode attention {name} page contains non-finite values"
-        )));
-    }
+    debug_assert_finite_values(name, source);
     for batch in 0..batch_count {
         for head in 0..head_count {
             for token in 0..token_count {
@@ -1190,6 +1422,42 @@ fn page_buffer_len(
 
 fn checked_u32(context: &str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::backend(format!("{context} exceeds Metal u32 limit")))
+}
+
+fn fused_decode_attention_threads(
+    pipeline: &ComputePipelineState,
+    key_tokens: usize,
+    row_count: usize,
+    context: &str,
+) -> Result<usize> {
+    if key_tokens == 0 {
+        return Err(Error::backend(format!(
+            "{context} requires at least one key"
+        )));
+    }
+    if key_tokens > FUSED_DECODE_ATTENTION_MAX_KEYS {
+        return Err(Error::backend(format!(
+            "{context} supports at most {FUSED_DECODE_ATTENTION_MAX_KEYS} keys, got {key_tokens}"
+        )));
+    }
+
+    let thread_execution_width = pipeline.thread_execution_width() as usize;
+    if thread_execution_width != 32 {
+        return Err(Error::backend(format!(
+            "{context} requires 32-lane Apple Metal SIMD groups, got {thread_execution_width}"
+        )));
+    }
+
+    let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+    if max_threads < FUSED_DECODE_ATTENTION_THREADS_PER_ROW {
+        return Err(Error::backend(format!(
+            "{context} requires {FUSED_DECODE_ATTENTION_THREADS_PER_ROW} threads per threadgroup, pipeline allows {max_threads}"
+        )));
+    }
+
+    row_count
+        .checked_mul(FUSED_DECODE_ATTENTION_THREADS_PER_ROW)
+        .ok_or_else(|| Error::backend(format!("{context} dispatch thread count overflow")))
 }
 
 fn write_all_paged_kv_to_buffers(
@@ -1259,14 +1527,6 @@ impl DecodeAttentionWorkspace {
         Ok(buffer)
     }
 
-    fn scores_buffer(&mut self, device: &Device, len: usize) -> Result<WorkspaceBufferRef> {
-        workspace_f32_buffer(device, &mut self.scores, len)
-    }
-
-    fn probs_buffer(&mut self, device: &Device, len: usize) -> Result<WorkspaceBufferRef> {
-        workspace_f32_buffer(device, &mut self.probs, len)
-    }
-
     fn output_buffer(&mut self, device: &Device, len: usize) -> Result<WorkspaceBufferRef> {
         workspace_f32_buffer(device, &mut self.output, len)
     }
@@ -1277,10 +1537,6 @@ impl DecodeAttentionWorkspace {
 
     fn head_count_buffer(&mut self, device: &Device, value: u32) -> Result<WorkspaceBufferRef> {
         workspace_u32_value_buffer(device, &mut self.head_count, value)
-    }
-
-    fn query_tokens_buffer(&mut self, device: &Device, value: u32) -> Result<WorkspaceBufferRef> {
-        workspace_u32_value_buffer(device, &mut self.query_tokens, value)
     }
 
     fn key_tokens_buffer(&mut self, device: &Device, value: u32) -> Result<WorkspaceBufferRef> {
@@ -1364,10 +1620,10 @@ fn workspace_buffer_with(
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod tests {
-    use crate::metal::Metal;
+    use crate::{metal::Metal, DevicePagedKvView, DeviceValue};
     use std::borrow::Cow;
 
-    use common::{F32Tensor, PagedKvPageView, PagedKvView};
+    use common::{DType, F32Tensor, PagedKvPageView, PagedKvView};
 
     #[test]
     fn matches_cpu_reference_for_small_attention_scores() {
@@ -1649,11 +1905,15 @@ mod tests {
 
         assert_close(&first.values, &expected, 1e-5);
         assert_close(&second.values, &expected, 1e-5);
+        assert_eq!(first.scores_len, 0);
+        assert_eq!(first.probs_len, 0);
+        assert_eq!(second.scores_len, 0);
+        assert_eq!(second.probs_len, 0);
         assert!(!first.reused_scores_buffer);
         assert!(!first.reused_probs_buffer);
         assert!(!first.reused_output_buffer);
-        assert!(second.reused_scores_buffer);
-        assert!(second.reused_probs_buffer);
+        assert!(!second.reused_scores_buffer);
+        assert!(!second.reused_probs_buffer);
         assert!(second.reused_output_buffer);
     }
 
@@ -1799,6 +2059,14 @@ mod tests {
         assert_close(&second.values, &expected, 1e-5);
         assert_eq!(first.past_tokens, past_tokens);
         assert_eq!(first.key_tokens, key_tokens);
+        assert_eq!(first.scores_len, 0);
+        assert_eq!(first.probs_len, 0);
+        assert_eq!(second.scores_len, 0);
+        assert_eq!(second.probs_len, 0);
+        assert!(!first.reused_scores_buffer);
+        assert!(!first.reused_probs_buffer);
+        assert!(!second.reused_scores_buffer);
+        assert!(!second.reused_probs_buffer);
         assert_eq!(first.page_count, 2);
         assert_eq!(first.uploaded_page_count, 2);
         assert_eq!(first.uploaded_page_tokens, past_tokens);
@@ -1806,6 +2074,331 @@ mod tests {
         assert_eq!(second.uploaded_page_tokens, past_tokens);
         assert!(first.transient_kv_buffers);
         assert!(second.transient_kv_buffers);
+    }
+
+    #[test]
+    fn selected_decode_attention_matches_contiguous_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let head_count = 2;
+        let selected_tokens = 4;
+        let key_tokens = selected_tokens + 1;
+        let head_dim = 4;
+        let value_dim = 3;
+        let q = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>();
+        let selected_k = (0..batch_count * head_count * selected_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>();
+        let selected_v = (0..batch_count * head_count * selected_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>();
+        let current_k = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 40.0)
+            .collect::<Vec<_>>();
+        let current_v = (0..batch_count * head_count * value_dim)
+            .map(|index| (index as f32 + 1.0) / 50.0)
+            .collect::<Vec<_>>();
+        let contiguous_k = append_current_token(
+            &selected_k,
+            &current_k,
+            batch_count,
+            head_count,
+            selected_tokens,
+            head_dim,
+        );
+        let contiguous_v = append_current_token(
+            &selected_v,
+            &current_v,
+            batch_count,
+            head_count,
+            selected_tokens,
+            value_dim,
+        );
+        let scores = cpu_attention_scores(
+            &q,
+            &contiguous_k,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            head_dim,
+        );
+        let probs = cpu_attention_causal_softmax(
+            &scores,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            selected_tokens,
+        );
+        let expected = cpu_attention_values(
+            &probs,
+            &contiguous_v,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            value_dim,
+        );
+
+        let q_buffer = metal.batch_upload_f32(&q).unwrap();
+        let selected_k_buffer = metal.batch_upload_f32(&selected_k).unwrap();
+        let selected_v_buffer = metal.batch_upload_f32(&selected_v).unwrap();
+        let current_k_buffer = metal.batch_upload_f32(&current_k).unwrap();
+        let current_v_buffer = metal.batch_upload_f32(&current_v).unwrap();
+        let (output_buffer, output_len) = metal
+            .batched_selected_decode_attention(
+                &q_buffer,
+                q.len(),
+                &selected_k_buffer,
+                selected_k.len(),
+                &selected_v_buffer,
+                selected_v.len(),
+                DType::F32,
+                &current_k_buffer,
+                current_k.len(),
+                &current_v_buffer,
+                current_v.len(),
+                batch_count,
+                head_count,
+                selected_tokens,
+                head_dim,
+                value_dim,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output_buffer, output_len).unwrap();
+
+        assert_close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn resident_paged_decode_attention_accepts_f16_kv() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let head_count = 2;
+        let past_tokens = 4;
+        let page_size = 4;
+        let page_count = 1;
+        let key_tokens = past_tokens + 1;
+        let head_dim = 4;
+        let value_dim = 3;
+        let q = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>();
+        let past_k = (0..batch_count * head_count * past_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>();
+        let past_v = (0..batch_count * head_count * past_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>();
+        let current_k = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 40.0)
+            .collect::<Vec<_>>();
+        let current_v = (0..batch_count * head_count * value_dim)
+            .map(|index| (index as f32 + 1.0) / 50.0)
+            .collect::<Vec<_>>();
+
+        let q_buffer = metal.batch_upload_f32(&q).unwrap();
+        let past_k_buffer = metal.batch_upload_f32_as_f16(&past_k).unwrap();
+        let past_v_buffer = metal.batch_upload_f32_as_f16(&past_v).unwrap();
+        let rounded_past_k = metal
+            .batch_read_f16_as_f32(&past_k_buffer, past_k.len())
+            .unwrap();
+        let rounded_past_v = metal
+            .batch_read_f16_as_f32(&past_v_buffer, past_v.len())
+            .unwrap();
+        let current_k_buffer = metal.batch_upload_f32(&current_k).unwrap();
+        let current_v_buffer = metal.batch_upload_f32(&current_v).unwrap();
+        let past_k_value = DeviceValue::new_with_dtype(
+            vec![page_count, batch_count, head_count, page_size, head_dim],
+            DType::F16,
+            past_k_buffer,
+        );
+        let past_v_value = DeviceValue::new_with_dtype(
+            vec![page_count, batch_count, head_count, page_size, value_dim],
+            DType::F16,
+            past_v_buffer,
+        );
+        let past_kv = DevicePagedKvView {
+            batch: batch_count,
+            attention_heads: head_count,
+            key_head_dim: head_dim,
+            value_head_dim: value_dim,
+            page_size,
+            cached_tokens: past_tokens,
+            capacity_tokens: page_count * page_size,
+            k: past_k_value,
+            v: past_v_value,
+        };
+        let contiguous_k = append_current_token(
+            &rounded_past_k,
+            &current_k,
+            batch_count,
+            head_count,
+            past_tokens,
+            head_dim,
+        );
+        let contiguous_v = append_current_token(
+            &rounded_past_v,
+            &current_v,
+            batch_count,
+            head_count,
+            past_tokens,
+            value_dim,
+        );
+        let scores = cpu_attention_scores(
+            &q,
+            &contiguous_k,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            head_dim,
+        );
+        let probs = cpu_attention_causal_softmax(
+            &scores,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            past_tokens,
+        );
+        let expected = cpu_attention_values(
+            &probs,
+            &contiguous_v,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            value_dim,
+        );
+
+        let (output_buffer, output_len) = metal
+            .batched_paged_decode_attention_resident(
+                &q_buffer,
+                q.len(),
+                &current_k_buffer,
+                current_k.len(),
+                &current_v_buffer,
+                current_v.len(),
+                &past_kv,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output_buffer, output_len).unwrap();
+
+        assert_close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn selected_decode_attention_accepts_f16_kv() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let head_count = 2;
+        let selected_tokens = 4;
+        let key_tokens = selected_tokens + 1;
+        let head_dim = 4;
+        let value_dim = 3;
+        let q = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>();
+        let selected_k = (0..batch_count * head_count * selected_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>();
+        let selected_v = (0..batch_count * head_count * selected_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>();
+        let current_k = (0..batch_count * head_count * head_dim)
+            .map(|index| (index as f32 + 1.0) / 40.0)
+            .collect::<Vec<_>>();
+        let current_v = (0..batch_count * head_count * value_dim)
+            .map(|index| (index as f32 + 1.0) / 50.0)
+            .collect::<Vec<_>>();
+
+        let q_buffer = metal.batch_upload_f32(&q).unwrap();
+        let selected_k_buffer = metal.batch_upload_f32_as_f16(&selected_k).unwrap();
+        let selected_v_buffer = metal.batch_upload_f32_as_f16(&selected_v).unwrap();
+        let rounded_selected_k = metal
+            .batch_read_f16_as_f32(&selected_k_buffer, selected_k.len())
+            .unwrap();
+        let rounded_selected_v = metal
+            .batch_read_f16_as_f32(&selected_v_buffer, selected_v.len())
+            .unwrap();
+        let current_k_buffer = metal.batch_upload_f32(&current_k).unwrap();
+        let current_v_buffer = metal.batch_upload_f32(&current_v).unwrap();
+        let contiguous_k = append_current_token(
+            &rounded_selected_k,
+            &current_k,
+            batch_count,
+            head_count,
+            selected_tokens,
+            head_dim,
+        );
+        let contiguous_v = append_current_token(
+            &rounded_selected_v,
+            &current_v,
+            batch_count,
+            head_count,
+            selected_tokens,
+            value_dim,
+        );
+        let scores = cpu_attention_scores(
+            &q,
+            &contiguous_k,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            head_dim,
+        );
+        let probs = cpu_attention_causal_softmax(
+            &scores,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            selected_tokens,
+        );
+        let expected = cpu_attention_values(
+            &probs,
+            &contiguous_v,
+            batch_count,
+            head_count,
+            1,
+            key_tokens,
+            value_dim,
+        );
+
+        let (output_buffer, output_len) = metal
+            .batched_selected_decode_attention(
+                &q_buffer,
+                q.len(),
+                &selected_k_buffer,
+                selected_k.len(),
+                &selected_v_buffer,
+                selected_v.len(),
+                DType::F16,
+                &current_k_buffer,
+                current_k.len(),
+                &current_v_buffer,
+                current_v.len(),
+                batch_count,
+                head_count,
+                selected_tokens,
+                head_dim,
+                value_dim,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output_buffer, output_len).unwrap();
+
+        assert_close(&actual, &expected, 1e-5);
     }
 
     #[test]

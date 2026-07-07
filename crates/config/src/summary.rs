@@ -14,6 +14,7 @@ pub struct ArchitectureSummary {
     pub qk_head_dim: usize,
     pub qk_no_rope_dim: usize,
     pub qk_rope_dim: usize,
+    pub kv_lora_rank: usize,
     pub v_head_dim: usize,
     pub merged_attention_width: usize,
     pub routed_experts: usize,
@@ -28,6 +29,9 @@ pub struct ArchitectureSummary {
     pub topk_method: String,
     pub max_context: usize,
     pub dsa_index_topk: usize,
+    pub index_head_dim: usize,
+    pub index_n_heads: usize,
+    pub index_topk_freq: usize,
 }
 
 impl ArchitectureSummary {
@@ -43,6 +47,7 @@ impl ArchitectureSummary {
             qk_head_dim: config.qk_head_dim,
             qk_no_rope_dim: config.qk_no_rope_dim,
             qk_rope_dim: config.qk_rope_dim,
+            kv_lora_rank: config.kv_lora_rank,
             v_head_dim: config.v_head_dim(),
             merged_attention_width: config.merged_attention_width(),
             routed_experts: config.num_routed_experts,
@@ -57,6 +62,9 @@ impl ArchitectureSummary {
             topk_method: config.topk_method.clone(),
             max_context: config.max_context,
             dsa_index_topk: config.dsa_index_topk,
+            index_head_dim: config.index_head_dim,
+            index_n_heads: config.index_n_heads,
+            index_topk_freq: config.index_topk_freq,
         }
     }
 }
@@ -158,18 +166,8 @@ impl ShapeSummary {
             moe_router_logits: Shape::new(vec![flat_token_count, config.num_routed_experts]),
             moe_topk_ids: Shape::new(vec![flat_token_count, config.experts_per_token]),
             moe_topk_weights: Shape::new(vec![flat_token_count, config.experts_per_token]),
-            k_cache: Shape::new(vec![
-                batch,
-                config.attention_heads,
-                tokens,
-                config.qk_head_dim,
-            ]),
-            v_cache: Shape::new(vec![
-                batch,
-                config.attention_heads,
-                tokens,
-                config.v_head_dim(),
-            ]),
+            k_cache: Shape::new(vec![batch, 1, tokens, config.kv_lora_rank]),
+            v_cache: Shape::new(vec![batch, 1, tokens, config.qk_rope_dim]),
             logits: Shape::new(vec![batch, tokens, config.vocab_size]),
         };
 
@@ -197,8 +195,8 @@ mod tests {
         assert_eq!(shapes.q_heads.dims(), &[1, 4, 64, 256]);
         assert_eq!(shapes.q_no_rope.dims(), &[1, 4, 64, 192]);
         assert_eq!(shapes.q_rope.dims(), &[1, 4, 64, 64]);
-        assert_eq!(shapes.k_cache.dims(), &[1, 64, 4, 256]);
-        assert_eq!(shapes.v_cache.dims(), &[1, 64, 4, 256]);
+        assert_eq!(shapes.k_cache.dims(), &[1, 1, 4, 512]);
+        assert_eq!(shapes.v_cache.dims(), &[1, 1, 4, 64]);
         assert_eq!(shapes.moe_router_logits.dims(), &[4, 256]);
         assert_eq!(shapes.moe_topk_ids.dims(), &[4, 8]);
         assert_eq!(shapes.logits.dims(), &[1, 4, 154880]);

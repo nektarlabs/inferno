@@ -2,8 +2,10 @@ mod activation;
 mod attention;
 mod batch;
 mod buffers;
+mod cast;
 mod command;
 mod device;
+mod dsa;
 mod layout;
 mod library;
 mod matmul;
@@ -19,13 +21,13 @@ pub use attention::MetalAttentionCausalSoftmaxReport;
 pub use attention::MetalPagedDecodeAttentionReport;
 pub use attention::{MetalAttentionScoresReport, MetalAttentionValuesReport};
 pub use device::Metal;
-pub(crate) use q2::QuantMatvecKind;
 pub use layout::{
     MetalCombineRopeTailReport, MetalHeadsToAttentionLayoutReport, MetalMergeAttentionHeadsReport,
     MetalSelectLastTokenReport, MetalSplitKvMqaReport, MetalSplitRopeTailReport,
 };
 pub use matmul::{MetalLinearReport, MetalMatmulReport};
 pub use moe::{MetalMoeCombineReport, MetalMoeGatherReport};
+pub(crate) use q2::QuantMatvecKind;
 pub use q2::{MetalQ2MatvecAddReport, MetalQ2MatvecArgmaxReport, MetalQ2MatvecReport};
 pub use rms_norm::MetalRmsNormReport;
 pub use rope::MetalRopeReport;

@@ -23,6 +23,7 @@ mod dense_block;
 mod dense_ffn;
 mod embedding;
 mod index;
+mod indexer;
 mod kv_types;
 mod layer_kind;
 mod layer_stack;
@@ -30,6 +31,7 @@ mod linear;
 mod model;
 mod moe_ffn;
 mod moe_router;
+mod mtp;
 mod output_head;
 mod profile;
 mod rms_norm;
@@ -54,9 +56,10 @@ pub use embedding::{
 };
 pub use index::{
     AttentionIndex, DenseFfnIndex, FfnIndex, Index, IndexSummary, IndexerIndex, LayerIndex,
-    PackedExpertsIndex, RootIndex, SharedExpertIndex, TensorRef,
+    MemoryAdviceReport, MtpIndex, PackedExpertsIndex, RootIndex, SharedExpertIndex, TensorRef,
 };
-pub use kv_types::{LayerKvCacheReport, LayerKvCacheTensors};
+pub use indexer::{DsaIndexer, DsaIndexerLoadReport, DsaTopKSelection};
+pub use kv_types::{LayerDeviceKvCacheTensors, LayerKvCacheReport, LayerKvCacheTensors};
 pub use layer_kind::LayerKind;
 pub use layer_stack::{
     LayerRuntimeKind, LayerRuntimeReport, LayerStack, LayerStackForwardF32Tensors,
@@ -68,12 +71,13 @@ pub use linear::{
     QuantizedLinear,
 };
 pub use model::{
-    Model, ModelGreedyOutput, ModelGreedyReport, ModelHiddenOutput, ModelHiddenReport,
-    ModelLoadReport, ModelLogitsOutput, ModelLogitsReport, ModelTokenOutput,
-    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    Model, ModelDeviceTokenOutput, ModelGreedyOutput, ModelGreedyReport, ModelHiddenOutput,
+    ModelHiddenReport, ModelLoadReport, ModelLogitsOutput, ModelLogitsReport, ModelTokenOutput,
+    ModelTokenSequenceOutput, ModelTokenWithHiddenOutput, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 pub use moe_ffn::{MoeFfn, MoeFfnForwardReport, MoeFfnLoadReport, MoeFfnOutput};
 pub use moe_router::{MoeRouter, MoeRouterLoadReport, MoeRoutingOutput, MoeRoutingReport};
+pub use mtp::{MtpDraftOutput, MtpHead, MtpLoadReport};
 pub use output_head::{
     GreedyOutput, GreedyReport, LogitsOutput, LogitsReport, OutputHead, OutputHeadLoadReport,
     TokenOutput,

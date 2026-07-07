@@ -316,19 +316,40 @@ impl<'a> DenseFfn<'a> {
             &[batch, tokens, config.hidden_size],
         )?;
 
-        let normed =
-            crate::try_device!(self.post_attention_norm.forward_device(hidden_states, backend));
-        let gate = crate::try_device!(self.gate.forward_device(&normed, backend));
-        let up = crate::try_device!(self.up.forward_device(&normed, backend));
-        let gated = crate::try_device!(backend.swiglu_device(&gate, &up));
+        let normed = require_dense_ffn_device_stage(
+            "dense_ffn.post_attention_norm",
+            self.post_attention_norm
+                .forward_device(hidden_states, backend),
+        )?;
+        let gate = require_dense_ffn_device_stage(
+            "dense_ffn.gate",
+            self.gate.forward_device(&normed, backend),
+        )?;
+        let up = require_dense_ffn_device_stage(
+            "dense_ffn.up",
+            self.up.forward_device(&normed, backend),
+        )?;
+        let gated =
+            require_dense_ffn_device_stage("dense_ffn.swiglu", backend.swiglu_device(&gate, &up))?;
         validate_exact_shape(
             "gguf_device_dense_ffn_gated",
             gated.dims(),
             &[batch, tokens, self.intermediate_size],
         )?;
-        let down = crate::try_device!(self.down.forward_device(&gated, backend));
-        backend.add_device(hidden_states, &down)
+        let down = require_dense_ffn_device_stage(
+            "dense_ffn.down",
+            self.down.forward_device(&gated, backend),
+        )?;
+        let output = require_dense_ffn_device_stage(
+            "dense_ffn.residual_add",
+            backend.add_device(hidden_states, &down),
+        )?;
+        Ok(Some(output))
     }
+}
+
+fn require_dense_ffn_device_stage<T>(stage: &str, result: Result<Option<T>>) -> Result<T> {
+    result?.ok_or_else(|| Error::backend(format!("{stage} has no native device path")))
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
@@ -557,6 +578,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 1,
             experts_per_token: 1,
@@ -570,6 +592,12 @@ mod tests {
             topk_method: "greedy".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

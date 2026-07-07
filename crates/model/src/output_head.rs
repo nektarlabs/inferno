@@ -338,6 +338,33 @@ impl<'a> OutputHead<'a> {
             token_score: token.token_score,
         })
     }
+
+    pub(crate) fn decode_token_from_normalized_f32<B: Backend>(
+        &self,
+        normalized_hidden_states: &F32Tensor,
+        backend: &B,
+    ) -> Result<TokenOutput> {
+        let dims = normalized_hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF normalized token decode expects hidden states [B, 1, H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        validate_exact_shape(
+            "gguf_output_head_normalized_token_hidden_states",
+            dims,
+            &[batch, 1, self.hidden_size],
+        )?;
+        let token = self
+            .output_projection
+            .greedy_token_f32(normalized_hidden_states, backend)?;
+
+        Ok(TokenOutput {
+            token_id: token.token_id,
+            token_score: token.token_score,
+        })
+    }
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
@@ -483,6 +510,7 @@ mod tests {
             qk_head_dim: hidden_size,
             qk_no_rope_dim: hidden_size,
             qk_rope_dim: 0,
+            kv_lora_rank: hidden_size,
             v_head_dim: Some(hidden_size),
             num_routed_experts: 1,
             experts_per_token: 1,
@@ -496,6 +524,12 @@ mod tests {
             topk_method: "greedy".to_string(),
             max_context: 16,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

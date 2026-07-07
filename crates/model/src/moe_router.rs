@@ -365,10 +365,11 @@ impl<'a> MoeRouter<'a> {
         })
     }
 
-    /// Batched device-resident routing: the post-attention norm is encoded on
-    /// the GPU, but the top-k expert selection is CPU logic, so the normed
-    /// activations are downloaded here. That download flushes the batch and is
-    /// the MoE block's synchronization point.
+    /// Batched device-resident routing: post-attention norm and router
+    /// projection are encoded on the GPU. Top-k expert selection is still CPU
+    /// logic, so only the small `[tokens, experts]` router-logit tensor is
+    /// downloaded; the normalized activations stay resident for the selected
+    /// experts.
     pub(crate) fn route_device<B: Backend>(
         &self,
         config: &Config,
@@ -393,25 +394,34 @@ impl<'a> MoeRouter<'a> {
             .checked_mul(tokens)
             .ok_or_else(|| Error::moe("GGUF device MoE flat token count overflow"))?;
 
-        let normed_hidden_states = crate::try_device!(self
-            .post_attention_norm
-            .forward_device(hidden_states, backend));
+        let normed_hidden_states = require_router_device_stage(
+            "sparse_moe.router.post_attention_norm",
+            self.post_attention_norm
+                .forward_device(hidden_states, backend),
+        )?;
         let flat_tokens =
             normed_hidden_states.reshape(vec![flat_token_count, config.hidden_size])?;
-        let flat_tokens_host = backend.device_download_f32_tensor(&flat_tokens)?;
-        let router_logits = self.router.forward_f32_tensor(&flat_tokens_host, backend)?;
-        validate_exact_shape(
-            "gguf_device_moe_router_logits",
-            router_logits.dims(),
-            &[flat_token_count, config.num_routed_experts],
+        let router_logits_device = require_router_device_stage(
+            "sparse_moe.router.projection",
+            self.router
+                .forward_device(&flat_tokens, flat_token_count, backend),
         )?;
-
-        let logits_host = matrix_rows(
-            router_logits.values(),
+        let topk = require_router_device_stage(
+            "sparse_moe.router.topk",
+            backend.moe_router_topk_device(
+                &router_logits_device,
+                &self.correction_bias,
+                config.experts_per_token,
+                config.norm_topk_prob,
+                config.routed_scaling_factor as f32,
+            ),
+        )?;
+        let topk_selections = topk_to_selections(
+            &topk,
             flat_token_count,
             config.num_routed_experts,
+            config.experts_per_token,
         )?;
-        let topk_selections = select_topk(config, &logits_host, &self.correction_bias)?;
         let dispatch_plan = build_dispatch_plan(&topk_selections, config.num_routed_experts)?;
 
         Ok(Some(MoeRoutingDeviceTensors {
@@ -419,6 +429,72 @@ impl<'a> MoeRouter<'a> {
             dispatch_plan,
         }))
     }
+}
+
+fn require_router_device_stage<T>(stage: &str, result: Result<Option<T>>) -> Result<T> {
+    result?.ok_or_else(|| Error::backend(format!("{stage} has no native device path")))
+}
+
+fn topk_to_selections(
+    topk: &backend::RouterTopK,
+    expected_token_count: usize,
+    expected_expert_count: usize,
+    expected_top_k: usize,
+) -> Result<Vec<TopKSelection>> {
+    validate_exact_shape(
+        "gguf_device_moe_router_topk_shape",
+        &[topk.token_count, topk.expert_count, topk.top_k],
+        &[expected_token_count, expected_expert_count, expected_top_k],
+    )?;
+    let expected_len = expected_token_count
+        .checked_mul(expected_top_k)
+        .ok_or_else(|| Error::moe("device MoE router top-k length overflow"))?;
+    validate_exact_shape(
+        "gguf_device_moe_router_topk_ids",
+        &[topk.expert_ids.len()],
+        &[expected_len],
+    )?;
+    validate_exact_shape(
+        "gguf_device_moe_router_topk_weights",
+        &[topk.weights.len()],
+        &[expected_len],
+    )?;
+
+    let mut selections = Vec::with_capacity(expected_token_count);
+    for token_index in 0..expected_token_count {
+        let offset = token_index
+            .checked_mul(expected_top_k)
+            .ok_or_else(|| Error::moe("device MoE router top-k row offset overflow"))?;
+        let mut expert_ids = Vec::with_capacity(expected_top_k);
+        let mut weights = Vec::with_capacity(expected_top_k);
+        for rank in 0..expected_top_k {
+            let expert_id = usize::try_from(topk.expert_ids[offset + rank]).map_err(|_| {
+                Error::moe(format!(
+                    "device MoE router expert id {} does not fit usize",
+                    topk.expert_ids[offset + rank]
+                ))
+            })?;
+            if expert_id >= expected_expert_count {
+                return Err(Error::moe(format!(
+                    "device MoE router expert id {expert_id} exceeds expert_count {expected_expert_count}"
+                )));
+            }
+            let weight = topk.weights[offset + rank];
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(Error::moe(format!(
+                    "device MoE router produced invalid weight {weight} for token {token_index}"
+                )));
+            }
+            expert_ids.push(expert_id);
+            weights.push(weight);
+        }
+        selections.push(TopKSelection {
+            token_index,
+            expert_ids,
+            weights,
+        });
+    }
+    Ok(selections)
 }
 
 impl<'a> RouterProjection<'a> {
@@ -571,6 +647,38 @@ impl<'a> RouterProjection<'a> {
             }
         }
     }
+
+    fn forward_device<B: Backend>(
+        &self,
+        input: &backend::DeviceValue,
+        rows: usize,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        match self {
+            Self::Quantized(router) => router.forward_device(input, backend),
+            Self::F32 {
+                weight,
+                input_features,
+                output_features,
+            } => {
+                let dims = input.dims();
+                validate_exact_shape(
+                    "gguf_device_moe_router_f32_input",
+                    dims,
+                    &[rows, *input_features],
+                )?;
+                let output = backend.linear_f32_device(input, weight)?;
+                if let Some(output) = output.as_ref() {
+                    validate_exact_shape(
+                        "gguf_device_moe_router_f32_output",
+                        output.dims(),
+                        &[rows, *output_features],
+                    )?;
+                }
+                Ok(output)
+            }
+        }
+    }
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
@@ -620,7 +728,9 @@ fn reference_linear_f32(
 }
 
 fn validate_sparse_layer(config: &Config, layer_index: usize) -> Result<()> {
-    if layer_index >= config.num_layers {
+    let is_single_mtp_layer =
+        layer_index == config.num_layers && config.num_nextn_predict_layers == 1;
+    if layer_index >= config.num_layers && !is_single_mtp_layer {
         return Err(Error::moe(format!(
             "GLM-5.2 GGUF MoE router layer {layer_index} exceeds num_layers {}",
             config.num_layers
@@ -1056,6 +1166,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 4,
             experts_per_token: 2,
@@ -1069,6 +1180,12 @@ mod tests {
             topk_method: "noaux_tc".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

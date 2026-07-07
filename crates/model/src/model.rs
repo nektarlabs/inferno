@@ -6,8 +6,9 @@ use gguf::{GgmlType, GgufFile};
 
 use crate::{
     EmbeddingLookupOutput, EmbeddingLookupReport, EmbeddingTable, GreedyReport, Index,
-    IndexSummary, LayerKvCacheTensors, LayerStack, LayerStackForwardReport, LayerStackLoadReport,
-    LogitsOutput, LogitsReport, OutputHead, OutputHeadLoadReport,
+    IndexSummary, LayerDeviceKvCacheTensors, LayerKvCacheTensors, LayerStack,
+    LayerStackForwardReport, LayerStackLoadReport, LogitsOutput, LogitsReport, MemoryAdviceReport,
+    MtpDraftOutput, MtpHead, MtpLoadReport, OutputHead, OutputHeadLoadReport,
 };
 
 pub const DEFAULT_GGUF_OUTPUT_CHUNK_ROWS: usize = 16_384;
@@ -18,6 +19,7 @@ pub struct Model<'a> {
     embedding_table: EmbeddingTable<'a>,
     layer_stack: LayerStack<'a>,
     output_head: OutputHead<'a>,
+    mtp_head: Option<MtpHead<'a>>,
     hidden_size: usize,
     max_context: usize,
     load_report: ModelLoadReport,
@@ -59,6 +61,29 @@ pub struct ModelTokenOutput {
 }
 
 #[derive(Debug)]
+pub struct ModelTokenWithHiddenOutput {
+    pub hidden_states: F32Tensor,
+    pub layer_kv_cache: Vec<LayerKvCacheTensors>,
+    pub token_id: u32,
+    pub token_score: f32,
+}
+
+#[derive(Debug)]
+pub struct ModelTokenSequenceOutput {
+    pub hidden_states: F32Tensor,
+    pub layer_kv_cache: Vec<LayerKvCacheTensors>,
+    pub token_ids: Vec<u32>,
+    pub token_scores: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct ModelDeviceTokenOutput {
+    pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
+    pub token_id: u32,
+    pub token_score: f32,
+}
+
+#[derive(Debug)]
 struct ModelHiddenTensors {
     hidden_states: Tensor,
     layer_kv_cache: Vec<LayerKvCacheTensors>,
@@ -75,12 +100,14 @@ pub struct ModelLoadReport {
     pub backend: BackendCapabilities,
     pub architecture: String,
     pub index: IndexSummary,
+    pub memory_advice: MemoryAdviceReport,
     pub token_embedding_tensor_name: String,
     pub token_embedding_tensor_type: GgmlType,
     pub token_embedding_shape: Shape,
     pub final_norm_tensor_name: String,
     pub layer_stack: LayerStackLoadReport,
     pub output_head: OutputHeadLoadReport,
+    pub mtp_head: Option<MtpLoadReport>,
     pub output_chunk_rows: usize,
     pub max_context: usize,
     pub limitations: Vec<String>,
@@ -126,16 +153,32 @@ impl<'a> Model<'a> {
         backend: &B,
         output_chunk_rows: usize,
     ) -> Result<Self> {
+        let memory_advice = index.advise_gguf_memory(gguf)?;
+        tracing::debug!(
+            hot_tensor_count = memory_advice.hot_tensor_count,
+            hot_bytes = memory_advice.hot_bytes,
+            random_tensor_count = memory_advice.random_tensor_count,
+            random_bytes = memory_advice.random_bytes,
+            "applied targeted GGUF mmap advice"
+        );
+
         let embedding_table = EmbeddingTable::open(gguf, config, &index.root.token_embedding)?;
         let layer_stack = LayerStack::open(gguf, config, &index, backend, output_chunk_rows)?;
         let layer_stack_report = layer_stack.load_report().clone();
         let output_head = OutputHead::open(gguf, config, &index.root, backend, output_chunk_rows)?;
         let output_head_report = output_head.load_report().clone();
+        let mtp_head = index
+            .mtp
+            .as_ref()
+            .map(|mtp| MtpHead::open(gguf, config, mtp, backend, output_chunk_rows))
+            .transpose()?;
+        let mtp_head_report = mtp_head.as_ref().map(|head| head.load_report().clone());
 
         let load_report = ModelLoadReport {
             backend: backend.capabilities(),
             architecture: index.architecture.clone(),
             index: index.summary.clone(),
+            memory_advice,
             token_embedding_tensor_name: index.root.token_embedding.name.clone(),
             token_embedding_tensor_type: index.root.token_embedding.ty,
             token_embedding_shape: Shape::new(
@@ -150,6 +193,7 @@ impl<'a> Model<'a> {
             final_norm_tensor_name: index.root.final_norm.name.clone(),
             layer_stack: layer_stack_report,
             output_head: output_head_report,
+            mtp_head: mtp_head_report,
             output_chunk_rows,
             max_context: config.max_context,
             limitations: vec![
@@ -166,6 +210,7 @@ impl<'a> Model<'a> {
             embedding_table,
             layer_stack,
             output_head,
+            mtp_head,
             hidden_size: config.hidden_size,
             max_context: config.max_context,
             load_report,
@@ -193,6 +238,10 @@ impl<'a> Model<'a> {
         self.max_context
     }
 
+    pub fn has_mtp_head(&self) -> bool {
+        self.mtp_head.is_some()
+    }
+
     pub fn embed_input_ids<B: Backend>(
         &self,
         input_ids: &[u32],
@@ -207,6 +256,31 @@ impl<'a> Model<'a> {
         backend: &B,
     ) -> Result<LogitsOutput> {
         self.output_head.decode_logits(hidden_states, backend)
+    }
+
+    pub fn draft_next_token_with_mtp<B: Backend>(
+        &self,
+        config: &Config,
+        main_hidden_states: &F32Tensor,
+        next_token_ids: &[u32],
+        backend: &B,
+        mtp_past_kv: Option<(&F32Tensor, &F32Tensor)>,
+        mtp_index_keys: Option<&F32Tensor>,
+    ) -> Result<Option<MtpDraftOutput>> {
+        let Some(mtp_head) = self.mtp_head.as_ref() else {
+            return Ok(None);
+        };
+        let draft = mtp_head.draft(
+            config,
+            main_hidden_states,
+            next_token_ids,
+            &self.embedding_table,
+            &self.output_head,
+            backend,
+            mtp_past_kv,
+            mtp_index_keys,
+        )?;
+        Ok(Some(draft))
     }
 
     pub fn prefill_last_logits<B: Backend>(
@@ -242,6 +316,55 @@ impl<'a> Model<'a> {
 
         let hidden = self.forward_hidden_tensors(config, input_ids, backend)?;
         self.last_token_only(hidden, backend)
+    }
+
+    pub fn prefill_next_token_with_hidden<B: Backend>(
+        &self,
+        config: &Config,
+        input_ids: &[u32],
+        backend: &B,
+    ) -> Result<ModelTokenWithHiddenOutput> {
+        if !backend.capabilities().custom_kernels {
+            return Err(Error::backend(
+                "MTP prefill requires the native GLM-5.2 Q2 path",
+            ));
+        }
+        let hidden = self.forward_hidden_f32_tensors(config, input_ids, backend)?;
+        self.last_token_only_f32_with_hidden(hidden, backend)
+    }
+
+    pub fn prefill_seed_device<B: Backend>(
+        &self,
+        config: &Config,
+        input_ids: &[u32],
+        backend: &B,
+    ) -> Result<Option<ModelDeviceTokenOutput>> {
+        if input_ids.len() != 1 {
+            return Err(Error::model(format!(
+                "device seed prefill requires exactly one token id, got {}",
+                input_ids.len()
+            )));
+        }
+        if !backend.capabilities().custom_kernels {
+            return Ok(None);
+        }
+
+        let embedding = self.embedding_table.lookup_f32(input_ids)?;
+        let stack = crate::try_device!(self.layer_stack.forward_seed_device(
+            config,
+            &embedding.hidden_states,
+            backend,
+        ));
+        let token = self
+            .output_head
+            .decode_token_device(&stack.hidden_states, backend)?
+            .ok_or_else(|| Error::backend("device seed output head has no native path"))?;
+
+        Ok(Some(ModelDeviceTokenOutput {
+            layer_kv_cache: stack.layer_kv_cache,
+            token_id: token.token_id,
+            token_score: token.token_score,
+        }))
     }
 
     pub fn decode_step_with_past_kv_provider<B, F>(
@@ -329,12 +452,83 @@ impl<'a> Model<'a> {
         self.last_token_only(hidden, backend)
     }
 
+    pub fn decode_next_token_with_sparse_past_kv_provider<B, F, I>(
+        &self,
+        config: &Config,
+        decode_token_ids: &[u32],
+        backend: &B,
+        past_kv_for_layer: F,
+        index_keys_for_layer: I,
+    ) -> Result<ModelTokenOutput>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<(F32Tensor, F32Tensor)>>,
+        I: FnMut(usize) -> Result<Option<F32Tensor>>,
+    {
+        if decode_token_ids.is_empty() {
+            return Err(Error::model(
+                "GLM-5.2 GGUF sparse next-token decode step requires at least one token id",
+            ));
+        }
+        if !backend.capabilities().custom_kernels {
+            return self.decode_next_token_with_past_kv_provider(
+                config,
+                decode_token_ids,
+                backend,
+                past_kv_for_layer,
+            );
+        }
+
+        let hidden = self.forward_hidden_sparse_f32_tensors_with_past_kv_provider(
+            config,
+            decode_token_ids,
+            backend,
+            past_kv_for_layer,
+            index_keys_for_layer,
+        )?;
+        self.last_token_only_f32(hidden, backend)
+    }
+
+    pub fn decode_token_sequence_with_sparse_past_kv_provider<B, F, I>(
+        &self,
+        config: &Config,
+        decode_token_ids: &[u32],
+        backend: &B,
+        past_kv_for_layer: F,
+        index_keys_for_layer: I,
+    ) -> Result<ModelTokenSequenceOutput>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<(F32Tensor, F32Tensor)>>,
+        I: FnMut(usize) -> Result<Option<F32Tensor>>,
+    {
+        if decode_token_ids.is_empty() {
+            return Err(Error::model(
+                "GLM-5.2 GGUF sparse token sequence decode requires at least one token id",
+            ));
+        }
+        if !backend.capabilities().custom_kernels {
+            return Err(Error::backend(
+                "MTP verification requires the native GLM-5.2 Q2 path",
+            ));
+        }
+
+        let hidden = self.forward_hidden_sparse_f32_tensors_with_past_kv_provider(
+            config,
+            decode_token_ids,
+            backend,
+            past_kv_for_layer,
+            index_keys_for_layer,
+        )?;
+        self.token_sequence_f32(hidden, backend)
+    }
+
     pub fn decode_next_token_with_paged_kv_provider<'kv, B, F>(
         &self,
         config: &Config,
         decode_token_ids: &[u32],
         backend: &B,
-        mut past_kv_for_layer: F,
+        past_kv_for_layer: F,
     ) -> Result<ModelTokenOutput>
     where
         B: Backend,
@@ -351,8 +545,43 @@ impl<'a> Model<'a> {
             ));
         }
 
-        // Prefer the batched device-resident path: one shared command buffer
-        // per stretch of GPU work instead of one commit+wait per kernel.
+        let hidden = self.forward_hidden_f32_tensors_with_paged_kv_provider(
+            config,
+            decode_token_ids,
+            backend,
+            past_kv_for_layer,
+        )?;
+        self.last_token_only_f32(hidden, backend)
+    }
+
+    pub fn decode_next_token_with_device_paged_kv_provider<B, F, S, I>(
+        &self,
+        config: &Config,
+        decode_token_ids: &[u32],
+        backend: &B,
+        mut past_kv_for_layer: F,
+        mut selected_kv_for_tokens: S,
+        mut index_keys_for_layer: I,
+    ) -> Result<Option<ModelDeviceTokenOutput>>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        if decode_token_ids.is_empty() {
+            return Err(Error::model(
+                "GLM-5.2 GGUF device paged next-token decode requires at least one token id",
+            ));
+        }
+        if !backend.capabilities().custom_kernels {
+            return Err(Error::backend(
+                "device paged decode requires the Metal Q2 backend",
+            ));
+        }
+
+        // One shared command buffer per stretch of GPU work. The runtime
+        // owns the resident KV cache and supplies per-layer device views.
         if decode_token_ids.len() == 1
             && backend.device_values_supported()
             && !self
@@ -364,8 +593,10 @@ impl<'a> Model<'a> {
                 decode_token_ids,
                 backend,
                 &mut past_kv_for_layer,
+                &mut selected_kv_for_tokens,
+                &mut index_keys_for_layer,
             )? {
-                Some(output) => return Ok(output),
+                Some(output) => return Ok(Some(output)),
                 None => {
                     // Discard any partially encoded work, then permanently
                     // fall back — the unsupported component will not change
@@ -381,29 +612,27 @@ impl<'a> Model<'a> {
             }
         }
 
-        let hidden = self.forward_hidden_f32_tensors_with_paged_kv_provider(
-            config,
-            decode_token_ids,
-            backend,
-            past_kv_for_layer,
-        )?;
-        self.last_token_only_f32(hidden, backend)
+        Ok(None)
     }
 
     /// Batched device-resident single-token decode. Embeds on the host (a
     /// table lookup), then runs every layer and the output head with
     /// GPU-resident hidden states; the fused argmax at the end flushes the
     /// final batch and yields the token.
-    fn decode_next_token_paged_device<'kv, B, F>(
+    fn decode_next_token_paged_device<B, F, S, I>(
         &self,
         config: &Config,
         decode_token_ids: &[u32],
         backend: &B,
         past_kv_for_layer: &mut F,
-    ) -> Result<Option<ModelTokenOutput>>
+        selected_kv_for_tokens: &mut S,
+        index_keys_for_layer: &mut I,
+    ) -> Result<Option<ModelDeviceTokenOutput>>
     where
         B: Backend,
-        F: FnMut(usize) -> Result<Option<PagedKvView<'kv>>>,
+        F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
         let embedding = self.embedding_table.lookup_f32(decode_token_ids)?;
         let stack = crate::try_device!(self.layer_stack.forward_decode_device(
@@ -411,6 +640,8 @@ impl<'a> Model<'a> {
             &embedding.hidden_states,
             backend,
             past_kv_for_layer,
+            selected_kv_for_tokens,
+            index_keys_for_layer,
         ));
 
         let token = match self
@@ -431,7 +662,7 @@ impl<'a> Model<'a> {
             }
         };
 
-        Ok(Some(ModelTokenOutput {
+        Ok(Some(ModelDeviceTokenOutput {
             layer_kv_cache: stack.layer_kv_cache,
             token_id: token.token_id,
             token_score: token.token_score,
@@ -583,6 +814,49 @@ impl<'a> Model<'a> {
         }
         validate_exact_shape(
             "gguf_native_model_output_hidden_size",
+            &[dims[2]],
+            &[self.hidden_size],
+        )?;
+
+        Ok(ModelHiddenF32Tensors {
+            hidden_states,
+            layer_kv_cache: stack_output.layer_kv_cache,
+        })
+    }
+
+    fn forward_hidden_sparse_f32_tensors_with_past_kv_provider<B, F, I>(
+        &self,
+        config: &Config,
+        input_ids: &[u32],
+        backend: &B,
+        past_kv_for_layer: F,
+        index_keys_for_layer: I,
+    ) -> Result<ModelHiddenF32Tensors>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<(F32Tensor, F32Tensor)>>,
+        I: FnMut(usize) -> Result<Option<F32Tensor>>,
+    {
+        let embedding = self.embedding_table.lookup_f32(input_ids)?;
+        let stack_output = self
+            .layer_stack
+            .forward_sparse_f32_input_with_past_kv_provider(
+                config,
+                &embedding.hidden_states,
+                backend,
+                past_kv_for_layer,
+                index_keys_for_layer,
+            )?;
+        let hidden_states = stack_output.hidden_states;
+
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF native sparse model hidden states must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        validate_exact_shape(
+            "gguf_native_sparse_model_output_hidden_size",
             &[dims[2]],
             &[self.hidden_size],
         )?;
@@ -857,6 +1131,69 @@ impl<'a> Model<'a> {
             token_score: token.token_score,
         })
     }
+
+    fn last_token_only_f32_with_hidden<B: Backend>(
+        &self,
+        hidden: ModelHiddenF32Tensors,
+        backend: &B,
+    ) -> Result<ModelTokenWithHiddenOutput> {
+        let token = self.last_token_only_f32(
+            ModelHiddenF32Tensors {
+                hidden_states: hidden.hidden_states.clone(),
+                layer_kv_cache: Vec::new(),
+            },
+            backend,
+        )?;
+
+        Ok(ModelTokenWithHiddenOutput {
+            hidden_states: hidden.hidden_states,
+            layer_kv_cache: hidden.layer_kv_cache,
+            token_id: token.token_id,
+            token_score: token.token_score,
+        })
+    }
+
+    fn token_sequence_f32<B: Backend>(
+        &self,
+        hidden: ModelHiddenF32Tensors,
+        backend: &B,
+    ) -> Result<ModelTokenSequenceOutput> {
+        let dims = hidden.hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF native token sequence input must be rank 3 [B,T,H], got {dims:?}"
+            )));
+        }
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape("gguf_model_token_sequence_batch", &[batch], &[1])?;
+        validate_exact_shape(
+            "gguf_model_token_sequence_hidden_size",
+            &[dims[2]],
+            &[self.hidden_size],
+        )?;
+
+        let mut token_ids = Vec::with_capacity(tokens);
+        let mut token_scores = Vec::with_capacity(tokens);
+        for token_index in 0..tokens {
+            let token_hidden = slice_token_range_f32(
+                "gguf_model_token_sequence_hidden_slice",
+                &hidden.hidden_states,
+                token_index,
+                1,
+            )?;
+            let token = self.output_head.decode_token_f32(&token_hidden, backend)?;
+            token_ids.push(token.token_id);
+            token_scores.push(token.token_score);
+        }
+
+        Ok(ModelTokenSequenceOutput {
+            hidden_states: hidden.hidden_states,
+            layer_kv_cache: hidden.layer_kv_cache,
+            token_ids,
+            token_scores,
+        })
+    }
 }
 
 fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
@@ -866,6 +1203,39 @@ fn tensor_to_f32_tensor(tensor: &Tensor) -> Result<F32Tensor> {
         .flatten_all()?
         .to_vec1::<f32>()?;
     F32Tensor::new(values, dims)
+}
+
+fn slice_token_range_f32(
+    context: &str,
+    tensor: &F32Tensor,
+    token_start: usize,
+    token_count: usize,
+) -> Result<F32Tensor> {
+    let dims = tensor.dims();
+    validate_exact_shape(format!("{context}_rank"), &[dims.len()], &[3])?;
+    let batch = dims[0];
+    let tokens = dims[1];
+    let hidden = dims[2];
+    let token_end = token_start
+        .checked_add(token_count)
+        .ok_or_else(|| Error::model(format!("{context} token range overflow")))?;
+    if token_count == 0 || token_end > tokens {
+        return Err(Error::model(format!(
+            "{context} token range [{token_start},{token_end}) exceeds token count {tokens}"
+        )));
+    }
+
+    let mut values = Vec::with_capacity(batch * token_count * hidden);
+    for batch_index in 0..batch {
+        let source_start = ((batch_index * tokens) + token_start)
+            .checked_mul(hidden)
+            .ok_or_else(|| Error::model(format!("{context} source start overflow")))?;
+        let source_end = source_start
+            .checked_add(token_count * hidden)
+            .ok_or_else(|| Error::model(format!("{context} source end overflow")))?;
+        values.extend_from_slice(&tensor.values()[source_start..source_end]);
+    }
+    F32Tensor::new(values, [batch, token_count, hidden])
 }
 
 fn require_native<T>(operation: &str, value: Option<T>) -> Result<T> {
@@ -1000,8 +1370,8 @@ mod tests {
         assert_eq!(model.load_report().layer_stack.loaded_sparse_layers, 1);
         assert_eq!(output.hidden_states.dims(), &[1, 2, 256]);
         assert_eq!(output.layer_kv_cache.len(), 2);
-        assert_eq!(output.layer_kv_cache[0].cache_k.dims(), &[1, 2, 2, 256]);
-        assert_eq!(output.layer_kv_cache[1].cache_k.dims(), &[1, 2, 2, 256]);
+        assert_eq!(output.layer_kv_cache[0].cache_k.dims(), &[1, 1, 2, 256]);
+        assert_eq!(output.layer_kv_cache[1].cache_k.dims(), &[1, 1, 2, 256]);
         assert_eq!(output.logits.dims(), &[1, 8]);
         assert_eq!(
             output.report.hidden.embedding.input_ids_shape.dims(),
@@ -1094,11 +1464,11 @@ mod tests {
         );
         assert_eq!(decode.hidden_states.dims(), &[1, 1, 256]);
         assert_eq!(decode.layer_kv_cache.len(), 2);
-        assert_eq!(decode.layer_kv_cache[0].cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode.layer_kv_cache[1].cache_k.dims(), &[1, 2, 1, 256]);
+        assert_eq!(decode.layer_kv_cache[0].cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode.layer_kv_cache[1].cache_k.dims(), &[1, 1, 1, 256]);
         assert_eq!(token.layer_kv_cache.len(), 2);
-        assert_eq!(token.layer_kv_cache[0].cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(token.layer_kv_cache[1].cache_k.dims(), &[1, 2, 1, 256]);
+        assert_eq!(token.layer_kv_cache[0].cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(token.layer_kv_cache[1].cache_k.dims(), &[1, 1, 1, 256]);
         assert_eq!(decode.logits.dims(), &[1, 8]);
         assert_eq!(
             decode.report.hidden.layer_stack.max_attention_past_tokens,
@@ -1130,6 +1500,7 @@ mod tests {
             qk_head_dim: hidden_size,
             qk_no_rope_dim: hidden_size,
             qk_rope_dim: 0,
+            kv_lora_rank: hidden_size,
             v_head_dim: Some(hidden_size),
             num_routed_experts: 1,
             experts_per_token: 1,
@@ -1143,6 +1514,12 @@ mod tests {
             topk_method: "greedy".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }
@@ -1160,6 +1537,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 4,
             experts_per_token: 2,
@@ -1173,6 +1551,12 @@ mod tests {
             topk_method: "noaux_tc".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

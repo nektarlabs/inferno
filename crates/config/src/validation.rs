@@ -10,6 +10,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
     require_positive("qk_head_dim", config.qk_head_dim)?;
     require_positive("qk_no_rope_dim", config.qk_no_rope_dim)?;
     require_positive("qk_rope_dim", config.qk_rope_dim)?;
+    require_positive("kv_lora_rank", config.kv_lora_rank)?;
     require_positive("v_head_dim", config.v_head_dim())?;
     require_positive("num_routed_experts", config.num_routed_experts)?;
     require_positive("experts_per_token", config.experts_per_token)?;
@@ -19,6 +20,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
     require_positive("topk_group", config.topk_group)?;
     require_positive("max_context", config.max_context)?;
     require_positive("dsa_index_topk", config.dsa_index_topk)?;
+    require_positive("index_head_dim", config.index_head_dim)?;
+    require_positive("index_n_heads", config.index_n_heads)?;
+    require_positive("index_topk_freq", config.index_topk_freq)?;
 
     if config.qk_no_rope_dim + config.qk_rope_dim != config.qk_head_dim {
         return Err(Error::config(format!(
@@ -54,6 +58,28 @@ pub fn validate_config(config: &Config) -> Result<()> {
         return Err(Error::config(format!(
             "dsa_index_topk {} exceeds max_context {}",
             config.dsa_index_topk, config.max_context
+        )));
+    }
+
+    if config.qk_rope_dim > config.index_head_dim {
+        return Err(Error::config(format!(
+            "qk_rope_dim {} exceeds index_head_dim {}",
+            config.qk_rope_dim, config.index_head_dim
+        )));
+    }
+
+    if !config.indexer_types.is_empty() && config.indexer_types.len() != config.num_layers {
+        return Err(Error::config(format!(
+            "indexer_types length {} must equal num_layers {}",
+            config.indexer_types.len(),
+            config.num_layers
+        )));
+    }
+
+    if config.num_nextn_predict_layers > 1 {
+        return Err(Error::config(format!(
+            "num_nextn_predict_layers {} is unsupported; Inferno targets the GLM-5.2 Q2 single-MTP-head artifact",
+            config.num_nextn_predict_layers
         )));
     }
 
@@ -126,5 +152,14 @@ mod tests {
 
         let err = validate_config(&config).expect_err("invalid scoring function should fail");
         assert!(err.to_string().contains("scoring_func"));
+    }
+
+    #[test]
+    fn rejects_multiple_nextn_predict_layers() {
+        let mut config = Config::from_json_str(GLM52_LIKE_CONFIG_JSON).unwrap();
+        config.num_nextn_predict_layers = 2;
+
+        let err = validate_config(&config).expect_err("multiple MTP heads should fail");
+        assert!(err.to_string().contains("num_nextn_predict_layers"));
     }
 }

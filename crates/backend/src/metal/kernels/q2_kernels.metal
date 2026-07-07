@@ -6,6 +6,8 @@ constant uint Q2_K_BLOCK_VALUES = 256;
 constant uint Q2_K_BLOCK_BYTES = 84;
 constant uint Q2_K_SCALE_BYTES = 16;
 constant uint Q2_K_QUANT_BYTES = 64;
+constant uint Q2_K_SIMD_LANES = 32;
+constant uint ARGMAX_THREADS = 256;
 constant uint Q8_0_BLOCK_VALUES = 32;
 constant uint Q8_0_BLOCK_BYTES = 34;
 
@@ -42,6 +44,44 @@ static inline float q2_k_block_value(const device uchar* weights, uint block_off
     return (scale * quant) - min_offset;
 }
 
+static inline float q2_k_block_dot_partial(
+    const device uchar* weights,
+    const device float* input,
+    uint input_block_offset,
+    uint block_offset,
+    uint simd_lane
+) {
+    uint scale_offset = block_offset + Q2_K_SCALE_BYTES + Q2_K_QUANT_BYTES;
+    float d = f16_bits_to_f32(read_le_u16(weights, scale_offset));
+    float min_scale = f16_bits_to_f32(read_le_u16(weights, scale_offset + 2));
+    float sum = 0.0f;
+
+    for (uint quant_byte_index = simd_lane; quant_byte_index < Q2_K_QUANT_BYTES; quant_byte_index += Q2_K_SIMD_LANES) {
+        uchar packed = weights[block_offset + Q2_K_SCALE_BYTES + quant_byte_index];
+        uint half_index = quant_byte_index / 32;
+        uint within_half = quant_byte_index - (half_index * 32);
+        bool upper_half_of_pair = within_half >= 16;
+        uint byte_in_pair = within_half % 16;
+        uint value_base = (half_index * 128)
+            + (upper_half_of_pair ? 16 : 0)
+            + byte_in_pair;
+        uint scale_base = block_offset
+            + (half_index * 8)
+            + (upper_half_of_pair ? 1 : 0);
+
+        for (uint pair = 0; pair < 4; pair++) {
+            uchar scale_min = weights[scale_base + (pair * 2)];
+            float scale = d * float(scale_min & 0x0f);
+            float min_offset = min_scale * float(scale_min >> 4);
+            float quant = float((packed >> (pair * 2)) & 0x03);
+            uint value_index = value_base + (pair * 32);
+            sum += input[input_block_offset + value_index] * ((scale * quant) - min_offset);
+        }
+    }
+
+    return sum;
+}
+
 static inline float q8_0_block_value(const device uchar* weights, uint block_offset, uint value_index) {
     float d = f16_bits_to_f32(read_le_u16(weights, block_offset));
     uchar raw = weights[block_offset + 2 + value_index];
@@ -57,72 +97,31 @@ kernel void q2_k_matvec_f32_kernel(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& blocks_per_row [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint input_row_offset = input_row * in_features;
     float sum = 0.0f;
 
     for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
         uint block_index = (output_feature * blocks_per_row) + block_in_row;
         uint block_offset = block_index * Q2_K_BLOCK_BYTES;
-        uint scale_offset = block_offset + Q2_K_SCALE_BYTES + Q2_K_QUANT_BYTES;
-
-        float d = f16_bits_to_f32(read_le_u16(weights, scale_offset));
-        float min_scale = f16_bits_to_f32(read_le_u16(weights, scale_offset + 2));
-
-        uint scale_index = block_offset;
-        uint quant_offset = block_offset + Q2_K_SCALE_BYTES;
-        uint local_value = 0;
-
-        while (local_value < Q2_K_BLOCK_VALUES) {
-            uint shift = 0;
-            for (uint group = 0; group < 4; group++) {
-                uchar scale_min = weights[scale_index];
-                scale_index += 1;
-                float scale = d * float(scale_min & 0x0f);
-                float min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                scale_min = weights[scale_index];
-                scale_index += 1;
-                scale = d * float(scale_min & 0x0f);
-                min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + 16 + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                shift += 2;
-            }
-            quant_offset += 32;
-        }
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        sum += q2_k_block_dot_partial(weights, input, input_block_offset, block_offset, simd_lane);
     }
 
-    output[gid] = sum;
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
 }
 
 kernel void q2_k_matvec_add_f32_kernel(
@@ -134,134 +133,48 @@ kernel void q2_k_matvec_add_f32_kernel(
     constant uint& in_features [[buffer(5)]],
     constant uint& out_features [[buffer(6)]],
     constant uint& blocks_per_row [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint input_row_offset = input_row * in_features;
     float sum = 0.0f;
 
     for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
         uint block_index = (output_feature * blocks_per_row) + block_in_row;
         uint block_offset = block_index * Q2_K_BLOCK_BYTES;
-        uint scale_offset = block_offset + Q2_K_SCALE_BYTES + Q2_K_QUANT_BYTES;
-
-        float d = f16_bits_to_f32(read_le_u16(weights, scale_offset));
-        float min_scale = f16_bits_to_f32(read_le_u16(weights, scale_offset + 2));
-
-        uint scale_index = block_offset;
-        uint quant_offset = block_offset + Q2_K_SCALE_BYTES;
-        uint local_value = 0;
-
-        while (local_value < Q2_K_BLOCK_VALUES) {
-            uint shift = 0;
-            for (uint group = 0; group < 4; group++) {
-                uchar scale_min = weights[scale_index];
-                scale_index += 1;
-                float scale = d * float(scale_min & 0x0f);
-                float min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                scale_min = weights[scale_index];
-                scale_index += 1;
-                scale = d * float(scale_min & 0x0f);
-                min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + 16 + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                shift += 2;
-            }
-            quant_offset += 32;
-        }
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        sum += q2_k_block_dot_partial(weights, input, input_block_offset, block_offset, simd_lane);
     }
 
-    output[gid] = sum + residual[gid];
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum + residual[output_index];
+    }
 }
 
-static inline float q2_k_row_dot(
+static inline float q2_k_row_dot_partial(
     const device uchar* weights,
     const device float* input,
     uint input_row_offset,
     uint output_feature,
-    uint blocks_per_row
+    uint blocks_per_row,
+    uint simd_lane
 ) {
     float sum = 0.0f;
 
     for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
         uint block_index = (output_feature * blocks_per_row) + block_in_row;
         uint block_offset = block_index * Q2_K_BLOCK_BYTES;
-        uint scale_offset = block_offset + Q2_K_SCALE_BYTES + Q2_K_QUANT_BYTES;
-
-        float d = f16_bits_to_f32(read_le_u16(weights, scale_offset));
-        float min_scale = f16_bits_to_f32(read_le_u16(weights, scale_offset + 2));
-
-        uint scale_index = block_offset;
-        uint quant_offset = block_offset + Q2_K_SCALE_BYTES;
-        uint local_value = 0;
-
-        while (local_value < Q2_K_BLOCK_VALUES) {
-            uint shift = 0;
-            for (uint group = 0; group < 4; group++) {
-                uchar scale_min = weights[scale_index];
-                scale_index += 1;
-                float scale = d * float(scale_min & 0x0f);
-                float min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                scale_min = weights[scale_index];
-                scale_index += 1;
-                scale = d * float(scale_min & 0x0f);
-                min_offset = min_scale * float(scale_min >> 4);
-
-                for (uint value_index = 0; value_index < 16; value_index++) {
-                    float quant = float((weights[quant_offset + 16 + value_index] >> shift) & 0x03);
-                    float weight_value = (scale * quant) - min_offset;
-                    uint input_index = input_row_offset
-                        + (block_in_row * Q2_K_BLOCK_VALUES)
-                        + local_value
-                        + value_index;
-                    sum += input[input_index] * weight_value;
-                }
-                local_value += 16;
-
-                shift += 2;
-            }
-            quant_offset += 32;
-        }
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        sum += q2_k_block_dot_partial(weights, input, input_block_offset, block_offset, simd_lane);
     }
 
     return sum;
@@ -276,22 +189,153 @@ kernel void q2_k_gate_up_swiglu_f32_kernel(
     constant uint& in_features [[buffer(5)]],
     constant uint& out_features [[buffer(6)]],
     constant uint& blocks_per_row [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint input_row_offset = input_row * in_features;
 
-    float gate = q2_k_row_dot(gate_weights, input, input_row_offset, output_feature, blocks_per_row);
-    float up = q2_k_row_dot(up_weights, input, input_row_offset, output_feature, blocks_per_row);
-    float silu_gate = gate / (1.0f + exp(-gate));
+    float gate_partial = q2_k_row_dot_partial(
+        gate_weights,
+        input,
+        input_row_offset,
+        output_feature,
+        blocks_per_row,
+        simd_lane
+    );
+    float up_partial = q2_k_row_dot_partial(
+        up_weights,
+        input,
+        input_row_offset,
+        output_feature,
+        blocks_per_row,
+        simd_lane
+    );
+    float gate = simd_sum(gate_partial);
+    float up = simd_sum(up_partial);
 
-    output[gid] = silu_gate * up;
+    if (simd_lane == 0) {
+        float silu_gate = gate / (1.0f + exp(-gate));
+        output[output_index] = silu_gate * up;
+    }
+}
+
+kernel void q2_k_multi_expert_gate_up_swiglu_f32_kernel(
+    const device uchar* gate_weights [[buffer(0)]],
+    const device uchar* up_weights [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    const device uint* token_indices [[buffer(3)]],
+    const device uint* expert_ids [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& token_count [[buffer(6)]],
+    constant uint& assignment_count [[buffer(7)]],
+    constant uint& in_features [[buffer(8)]],
+    constant uint& out_features [[buffer(9)]],
+    constant uint& blocks_per_row [[buffer(10)]],
+    constant uint& expert_stride_bytes [[buffer(11)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint output_values = assignment_count * out_features;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint assignment = output_index / out_features;
+    uint output_feature = output_index - (assignment * out_features);
+    uint token = token_indices[assignment];
+    if (token >= token_count) {
+        if (simd_lane == 0) {
+            output[output_index] = 0.0f;
+        }
+        return;
+    }
+
+    uint expert = expert_ids[assignment];
+    uint input_row_offset = token * in_features;
+    uint expert_base = expert * expert_stride_bytes;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+
+    for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
+        uint block_offset = expert_base
+            + ((output_feature * blocks_per_row) + block_in_row) * Q2_K_BLOCK_BYTES;
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        gate_sum += q2_k_block_dot_partial(
+            gate_weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+        up_sum += q2_k_block_dot_partial(
+            up_weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+    }
+
+    float gate = simd_sum(gate_sum);
+    float up = simd_sum(up_sum);
+    if (simd_lane == 0) {
+        float silu_gate = gate / (1.0f + exp(-gate));
+        output[output_index] = silu_gate * up;
+    }
+}
+
+kernel void q2_k_multi_expert_matvec_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    const device uint* expert_ids [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& assignment_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    constant uint& expert_stride_bytes [[buffer(8)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint output_values = assignment_count * out_features;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint assignment = output_index / out_features;
+    uint output_feature = output_index - (assignment * out_features);
+    uint expert = expert_ids[assignment];
+    uint input_row_offset = assignment * in_features;
+    uint expert_base = expert * expert_stride_bytes;
+    float sum = 0.0f;
+
+    for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
+        uint block_offset = expert_base
+            + ((output_feature * blocks_per_row) + block_in_row) * Q2_K_BLOCK_BYTES;
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        sum += q2_k_block_dot_partial(
+            weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+    }
+
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
 }
 
 kernel void q2_k_transposed_matvec_f32_kernel(
@@ -398,23 +442,41 @@ kernel void argmax_f32_kernel(
     device uint* token_id [[buffer(1)]],
     device float* token_score [[buffer(2)]],
     constant uint& value_count [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    if (gid > 0 || value_count == 0) {
+    if (value_count == 0) {
         return;
     }
 
-    uint best_id = 0;
-    float best_score = scores[0];
+    float best_score = -3.402823466e+38F;
+    uint best_id = 0xffffffff;
 
-    for (uint index = 1; index < value_count; index++) {
+    for (uint index = tid; index < value_count; index += ARGMAX_THREADS) {
         float score = scores[index];
-        if (score > best_score) {
+        if (score > best_score || (score == best_score && index < best_id)) {
             best_id = index;
             best_score = score;
         }
     }
 
-    token_id[0] = best_id;
-    token_score[0] = best_score;
+    threadgroup float partial_scores[ARGMAX_THREADS];
+    threadgroup uint partial_ids[ARGMAX_THREADS];
+    partial_scores[tid] = best_score;
+    partial_ids[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float group_best_score = partial_scores[0];
+        uint group_best_id = partial_ids[0];
+        for (uint index = 1; index < ARGMAX_THREADS; index++) {
+            float score = partial_scores[index];
+            uint id = partial_ids[index];
+            if (score > group_best_score || (score == group_best_score && id < group_best_id)) {
+                group_best_score = score;
+                group_best_id = id;
+            }
+        }
+        token_id[0] = group_best_id;
+        token_score[0] = group_best_score;
+    }
 }

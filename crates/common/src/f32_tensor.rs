@@ -11,6 +11,17 @@ pub enum Device {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
     F32,
+    F16,
+    BF16,
+}
+
+impl DType {
+    pub fn byte_size(self) -> usize {
+        match self {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+        }
+    }
 }
 
 pub trait TensorShape {
@@ -116,9 +127,10 @@ impl Tensor {
         let shape = Shape::new(shape.into_shape());
         let expected_len = element_count(shape.dims())?;
         validate_exact_shape("f32_tensor_value_count", &[values.len()], &[expected_len])?;
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(Error::model("F32 tensor contains non-finite values"));
-        }
+        debug_assert!(
+            values.iter().all(|value| value.is_finite()),
+            "F32 tensor contains non-finite values"
+        );
 
         Ok(Self { shape, values })
     }
@@ -147,7 +159,7 @@ impl Tensor {
         _device: &Device,
     ) -> Result<Self> {
         match dtype {
-            DType::F32 => Self::zeros(shape),
+            DType::F32 | DType::F16 | DType::BF16 => Self::zeros(shape),
         }
     }
 
@@ -177,7 +189,7 @@ impl Tensor {
 
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
         match dtype {
-            DType::F32 => Ok(self.clone()),
+            DType::F32 | DType::F16 | DType::BF16 => Ok(self.clone()),
         }
     }
 
@@ -379,11 +391,19 @@ mod tests {
         assert!(err.to_string().contains("f32_tensor_value_count"));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
+    #[should_panic(expected = "F32 tensor contains non-finite values")]
     fn rejects_non_finite_values() {
-        let err = F32Tensor::new(vec![f32::NAN], [1]).expect_err("non-finite tensors should fail");
+        let _ = F32Tensor::new(vec![f32::NAN], [1]);
+    }
 
-        assert!(err.to_string().contains("non-finite"));
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_builds_do_not_scan_non_finite_values() {
+        let tensor = F32Tensor::new(vec![f32::NAN], [1]).unwrap();
+
+        assert!(tensor.values()[0].is_nan());
     }
 
     #[test]

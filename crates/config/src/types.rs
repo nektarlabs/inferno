@@ -6,6 +6,13 @@ use crate::{
 };
 use common::Result;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexerLayerKind {
+    Full,
+    Shared,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
     pub model_type: String,
@@ -18,6 +25,7 @@ pub struct Config {
     pub qk_head_dim: usize,
     pub qk_no_rope_dim: usize,
     pub qk_rope_dim: usize,
+    pub kv_lora_rank: usize,
     pub v_head_dim: Option<usize>,
     pub num_routed_experts: usize,
     pub experts_per_token: usize,
@@ -31,6 +39,12 @@ pub struct Config {
     pub topk_method: String,
     pub max_context: usize,
     pub dsa_index_topk: usize,
+    pub index_head_dim: usize,
+    pub index_n_heads: usize,
+    pub index_topk_freq: usize,
+    pub indexer_rope_interleave: bool,
+    pub indexer_types: Vec<IndexerLayerKind>,
+    pub num_nextn_predict_layers: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
 }
@@ -53,6 +67,7 @@ struct RawConfig {
     qk_nope_head_dim: Option<usize>,
     qk_rope_dim: Option<usize>,
     qk_rope_head_dim: Option<usize>,
+    kv_lora_rank: Option<usize>,
     v_head_dim: Option<usize>,
     num_routed_experts: Option<usize>,
     n_routed_experts: Option<usize>,
@@ -73,6 +88,12 @@ struct RawConfig {
     max_position_embeddings: Option<usize>,
     dsa_index_topk: Option<usize>,
     index_topk: Option<usize>,
+    index_head_dim: Option<usize>,
+    index_n_heads: Option<usize>,
+    index_topk_freq: Option<usize>,
+    indexer_rope_interleave: Option<bool>,
+    indexer_types: Option<Vec<IndexerLayerKind>>,
+    num_nextn_predict_layers: Option<usize>,
     rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
     rope_parameters: Option<RawRopeParameters>,
@@ -118,6 +139,7 @@ impl<'de> Deserialize<'de> for Config {
                 prefer(raw.qk_rope_head_dim, raw.qk_rope_dim),
                 "qk_rope_head_dim/qk_rope_dim",
             )?,
+            kv_lora_rank: raw.kv_lora_rank.unwrap_or_else(default_kv_lora_rank),
             v_head_dim: raw.v_head_dim,
             num_routed_experts: required(
                 prefer(raw.n_routed_experts, raw.num_routed_experts),
@@ -147,6 +169,14 @@ impl<'de> Deserialize<'de> for Config {
                 prefer(raw.index_topk, raw.dsa_index_topk),
                 "index_topk/dsa_index_topk",
             )?,
+            index_head_dim: raw.index_head_dim.unwrap_or_else(default_index_head_dim),
+            index_n_heads: raw.index_n_heads.unwrap_or_else(default_index_n_heads),
+            index_topk_freq: raw.index_topk_freq.unwrap_or_else(default_index_topk_freq),
+            indexer_rope_interleave: raw
+                .indexer_rope_interleave
+                .unwrap_or_else(default_indexer_rope_interleave),
+            indexer_types: raw.indexer_types.unwrap_or_default(),
+            num_nextn_predict_layers: raw.num_nextn_predict_layers.unwrap_or(0),
             rms_norm_eps: raw.rms_norm_eps.unwrap_or_else(default_rms_norm_eps),
             rope_theta: raw
                 .rope_parameters
@@ -176,6 +206,11 @@ impl Config {
             self.v_head_dim = Some(self.qk_head_dim);
         }
 
+        if self.indexer_types.is_empty() {
+            self.indexer_types =
+                default_indexer_types_for_dense_layers(self.num_layers, self.dense_layers);
+        }
+
         validate_config(&self)?;
         Ok(self)
     }
@@ -193,6 +228,21 @@ impl Config {
         self.attention_heads * self.v_head_dim()
     }
 
+    pub fn indexer_layer_kind(&self, layer_index: usize) -> Option<IndexerLayerKind> {
+        if layer_index >= self.num_layers {
+            return None;
+        }
+        self.indexer_types.get(layer_index).copied().or_else(|| {
+            if layer_index < self.dense_layers
+                || (layer_index - self.dense_layers) % self.index_topk_freq == 0
+            {
+                Some(IndexerLayerKind::Full)
+            } else {
+                Some(IndexerLayerKind::Shared)
+            }
+        })
+    }
+
     pub fn architecture_summary(&self) -> ArchitectureSummary {
         ArchitectureSummary::from_config(self)
     }
@@ -208,6 +258,10 @@ fn default_rms_norm_eps() -> f64 {
 
 fn default_moe_intermediate_size() -> usize {
     2048
+}
+
+fn default_kv_lora_rank() -> usize {
+    512
 }
 
 fn default_num_shared_experts() -> usize {
@@ -236,6 +290,39 @@ fn default_scoring_func() -> String {
 
 fn default_topk_method() -> String {
     "greedy".to_string()
+}
+
+fn default_index_head_dim() -> usize {
+    128
+}
+
+fn default_index_n_heads() -> usize {
+    32
+}
+
+fn default_index_topk_freq() -> usize {
+    4
+}
+
+fn default_indexer_rope_interleave() -> bool {
+    true
+}
+
+fn default_indexer_types_for_dense_layers(
+    num_layers: usize,
+    dense_layers: usize,
+) -> Vec<IndexerLayerKind> {
+    (0..num_layers)
+        .map(|layer_index| {
+            if layer_index < dense_layers
+                || (layer_index - dense_layers) % default_index_topk_freq() == 0
+            {
+                IndexerLayerKind::Full
+            } else {
+                IndexerLayerKind::Shared
+            }
+        })
+        .collect()
 }
 
 fn default_rope_theta() -> f64 {
@@ -283,6 +370,13 @@ mod tests {
         assert_eq!(config.topk_method, "noaux_tc");
         assert_eq!(config.max_context, 1_048_576);
         assert_eq!(config.dsa_index_topk, 2048);
+        assert_eq!(config.index_head_dim, 128);
+        assert_eq!(config.index_n_heads, 32);
+        assert_eq!(config.index_topk_freq, 4);
+        assert!(config.indexer_rope_interleave);
+        assert_eq!(config.indexer_types.len(), 78);
+        assert_eq!(config.indexer_types[3], IndexerLayerKind::Full);
+        assert_eq!(config.indexer_types[4], IndexerLayerKind::Shared);
     }
 
     #[test]
@@ -309,6 +403,8 @@ mod tests {
         assert_eq!(config.num_layers, 78);
         assert_eq!(config.dense_layers, 3);
         assert_eq!(config.sparse_moe_layers(), 75);
+        assert_eq!(config.index_head_dim, 128);
+        assert_eq!(config.index_n_heads, 32);
     }
 
     #[test]

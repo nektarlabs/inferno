@@ -4,8 +4,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use common::Shape;
 use common::{
-    validate_exact_shape, BackendKind, DeviceKind, DeviceReport, Error, F32Tensor, PagedKvView,
-    Result,
+    validate_exact_shape, BackendKind, DType, DeviceKind, DeviceReport, Error, F32Tensor,
+    PagedKvView, Result,
 };
 use common::{Device, Tensor};
 
@@ -30,6 +30,170 @@ pub struct BackendCapabilities {
 pub struct BackendMemoryReport {
     pub metal_current_allocated_bytes: Option<u64>,
     pub metal_recommended_max_working_set_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterTopK {
+    pub token_count: usize,
+    pub expert_count: usize,
+    pub top_k: usize,
+    pub expert_ids: Vec<u32>,
+    pub weights: Vec<f32>,
+}
+
+/// Device-resident paged KV view for the Metal decode path.
+///
+/// The K/V buffers use an append-only layout:
+///
+/// `[page_count, batch, attention_heads, page_size, head_dim]`
+///
+/// `cached_tokens` tells attention how much of that capacity is valid. This
+/// avoids re-uploading the full KV history every decode step; decode attention
+/// reads the existing page buffer and the current token's K/V buffer directly.
+#[derive(Debug, Clone)]
+pub struct DevicePagedKvView {
+    pub batch: usize,
+    pub attention_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub page_size: usize,
+    pub cached_tokens: usize,
+    pub capacity_tokens: usize,
+    pub k: DeviceValue,
+    pub v: DeviceValue,
+}
+
+impl DevicePagedKvView {
+    pub fn validate(&self) -> Result<()> {
+        if self.batch == 0
+            || self.attention_heads == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || self.page_size == 0
+            || self.cached_tokens == 0
+            || self.capacity_tokens == 0
+        {
+            return Err(Error::cache(
+                "device paged KV view dimensions must be positive for decode attention",
+            ));
+        }
+        if self.cached_tokens > self.capacity_tokens {
+            return Err(Error::cache(format!(
+                "device paged KV cached_tokens {} exceeds capacity_tokens {}",
+                self.cached_tokens, self.capacity_tokens
+            )));
+        }
+        if self.capacity_tokens % self.page_size != 0 {
+            return Err(Error::cache(format!(
+                "device paged KV capacity_tokens {} must be a multiple of page_size {}",
+                self.capacity_tokens, self.page_size
+            )));
+        }
+        let page_count = self.capacity_tokens / self.page_size;
+        validate_exact_shape(
+            "device_paged_kv_k_shape",
+            self.k.dims(),
+            &[
+                page_count,
+                self.batch,
+                self.attention_heads,
+                self.page_size,
+                self.key_head_dim,
+            ],
+        )?;
+        validate_exact_shape(
+            "device_paged_kv_v_shape",
+            self.v.dims(),
+            &[
+                page_count,
+                self.batch,
+                self.attention_heads,
+                self.page_size,
+                self.value_head_dim,
+            ],
+        )?;
+        if self.k.dtype() != self.v.dtype() {
+            return Err(Error::cache(format!(
+                "device paged KV dtype mismatch: k={:?}, v={:?}",
+                self.k.dtype(),
+                self.v.dtype()
+            )));
+        }
+        match self.k.dtype() {
+            DType::F32 | DType::F16 => Ok(()),
+            DType::BF16 => Err(Error::cache(
+                "device paged KV BF16 is not supported by the native Metal attention path",
+            )),
+        }
+    }
+}
+
+/// Device-resident compact KV rows selected by the DSA indexer.
+///
+/// Layout:
+///
+/// `[batch, attention_heads, selected_tokens, head_dim]`
+///
+/// This is intentionally separate from `DevicePagedKvView`: sparse layers do
+/// not need page metadata once the SSD/block-store layer has packed exactly
+/// the selected rows for the current decode token.
+#[derive(Debug, Clone)]
+pub struct DeviceSelectedKvView {
+    pub batch: usize,
+    pub attention_heads: usize,
+    pub selected_tokens: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub k: DeviceValue,
+    pub v: DeviceValue,
+}
+
+impl DeviceSelectedKvView {
+    pub fn validate(&self) -> Result<()> {
+        if self.batch == 0
+            || self.attention_heads == 0
+            || self.selected_tokens == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+        {
+            return Err(Error::cache(
+                "device selected KV dimensions must be positive for sparse decode attention",
+            ));
+        }
+        validate_exact_shape(
+            "device_selected_kv_k_shape",
+            self.k.dims(),
+            &[
+                self.batch,
+                self.attention_heads,
+                self.selected_tokens,
+                self.key_head_dim,
+            ],
+        )?;
+        validate_exact_shape(
+            "device_selected_kv_v_shape",
+            self.v.dims(),
+            &[
+                self.batch,
+                self.attention_heads,
+                self.selected_tokens,
+                self.value_head_dim,
+            ],
+        )?;
+        if self.k.dtype() != self.v.dtype() {
+            return Err(Error::cache(format!(
+                "device selected KV dtype mismatch: k={:?}, v={:?}",
+                self.k.dtype(),
+                self.v.dtype()
+            )));
+        }
+        match self.k.dtype() {
+            DType::F32 | DType::F16 => Ok(()),
+            DType::BF16 => Err(Error::cache(
+                "device selected KV BF16 is not supported by the native Metal attention path",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +267,13 @@ pub trait Backend {
         _input: &F32Tensor,
         _weight: &F32Tensor,
     ) -> Result<Option<F32Tensor>> {
+        Ok(None)
+    }
+    fn linear_f32_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &F32Tensor,
+    ) -> Result<Option<DeviceValue>> {
         Ok(None)
     }
     fn select_last_token_f32_tensor(
@@ -388,6 +559,50 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// Copies a host f32 tensor into a GPU f16 buffer. Kernels that consume it
+    /// must accumulate in f32 if they need full accumulation precision.
+    fn device_upload_f32_tensor_as_f16(&self, _tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Allocates an uninitialized GPU tensor. The caller must fill every
+    /// element it will later read.
+    fn device_alloc_f32_tensor(&self, _dims: &[usize]) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Allocates an uninitialized GPU f16 tensor. Shape is still expressed in
+    /// logical tensor elements, not bytes.
+    fn device_alloc_f16_tensor(&self, _dims: &[usize]) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Encodes a GPU-side copy between tensors with the same dtype. Offsets
+    /// and length are in logical tensor elements.
+    fn device_copy_same_dtype(
+        &self,
+        _source: &DeviceValue,
+        _source_offset: usize,
+        _destination: &DeviceValue,
+        _destination_offset: usize,
+        _len: usize,
+    ) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    /// Encodes a GPU-side f32 copy between two device tensors. Offsets and
+    /// length are in f32 elements.
+    fn device_copy_f32(
+        &self,
+        _source: &DeviceValue,
+        _source_offset: usize,
+        _destination: &DeviceValue,
+        _destination_offset: usize,
+        _len: usize,
+    ) -> Result<Option<()>> {
+        Ok(None)
+    }
+
     /// Synchronizes pending batched work, then copies a device value back to
     /// the host. This is the only way to observe `*_device` results.
     fn device_download_f32_tensor(&self, _value: &DeviceValue) -> Result<F32Tensor> {
@@ -463,12 +678,26 @@ pub trait Backend {
         Ok(None)
     }
 
-    fn q2_k_gate_up_swiglu_device(
+    #[allow(clippy::too_many_arguments)]
+    fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
         _gate_weights: &[u8],
         _up_weights: &[u8],
         _input: &DeviceValue,
-        _row_count: usize,
+        _token_indices: &[u32],
+        _expert_ids: &[u32],
+        _token_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_multi_expert_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _expert_ids: &[u32],
         _in_features: usize,
         _out_features: usize,
     ) -> Result<Option<DeviceValue>> {
@@ -538,6 +767,17 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// Stack per-head projection outputs from `[head][row, head_dim]` into
+    /// one token-major device tensor `[row, head, head_dim]`.
+    fn stack_head_outputs_device(
+        &self,
+        _head_outputs: &[DeviceValue],
+        _row_count: usize,
+        _head_dim: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     fn select_last_token_device(
         &self,
         _hidden_states: &DeviceValue,
@@ -563,6 +803,85 @@ pub trait Backend {
         Ok(None)
     }
 
+    fn paged_decode_attention_resident_device(
+        &self,
+        _q: &DeviceValue,
+        _current_k: &DeviceValue,
+        _current_v: &DeviceValue,
+        _past_kv: &DevicePagedKvView,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Sparse decode attention over a compact selected KV set plus the
+    /// current token. This is the DSA/indexer hot primitive for GLM sparse
+    /// layers: callers pass only the K/V rows chosen by the indexer, so the
+    /// kernel does not scan the full context.
+    fn selected_decode_attention_device(
+        &self,
+        _q: &DeviceValue,
+        _selected_k: &DeviceValue,
+        _selected_v: &DeviceValue,
+        _current_k: &DeviceValue,
+        _current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Linearizes resident paged KV into contiguous `[B,H,T,D]` device tensors.
+    /// Dense MLA uses this to expand latent cache on GPU without CPU
+    /// reconstruction.
+    fn paged_kv_contiguous_device(
+        &self,
+        _past_kv: &DevicePagedKvView,
+    ) -> Result<Option<DeviceSelectedKvView>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_row_selected_kv_device(
+        &self,
+        _key_payload: &[u8],
+        _value_payload: &[u8],
+        _batch: usize,
+        _attention_heads: usize,
+        _selected_tokens: usize,
+        _key_head_dim: usize,
+        _value_head_dim: usize,
+    ) -> Result<Option<DeviceSelectedKvView>> {
+        Ok(None)
+    }
+
+    fn dsa_index_key_device(
+        &self,
+        _raw_key: &DeviceValue,
+        _weight: &F32Tensor,
+        _bias: &F32Tensor,
+        _rope_dim: usize,
+        _position_offset: usize,
+        _theta: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dsa_decode_topk_device(
+        &self,
+        _hidden_states: &DeviceValue,
+        _q_raw: &DeviceValue,
+        _past_index_keys: &DeviceValue,
+        _current_index_key: &DeviceValue,
+        _weights_proj: &F32Tensor,
+        _heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _position_offset: usize,
+        _theta: f32,
+        _top_k: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Stacks equal-length device rows into one `[rows.len(), row_len]` value
     /// with GPU-side copies. Used to assemble per-expert outputs for the MoE
     /// combine without a host round-trip.
@@ -577,6 +896,17 @@ pub trait Backend {
         _expert_outputs: &DeviceValue,
         _expert_weights: &[f32],
     ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn moe_router_topk_device(
+        &self,
+        _router_logits: &DeviceValue,
+        _correction_bias: &[f32],
+        _top_k: usize,
+        _norm_topk_prob: bool,
+        _routed_scaling_factor: f32,
+    ) -> Result<Option<RouterTopK>> {
         Ok(None)
     }
 }
@@ -1327,6 +1657,57 @@ impl Backend for MetalBackend {
         }
 
         Ok(None)
+    }
+
+    fn linear_f32_device(
+        &self,
+        input: &DeviceValue,
+        weight: &F32Tensor,
+    ) -> Result<Option<DeviceValue>> {
+        let input_dims = input.dims();
+        if input_dims.len() != 2 {
+            return Err(Error::backend(format!(
+                "native_linear_device input must be rank 2 [rows,in_features], got {input_dims:?}"
+            )));
+        }
+        if input.dtype() != DType::F32 {
+            return Err(Error::backend(format!(
+                "native_linear_device input must be F32, got {:?}",
+                input.dtype()
+            )));
+        }
+        let weight_dims = require_f32_rank("native_linear_device_weight", weight, 2)?;
+        let rows = input_dims[0];
+        let in_features = input_dims[1];
+        let out_features = weight_dims[0];
+        validate_exact_shape(
+            "native_linear_device_input_weight_features",
+            &[weight_dims[1]],
+            &[in_features],
+        )?;
+        let input_len = input.element_count()?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batched_linear_f32(
+                &input.buffer,
+                input_len,
+                weight.values(),
+                rows,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(vec![rows, out_features], buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input_len, rows, in_features, out_features);
+            Ok(None)
+        }
     }
 
     fn select_last_token_f32_tensor(&self, hidden_states: &F32Tensor) -> Result<Option<F32Tensor>> {
@@ -2575,11 +2956,205 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn device_upload_f32_tensor_as_f16(&self, tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batch_upload_f32_as_f16(tensor.values())?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                tensor.dims().to_vec(),
+                DType::F16,
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = tensor;
+            Ok(None)
+        }
+    }
+
+    fn device_alloc_f32_tensor(&self, dims: &[usize]) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let len = dims.iter().try_fold(1_usize, |count, dim| {
+                count
+                    .checked_mul(*dim)
+                    .ok_or_else(|| Error::backend("device allocation element count overflow"))
+            })?;
+            let buffer = native_metal.batched_alloc_f32(len)?;
+            return Ok(Some(DeviceValue::new(dims.to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = dims;
+            Ok(None)
+        }
+    }
+
+    fn device_alloc_f16_tensor(&self, dims: &[usize]) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let len = dims.iter().try_fold(1_usize, |count, dim| {
+                count
+                    .checked_mul(*dim)
+                    .ok_or_else(|| Error::backend("device f16 allocation element count overflow"))
+            })?;
+            let buffer = native_metal.batched_alloc_f16(len)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                dims.to_vec(),
+                DType::F16,
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = dims;
+            Ok(None)
+        }
+    }
+
+    fn device_copy_same_dtype(
+        &self,
+        source: &DeviceValue,
+        source_offset: usize,
+        destination: &DeviceValue,
+        destination_offset: usize,
+        len: usize,
+    ) -> Result<Option<()>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            if source.dtype() != destination.dtype() {
+                return Err(Error::backend(format!(
+                    "device copy dtype mismatch: source={:?}, destination={:?}",
+                    source.dtype(),
+                    destination.dtype()
+                )));
+            }
+            let source_count = source.element_count()?;
+            let destination_count = destination.element_count()?;
+            source_offset
+                .checked_add(len)
+                .filter(|end| *end <= source_count)
+                .ok_or_else(|| {
+                    Error::backend(format!(
+                        "device copy source range {source_offset}..{} exceeds element count {source_count}",
+                        source_offset.saturating_add(len)
+                    ))
+                })?;
+            destination_offset
+                .checked_add(len)
+                .filter(|end| *end <= destination_count)
+                .ok_or_else(|| {
+                    Error::backend(format!(
+                        "device copy destination range {destination_offset}..{} exceeds element count {destination_count}",
+                        destination_offset.saturating_add(len)
+                    ))
+                })?;
+            native_metal.batched_element_copy(
+                &source.buffer,
+                source_offset,
+                &destination.buffer,
+                destination_offset,
+                len,
+                source.dtype().byte_size(),
+            )?;
+            return Ok(Some(()));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (source, source_offset, destination, destination_offset, len);
+            Ok(None)
+        }
+    }
+
+    fn device_copy_f32(
+        &self,
+        source: &DeviceValue,
+        source_offset: usize,
+        destination: &DeviceValue,
+        destination_offset: usize,
+        len: usize,
+    ) -> Result<Option<()>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            if source.dtype() != DType::F32 || destination.dtype() != DType::F32 {
+                return Err(Error::backend(format!(
+                    "device f32 copy requires f32 tensors, got source={:?}, destination={:?}",
+                    source.dtype(),
+                    destination.dtype()
+                )));
+            }
+            let source_count = source.element_count()?;
+            let destination_count = destination.element_count()?;
+            source_offset
+                .checked_add(len)
+                .filter(|end| *end <= source_count)
+                .ok_or_else(|| {
+                    Error::backend(format!(
+                        "device copy source range {source_offset}..{} exceeds element count {source_count}",
+                        source_offset.saturating_add(len)
+                    ))
+                })?;
+            destination_offset
+                .checked_add(len)
+                .filter(|end| *end <= destination_count)
+                .ok_or_else(|| {
+                    Error::backend(format!(
+                        "device copy destination range {destination_offset}..{} exceeds element count {destination_count}",
+                        destination_offset.saturating_add(len)
+                    ))
+                })?;
+            native_metal.batched_f32_copy(
+                &source.buffer,
+                source_offset,
+                &destination.buffer,
+                destination_offset,
+                len,
+            )?;
+            return Ok(Some(()));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (source, source_offset, destination, destination_offset, len);
+            Ok(None)
+        }
+    }
+
     fn device_download_f32_tensor(&self, value: &DeviceValue) -> Result<F32Tensor> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             if let Some(native_metal) = self.native_metal() {
-                let values = native_metal.batch_read_f32(&value.buffer, value.element_count()?)?;
+                let values =
+                    match value.dtype() {
+                        DType::F32 => {
+                            native_metal.batch_read_f32(&value.buffer, value.element_count()?)?
+                        }
+                        DType::F16 => native_metal
+                            .batch_read_f16_as_f32(&value.buffer, value.element_count()?)?,
+                        DType::BF16 => return Err(Error::backend(
+                            "BF16 device download is not implemented for the native Metal backend",
+                        )),
+                    };
                 return F32Tensor::new(values, value.dims().to_vec());
             }
         }
@@ -2607,7 +3182,9 @@ impl Backend for MetalBackend {
                 .ok_or_else(|| Error::backend("rms_norm device input has empty shape"))?;
             let input_len = input.element_count()?;
             let rows = if hidden_size == 0 {
-                return Err(Error::backend("rms_norm device hidden_size must be non-zero"));
+                return Err(Error::backend(
+                    "rms_norm device hidden_size must be non-zero",
+                ));
             } else {
                 input_len / hidden_size
             };
@@ -2768,17 +3345,27 @@ impl Backend for MetalBackend {
 
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
-            let _ = (weights, input, residual, row_count, in_features, out_features);
+            let _ = (
+                weights,
+                input,
+                residual,
+                row_count,
+                in_features,
+                out_features,
+            );
             Ok(None)
         }
     }
 
-    fn q2_k_gate_up_swiglu_device(
+    #[allow(clippy::too_many_arguments)]
+    fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
         gate_weights: &[u8],
         up_weights: &[u8],
         input: &DeviceValue,
-        row_count: usize,
+        token_indices: &[u32],
+        expert_ids: &[u32],
+        token_count: usize,
         in_features: usize,
         out_features: usize,
     ) -> Result<Option<DeviceValue>> {
@@ -2787,23 +3374,35 @@ impl Backend for MetalBackend {
             let Some(native_metal) = self.native_metal() else {
                 return Ok(None);
             };
-            let (actual_rows, output_shape) =
-                matvec_dims_shape(input.dims(), in_features, out_features)?;
+            let dims = require_device_rank("device_q2_multi_expert_gate_up_input", input, 2)?;
             validate_exact_shape(
-                "device_q2_k_gate_up_swiglu_rows",
-                &[actual_rows],
-                &[row_count],
+                "device_q2_multi_expert_gate_up_input_shape",
+                dims,
+                &[token_count, in_features],
             )?;
-            let buffer = native_metal.batched_q2_k_gate_up_swiglu(
+            if token_indices.len() != expert_ids.len() {
+                return Err(Error::backend(format!(
+                    "device Q2 multi-expert gate/up routing mismatch: {} token indices and {} expert ids",
+                    token_indices.len(),
+                    expert_ids.len()
+                )));
+            }
+            let assignment_count = token_indices.len();
+            let buffer = native_metal.batched_q2_k_multi_expert_gate_up_swiglu(
                 gate_weights,
                 up_weights,
                 &input.buffer,
                 input.element_count()?,
-                row_count,
+                token_indices,
+                expert_ids,
+                token_count,
                 in_features,
                 out_features,
             )?;
-            return Ok(Some(DeviceValue::new(output_shape, buffer)));
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
         }
 
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -2812,10 +3411,53 @@ impl Backend for MetalBackend {
                 gate_weights,
                 up_weights,
                 input,
-                row_count,
+                token_indices,
+                expert_ids,
+                token_count,
                 in_features,
                 out_features,
             );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_multi_expert_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        expert_ids: &[u32],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_q2_multi_expert_matvec_input", input, 2)?;
+            let assignment_count = expert_ids.len();
+            validate_exact_shape(
+                "device_q2_multi_expert_matvec_input_shape",
+                dims,
+                &[assignment_count, in_features],
+            )?;
+            let buffer = native_metal.batched_q2_k_multi_expert_matvec(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                expert_ids,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, expert_ids, in_features, out_features);
             Ok(None)
         }
     }
@@ -3014,10 +3656,7 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn heads_to_attention_layout_device(
-        &self,
-        heads: &DeviceValue,
-    ) -> Result<Option<DeviceValue>> {
+    fn heads_to_attention_layout_device(&self, heads: &DeviceValue) -> Result<Option<DeviceValue>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let Some(native_metal) = self.native_metal() else {
@@ -3081,10 +3720,49 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn select_last_token_device(
+    fn stack_head_outputs_device(
         &self,
-        hidden_states: &DeviceValue,
+        head_outputs: &[DeviceValue],
+        row_count: usize,
+        head_dim: usize,
     ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            if head_outputs.is_empty() {
+                return Err(Error::backend(
+                    "device stack_head_outputs requires at least one head",
+                ));
+            }
+            let expected_dims = [row_count, head_dim];
+            for head_output in head_outputs {
+                validate_exact_shape(
+                    "device_stack_head_outputs_head",
+                    head_output.dims(),
+                    &expected_dims,
+                )?;
+            }
+            let buffers = head_outputs
+                .iter()
+                .map(|output| &output.buffer)
+                .collect::<Vec<_>>();
+            let buffer = native_metal.batched_stack_head_outputs(&buffers, row_count, head_dim)?;
+            return Ok(Some(DeviceValue::new(
+                vec![row_count, head_outputs.len(), head_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (head_outputs, row_count, head_dim);
+            Ok(None)
+        }
+    }
+
+    fn select_last_token_device(&self, hidden_states: &DeviceValue) -> Result<Option<DeviceValue>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let Some(native_metal) = self.native_metal() else {
@@ -3169,15 +3847,21 @@ impl Backend for MetalBackend {
             };
             past_kv.validate()?;
             let q_dims = require_device_rank("device_paged_decode_attention_q", q, 4)?;
-            let k_dims = require_device_rank("device_paged_decode_attention_current_k", current_k, 4)?;
-            let v_dims = require_device_rank("device_paged_decode_attention_current_v", current_v, 4)?;
+            let k_dims =
+                require_device_rank("device_paged_decode_attention_current_k", current_k, 4)?;
+            let v_dims =
+                require_device_rank("device_paged_decode_attention_current_v", current_v, 4)?;
             let expected_qk = [
                 past_kv.batch,
                 past_kv.attention_heads,
                 1,
                 past_kv.key_head_dim,
             ];
-            validate_exact_shape("device_paged_decode_attention_q_shape", q_dims, &expected_qk)?;
+            validate_exact_shape(
+                "device_paged_decode_attention_q_shape",
+                q_dims,
+                &expected_qk,
+            )?;
             validate_exact_shape(
                 "device_paged_decode_attention_current_k_shape",
                 k_dims,
@@ -3220,6 +3904,488 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn paged_decode_attention_resident_device(
+        &self,
+        q: &DeviceValue,
+        current_k: &DeviceValue,
+        current_v: &DeviceValue,
+        past_kv: &DevicePagedKvView,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            past_kv.validate()?;
+            let q_dims = require_device_rank("device_resident_paged_decode_attention_q", q, 4)?;
+            let k_dims = require_device_rank(
+                "device_resident_paged_decode_attention_current_k",
+                current_k,
+                4,
+            )?;
+            let v_dims = require_device_rank(
+                "device_resident_paged_decode_attention_current_v",
+                current_v,
+                4,
+            )?;
+            let expected_qk = [
+                past_kv.batch,
+                past_kv.attention_heads,
+                1,
+                past_kv.key_head_dim,
+            ];
+            if q.dtype() != DType::F32
+                || current_k.dtype() != DType::F32
+                || current_v.dtype() != DType::F32
+            {
+                return Err(Error::backend(format!(
+                    "device resident paged decode attention requires f32 q/current K/current V, got q={:?}, current_k={:?}, current_v={:?}",
+                    q.dtype(),
+                    current_k.dtype(),
+                    current_v.dtype()
+                )));
+            }
+            validate_exact_shape(
+                "device_resident_paged_decode_attention_q_shape",
+                q_dims,
+                &expected_qk,
+            )?;
+            validate_exact_shape(
+                "device_resident_paged_decode_attention_current_k_shape",
+                k_dims,
+                &expected_qk,
+            )?;
+            validate_exact_shape(
+                "device_resident_paged_decode_attention_current_v_shape",
+                v_dims,
+                &[
+                    past_kv.batch,
+                    past_kv.attention_heads,
+                    1,
+                    past_kv.value_head_dim,
+                ],
+            )?;
+            let (buffer, _output_len) = native_metal.batched_paged_decode_attention_resident(
+                &q.buffer,
+                q.element_count()?,
+                &current_k.buffer,
+                current_k.element_count()?,
+                &current_v.buffer,
+                current_v.element_count()?,
+                past_kv,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![
+                    past_kv.batch,
+                    past_kv.attention_heads,
+                    1,
+                    past_kv.value_head_dim,
+                ],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (q, current_k, current_v, past_kv);
+            Ok(None)
+        }
+    }
+
+    fn selected_decode_attention_device(
+        &self,
+        q: &DeviceValue,
+        selected_k: &DeviceValue,
+        selected_v: &DeviceValue,
+        current_k: &DeviceValue,
+        current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let q_dims = require_device_rank("device_selected_decode_attention_q", q, 4)?;
+            let selected_k_dims =
+                require_device_rank("device_selected_decode_attention_selected_k", selected_k, 4)?;
+            let selected_v_dims =
+                require_device_rank("device_selected_decode_attention_selected_v", selected_v, 4)?;
+            let current_k_dims =
+                require_device_rank("device_selected_decode_attention_current_k", current_k, 4)?;
+            let current_v_dims =
+                require_device_rank("device_selected_decode_attention_current_v", current_v, 4)?;
+
+            let (batch, heads, query_tokens, head_dim) =
+                (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+            if q.dtype() != DType::F32
+                || current_k.dtype() != DType::F32
+                || current_v.dtype() != DType::F32
+            {
+                return Err(Error::backend(format!(
+                    "device selected decode attention requires f32 q/current K/current V, got q={:?}, current_k={:?}, current_v={:?}",
+                    q.dtype(),
+                    current_k.dtype(),
+                    current_v.dtype()
+                )));
+            }
+            if selected_k.dtype() != selected_v.dtype() {
+                return Err(Error::backend(format!(
+                    "device selected decode attention selected KV dtype mismatch: k={:?}, v={:?}",
+                    selected_k.dtype(),
+                    selected_v.dtype()
+                )));
+            }
+            validate_exact_shape(
+                "device_selected_decode_attention_query_tokens",
+                &[query_tokens],
+                &[1],
+            )?;
+            let selected_tokens = selected_k_dims[2];
+            if selected_tokens == 0 {
+                return Err(Error::backend(
+                    "device selected decode attention requires at least one selected token",
+                ));
+            }
+            validate_exact_shape(
+                "device_selected_decode_attention_selected_k_shape",
+                selected_k_dims,
+                &[batch, heads, selected_tokens, head_dim],
+            )?;
+            let value_dim = selected_v_dims[3];
+            validate_exact_shape(
+                "device_selected_decode_attention_selected_v_shape",
+                selected_v_dims,
+                &[batch, heads, selected_tokens, value_dim],
+            )?;
+            validate_exact_shape(
+                "device_selected_decode_attention_current_k_shape",
+                current_k_dims,
+                &[batch, heads, 1, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_selected_decode_attention_current_v_shape",
+                current_v_dims,
+                &[batch, heads, 1, value_dim],
+            )?;
+
+            let (buffer, _output_len) = native_metal.batched_selected_decode_attention(
+                &q.buffer,
+                q.element_count()?,
+                &selected_k.buffer,
+                selected_k.element_count()?,
+                &selected_v.buffer,
+                selected_v.element_count()?,
+                selected_k.dtype(),
+                &current_k.buffer,
+                current_k.element_count()?,
+                &current_v.buffer,
+                current_v.element_count()?,
+                batch,
+                heads,
+                selected_tokens,
+                head_dim,
+                value_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, heads, 1, value_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (q, selected_k, selected_v, current_k, current_v);
+            Ok(None)
+        }
+    }
+
+    fn paged_kv_contiguous_device(
+        &self,
+        past_kv: &DevicePagedKvView,
+    ) -> Result<Option<DeviceSelectedKvView>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            past_kv.validate()?;
+            if past_kv.k.dtype() != DType::F32 || past_kv.v.dtype() != DType::F32 {
+                return Err(Error::backend(format!(
+                    "paged KV linearization requires f32 cache buffers, got k={:?}, v={:?}",
+                    past_kv.k.dtype(),
+                    past_kv.v.dtype()
+                )));
+            }
+            let k = native_metal.batched_linearize_paged_cache(
+                &past_kv.k.buffer,
+                past_kv.k.element_count()?,
+                past_kv.batch,
+                past_kv.attention_heads,
+                past_kv.cached_tokens,
+                past_kv.capacity_tokens,
+                past_kv.page_size,
+                past_kv.key_head_dim,
+            )?;
+            let v = native_metal.batched_linearize_paged_cache(
+                &past_kv.v.buffer,
+                past_kv.v.element_count()?,
+                past_kv.batch,
+                past_kv.attention_heads,
+                past_kv.cached_tokens,
+                past_kv.capacity_tokens,
+                past_kv.page_size,
+                past_kv.value_head_dim,
+            )?;
+            let view = DeviceSelectedKvView {
+                batch: past_kv.batch,
+                attention_heads: past_kv.attention_heads,
+                selected_tokens: past_kv.cached_tokens,
+                key_head_dim: past_kv.key_head_dim,
+                value_head_dim: past_kv.value_head_dim,
+                k: DeviceValue::new(
+                    vec![
+                        past_kv.batch,
+                        past_kv.attention_heads,
+                        past_kv.cached_tokens,
+                        past_kv.key_head_dim,
+                    ],
+                    k,
+                ),
+                v: DeviceValue::new(
+                    vec![
+                        past_kv.batch,
+                        past_kv.attention_heads,
+                        past_kv.cached_tokens,
+                        past_kv.value_head_dim,
+                    ],
+                    v,
+                ),
+            };
+            view.validate()?;
+            return Ok(Some(view));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = past_kv;
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_row_selected_kv_device(
+        &self,
+        key_payload: &[u8],
+        value_payload: &[u8],
+        batch: usize,
+        attention_heads: usize,
+        selected_tokens: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> Result<Option<DeviceSelectedKvView>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            if batch == 0 || attention_heads == 0 || selected_tokens == 0 {
+                return Err(Error::backend(
+                    "Q8 selected KV device upload requires positive batch, heads and selected_tokens",
+                ));
+            }
+            if key_head_dim == 0 || value_head_dim == 0 {
+                return Err(Error::backend(
+                    "Q8 selected KV device upload requires positive head dimensions",
+                ));
+            }
+            let rows = batch
+                .checked_mul(attention_heads)
+                .and_then(|value| value.checked_mul(selected_tokens))
+                .ok_or_else(|| Error::backend("Q8 selected KV row count overflow"))?;
+            let key_payload_len = q8_row_payload_len(rows, key_head_dim)?;
+            let value_payload_len = q8_row_payload_len(rows, value_head_dim)?;
+            validate_exact_shape(
+                "q8_selected_kv_key_payload_len",
+                &[key_payload.len()],
+                &[key_payload_len],
+            )?;
+            validate_exact_shape(
+                "q8_selected_kv_value_payload_len",
+                &[value_payload.len()],
+                &[value_payload_len],
+            )?;
+
+            let k = native_metal.batch_upload_q8_rows_as_f32(key_payload, rows, key_head_dim)?;
+            let v =
+                native_metal.batch_upload_q8_rows_as_f32(value_payload, rows, value_head_dim)?;
+            let view = DeviceSelectedKvView {
+                batch,
+                attention_heads,
+                selected_tokens,
+                key_head_dim,
+                value_head_dim,
+                k: DeviceValue::new_with_dtype(
+                    vec![batch, attention_heads, selected_tokens, key_head_dim],
+                    DType::F32,
+                    k,
+                ),
+                v: DeviceValue::new_with_dtype(
+                    vec![batch, attention_heads, selected_tokens, value_head_dim],
+                    DType::F32,
+                    v,
+                ),
+            };
+            view.validate()?;
+            return Ok(Some(view));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                key_payload,
+                value_payload,
+                batch,
+                attention_heads,
+                selected_tokens,
+                key_head_dim,
+                value_head_dim,
+            );
+            Ok(None)
+        }
+    }
+
+    fn dsa_index_key_device(
+        &self,
+        raw_key: &DeviceValue,
+        weight: &F32Tensor,
+        bias: &F32Tensor,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_dsa_index_key_raw", raw_key, 3)?;
+            let (batch, tokens, head_dim) = (dims[0], dims[1], dims[2]);
+            validate_exact_shape("device_dsa_index_key_weight", weight.dims(), &[head_dim])?;
+            validate_exact_shape("device_dsa_index_key_bias", bias.dims(), &[head_dim])?;
+            let buffer = native_metal.batched_dsa_index_key(
+                &raw_key.buffer,
+                raw_key.element_count()?,
+                weight.values(),
+                bias.values(),
+                batch,
+                tokens,
+                head_dim,
+                rope_dim,
+                position_offset,
+                theta,
+            )?;
+            return Ok(Some(DeviceValue::new(dims.to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (raw_key, weight, bias, rope_dim, position_offset, theta);
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dsa_decode_topk_device(
+        &self,
+        hidden_states: &DeviceValue,
+        q_raw: &DeviceValue,
+        past_index_keys: &DeviceValue,
+        current_index_key: &DeviceValue,
+        weights_proj: &F32Tensor,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+        top_k: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let hidden_dims = require_device_rank("device_dsa_topk_hidden", hidden_states, 3)?;
+            let q_dims = require_device_rank("device_dsa_topk_q_raw", q_raw, 3)?;
+            let past_dims = require_device_rank("device_dsa_topk_past_keys", past_index_keys, 3)?;
+            let current_dims =
+                require_device_rank("device_dsa_topk_current_key", current_index_key, 3)?;
+            let (batch, query_tokens, hidden_size) =
+                (hidden_dims[0], hidden_dims[1], hidden_dims[2]);
+            validate_exact_shape("device_dsa_topk_query_tokens", &[query_tokens], &[1])?;
+            validate_exact_shape(
+                "device_dsa_topk_q_shape",
+                q_dims,
+                &[batch, 1, heads * head_dim],
+            )?;
+            let past_tokens = past_dims[1];
+            validate_exact_shape(
+                "device_dsa_topk_past_key_shape",
+                past_dims,
+                &[batch, past_tokens, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_dsa_topk_current_key_shape",
+                current_dims,
+                &[batch, 1, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_dsa_topk_weights_proj",
+                weights_proj.dims(),
+                &[hidden_size, heads],
+            )?;
+
+            let token_ids = native_metal.batched_dsa_decode_topk(
+                &hidden_states.buffer,
+                hidden_states.element_count()?,
+                &q_raw.buffer,
+                q_raw.element_count()?,
+                &past_index_keys.buffer,
+                past_index_keys.element_count()?,
+                &current_index_key.buffer,
+                current_index_key.element_count()?,
+                weights_proj.values(),
+                batch,
+                hidden_size,
+                past_tokens,
+                heads,
+                head_dim,
+                rope_dim,
+                position_offset,
+                theta,
+                top_k,
+            )?;
+            return Ok(Some(token_ids));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                hidden_states,
+                q_raw,
+                past_index_keys,
+                current_index_key,
+                weights_proj,
+                heads,
+                head_dim,
+                rope_dim,
+                position_offset,
+                theta,
+                top_k,
+            );
+            Ok(None)
+        }
+    }
+
     fn moe_stack_rows_device(&self, rows: &[DeviceValue]) -> Result<Option<DeviceValue>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -3241,7 +4407,13 @@ impl Backend for MetalBackend {
             for (index, row) in rows.iter().enumerate() {
                 let count = row.element_count()?;
                 validate_exact_shape("device_moe_stack_row_len", &[count], &[row_len])?;
-                native_metal.batched_f32_copy(&row.buffer, 0, &stacked, index * row_len, row_len)?;
+                native_metal.batched_f32_copy(
+                    &row.buffer,
+                    0,
+                    &stacked,
+                    index * row_len,
+                    row_len,
+                )?;
             }
             return Ok(Some(DeviceValue::new(vec![rows.len(), row_len], stacked)));
         }
@@ -3296,6 +4468,58 @@ impl Backend for MetalBackend {
             Ok(None)
         }
     }
+
+    fn moe_router_topk_device(
+        &self,
+        router_logits: &DeviceValue,
+        correction_bias: &[f32],
+        top_k: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    ) -> Result<Option<RouterTopK>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_moe_router_topk_logits", router_logits, 2)?;
+            let (token_count, expert_count) = (dims[0], dims[1]);
+            validate_exact_shape(
+                "device_moe_router_topk_correction_bias",
+                &[correction_bias.len()],
+                &[expert_count],
+            )?;
+            let (expert_ids, weights) = native_metal.batched_moe_router_topk(
+                &router_logits.buffer,
+                router_logits.element_count()?,
+                correction_bias,
+                token_count,
+                expert_count,
+                top_k,
+                norm_topk_prob,
+                routed_scaling_factor,
+            )?;
+            return Ok(Some(RouterTopK {
+                token_count,
+                expert_count,
+                top_k,
+                expert_ids,
+                weights,
+            }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                router_logits,
+                correction_bias,
+                top_k,
+                norm_topk_prob,
+                routed_scaling_factor,
+            );
+            Ok(None)
+        }
+    }
 }
 
 impl MetalBackend {
@@ -3332,7 +4556,6 @@ impl MetalBackend {
         Ok(Some(DeviceValue::new(output_shape, buffer)))
     }
 
-
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn native_metal(&self) -> Option<&Metal> {
         self.native_metal.as_deref()
@@ -3367,9 +4590,12 @@ fn backend_operations(has_native_metal: bool) -> Vec<&'static str> {
     if has_native_metal {
         operations.push("add_f32_tensor");
         operations.push("linear_f32_tensor");
+        operations.push("linear_f32_device");
         operations.push("select_last_token_f32_tensor");
         operations.push("heads_to_attention_layout_f32_tensor");
         operations.push("merge_attention_heads_f32_tensor");
+        operations.push("stack_head_outputs_device");
+        operations.push("paged_kv_contiguous_device");
         operations.push("split_rope_tail_f32_tensor");
         operations.push("split_kv_mqa_f32_tensor");
         operations.push("combine_rope_tail_f32_tensor");
@@ -3379,9 +4605,13 @@ fn backend_operations(has_native_metal: bool) -> Vec<&'static str> {
         operations.push("attention_causal_softmax_f32_tensor");
         operations.push("decode_attention_f32_tensor");
         operations.push("paged_decode_attention_f32_tensor");
+        operations.push("selected_decode_attention_device");
+        operations.push("dsa_index_key_device");
+        operations.push("dsa_decode_topk_device");
         operations.push("rope_slice_f32_tensor");
         operations.push("moe_gather_tokens_f32_tensor");
         operations.push("moe_weighted_index_add_combine_f32_tensor");
+        operations.push("moe_router_topk_device");
         operations.push("q2_k_matvec_f32_tensor");
         operations.push("q2_k_matvec_add_f32_tensor");
         operations.push("q2_k_matvec_f32");
@@ -3463,6 +4693,15 @@ fn require_device_rank<'a>(
         )));
     }
     Ok(dims)
+}
+
+fn q8_row_payload_len(row_count: usize, dim: usize) -> Result<usize> {
+    let row_bytes = dim
+        .checked_add(4)
+        .ok_or_else(|| Error::backend("Q8 row byte length overflow"))?;
+    row_count
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::backend("Q8 row payload length overflow"))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4237,11 +5476,8 @@ fn reference_matmul(lhs: &Tensor, rhs: &Tensor, device: &Device) -> Result<Tenso
         .flatten_all()?
         .to_vec1::<f32>()?;
 
-    if lhs_values.iter().any(|value| !value.is_finite())
-        || rhs_values.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend("matmul input contains non-finite values"));
-    }
+    debug_assert_finite_values("matmul lhs", &lhs_values);
+    debug_assert_finite_values("matmul rhs", &rhs_values);
 
     let mut output = vec![0.0_f32; rows * cols];
     for row in 0..rows {
@@ -4266,13 +5502,8 @@ fn reference_linear_from_values(
     output_shape: &[usize],
     device: &Device,
 ) -> Result<Tensor> {
-    if input_values.iter().any(|value| !value.is_finite())
-        || weight_values.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend(
-            "linear input or weight contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("linear input", input_values);
+    debug_assert_finite_values("linear weight", weight_values);
 
     let expected_input_len = rows
         .checked_mul(in_features)
@@ -4316,11 +5547,8 @@ fn reference_add_from_values(
     device: &Device,
 ) -> Result<Tensor> {
     validate_exact_shape("add_value_count", &[lhs_values.len()], &[rhs_values.len()])?;
-    if lhs_values.iter().any(|value| !value.is_finite())
-        || rhs_values.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend("add input contains non-finite values"));
-    }
+    debug_assert_finite_values("add lhs", lhs_values);
+    debug_assert_finite_values("add rhs", rhs_values);
 
     let output = lhs_values
         .iter()
@@ -4610,11 +5838,8 @@ fn reference_swiglu_from_values(
         &[gate_values.len()],
         &[up_values.len()],
     )?;
-    if gate_values.iter().any(|value| !value.is_finite())
-        || up_values.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend("SwiGLU input contains non-finite values"));
-    }
+    debug_assert_finite_values("SwiGLU gate", gate_values);
+    debug_assert_finite_values("SwiGLU up", up_values);
 
     let mut output = Vec::with_capacity(gate_values.len());
     for (gate, up) in gate_values.iter().zip(up_values) {
@@ -4992,11 +6217,8 @@ fn validate_reference_attention_scores(
         .and_then(|value| value.checked_mul(head_dim))
         .ok_or_else(|| Error::backend("attention k value count overflow"))?;
     validate_exact_shape("attention_k_values", &[k.len()], &[expected_k_len])?;
-    if q.iter().any(|value| !value.is_finite()) || k.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "attention q or k contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("attention q", q);
+    debug_assert_finite_values("attention k", k);
     Ok(())
 }
 
@@ -5100,12 +6322,8 @@ fn validate_reference_attention_values(
         &[values.len()],
         &[expected_values_len],
     )?;
-    if probs.iter().any(|value| !value.is_finite()) || values.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend(
-            "attention probabilities or values contain non-finite values",
-        ));
-    }
+    debug_assert_finite_values("attention probabilities", probs);
+    debug_assert_finite_values("attention values", values);
     Ok(())
 }
 
@@ -5141,11 +6359,7 @@ fn validate_reference_attention_causal_softmax(
         &[scores.len()],
         &[expected_scores_len],
     )?;
-    if scores.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "attention causal softmax scores contain non-finite values",
-        ));
-    }
+    debug_assert_finite_values("attention causal softmax scores", scores);
     Ok(())
 }
 
@@ -5180,9 +6394,7 @@ fn validate_reference_rope_slice(
         .and_then(|value| value.checked_mul(rope_dim))
         .ok_or_else(|| Error::backend("RoPE input value count overflow"))?;
     validate_exact_shape("rope_input_values", &[input.len()], &[expected_input_len])?;
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend("RoPE input contains non-finite values"));
-    }
+    debug_assert_finite_values("RoPE input", input);
     Ok(())
 }
 
@@ -5206,11 +6418,7 @@ fn validate_reference_select_last_token(
         &[hidden_states.len()],
         &[expected_len],
     )?;
-    if hidden_states.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "select_last_token input contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("select_last_token input", hidden_states);
     Ok(())
 }
 
@@ -5226,11 +6434,7 @@ fn validate_reference_layout_values(name: &str, values: &[f32], dims: &[usize]) 
             .ok_or_else(|| Error::backend(format!("{name} input value count overflow")))
     })?;
     validate_exact_shape(name, &[values.len()], &[expected_len])?;
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(format!(
-            "{name} input contains non-finite values"
-        )));
-    }
+    debug_assert_finite_values(name, values);
     Ok(())
 }
 
@@ -5259,11 +6463,7 @@ fn validate_reference_moe_gather_tokens(
         &[token_indices.len()],
         &[assignment_count],
     )?;
-    if flat_tokens.iter().any(|value| !value.is_finite()) {
-        return Err(Error::backend(
-            "MoE gather flat_tokens contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("MoE gather flat_tokens", flat_tokens);
     if let Some(token_index) = token_indices
         .iter()
         .copied()
@@ -5316,14 +6516,9 @@ fn validate_reference_moe_weighted_index_add_combine(
         &[expert_outputs.len()],
         &[expected_expert_output_len],
     )?;
-    if accumulator.iter().any(|value| !value.is_finite())
-        || expert_outputs.iter().any(|value| !value.is_finite())
-        || expert_weights.iter().any(|value| !value.is_finite())
-    {
-        return Err(Error::backend(
-            "MoE combine accumulator, expert_outputs, or expert_weights contains non-finite values",
-        ));
-    }
+    debug_assert_finite_values("MoE combine accumulator", accumulator);
+    debug_assert_finite_values("MoE combine expert_outputs", expert_outputs);
+    debug_assert_finite_values("MoE combine expert_weights", expert_weights);
     if let Some(token_index) = token_indices
         .iter()
         .copied()
@@ -5342,6 +6537,13 @@ fn tensor_from_values(values: Vec<f32>, output_shape: &[usize], device: &Device)
         return Err(Error::backend("tensor output shape is empty"));
     }
     Ok(Tensor::from_vec(values, output_shape, device)?)
+}
+
+fn debug_assert_finite_values(name: &str, values: &[f32]) {
+    debug_assert!(
+        values.iter().all(|value| value.is_finite()),
+        "{name} contains non-finite values"
+    );
 }
 
 #[cfg(test)]
@@ -5375,6 +6577,18 @@ mod tests {
         MetalBackend::from_device(Device::Cpu).unwrap()
     }
 
+    fn q8_rows_payload(rows: &[(f32, &[i8])]) -> Vec<u8> {
+        let value_count = rows.first().map(|(_, values)| values.len()).unwrap_or(0);
+        let mut payload = Vec::with_capacity(rows.len() * (4 + value_count));
+        for (scale, values) in rows {
+            payload.extend(scale.to_le_bytes());
+            for value in *values {
+                payload.push(*value as u8);
+            }
+        }
+        payload
+    }
+
     #[test]
     fn capabilities_report_reference_without_custom_kernels() {
         let backend = cpu_backend();
@@ -5384,6 +6598,106 @@ mod tests {
         assert_eq!(capabilities.device, DeviceKind::Cpu);
         assert!(!capabilities.custom_kernels);
         assert!(capabilities.operations.contains(&"attention_scores"));
+    }
+
+    #[test]
+    fn dsa_decode_topk_device_matches_expected_ranking_when_metal_available() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let hidden = F32Tensor::new(vec![2.0_f32.sqrt(), 0.0, 0.0, 0.0], [1, 1, 4]).unwrap();
+        let q_raw = F32Tensor::new(vec![1.0, 0.0, 0.0, 1.0], [1, 1, 4]).unwrap();
+        let past_keys = F32Tensor::new(
+            vec![
+                1.0, 0.0, //
+                0.0, 1.0, //
+                2.0, 0.0,
+            ],
+            [1, 3, 2],
+        )
+        .unwrap();
+        let current_key = F32Tensor::new(vec![0.0, 2.0], [1, 1, 2]).unwrap();
+        let weights_proj = F32Tensor::new(
+            vec![
+                1.0, 1.0, //
+                0.0, 0.0, //
+                0.0, 0.0, //
+                0.0, 0.0,
+            ],
+            [4, 2],
+        )
+        .unwrap();
+
+        let hidden = backend
+            .device_upload_f32_tensor(&hidden)
+            .unwrap()
+            .expect("Metal device value");
+        let q_raw = backend
+            .device_upload_f32_tensor(&q_raw)
+            .unwrap()
+            .expect("Metal device value");
+        let past_keys = backend
+            .device_upload_f32_tensor(&past_keys)
+            .unwrap()
+            .expect("Metal device value");
+        let current_key = backend
+            .device_upload_f32_tensor(&current_key)
+            .unwrap()
+            .expect("Metal device value");
+
+        let topk = backend
+            .dsa_decode_topk_device(
+                &hidden,
+                &q_raw,
+                &past_keys,
+                &current_key,
+                &weights_proj,
+                2,
+                2,
+                2,
+                0,
+                10_000.0,
+                2,
+            )
+            .unwrap()
+            .expect("Metal DSA top-k");
+
+        assert_eq!(topk, vec![2, 3]);
+    }
+
+    #[test]
+    fn q8_selected_kv_device_decodes_to_f32_when_metal_available() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let key_payload = q8_rows_payload(&[(0.5, &[2_i8, -2]), (1.0, &[3, -3])]);
+        let value_payload = q8_rows_payload(&[(0.25, &[4_i8, -4]), (2.0, &[1, -1])]);
+
+        let Some(view) = backend
+            .q8_row_selected_kv_device(&key_payload, &value_payload, 1, 1, 2, 2, 2)
+            .unwrap()
+        else {
+            return;
+        };
+
+        assert_eq!(view.k.dtype(), DType::F32);
+        assert_eq!(view.v.dtype(), DType::F32);
+        assert_eq!(view.k.dims(), &[1, 1, 2, 2]);
+        assert_eq!(view.v.dims(), &[1, 1, 2, 2]);
+        assert_eq!(
+            backend
+                .device_download_f32_tensor(&view.k)
+                .unwrap()
+                .values(),
+            vec![1.0, -1.0, 3.0, -3.0]
+        );
+        assert_eq!(
+            backend
+                .device_download_f32_tensor(&view.v)
+                .unwrap()
+                .values(),
+            vec![1.0, -1.0, 2.0, -2.0]
+        );
     }
 
     #[test]

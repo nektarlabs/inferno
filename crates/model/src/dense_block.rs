@@ -29,6 +29,7 @@ pub struct DenseBlockTensors {
     pub hidden_states: Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,7 @@ pub struct DenseBlockF32Tensors {
     pub hidden_states: F32Tensor,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +166,7 @@ impl<'a> DenseBlock<'a> {
             hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
     }
 
@@ -183,6 +186,7 @@ impl<'a> DenseBlock<'a> {
             hidden_states: tensor_from_f32_tensor(output.hidden_states, backend.device())?,
             cache_k: output.cache_k,
             cache_v: output.cache_v,
+            index_key: output.index_key,
         })
     }
 
@@ -213,6 +217,7 @@ impl<'a> DenseBlock<'a> {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
     }
 
@@ -243,6 +248,7 @@ impl<'a> DenseBlock<'a> {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         })
     }
 
@@ -253,27 +259,81 @@ impl<'a> DenseBlock<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
-        past_kv: &PagedKvView<'_>,
+        past_kv: &backend::DevicePagedKvView,
     ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
-        let attention_output = crate::try_device!(profile::run_layer_stage(
-            self.load_report.layer_index,
-            "dense.attention",
-            || self
-                .attention
-                .forward_decode_device(config, hidden_states, backend, past_kv),
-        ));
-        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
-            self.load_report.layer_index,
-            "dense.ffn",
-            || self
-                .ffn
-                .forward_device(config, &attention_output.hidden_states, backend),
-        ));
+        let attention_output =
+            match profile::run_layer_stage(self.load_report.layer_index, "dense.attention", || {
+                self.attention
+                    .forward_decode_device(config, hidden_states, backend, past_kv)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "dense layer {} attention has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
+        let output_hidden_states =
+            match profile::run_layer_stage(self.load_report.layer_index, "dense.ffn", || {
+                self.ffn
+                    .forward_device(config, &attention_output.hidden_states, backend)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "dense layer {} FFN has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
 
         Ok(Some(crate::kv_types::BlockDeviceTensors {
             hidden_states: output_hidden_states,
             cache_k: attention_output.cache_k,
             cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
+        }))
+    }
+
+    pub(crate) fn forward_seed_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
+        let attention_output =
+            match profile::run_layer_stage(self.load_report.layer_index, "dense.attention", || {
+                self.attention
+                    .forward_seed_device(config, hidden_states, backend)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "dense layer {} seed attention has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
+        let output_hidden_states =
+            match profile::run_layer_stage(self.load_report.layer_index, "dense.ffn", || {
+                self.ffn
+                    .forward_device(config, &attention_output.hidden_states, backend)
+            })? {
+                Some(output) => output,
+                None => {
+                    return Err(Error::backend(format!(
+                        "dense layer {} seed FFN has no complete native device path",
+                        self.load_report.layer_index
+                    )));
+                }
+            };
+
+        Ok(Some(crate::kv_types::BlockDeviceTensors {
+            hidden_states: output_hidden_states,
+            cache_k: attention_output.cache_k,
+            cache_v: attention_output.cache_v,
+            index_key: attention_output.index_key,
         }))
     }
 
@@ -427,10 +487,10 @@ mod tests {
         assert_eq!(block.load_report().ffn.intermediate_size, 512);
         assert_eq!(output.hidden_states.dims(), &[2, 3, 256]);
         assert_eq!(tensors.hidden_states.dims(), &[2, 3, 256]);
-        assert_eq!(output.cache_k.dims(), &[2, 2, 3, 256]);
-        assert_eq!(output.cache_v.dims(), &[2, 2, 3, 256]);
-        assert_eq!(tensors.cache_k.dims(), &[2, 2, 3, 256]);
-        assert_eq!(tensors.cache_v.dims(), &[2, 2, 3, 256]);
+        assert_eq!(output.cache_k.dims(), &[2, 1, 3, 256]);
+        assert_eq!(output.cache_v.dims(), &[2, 1, 3, 128]);
+        assert_eq!(tensors.cache_k.dims(), &[2, 1, 3, 256]);
+        assert_eq!(tensors.cache_v.dims(), &[2, 1, 3, 128]);
         assert_eq!(
             output.report.attention_output_hidden_states_shape.dims(),
             &[2, 3, 256]
@@ -483,10 +543,10 @@ mod tests {
         );
         assert_eq!(decode.hidden_states.dims(), &[1, 1, 256]);
         assert_eq!(decode_tensors.hidden_states.dims(), &[1, 1, 256]);
-        assert_eq!(decode.cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode.cache_v.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode_tensors.cache_k.dims(), &[1, 2, 1, 256]);
-        assert_eq!(decode_tensors.cache_v.dims(), &[1, 2, 1, 256]);
+        assert_eq!(decode.cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode.cache_v.dims(), &[1, 1, 1, 128]);
+        assert_eq!(decode_tensors.cache_k.dims(), &[1, 1, 1, 256]);
+        assert_eq!(decode_tensors.cache_v.dims(), &[1, 1, 1, 128]);
         assert_eq!(decode.report.attention_past_tokens, 3);
         assert_eq!(decode.report.attention_scores_shape.dims(), &[1, 2, 1, 4]);
     }
@@ -518,6 +578,7 @@ mod tests {
             qk_head_dim: 256,
             qk_no_rope_dim: 128,
             qk_rope_dim: 128,
+            kv_lora_rank: 256,
             v_head_dim: Some(256),
             num_routed_experts: 1,
             experts_per_token: 1,
@@ -531,6 +592,12 @@ mod tests {
             topk_method: "greedy".to_string(),
             max_context: 32,
             dsa_index_topk: 1,
+            index_head_dim: 128,
+            index_n_heads: 32,
+            index_topk_freq: 4,
+            indexer_rope_interleave: true,
+            indexer_types: Vec::new(),
+            num_nextn_predict_layers: 0,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000_000.0,
         }

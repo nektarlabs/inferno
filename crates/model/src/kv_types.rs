@@ -9,16 +9,27 @@ pub struct LayerKvCacheTensors {
     pub layer_kind: LayerKind,
     pub cache_k: F32Tensor,
     pub cache_v: F32Tensor,
+    pub index_key: Option<F32Tensor>,
+}
+
+#[derive(Debug)]
+pub struct LayerDeviceKvCacheTensors {
+    pub layer_index: usize,
+    pub layer_kind: LayerKind,
+    pub cache_k: backend::DeviceValue,
+    pub cache_v: backend::DeviceValue,
+    pub index_key: Option<F32Tensor>,
 }
 
 /// Output of a batched device-resident decode layer: the hidden states stay
-/// on the GPU for the next layer; the current token's K/V come back to the
-/// host because the paged KV cache appends there.
+/// on the GPU for the next layer; the current token's K/V stay on the GPU so
+/// the runtime can append them into the resident Metal KV cache.
 #[derive(Debug)]
 pub(crate) struct BlockDeviceTensors {
     pub(crate) hidden_states: backend::DeviceValue,
-    pub(crate) cache_k: F32Tensor,
-    pub(crate) cache_v: F32Tensor,
+    pub(crate) cache_k: backend::DeviceValue,
+    pub(crate) cache_v: backend::DeviceValue,
+    pub(crate) index_key: Option<F32Tensor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

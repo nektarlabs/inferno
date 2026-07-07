@@ -81,6 +81,7 @@ pub(crate) fn record_layer(layer_index: usize, layer_kind: &str, elapsed: Durati
         context.phase,
         elapsed.as_secs_f64() * 1000.0
     );
+    let _ = file.flush();
 }
 
 pub(crate) fn run_layer_stage<T, F>(layer_index: usize, layer_kind: &str, operation: F) -> Result<T>

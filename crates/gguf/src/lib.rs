@@ -12,7 +12,7 @@ use std::{
 };
 
 use common::{Error, Result};
-use io::MappedFile;
+use io::{MappedFile, MappedFileAdvice};
 use tracing::debug;
 
 pub const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -140,6 +140,12 @@ pub struct GgufSummary {
 pub struct GgufTensorTypeCount {
     pub ty: GgmlType,
     pub count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufTensorAdvice {
+    Random,
+    WillNeed,
 }
 
 impl GgufFile {
@@ -370,6 +376,34 @@ impl GgufFile {
         storage.quantized_payload()
     }
 
+    pub fn advise_tensor(&self, name: &str, advice: GgufTensorAdvice) -> Result<()> {
+        let tensor = self
+            .tensor(name)
+            .ok_or_else(|| Error::gguf(format!("missing GGUF tensor {name}")))?;
+        self.advise_tensor_by_info(tensor, advice)
+    }
+
+    pub fn advise_tensor_by_info(
+        &self,
+        info: &GgufTensorInfo,
+        advice: GgufTensorAdvice,
+    ) -> Result<()> {
+        self.mapped
+            .advise_range(advice.into(), info.absolute_offset, info.storage_byte_len)
+    }
+
+    pub fn prefetch_range(&self, absolute_offset: u64, byte_len: u64) -> Result<()> {
+        self.mapped.prefetch_range(absolute_offset, byte_len)
+    }
+
+    pub fn prefetch_ranges(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        self.mapped.prefetch_ranges(ranges)
+    }
+
+    pub fn cache_identity(&self) -> usize {
+        self.mapped.cache_identity()
+    }
+
     pub fn tensor_q2_k_f32_values(&self, name: &str) -> Result<Vec<f32>> {
         self.tensor_quantized_storage(name)?.dequantize_q2_k()
     }
@@ -387,6 +421,15 @@ impl GgufFile {
 
     pub fn metadata_unsigned(&self, key: &str) -> Option<u64> {
         metadata_value_as_unsigned(self.metadata.get(key)?)
+    }
+}
+
+impl From<GgufTensorAdvice> for MappedFileAdvice {
+    fn from(value: GgufTensorAdvice) -> Self {
+        match value {
+            GgufTensorAdvice::Random => Self::Random,
+            GgufTensorAdvice::WillNeed => Self::WillNeed,
+        }
     }
 }
 
