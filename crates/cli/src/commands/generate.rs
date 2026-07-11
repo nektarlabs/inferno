@@ -1,4 +1,5 @@
 use std::{
+    fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -32,6 +33,7 @@ pub fn run(
     profile_runtime: Option<&Path>,
     profile_layers: Option<&Path>,
     measure_tokens_per_second: bool,
+    throughput_file: Option<&Path>,
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
 ) -> Result<()> {
@@ -79,7 +81,7 @@ pub fn run(
     let mut stdout = io::stdout().lock();
     let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
     let mut generated_token_count = 0_usize;
-    let generation_started_at = Instant::now();
+    let mut throughput = ThroughputRecorder::start();
     run_generate_streaming_with_stop_tokens(
         &model,
         &config,
@@ -89,6 +91,7 @@ pub fn run(
         page_size,
         &tokenizer_metadata.eos_token_ids,
         |token_id| {
+            throughput.record_token();
             generated_token_count = generated_token_count
                 .checked_add(1)
                 .ok_or_else(|| Error::runtime("generated token count overflow"))?;
@@ -107,25 +110,102 @@ pub fn run(
             Ok(())
         },
     )?;
-    let generation_elapsed = generation_started_at.elapsed();
+    let throughput_report = throughput.finish(encoded.token_ids.len());
     stdout.write_all(b"\n")?;
-    if measure_tokens_per_second {
-        write_tokens_per_second_report(generated_token_count, generation_elapsed)?;
+    if measure_tokens_per_second || throughput_file.is_some() {
+        validate_exact_generated_token_count(generated_token_count, &throughput_report)?;
+        if measure_tokens_per_second {
+            write_tokens_per_second_report(&throughput_report)?;
+        }
+        if let Some(path) = throughput_file {
+            append_tokens_per_second_report(path, &throughput_report)?;
+        }
     }
     Ok(())
 }
 
-fn write_tokens_per_second_report(token_count: usize, elapsed: Duration) -> InfernoResult<()> {
-    let elapsed_seconds = elapsed.as_secs_f64();
-    let tokens_per_second = tokens_per_second(token_count, elapsed);
+fn validate_exact_generated_token_count(
+    generated_token_count: usize,
+    report: &ThroughputReport,
+) -> InfernoResult<()> {
+    if generated_token_count != report.generated_tokens {
+        return Err(Error::runtime(format!(
+            "throughput token count mismatch: callback counted {generated_token_count}, report counted {}",
+            report.generated_tokens
+        )));
+    }
+    Ok(())
+}
+
+fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()> {
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
-        "inferno throughput: generated_tokens={} elapsed_seconds={:.3} tokens_per_second={:.3}",
-        token_count, elapsed_seconds, tokens_per_second
+        "inferno throughput: prompt_tokens={} generated_tokens={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3}",
+        report.prompt_tokens,
+        report.generated_tokens,
+        report.total_seconds,
+        report.total_tokens_per_second,
+        report.time_to_first_token_seconds,
+        report.decode_tokens,
+        report.decode_seconds,
+        report.decode_tokens_per_second,
+        report.decode_token_mean_seconds,
+        report.decode_token_p50_seconds,
+        report.decode_token_p95_seconds
     )
     .map_err(|source| Error::Io {
         path: PathBuf::from("<stderr>"),
+        source,
+    })
+}
+
+fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> InfernoResult<()> {
+    let needs_header = match path.metadata() {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if needs_header {
+        writeln!(
+            file,
+            "prompt_tokens\tgenerated_tokens\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds"
+        )
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    writeln!(
+        file,
+        "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+        report.prompt_tokens,
+        report.generated_tokens,
+        report.total_seconds,
+        report.total_tokens_per_second,
+        report.time_to_first_token_seconds,
+        report.decode_tokens,
+        report.decode_seconds,
+        report.decode_tokens_per_second,
+        report.decode_token_mean_seconds,
+        report.decode_token_p50_seconds,
+        report.decode_token_p95_seconds
+    )
+    .map_err(|source| Error::Io {
+        path: path.to_path_buf(),
         source,
     })
 }
@@ -136,6 +216,114 @@ fn tokens_per_second(token_count: usize, elapsed: Duration) -> f64 {
         return 0.0;
     }
     token_count as f64 / elapsed_seconds
+}
+
+struct ThroughputRecorder {
+    started_at: Instant,
+    token_offsets: Vec<Duration>,
+}
+
+impl ThroughputRecorder {
+    fn start() -> Self {
+        Self {
+            started_at: Instant::now(),
+            token_offsets: Vec::new(),
+        }
+    }
+
+    fn record_token(&mut self) {
+        self.token_offsets.push(self.started_at.elapsed());
+    }
+
+    fn finish(self, prompt_tokens: usize) -> ThroughputReport {
+        ThroughputReport::from_token_offsets(
+            prompt_tokens,
+            self.started_at.elapsed(),
+            &self.token_offsets,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ThroughputReport {
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    total_seconds: f64,
+    total_tokens_per_second: f64,
+    time_to_first_token_seconds: f64,
+    decode_tokens: usize,
+    decode_seconds: f64,
+    decode_tokens_per_second: f64,
+    decode_token_mean_seconds: f64,
+    decode_token_p50_seconds: f64,
+    decode_token_p95_seconds: f64,
+}
+
+impl ThroughputReport {
+    fn from_token_offsets(
+        prompt_tokens: usize,
+        total_elapsed: Duration,
+        token_offsets: &[Duration],
+    ) -> Self {
+        let generated_tokens = token_offsets.len();
+        let total_seconds = total_elapsed.as_secs_f64();
+        let total_tokens_per_second = tokens_per_second(generated_tokens, total_elapsed);
+        let time_to_first_token_seconds = token_offsets
+            .first()
+            .map(Duration::as_secs_f64)
+            .unwrap_or(0.0);
+        let intervals = decode_token_intervals(token_offsets);
+        let decode_tokens = intervals.len();
+        let decode_seconds = match (token_offsets.first(), token_offsets.last()) {
+            (Some(first), Some(last)) if generated_tokens > 1 => {
+                last.checked_sub(*first).unwrap_or_default().as_secs_f64()
+            }
+            _ => 0.0,
+        };
+        let decode_tokens_per_second = if decode_seconds <= 0.0 {
+            0.0
+        } else {
+            decode_tokens as f64 / decode_seconds
+        };
+        let decode_token_mean_seconds = if intervals.is_empty() {
+            0.0
+        } else {
+            intervals.iter().map(Duration::as_secs_f64).sum::<f64>() / intervals.len() as f64
+        };
+        let decode_token_p50_seconds = percentile_seconds(intervals.clone(), 50);
+        let decode_token_p95_seconds = percentile_seconds(intervals, 95);
+
+        Self {
+            prompt_tokens,
+            generated_tokens,
+            total_seconds,
+            total_tokens_per_second,
+            time_to_first_token_seconds,
+            decode_tokens,
+            decode_seconds,
+            decode_tokens_per_second,
+            decode_token_mean_seconds,
+            decode_token_p50_seconds,
+            decode_token_p95_seconds,
+        }
+    }
+}
+
+fn decode_token_intervals(token_offsets: &[Duration]) -> Vec<Duration> {
+    token_offsets
+        .windows(2)
+        .filter_map(|window| window[1].checked_sub(window[0]))
+        .collect()
+}
+
+fn percentile_seconds(mut values: Vec<Duration>, percentile: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable();
+    let last_index = values.len() - 1;
+    let index = last_index.saturating_mul(percentile).div_ceil(100);
+    values[index.min(last_index)].as_secs_f64()
 }
 
 struct DecodedTextStream<'a> {
@@ -380,6 +568,74 @@ mod tests {
         let rate = tokens_per_second(6, Duration::from_secs(0));
 
         assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn throughput_report_separates_first_token_from_decode_rate() {
+        let report = ThroughputReport::from_token_offsets(
+            5,
+            Duration::from_secs(10),
+            &[
+                Duration::from_secs(4),
+                Duration::from_secs(6),
+                Duration::from_secs(7),
+                Duration::from_secs(10),
+            ],
+        );
+
+        assert_eq!(report.prompt_tokens, 5);
+        assert_eq!(report.generated_tokens, 4);
+        assert_eq!(report.total_seconds, 10.0);
+        assert_eq!(report.total_tokens_per_second, 0.4);
+        assert_eq!(report.time_to_first_token_seconds, 4.0);
+        assert_eq!(report.decode_tokens, 3);
+        assert_eq!(report.decode_seconds, 6.0);
+        assert_eq!(report.decode_tokens_per_second, 0.5);
+        assert_eq!(report.decode_token_mean_seconds, 2.0);
+        assert_eq!(report.decode_token_p50_seconds, 2.0);
+        assert_eq!(report.decode_token_p95_seconds, 3.0);
+    }
+
+    #[test]
+    fn throughput_report_handles_single_generated_token() {
+        let report = ThroughputReport::from_token_offsets(
+            3,
+            Duration::from_secs(5),
+            &[Duration::from_secs(5)],
+        );
+
+        assert_eq!(report.generated_tokens, 1);
+        assert_eq!(report.decode_tokens, 0);
+        assert_eq!(report.decode_seconds, 0.0);
+        assert_eq!(report.decode_tokens_per_second, 0.0);
+        assert_eq!(report.decode_token_mean_seconds, 0.0);
+        assert_eq!(report.decode_token_p50_seconds, 0.0);
+        assert_eq!(report.decode_token_p95_seconds, 0.0);
+    }
+
+    #[test]
+    fn append_tokens_per_second_report_writes_header_once() {
+        let dir = unique_temp_dir("throughput-report");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("throughput.tsv");
+        let report = ThroughputReport::from_token_offsets(
+            2,
+            Duration::from_secs(2),
+            &[Duration::from_secs(1)],
+        );
+
+        append_tokens_per_second_report(&path, &report).unwrap();
+        append_tokens_per_second_report(&path, &report).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.starts_with("prompt_tokens"))
+                .count(),
+            1
+        );
+        assert_eq!(contents.lines().count(), 3);
     }
 
     #[test]

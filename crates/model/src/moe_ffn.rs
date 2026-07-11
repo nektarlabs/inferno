@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 
-use backend::{Backend, BackendCapabilities};
+use backend::{Backend, BackendCapabilities, Q2ExpertSource};
 use common::Tensor;
 use common::{validate_exact_shape, DeviceKind, Error, F32Tensor, Result, Shape};
 use config::Config;
@@ -19,7 +19,7 @@ use crate::{
     QuantizedLinear, SharedExpertIndex, TensorRef,
 };
 
-const ROUTED_EXPERT_PREFETCH_CACHE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+const ROUTED_EXPERT_PREFETCH_CACHE_BYTES: u64 = 9 * 1024 * 1024 * 1024;
 static ROUTED_EXPERT_PREFETCH_CACHE: OnceLock<Mutex<ExpertPayloadPrefetchCache>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -84,12 +84,6 @@ pub struct MoeFfnForwardReport {
     pub routed_source_payload_bytes_read: u64,
     pub routed_full_source_payload_bytes: u64,
     pub routed_peak_decoded_f32_bytes: u64,
-}
-
-struct RoutedDeviceBatch {
-    token_indices: Vec<u32>,
-    expert_weights: Vec<f32>,
-    expert_outputs: backend::DeviceValue,
 }
 
 fn require_moe_device_stage<T>(stage: &str, result: Result<Option<T>>) -> Result<T> {
@@ -303,6 +297,47 @@ impl<'a> MoeFfn<'a> {
     fn prefetch_selected_routed_experts(&self, dispatch_plan: &[ExpertDispatch]) -> Result<()> {
         let work = self.selected_routed_expert_prefetch_work(dispatch_plan)?;
         work.run(self.routed_gate.gguf, self.layer_index)
+    }
+
+    fn stage_selected_routed_expert_ids<B: Backend>(
+        &self,
+        expert_ids: &[u32],
+        backend: &B,
+    ) -> Result<Option<backend::DeviceQ2Experts>> {
+        if expert_ids.is_empty() {
+            return Err(Error::moe(
+                "device Q2 expert staging requires selected expert IDs",
+            ));
+        }
+        let mut gate_payloads = Vec::with_capacity(expert_ids.len());
+        let mut up_payloads = Vec::with_capacity(expert_ids.len());
+        let mut down_payloads = Vec::with_capacity(expert_ids.len());
+        for &expert_id in expert_ids {
+            let expert_id = usize::try_from(expert_id)
+                .map_err(|_| Error::moe("device router expert id does not fit usize"))?;
+            let gate = self.routed_gate.q2_expert_payload(expert_id)?;
+            let up = self.routed_up.q2_expert_payload(expert_id)?;
+            let down = self.routed_down.q2_expert_payload(expert_id)?;
+            gate_payloads.push(Q2ExpertSource {
+                bytes: gate.bytes,
+                absolute_offset: gate.absolute_offset,
+            });
+            up_payloads.push(Q2ExpertSource {
+                bytes: up.bytes,
+                absolute_offset: up.absolute_offset,
+            });
+            down_payloads.push(Q2ExpertSource {
+                bytes: down.bytes,
+                absolute_offset: down.absolute_offset,
+            });
+        }
+        backend.stage_q2_experts_device(
+            self.layer_index,
+            self.routed_gate.gguf.path(),
+            &gate_payloads,
+            &up_payloads,
+            &down_payloads,
+        )
     }
 
     fn run_with_async_selected_routed_expert_prefetch<T>(
@@ -717,11 +752,11 @@ impl<'a> MoeFfn<'a> {
         require_native("add", backend.add_f32_tensor(hidden_states, &ffn_delta)?)
     }
 
-    /// Batched device-resident MoE FFN for single-token decode. The routed
-    /// top-k selection needs the CPU (inside `route_device`, which downloads
-    /// the normed activations and flushes the batch); everything else — shared
-    /// expert, routed experts, combine, residual — is encoded without further
-    /// synchronization. `Ok(None)` falls back to the eager path.
+    /// Batched device-resident MoE FFN for single-token decode. The router and
+    /// expert math stay on Metal. After top-k, one deliberate synchronization
+    /// reads eight IDs so their exact Q2 ranges can be prefetched sequentially
+    /// from SSD; this avoids demand-faulting random GGUF pages inside the
+    /// expert kernels. `Ok(None)` falls back to the eager path.
     pub(crate) fn forward_device<B: Backend>(
         &self,
         config: &Config,
@@ -753,6 +788,23 @@ impl<'a> MoeFfn<'a> {
             "sparse_moe.router",
             || self.router.route_device(config, hidden_states, backend),
         ));
+        let selected_expert_ids = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "sparse_moe.router_sync",
+            || backend.moe_router_expert_ids_device(&routing.topk),
+        ));
+        let staged_experts = crate::try_device!(profile::run_layer_stage(
+            self.layer_index,
+            "sparse_moe.expert_stage",
+            || self.stage_selected_routed_expert_ids(&selected_expert_ids, backend),
+        ));
+        tracing::debug!(
+            layer_index = self.layer_index,
+            cache_hits = staged_experts.cache_hits(),
+            cache_misses = staged_experts.cache_misses(),
+            expert_ids = ?selected_expert_ids,
+            "resolved routed expert cache entries"
+        );
         let flat_tokens = routing
             .normed_hidden_states
             .reshape(vec![flat_token_count, config.hidden_size])?;
@@ -789,65 +841,37 @@ impl<'a> MoeFfn<'a> {
 
         let routed = require_moe_device_stage(
             "sparse_moe.routed",
-            self.forward_single_token_routed_device(&routing.dispatch_plan, &flat_tokens, backend),
-        )?;
-
-        // Seeding the combine accumulator with the shared-expert output folds
-        // "routed sum + shared" into the one combine kernel; the eager path
-        // combines into zeros and adds the shared output afterwards, which is
-        // arithmetically identical.
-        let ffn_delta_flat = require_moe_device_stage(
-            "sparse_moe.weighted_combine",
-            backend.moe_weighted_index_add_combine_device(
-                &shared_down,
-                &routed.token_indices,
-                &routed.expert_outputs,
-                &routed.expert_weights,
+            self.forward_single_token_routed_device(
+                &routing.topk,
+                &staged_experts,
+                &flat_tokens,
+                backend,
             ),
         )?;
-        let ffn_delta = ffn_delta_flat.reshape(vec![batch, tokens, config.hidden_size])?;
+
         let output = require_moe_device_stage(
-            "sparse_moe.residual_add",
-            backend.add_device(hidden_states, &ffn_delta),
+            "sparse_moe.weighted_combine_residual",
+            backend.moe_topk_combine_residual_device(
+                &shared_down,
+                hidden_states,
+                &routed,
+                &routing.topk,
+            ),
         )?;
         Ok(Some(output))
     }
 
     fn forward_single_token_routed_device<B: Backend>(
         &self,
-        dispatch_plan: &[ExpertDispatch],
+        routing: &backend::DeviceRouterTopK,
+        staged_experts: &backend::DeviceQ2Experts,
         flat_tokens: &backend::DeviceValue,
         backend: &B,
-    ) -> Result<Option<RoutedDeviceBatch>> {
-        if dispatch_plan.is_empty() {
+    ) -> Result<Option<backend::DeviceValue>> {
+        if routing.assignment_count()? == 0 {
             return Err(Error::moe(
                 "GLM-5.2 GGUF device MoE FFN routing produced no expert assignments",
             ));
-        }
-
-        let mut token_indices = Vec::<u32>::with_capacity(dispatch_plan.len());
-        let mut expert_weights = Vec::<f32>::with_capacity(dispatch_plan.len());
-        let mut expert_ids = Vec::<u32>::with_capacity(dispatch_plan.len());
-        for dispatch in dispatch_plan {
-            validate_exact_shape(
-                "gguf_device_moe_single_token_assignment_count",
-                &[dispatch.assignments.len()],
-                &[1],
-            )?;
-            let assignment = dispatch.assignments.first().ok_or_else(|| {
-                Error::moe("GLM-5.2 GGUF device MoE single-token dispatch has no assignment")
-            })?;
-            validate_exact_shape(
-                "gguf_device_moe_single_token_assignment_index",
-                &[assignment.token_index],
-                &[0],
-            )?;
-            token_indices.push(0);
-            expert_weights.push(assignment.weight);
-            expert_ids.push(
-                u32::try_from(dispatch.expert_id)
-                    .map_err(|_| Error::moe("GGUF device MoE expert id does not fit u32"))?,
-            );
         }
 
         let gated = require_moe_device_stage(
@@ -856,13 +880,10 @@ impl<'a> MoeFfn<'a> {
                 self.layer_index,
                 "sparse_moe.routed_gate_up_swiglu.multi_expert",
                 || {
-                    backend.q2_k_multi_expert_gate_up_swiglu_device(
-                        self.routed_gate_up.gate_packed_payload,
-                        self.routed_gate_up.up_packed_payload,
+                    backend.q2_k_staged_routed_gate_up_swiglu_device(
+                        staged_experts,
                         flat_tokens,
-                        &token_indices,
-                        &expert_ids,
-                        1,
+                        routing,
                         self.routed_gate_up.in_features,
                         self.routed_gate_up.out_features,
                     )
@@ -872,7 +893,10 @@ impl<'a> MoeFfn<'a> {
         validate_exact_shape(
             "gguf_device_moe_multi_expert_gated_shape",
             gated.dims(),
-            &[dispatch_plan.len(), self.routed_gate_up.out_features],
+            &[
+                routing.assignment_count()?,
+                self.routed_gate_up.out_features,
+            ],
         )?;
 
         let expert_outputs = require_moe_device_stage(
@@ -881,10 +905,10 @@ impl<'a> MoeFfn<'a> {
                 self.layer_index,
                 "sparse_moe.routed_down.multi_expert",
                 || {
-                    backend.q2_k_multi_expert_matvec_device(
-                        self.routed_down.q2_packed_payload()?,
+                    backend.q2_k_staged_routed_matvec_device(
+                        staged_experts,
                         &gated,
-                        &expert_ids,
+                        routing,
                         self.routed_down.in_features,
                         self.routed_down.out_features,
                     )
@@ -894,14 +918,9 @@ impl<'a> MoeFfn<'a> {
         validate_exact_shape(
             "gguf_device_moe_multi_expert_down_shape",
             expert_outputs.dims(),
-            &[dispatch_plan.len(), self.routed_down.out_features],
+            &[routing.assignment_count()?, self.routed_down.out_features],
         )?;
-
-        Ok(Some(RoutedDeviceBatch {
-            token_indices,
-            expert_weights,
-            expert_outputs,
-        }))
+        Ok(Some(expert_outputs))
     }
 
     fn forward_single_token_routed_tensors<B: Backend>(
@@ -1246,7 +1265,6 @@ struct PackedExpertLinear<'a> {
     expert_source_payload_bytes: u64,
     full_source_payload_bytes: u64,
     q2_expert_payloads: Option<Vec<Q2ExpertPayload<'a>>>,
-    q2_packed_payload: Option<&'a [u8]>,
 }
 
 impl fmt::Debug for PackedExpertLinear<'_> {
@@ -1362,7 +1380,6 @@ impl<'a> PackedExpertLinear<'a> {
         } else {
             None
         };
-        let q2_packed_payload = (storage.block == GgufQuantBlockKind::Q2K).then_some(storage.bytes);
         Ok(Self {
             gguf,
             tensor_ref: tensor_ref.clone(),
@@ -1374,7 +1391,6 @@ impl<'a> PackedExpertLinear<'a> {
             expert_source_payload_bytes,
             full_source_payload_bytes: storage.payload_byte_len,
             q2_expert_payloads,
-            q2_packed_payload,
         })
     }
 
@@ -1625,15 +1641,6 @@ impl<'a> PackedExpertLinear<'a> {
             ))
         })
     }
-
-    fn q2_packed_payload(&self) -> Result<&'a [u8]> {
-        self.q2_packed_payload.ok_or_else(|| {
-            Error::gguf(format!(
-                "GGUF tensor {} must be Q2_K for packed multi-expert Q2 matmul, got {}",
-                self.tensor_ref.name, self.tensor_ref.ty
-            ))
-        })
-    }
 }
 
 struct PackedExpertGateUp<'a> {
@@ -1644,8 +1651,6 @@ struct PackedExpertGateUp<'a> {
     expert_count: usize,
     gate_payloads: Vec<Q2ExpertPayload<'a>>,
     up_payloads: Vec<Q2ExpertPayload<'a>>,
-    gate_packed_payload: &'a [u8],
-    up_packed_payload: &'a [u8],
 }
 
 impl fmt::Debug for PackedExpertGateUp<'_> {
@@ -1684,9 +1689,6 @@ impl<'a> PackedExpertGateUp<'a> {
             &[gate_payloads.len(), up_payloads.len()],
             &[gate.expert_count, gate.expert_count],
         )?;
-        let gate_packed_payload = gate.q2_packed_payload()?;
-        let up_packed_payload = up.q2_packed_payload()?;
-
         Ok(Self {
             gate_tensor_name: gate.tensor_ref.name.clone(),
             up_tensor_name: up.tensor_ref.name.clone(),
@@ -1695,8 +1697,6 @@ impl<'a> PackedExpertGateUp<'a> {
             expert_count: gate.expert_count,
             gate_payloads: gate_payloads.clone(),
             up_payloads: up_payloads.clone(),
-            gate_packed_payload,
-            up_packed_payload,
         })
     }
 

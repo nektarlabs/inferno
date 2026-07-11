@@ -309,6 +309,10 @@ impl GgufFile {
         }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn metadata(&self) -> &BTreeMap<String, GgufMetadataValue> {
         &self.metadata
     }

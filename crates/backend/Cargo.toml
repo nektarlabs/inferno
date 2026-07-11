@@ -11,5 +11,6 @@ metal = ["dep:metal"]
 
 [dependencies]
 common = { path = "../common" }
+libc.workspace = true
 metal = { workspace = true, optional = true }
 tracing.workspace = true

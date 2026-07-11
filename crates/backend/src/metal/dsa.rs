@@ -3,8 +3,8 @@ use common::{validate_exact_shape, Error, Result};
 
 use super::{
     buffers::{
-        empty_f32_buffer, empty_u32_buffer, f32_buffer, f32_scalar_buffer, read_u32_buffer,
-        require_f32_capacity, u32_scalar_buffer,
+        empty_f32_buffer, empty_u32_buffer, f32_scalar_buffer, read_u32_buffer,
+        require_f32_capacity, u32_scalar_buffer, ImmutableF32BufferCache,
     },
     command::encode_1d,
     library::MetalLibrary,
@@ -23,6 +23,7 @@ pub(crate) struct MetalDsa {
     query_weights_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
     topk_pipeline: ComputePipelineState,
+    weight_buffers: ImmutableF32BufferCache,
 }
 
 #[derive(Debug)]
@@ -38,6 +39,7 @@ impl MetalDsa {
             query_weights_pipeline: compute_pipeline(device, library, DSA_QUERY_WEIGHTS_KERNEL)?,
             scores_pipeline: compute_pipeline(device, library, DSA_SCORES_KERNEL)?,
             topk_pipeline: compute_pipeline(device, library, DSA_TOPK_KERNEL)?,
+            weight_buffers: ImmutableF32BufferCache::default(),
         })
     }
 
@@ -77,8 +79,8 @@ impl MetalDsa {
         require_f32_capacity(raw_key, raw_key_len, "DSA raw key")?;
 
         let output = empty_f32_buffer(device, expected_len)?;
-        let weight = f32_buffer(device, weight)?;
-        let bias = f32_buffer(device, bias)?;
+        let weight = self.weight_buffers.get(device, weight)?;
+        let bias = self.weight_buffers.get(device, bias)?;
         let row_count = batch
             .checked_mul(tokens)
             .ok_or_else(|| Error::backend("DSA key norm/RoPE row count overflow"))?;
@@ -209,7 +211,7 @@ impl MetalDsa {
             "DSA current index key",
         )?;
 
-        let weights_proj = f32_buffer(device, weights_proj)?;
+        let weights_proj = self.weight_buffers.get(device, weights_proj)?;
         let q_output = empty_f32_buffer(device, expected_q)?;
         let weights = empty_f32_buffer(
             device,

@@ -18,7 +18,7 @@ pub struct LayerDeviceKvCacheTensors {
     pub layer_kind: LayerKind,
     pub cache_k: backend::DeviceValue,
     pub cache_v: backend::DeviceValue,
-    pub index_key: Option<F32Tensor>,
+    pub index_key: Option<backend::DeviceValue>,
 }
 
 /// Output of a batched device-resident decode layer: the hidden states stay
@@ -29,7 +29,7 @@ pub(crate) struct BlockDeviceTensors {
     pub(crate) hidden_states: backend::DeviceValue,
     pub(crate) cache_k: backend::DeviceValue,
     pub(crate) cache_v: backend::DeviceValue,
-    pub(crate) index_key: Option<F32Tensor>,
+    pub(crate) index_key: Option<backend::DeviceValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

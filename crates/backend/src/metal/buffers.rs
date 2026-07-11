@@ -1,4 +1,4 @@
-use std::{ffi::c_void, mem::size_of, ptr, slice};
+use std::{collections::HashMap, ffi::c_void, mem::size_of, ptr, slice, sync::Mutex};
 
 use ::metal::{Buffer, Device, MTLResourceOptions};
 use common::{Error, Result};
@@ -6,8 +6,53 @@ use common::{Error, Result};
 const BUFFER_OPTIONS: MTLResourceOptions =
     MTLResourceOptions::StorageModeShared.union(MTLResourceOptions::CPUCacheModeDefaultCache);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BufferKey {
+    address: usize,
+    byte_len: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ImmutableF32BufferCache {
+    buffers: Mutex<HashMap<BufferKey, Buffer>>,
+}
+
+impl ImmutableF32BufferCache {
+    pub(crate) fn get(&self, device: &Device, values: &[f32]) -> Result<Buffer> {
+        let key = BufferKey {
+            address: values.as_ptr() as usize,
+            byte_len: byte_len::<f32>(values.len())?,
+        };
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| Error::backend("Metal immutable F32 buffer cache lock poisoned"))?;
+        if let Some(buffer) = buffers.get(&key) {
+            return Ok(buffer.clone());
+        }
+        let buffer = f32_buffer_no_copy(device, values)?;
+        buffers.insert(key, buffer.clone());
+        Ok(buffer)
+    }
+}
+
 pub(crate) fn f32_buffer(device: &Device, values: &[f32]) -> Result<Buffer> {
     buffer_with_data(device, values)
+}
+
+/// References immutable model-owned F32 storage without copying it. The slice
+/// must outlive every command buffer and cached `Buffer` that uses it.
+pub(crate) fn f32_buffer_no_copy(device: &Device, values: &[f32]) -> Result<Buffer> {
+    let bytes = byte_len::<f32>(values.len())?;
+    if bytes == 0 {
+        return Err(Error::backend("cannot create an empty Metal F32 buffer"));
+    }
+    Ok(device.new_buffer_with_bytes_no_copy(
+        values.as_ptr().cast::<c_void>(),
+        bytes as u64,
+        BUFFER_OPTIONS,
+        None,
+    ))
 }
 
 pub(crate) fn u32_scalar_buffer(device: &Device, value: u32) -> Result<Buffer> {
@@ -18,8 +63,20 @@ pub(crate) fn u32_buffer(device: &Device, values: &[u32]) -> Result<Buffer> {
     buffer_with_data(device, values)
 }
 
+pub(crate) fn u64_buffer(device: &Device, values: &[u64]) -> Result<Buffer> {
+    buffer_with_data(device, values)
+}
+
 pub(crate) fn u8_buffer(device: &Device, values: &[u8]) -> Result<Buffer> {
     buffer_with_data(device, values)
+}
+
+pub(crate) fn empty_u8_buffer(device: &Device, len: usize) -> Result<Buffer> {
+    let bytes = byte_len::<u8>(len)?;
+    if bytes == 0 {
+        return Err(Error::backend("cannot create an empty Metal byte buffer"));
+    }
+    Ok(device.new_buffer(bytes as u64, BUFFER_OPTIONS))
 }
 
 pub(crate) fn empty_u32_buffer(device: &Device, len: usize) -> Result<Buffer> {
@@ -43,15 +100,9 @@ pub(crate) fn empty_f16_buffer(device: &Device, len: usize) -> Result<Buffer> {
     Ok(device.new_buffer(bytes as u64, BUFFER_OPTIONS))
 }
 
-/// Creates a Metal buffer that references the existing byte slice instead of
-/// copying it. Production Q2 weights are GGUF mmap slices, so this lets Apple
-/// Silicon read quantized expert bytes from unified memory and leaves caching
-/// decisions to the macOS page cache.
-///
-/// The caller must keep `values` alive until all command buffers using the
-/// returned Metal buffer have completed. This is true for model-owned mmap
-/// weights; do not use this for short-lived temporary byte arrays in deferred
-/// command buffers.
+/// Creates a Metal view over immutable model-owned bytes without copying the
+/// GGUF mapping. Routed experts use a separate bounded cache; this helper is
+/// for always-used quantized tensors whose mmap storage outlives the backend.
 pub(crate) fn u8_buffer_no_copy(device: &Device, values: &[u8]) -> Result<Buffer> {
     let bytes = byte_len::<u8>(values.len())?;
     if bytes == 0 {

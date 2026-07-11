@@ -1,6 +1,6 @@
 use ::metal::{
-    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, MTLCommandBufferStatus, MTLSize,
-    NSUInteger,
+    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, MTLCommandBufferStatus,
+    MTLResourceUsage, MTLSize, NSUInteger,
 };
 use common::{Error, Result};
 use tracing::trace;
@@ -193,6 +193,45 @@ pub(crate) fn encode_1d(
     encoder.dispatch_threads(
         MTLSize::new(threads as NSUInteger, 1, 1),
         MTLSize::new(threads_per_group, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// Encodes a 1D kernel that dereferences GPU addresses stored in another
+/// buffer. Metal cannot infer those dependencies, so every indirectly
+/// addressed buffer must be declared explicitly with `use_resource`.
+pub(crate) fn encode_1d_with_indirect_reads(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    buffers: &[&Buffer],
+    indirect_reads: &[&Buffer],
+    threads: usize,
+) -> Result<()> {
+    if threads == 0 {
+        return Err(Error::backend(
+            "Metal indirect dispatch requires at least one thread",
+        ));
+    }
+    if indirect_reads.is_empty() {
+        return Err(Error::backend(
+            "Metal indirect dispatch requires declared read resources",
+        ));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        encoder.set_buffer(index as NSUInteger, Some(buffer), 0);
+    }
+    for resource in indirect_reads {
+        encoder.use_resource(resource.as_ref(), MTLResourceUsage::Read);
+    }
+
+    let threads_per_group = preferred_1d_threadgroup_size(pipeline);
+    encoder.dispatch_threads(
+        MTLSize::new(threads as u64, 1, 1),
+        MTLSize::new(threads_per_group as u64, 1, 1),
     );
     encoder.end_encoding();
     Ok(())

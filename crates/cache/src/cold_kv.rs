@@ -408,12 +408,19 @@ impl ColdKvBlockStore {
     }
 
     pub fn clone_reader(&self) -> Result<Self> {
-        let mut file = self.file.try_clone().map_err(|error| {
-            Error::cache(format!(
-                "failed to clone cold KV block store reader {}: {error}",
-                self.path.display()
-            ))
-        })?;
+        // `File::try_clone` duplicates the descriptor but may share the same
+        // kernel file offset. Prefetch threads seek while the writer appends,
+        // so a shared offset can make a reader start in the middle of another
+        // record. Reopening the path gives every reader an independent cursor.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|error| {
+                Error::cache(format!(
+                    "failed to open cold KV block store reader {}: {error}",
+                    self.path.display()
+                ))
+            })?;
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             Error::cache(format!(
                 "failed to seek cloned cold KV block store reader {}: {error}",
@@ -2046,6 +2053,22 @@ mod tests {
         assert!(reader.read_layer_range_contiguous(2, 0, 4).is_err());
         assert!(writer.read_layer_range_contiguous(2, 0, 4).is_ok());
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cloned_reader_has_an_independent_file_cursor() {
+        let path = temp_path("cold-kv-independent-reader-cursor");
+        let mut writer = ColdKvBlockStore::create(&path, spec()).unwrap();
+        writer
+            .write_layer_block(2, 0, &tensor(1, 0.0), &tensor(1, 10.0))
+            .unwrap();
+        let writer_offset = writer.file.stream_position().unwrap();
+        let mut reader = writer.clone_reader().unwrap();
+
+        reader.file.seek(SeekFrom::Start(7)).unwrap();
+
+        assert_eq!(writer.file.stream_position().unwrap(), writer_offset);
         std::fs::remove_file(path).ok();
     }
 

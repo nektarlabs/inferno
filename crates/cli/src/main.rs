@@ -63,6 +63,10 @@ enum Command {
         #[arg(long, default_value_t = false)]
         measure_tokens_per_second: bool,
 
+        /// Append generated-token throughput metrics to a TSV file.
+        #[arg(long)]
+        throughput_file: Option<PathBuf>,
+
         /// Emit runtime memory telemetry to stderr during generation.
         #[arg(long, default_value_t = false)]
         enable_telemetry: bool,
@@ -89,6 +93,7 @@ fn main() -> Result<()> {
             profile_runtime,
             profile_layers,
             measure_tokens_per_second,
+            throughput_file,
             enable_telemetry,
             telemetry_file,
         } => commands::generate::run(
@@ -103,6 +108,7 @@ fn main() -> Result<()> {
             profile_runtime.as_deref(),
             profile_layers.as_deref(),
             measure_tokens_per_second,
+            throughput_file.as_deref(),
             enable_telemetry,
             telemetry_file.as_deref(),
         )?,
@@ -291,6 +297,29 @@ mod tests {
             ..
         } = cli.command;
         assert!(measure_tokens_per_second);
+    }
+
+    #[test]
+    fn generate_accepts_throughput_file() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--throughput-file",
+            "/tmp/inferno-throughput.tsv",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            throughput_file, ..
+        } = cli.command;
+        assert_eq!(
+            throughput_file.unwrap(),
+            PathBuf::from("/tmp/inferno-throughput.tsv")
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ fn main() {
         token_count: 1,
         assignment_count: 8,
         hidden_size: 6144,
-        intermediate_size: 1024,
+        intermediate_size: 2048,
         expert_count: 8,
     };
 

@@ -5,7 +5,7 @@ use tracing::trace;
 use super::{
     buffers::{
         empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, require_f32_capacity,
-        u32_scalar_buffer,
+        u32_scalar_buffer, ImmutableF32BufferCache,
     },
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
@@ -19,6 +19,7 @@ const RMS_NORM_SIMD_LANES: usize = 32;
 
 pub(crate) struct MetalRmsNorm {
     pipeline: ComputePipelineState,
+    weight_buffers: ImmutableF32BufferCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,7 @@ impl MetalRmsNorm {
     pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
         Ok(Self {
             pipeline: compute_pipeline(device, library, RMS_NORM_KERNEL)?,
+            weight_buffers: ImmutableF32BufferCache::default(),
         })
     }
 
@@ -166,7 +168,11 @@ impl MetalRmsNorm {
         let hidden_size_u32 = u32::try_from(hidden_size)
             .map_err(|_| Error::backend("RMSNorm hidden_size exceeds Metal u32 limit"))?;
 
-        let weight_buffer = f32_buffer(device, weight)?;
+        // Device batches only receive model-owned immutable weights. Keep one
+        // no-copy Metal view per slice instead of copying 24 KiB for every
+        // norm in every token. The eager reference path still copies its
+        // potentially short-lived test inputs.
+        let weight_buffer = self.weight_buffers.get(device, weight)?;
         let output_buffer = empty_f32_buffer(device, input_len)?;
         let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
         let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
@@ -200,6 +206,10 @@ impl MetalRmsNorm {
 
     pub(crate) fn pipeline(&self) -> &ComputePipelineState {
         &self.pipeline
+    }
+
+    pub(crate) fn thread_count(&self, rows: usize) -> Result<usize> {
+        rms_norm_threads(&self.pipeline, rows)
     }
 }
 

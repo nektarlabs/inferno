@@ -338,6 +338,117 @@ kernel void q2_k_multi_expert_matvec_f32_kernel(
     }
 }
 
+kernel void q2_k_address_gate_up_swiglu_f32_kernel(
+    const device ulong* gate_addresses [[buffer(0)]],
+    const device ulong* up_addresses [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    const device uint* token_indices [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& token_count [[buffer(5)]],
+    constant uint& assignment_count [[buffer(6)]],
+    constant uint& in_features [[buffer(7)]],
+    constant uint& out_features [[buffer(8)]],
+    constant uint& blocks_per_row [[buffer(9)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint output_values = assignment_count * out_features;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint assignment = output_index / out_features;
+    uint output_feature = output_index - (assignment * out_features);
+    uint token = token_indices[assignment];
+    if (token >= token_count || gate_addresses[assignment] == 0 || up_addresses[assignment] == 0) {
+        if (simd_lane == 0) {
+            output[output_index] = 0.0f;
+        }
+        return;
+    }
+
+    const device uchar* gate_weights =
+        reinterpret_cast<device const uchar*>(gate_addresses[assignment]);
+    const device uchar* up_weights =
+        reinterpret_cast<device const uchar*>(up_addresses[assignment]);
+    uint input_row_offset = token * in_features;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
+        uint block_offset = ((output_feature * blocks_per_row) + block_in_row) * Q2_K_BLOCK_BYTES;
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        gate_sum += q2_k_block_dot_partial(
+            gate_weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+        up_sum += q2_k_block_dot_partial(
+            up_weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+    }
+
+    float gate = simd_sum(gate_sum);
+    float up = simd_sum(up_sum);
+    if (simd_lane == 0) {
+        float silu_gate = gate / (1.0f + exp(-gate));
+        output[output_index] = silu_gate * up;
+    }
+}
+
+kernel void q2_k_address_matvec_f32_kernel(
+    const device ulong* weight_addresses [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& assignment_count [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint output_values = assignment_count * out_features;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint assignment = output_index / out_features;
+    uint output_feature = output_index - (assignment * out_features);
+    if (weight_addresses[assignment] == 0) {
+        if (simd_lane == 0) {
+            output[output_index] = 0.0f;
+        }
+        return;
+    }
+    const device uchar* weights =
+        reinterpret_cast<device const uchar*>(weight_addresses[assignment]);
+    uint input_row_offset = assignment * in_features;
+    float sum = 0.0f;
+    for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
+        uint block_offset = ((output_feature * blocks_per_row) + block_in_row) * Q2_K_BLOCK_BYTES;
+        uint input_block_offset = input_row_offset + (block_in_row * Q2_K_BLOCK_VALUES);
+        sum += q2_k_block_dot_partial(
+            weights,
+            input,
+            input_block_offset,
+            block_offset,
+            simd_lane
+        );
+    }
+
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
+}
+
 kernel void q2_k_transposed_matvec_f32_kernel(
     const device uchar* weights [[buffer(0)]],
     const device float* input [[buffer(1)]],
@@ -346,28 +457,33 @@ kernel void q2_k_transposed_matvec_f32_kernel(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& blocks_per_input_row [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint output_block = output_feature / Q2_K_BLOCK_VALUES;
     uint output_value_in_block = output_feature - (output_block * Q2_K_BLOCK_VALUES);
     uint input_row_offset = input_row * in_features;
     float sum = 0.0f;
 
-    for (uint input_feature = 0; input_feature < in_features; input_feature++) {
+    for (uint input_feature = simd_lane; input_feature < in_features; input_feature += Q2_K_SIMD_LANES) {
         uint block_index = (input_feature * blocks_per_input_row) + output_block;
         uint block_offset = block_index * Q2_K_BLOCK_BYTES;
         float weight_value = q2_k_block_value(weights, block_offset, output_value_in_block);
         sum += input[input_row_offset + input_feature] * weight_value;
     }
 
-    output[gid] = sum;
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
 }
 
 kernel void q8_0_matvec_f32_kernel(
@@ -378,31 +494,33 @@ kernel void q8_0_matvec_f32_kernel(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& blocks_per_row [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint input_row_offset = input_row * in_features;
     float sum = 0.0f;
 
     for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
         uint block_index = (output_feature * blocks_per_row) + block_in_row;
         uint block_offset = block_index * Q8_0_BLOCK_BYTES;
-
-        for (uint value_index = 0; value_index < Q8_0_BLOCK_VALUES; value_index++) {
-            uint input_index = input_row_offset
-                + (block_in_row * Q8_0_BLOCK_VALUES)
-                + value_index;
-            sum += input[input_index] * q8_0_block_value(weights, block_offset, value_index);
-        }
+        uint input_index = input_row_offset
+            + (block_in_row * Q8_0_BLOCK_VALUES)
+            + simd_lane;
+        sum += input[input_index] * q8_0_block_value(weights, block_offset, simd_lane);
     }
 
-    output[gid] = sum;
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
 }
 
 kernel void q8_0_transposed_matvec_f32_kernel(
@@ -413,28 +531,123 @@ kernel void q8_0_transposed_matvec_f32_kernel(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& blocks_per_input_row [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     uint output_values = row_count * out_features;
-    if (gid >= output_values) {
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
         return;
     }
 
-    uint input_row = gid / out_features;
-    uint output_feature = gid - (input_row * out_features);
+    uint input_row = output_index / out_features;
+    uint output_feature = output_index - (input_row * out_features);
     uint output_block = output_feature / Q8_0_BLOCK_VALUES;
     uint output_value_in_block = output_feature - (output_block * Q8_0_BLOCK_VALUES);
     uint input_row_offset = input_row * in_features;
     float sum = 0.0f;
 
-    for (uint input_feature = 0; input_feature < in_features; input_feature++) {
+    for (uint input_feature = simd_lane; input_feature < in_features; input_feature += Q2_K_SIMD_LANES) {
         uint block_index = (input_feature * blocks_per_input_row) + output_block;
         uint block_offset = block_index * Q8_0_BLOCK_BYTES;
         float weight_value = q8_0_block_value(weights, block_offset, output_value_in_block);
         sum += input[input_row_offset + input_feature] * weight_value;
     }
 
-    output[gid] = sum;
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
+}
+
+kernel void q2_k_packed_heads_transposed_matvec_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& head_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_input_row [[buffer(7)]],
+    constant uint& blocks_per_head [[buffer(8)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint outputs_per_row = head_count * out_features;
+    uint output_values = row_count * outputs_per_row;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint input_row = output_index / outputs_per_row;
+    uint output_in_row = output_index - (input_row * outputs_per_row);
+    uint head = output_in_row / out_features;
+    uint output_feature = output_in_row - (head * out_features);
+    uint output_block = output_feature / Q2_K_BLOCK_VALUES;
+    uint output_value_in_block = output_feature - (output_block * Q2_K_BLOCK_VALUES);
+    uint input_row_offset = input_row * in_features;
+    uint head_block_offset = head * blocks_per_head;
+    float sum = 0.0f;
+
+    for (uint input_feature = simd_lane; input_feature < in_features; input_feature += Q2_K_SIMD_LANES) {
+        uint block_index = head_block_offset
+            + (input_feature * blocks_per_input_row)
+            + output_block;
+        uint block_offset = block_index * Q2_K_BLOCK_BYTES;
+        float weight_value = q2_k_block_value(weights, block_offset, output_value_in_block);
+        sum += input[input_row_offset + input_feature] * weight_value;
+    }
+
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
+}
+
+kernel void q8_0_packed_heads_transposed_matvec_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& head_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_input_row [[buffer(7)]],
+    constant uint& blocks_per_head [[buffer(8)]],
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint outputs_per_row = head_count * out_features;
+    uint output_values = row_count * outputs_per_row;
+    uint output_index = gid / Q2_K_SIMD_LANES;
+    if (output_index >= output_values) {
+        return;
+    }
+
+    uint input_row = output_index / outputs_per_row;
+    uint output_in_row = output_index - (input_row * outputs_per_row);
+    uint head = output_in_row / out_features;
+    uint output_feature = output_in_row - (head * out_features);
+    uint output_block = output_feature / Q8_0_BLOCK_VALUES;
+    uint output_value_in_block = output_feature - (output_block * Q8_0_BLOCK_VALUES);
+    uint input_row_offset = input_row * in_features;
+    uint head_block_offset = head * blocks_per_head;
+    float sum = 0.0f;
+
+    for (uint input_feature = simd_lane; input_feature < in_features; input_feature += Q2_K_SIMD_LANES) {
+        uint block_index = head_block_offset
+            + (input_feature * blocks_per_input_row)
+            + output_block;
+        uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+        float weight_value = q8_0_block_value(weights, block_offset, output_value_in_block);
+        sum += input[input_row_offset + input_feature] * weight_value;
+    }
+
+    float reduced_sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[output_index] = reduced_sum;
+    }
 }
 
 kernel void argmax_f32_kernel(

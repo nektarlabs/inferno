@@ -8,6 +8,7 @@ use std::{
     fs::File,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
+    thread,
 };
 
 use common::{Error, Result};
@@ -16,6 +17,7 @@ use memmap2::Advice;
 use memmap2::{Mmap, MmapOptions};
 
 const PREFETCH_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const PREFETCH_MAX_IN_FLIGHT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappedFileAdvice {
@@ -174,29 +176,56 @@ impl MappedFile {
 
         #[cfg(unix)]
         {
-            let max_range_len = ranges
-                .iter()
-                .map(|&(_, byte_len)| byte_len)
-                .max()
-                .unwrap_or(0);
-            if max_range_len == 0 {
-                return Ok(());
-            }
-            let buffer_len = usize::try_from(max_range_len)
-                .ok()
-                .map(|len| len.min(PREFETCH_CHUNK_BYTES))
-                .unwrap_or(PREFETCH_CHUNK_BYTES);
-            let mut buffer = vec![0_u8; buffer_len];
-
-            for &(offset, byte_len) in ranges {
-                self.prefetch_range_with_buffer(offset, byte_len, &mut buffer)?;
-            }
+            self.prefetch_ranges_parallel(ranges)?;
         }
 
         #[cfg(not(unix))]
         let _ = ranges;
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prefetch_ranges_parallel(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        let non_empty = ranges
+            .iter()
+            .copied()
+            .filter(|(_, byte_len)| *byte_len != 0)
+            .collect::<Vec<_>>();
+        if non_empty.is_empty() {
+            return Ok(());
+        }
+
+        let worker_count = non_empty.len().min(PREFETCH_MAX_IN_FLIGHT);
+        let ranges_per_worker = non_empty.len().div_ceil(worker_count);
+        thread::scope(|scope| -> Result<()> {
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker_ranges in non_empty.chunks(ranges_per_worker) {
+                workers.push(scope.spawn(move || -> Result<()> {
+                    let max_range_len = worker_ranges
+                        .iter()
+                        .map(|&(_, byte_len)| byte_len)
+                        .max()
+                        .unwrap_or(0);
+                    let buffer_len = usize::try_from(max_range_len)
+                        .ok()
+                        .map(|len| len.min(PREFETCH_CHUNK_BYTES))
+                        .unwrap_or(PREFETCH_CHUNK_BYTES);
+                    let mut buffer = vec![0_u8; buffer_len];
+                    for &(offset, byte_len) in worker_ranges {
+                        self.prefetch_range_with_buffer(offset, byte_len, &mut buffer)?;
+                    }
+                    Ok(())
+                }));
+            }
+
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| Error::weights("mapped file prefetch worker thread panicked"))??;
+            }
+            Ok(())
+        })
     }
 
     #[cfg(unix)]

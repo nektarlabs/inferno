@@ -1,4 +1,6 @@
-use crate::DevicePagedKvView;
+use std::path::Path;
+
+use crate::{DevicePagedKvView, DeviceQ2Experts, DeviceRouterTopK, Q2ExpertSource};
 use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, DeviceKind, Error, PagedKvView, Result};
 
@@ -934,7 +936,7 @@ impl Metal {
         let norm_dispatch = Dispatch1d {
             pipeline: self.rms_norm.pipeline(),
             buffers: &norm_buffers,
-            threads: row_count,
+            threads: self.rms_norm.thread_count(row_count)?,
         };
         self.q2_matvec
             .run_argmax_with_input_buffer_after_dispatch(
@@ -1306,6 +1308,34 @@ impl Metal {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_packed_heads_transposed_matvec(
+        &self,
+        kind: QuantMatvecKind,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        head_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_packed_heads_transposed_matvec(
+                command_buffer,
+                &self.device,
+                kind,
+                weights,
+                input,
+                input_len,
+                row_count,
+                head_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_q2_k_matvec_add(
         &self,
         weights: &[u8],
@@ -1387,6 +1417,141 @@ impl Metal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q2_k_routed_gate_up_swiglu(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        token_count: usize,
+        expert_count: usize,
+        top_k: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_routed_gate_up_swiglu(
+                command_buffer,
+                &self.device,
+                gate_weights,
+                up_weights,
+                input,
+                input_len,
+                &routing.token_indices,
+                &routing.expert_ids,
+                token_count,
+                expert_count,
+                top_k,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q2_k_routed_matvec(
+        &self,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        token_count: usize,
+        expert_count: usize,
+        top_k: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_routed_matvec(
+                command_buffer,
+                &self.device,
+                weights,
+                input,
+                input_len,
+                &routing.expert_ids,
+                token_count,
+                expert_count,
+                top_k,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    pub(crate) fn stage_q2_experts(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<DeviceQ2Experts> {
+        // Staging buffers are reused for every sparse layer. Complete older
+        // readers before overwriting them with the next eight experts.
+        self.batch.flush()?;
+        self.q2_matvec.stage_experts(
+            &self.device,
+            layer_index,
+            model_path,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q2_k_staged_routed_gate_up_swiglu(
+        &self,
+        experts: &DeviceQ2Experts,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_staged_routed_gate_up_swiglu(
+                command_buffer,
+                &self.device,
+                experts,
+                input,
+                input_len,
+                &routing.token_indices,
+                routing.token_count,
+                routing.top_k,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q2_k_staged_routed_matvec(
+        &self,
+        experts: &DeviceQ2Experts,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_staged_routed_matvec(
+                command_buffer,
+                &self.device,
+                experts,
+                input,
+                input_len,
+                routing.token_count,
+                routing.top_k,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
     /// Encodes the output-head matvec + greedy argmax against a device-resident
     /// hidden state, then flushes the whole batch and returns the chosen token.
     /// This is the natural end-of-token synchronization point.
@@ -1420,6 +1585,30 @@ impl Metal {
             .into_iter()
             .next()
             .ok_or_else(|| Error::backend("Q2_K argmax produced no token score"))?;
+        Ok((token_id, token_score))
+    }
+
+    /// Encodes greedy argmax over an existing device-resident f32 score
+    /// buffer, then flushes the batch and returns the chosen token.
+    pub(crate) fn batched_f32_argmax(
+        &self,
+        scores: &Buffer,
+        value_count: usize,
+    ) -> Result<(u32, f32)> {
+        let (token_id_buffer, token_score_buffer) =
+            self.batch.encode(&self.queue, |command_buffer| {
+                self.q2_matvec
+                    .encode_f32_argmax(command_buffer, &self.device, scores, value_count)
+            })?;
+        self.batch.flush()?;
+        let token_id = read_u32_buffer(&token_id_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("f32 argmax produced no token id"))?;
+        let token_score = read_f32_buffer(&token_score_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("f32 argmax produced no token score"))?;
         Ok((token_id, token_score))
     }
 
@@ -1703,8 +1892,37 @@ impl Metal {
         })
     }
 
+    pub(crate) fn batched_moe_topk_combine_residual(
+        &self,
+        shared: &Buffer,
+        shared_len: usize,
+        residual: &Buffer,
+        residual_len: usize,
+        expert_outputs: &Buffer,
+        expert_outputs_len: usize,
+        routing: &DeviceRouterTopK,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.moe.encode_topk_combine_residual(
+                command_buffer,
+                &self.device,
+                shared,
+                shared_len,
+                residual,
+                residual_len,
+                expert_outputs,
+                expert_outputs_len,
+                &routing.expert_weights,
+                routing.token_count,
+                hidden_size,
+                routing.top_k,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn batched_moe_router_topk(
+    pub(crate) fn batched_moe_router_topk_resident(
         &self,
         router_logits: &Buffer,
         router_logits_len: usize,
@@ -1714,7 +1932,7 @@ impl Metal {
         top_k: usize,
         norm_topk_prob: bool,
         routed_scaling_factor: f32,
-    ) -> Result<(Vec<u32>, Vec<f32>)> {
+    ) -> Result<DeviceRouterTopK> {
         let buffers = self.batch.encode(&self.queue, |command_buffer| {
             self.moe.encode_router_topk(
                 command_buffer,
@@ -1729,10 +1947,51 @@ impl Metal {
                 routed_scaling_factor,
             )
         })?;
+        Ok(DeviceRouterTopK {
+            token_count,
+            expert_count,
+            top_k,
+            token_indices: buffers.token_indices,
+            expert_ids: buffers.expert_ids,
+            expert_weights: buffers.expert_weights,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_moe_router_topk(
+        &self,
+        router_logits: &Buffer,
+        router_logits_len: usize,
+        correction_bias: &[f32],
+        token_count: usize,
+        expert_count: usize,
+        top_k: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let routing = self.batched_moe_router_topk_resident(
+            router_logits,
+            router_logits_len,
+            correction_bias,
+            token_count,
+            expert_count,
+            top_k,
+            norm_topk_prob,
+            routed_scaling_factor,
+        )?;
         self.batch.flush()?;
-        let expert_ids = read_u32_buffer(&buffers.expert_ids, buffers.output_len)?;
-        let expert_weights = read_f32_buffer(&buffers.expert_weights, buffers.output_len)?;
+        let output_len = routing.assignment_count()?;
+        let expert_ids = read_u32_buffer(&routing.expert_ids, output_len)?;
+        let expert_weights = read_f32_buffer(&routing.expert_weights, output_len)?;
         Ok((expert_ids, expert_weights))
+    }
+
+    pub(crate) fn batched_moe_router_expert_ids(
+        &self,
+        routing: &DeviceRouterTopK,
+    ) -> Result<Vec<u32>> {
+        self.batch.flush()?;
+        read_u32_buffer(&routing.expert_ids, routing.assignment_count()?)
     }
 
     #[allow(clippy::too_many_arguments)]

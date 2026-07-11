@@ -161,7 +161,6 @@ impl<'a> Model<'a> {
             random_bytes = memory_advice.random_bytes,
             "applied targeted GGUF mmap advice"
         );
-
         let embedding_table = EmbeddingTable::open(gguf, config, &index.root.token_embedding)?;
         let layer_stack = LayerStack::open(gguf, config, &index, backend, output_chunk_rows)?;
         let layer_stack_report = layer_stack.load_report().clone();

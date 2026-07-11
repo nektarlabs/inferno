@@ -66,7 +66,7 @@ pub(crate) struct AttentionDeviceTensors {
     pub(crate) hidden_states: DeviceValue,
     pub(crate) cache_k: DeviceValue,
     pub(crate) cache_v: DeviceValue,
-    pub(crate) index_key: Option<F32Tensor>,
+    pub(crate) index_key: Option<DeviceValue>,
 }
 
 #[derive(Debug)]
@@ -536,10 +536,8 @@ impl<'a> HeadProjection<'a> {
         }
     }
 
-    /// Transposed head projection: one encoded transposed matvec per head
-    /// against that head's payload slice, then token-major stacking into
-    /// `[batch, tokens, heads, output_features]`. This is required by MLA/DSA:
-    /// selected latent rows contain many tokens, not only the decode token.
+    /// Transposed head projection over the complete packed head tensor. One
+    /// dispatch writes `[batch, tokens, heads, output_features]` directly.
     fn forward_transposed_heads_device<B: Backend>(
         &self,
         backend: &B,
@@ -547,91 +545,50 @@ impl<'a> HeadProjection<'a> {
         batch: usize,
         tokens: usize,
     ) -> Result<Option<DeviceValue>> {
-        let (raw_data, block_bytes) = match self.tensor_ref.ty {
-            GgmlType::Q2K => (
-                self.q2_payload_bytes.ok_or_else(|| {
+        let flat_tokens = batch.checked_mul(tokens).ok_or_else(|| {
+            Error::model("GLM device transposed head projection row count overflow")
+        })?;
+        let packed = match self.tensor_ref.ty {
+            GgmlType::Q2K => {
+                let raw_data = self.q2_payload_bytes.ok_or_else(|| {
                     Error::gguf(format!(
-                        "GGUF tensor {} must be Q2_K for the device transposed Q2 head projection path, got {}",
-                        self.tensor_ref.name, self.tensor_ref.ty
+                        "GGUF tensor {} has no Q2_K packed head payload",
+                        self.tensor_ref.name
                     ))
-                })?,
-                GGML_Q2_K_BLOCK_BYTES as usize,
-            ),
-            GgmlType::Q8_0 => (
-                self.q8_payload_bytes.ok_or_else(|| {
+                })?;
+                crate::try_device!(backend.q2_k_packed_heads_transposed_matvec_device(
+                    raw_data,
+                    flat_input,
+                    flat_tokens,
+                    self.heads,
+                    self.input_features,
+                    self.output_features,
+                ))
+            }
+            GgmlType::Q8_0 => {
+                let raw_data = self.q8_payload_bytes.ok_or_else(|| {
                     Error::gguf(format!(
-                        "GGUF tensor {} must be Q8_0 for the device transposed Q8 head projection path, got {}",
-                        self.tensor_ref.name, self.tensor_ref.ty
+                        "GGUF tensor {} has no Q8_0 packed head payload",
+                        self.tensor_ref.name
                     ))
-                })?,
-                GGML_Q8_0_BLOCK_BYTES as usize,
-            ),
+                })?;
+                crate::try_device!(backend.q8_0_packed_heads_transposed_matvec_device(
+                    raw_data,
+                    flat_input,
+                    flat_tokens,
+                    self.heads,
+                    self.input_features,
+                    self.output_features,
+                ))
+            }
             other => {
                 return Err(Error::gguf(format!(
-                    "GGUF tensor {} must be Q2_K or Q8_0 for device transposed head projection, got {other}",
+                    "GGUF tensor {} must be Q2_K or Q8_0 for packed head projection, got {other}",
                     self.tensor_ref.name
                 )))
             }
         };
-        let head_byte_len = usize::try_from(self.blocks_per_head)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
-            .ok_or_else(|| {
-                Error::gguf(format!(
-                    "GGUF tensor {} device transposed head byte length overflow",
-                    self.tensor_ref.name
-                ))
-            })?;
-        let expected_payload_len = head_byte_len.checked_mul(self.heads).ok_or_else(|| {
-            Error::gguf(format!(
-                "GGUF tensor {} device transposed payload length overflow",
-                self.tensor_ref.name
-            ))
-        })?;
-        validate_exact_shape(
-            format!(
-                "gguf_device_attention_transposed_head_projection_payload:{}",
-                self.tensor_ref.name
-            ),
-            &[raw_data.len()],
-            &[expected_payload_len],
-        )?;
-
-        let mut head_outputs = Vec::with_capacity(self.heads);
-        for head_index in 0..self.heads {
-            let byte_start = head_index * head_byte_len;
-            let head_bytes = &raw_data[byte_start..byte_start + head_byte_len];
-            let head_output = match self.tensor_ref.ty {
-                GgmlType::Q2K => crate::try_device!(backend.q2_k_transposed_matvec_device(
-                    head_bytes,
-                    flat_input,
-                    batch.checked_mul(tokens).ok_or_else(|| {
-                        Error::model("GLM device transposed head projection row count overflow")
-                    })?,
-                    self.input_features,
-                    self.output_features,
-                )),
-                _ => crate::try_device!(backend.q8_0_transposed_matvec_device(
-                    head_bytes,
-                    flat_input,
-                    batch.checked_mul(tokens).ok_or_else(|| {
-                        Error::model("GLM device transposed head projection row count overflow")
-                    })?,
-                    self.input_features,
-                    self.output_features,
-                )),
-            };
-            head_outputs.push(head_output);
-        }
-        let flat_tokens = batch.checked_mul(tokens).ok_or_else(|| {
-            Error::model("GLM device transposed head projection row count overflow")
-        })?;
-        let stacked = crate::try_device!(backend.stack_head_outputs_device(
-            &head_outputs,
-            flat_tokens,
-            self.output_features,
-        ));
-        Ok(Some(stacked.reshape(vec![
+        Ok(Some(packed.reshape(vec![
             batch,
             tokens,
             self.heads,
@@ -1969,6 +1926,54 @@ impl<'a> Attention<'a> {
     ///
     /// Returns `Ok(None)` when any component has no device path (the caller
     /// falls back to the eager route); requires a single decode token.
+    fn mla_context_device<B: Backend>(
+        &self,
+        config: &Config,
+        batch: usize,
+        q_for_attention: &DeviceValue,
+        current_k_for_attention: &DeviceValue,
+        current_v_for_attention: &DeviceValue,
+        past_kv: &DevicePagedKvView,
+        backend: &B,
+    ) -> Result<Option<DeviceValue>> {
+        let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
+        validate_exact_shape(
+            "dense_mla_past_device_kv_shape",
+            &[
+                past.batch,
+                past.attention_heads,
+                past.key_head_dim,
+                past.value_head_dim,
+            ],
+            &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
+        )?;
+        let past_latent = past
+            .k
+            .reshape(vec![batch, past.selected_tokens, self.kv_lora_rank])?;
+        let past_rope = past
+            .v
+            .reshape(vec![batch, past.selected_tokens, 1, config.qk_rope_dim])?;
+        let past_latent_norm =
+            crate::try_device!(self.kv_a_norm.forward_device(&past_latent, backend));
+        let past_k_no_rope =
+            crate::try_device!(self.k_b.forward_heads_device(&past_latent_norm, backend));
+        let past_v_heads =
+            crate::try_device!(self.v_b.forward_heads_device(&past_latent_norm, backend));
+        let past_k_heads =
+            crate::try_device!(backend.combine_rope_tail_device(&past_k_no_rope, &past_rope));
+        let past_k_for_attention =
+            crate::try_device!(backend.heads_to_attention_layout_device(&past_k_heads));
+        let past_v_for_attention =
+            crate::try_device!(backend.heads_to_attention_layout_device(&past_v_heads));
+        backend.selected_decode_attention_device(
+            q_for_attention,
+            &past_k_for_attention,
+            &past_v_for_attention,
+            current_k_for_attention,
+            current_v_for_attention,
+        )
+    }
+
     pub(crate) fn forward_decode_device<B: Backend>(
         &self,
         config: &Config,
@@ -2105,47 +2110,15 @@ impl<'a> Attention<'a> {
             DevicePastKvLayout::MlaLatent => crate::try_device!(profile::run_layer_stage(
                 self.layer_index,
                 "attention.dense_mla_decode",
-                || {
-                    let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
-                    validate_exact_shape(
-                        "dense_mla_past_device_kv_shape",
-                        &[
-                            past.batch,
-                            past.attention_heads,
-                            past.key_head_dim,
-                            past.value_head_dim,
-                        ],
-                        &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
-                    )?;
-                    let past_latent =
-                        past.k
-                            .reshape(vec![batch, past.selected_tokens, self.kv_lora_rank])?;
-                    let past_rope =
-                        past.v
-                            .reshape(vec![batch, past.selected_tokens, 1, config.qk_rope_dim])?;
-                    let past_latent_norm =
-                        crate::try_device!(self.kv_a_norm.forward_device(&past_latent, backend));
-                    let past_k_no_rope = crate::try_device!(self
-                        .k_b
-                        .forward_heads_device(&past_latent_norm, backend));
-                    let past_v_heads = crate::try_device!(self
-                        .v_b
-                        .forward_heads_device(&past_latent_norm, backend));
-                    let past_k_heads = crate::try_device!(
-                        backend.combine_rope_tail_device(&past_k_no_rope, &past_rope)
-                    );
-                    let past_k_for_attention =
-                        crate::try_device!(backend.heads_to_attention_layout_device(&past_k_heads));
-                    let past_v_for_attention =
-                        crate::try_device!(backend.heads_to_attention_layout_device(&past_v_heads));
-                    backend.selected_decode_attention_device(
-                        &q_for_attention,
-                        &past_k_for_attention,
-                        &past_v_for_attention,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
-                    )
-                },
+                || self.mla_context_device(
+                    config,
+                    batch,
+                    &q_for_attention,
+                    &current_k_for_attention,
+                    &current_v_for_attention,
+                    past_kv,
+                    backend,
+                ),
             )),
         };
         let output_hidden_states = crate::try_device!(profile::run_layer_stage(
@@ -2247,9 +2220,12 @@ impl<'a> Attention<'a> {
         ));
 
         let index_key = if let Some(indexer) = self.indexer.as_ref() {
-            let index_key_device =
-                crate::try_device!(indexer.key_device(config, hidden_states, 0, backend));
-            Some(backend.device_download_f32_tensor(&index_key_device)?)
+            Some(crate::try_device!(indexer.key_device(
+                config,
+                hidden_states,
+                0,
+                backend,
+            )))
         } else {
             None
         };
@@ -2395,40 +2371,56 @@ impl<'a> Attention<'a> {
 
         let mut index_key = None;
         let mut next_shared_selection = None;
+        let full_context = past_tokens
+            .checked_add(1)
+            .ok_or_else(|| Error::model("DSA decode key token count overflow"))?
+            <= config.dsa_index_topk;
         let selected_past_tokens = if let Some(indexer) = self.indexer.as_ref() {
-            let cached_index_keys = index_keys_for_layer(self.layer_index)?.ok_or_else(|| {
-                Error::model(format!(
-                    "DSA index keys missing for full sparse attention layer {}",
-                    self.layer_index
-                ))
-            })?;
-            let selection = crate::try_device!(profile::run_layer_stage(
-                self.layer_index,
-                "dsa_indexer.topk_device",
-                || indexer.select_decode_topk_device(
-                    config,
-                    hidden_states,
-                    &q_resid,
-                    &cached_index_keys,
-                    past_tokens,
-                    backend,
-                ),
-            ));
-            let current_key = profile::run_layer_stage(
-                self.layer_index,
-                "dsa_indexer.download_current_key",
-                || backend.device_download_f32_tensor(&selection.current_key_device),
-            )?;
-            index_key = Some(current_key);
-            next_shared_selection = Some(selection.token_indices.clone());
-            past_only_selected_indices(&selection.token_indices, past_tokens)?
+            if full_context {
+                index_key = Some(crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "dsa_indexer.current_key_device",
+                    || indexer.key_device(config, hidden_states, past_tokens, backend),
+                )));
+                Vec::new()
+            } else {
+                let cached_index_keys =
+                    index_keys_for_layer(self.layer_index)?.ok_or_else(|| {
+                        Error::model(format!(
+                            "DSA index keys missing for full sparse attention layer {}",
+                            self.layer_index
+                        ))
+                    })?;
+                let selection = crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "dsa_indexer.topk_device",
+                    || indexer.select_decode_topk_device(
+                        config,
+                        hidden_states,
+                        &q_resid,
+                        &cached_index_keys,
+                        past_tokens,
+                        backend,
+                    ),
+                ));
+                index_key = Some(selection.current_key_device);
+                next_shared_selection = Some(selection.token_indices.clone());
+                past_only_selected_indices(&selection.token_indices, past_tokens)?
+            }
+        } else if full_context {
+            Vec::new()
         } else if let Some(shared_selection) = shared_selection {
             past_only_selected_indices(shared_selection, past_tokens)?
         } else {
-            Vec::new()
+            return Err(Error::model(format!(
+                "DSA shared selection missing for sparse attention layer {}",
+                self.layer_index
+            )));
         };
 
-        let context_heads = if selected_past_tokens.is_empty() {
+        let context_heads = if past_tokens == 0 {
+            current_v_for_attention.clone()
+        } else if full_context {
             match past_layout {
                 DevicePastKvLayout::ExpandedHeads => crate::try_device!(profile::run_layer_stage(
                     self.layer_index,
@@ -2440,7 +2432,19 @@ impl<'a> Attention<'a> {
                         past_kv,
                     ),
                 )),
-                DevicePastKvLayout::MlaLatent => current_v_for_attention.clone(),
+                DevicePastKvLayout::MlaLatent => crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.full_context_mla_decode",
+                    || self.mla_context_device(
+                        config,
+                        batch,
+                        &q_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                        past_kv,
+                        backend,
+                    ),
+                )),
             }
         } else {
             let selected_kv = selected_kv_for_tokens(self.layer_index, &selected_past_tokens)?

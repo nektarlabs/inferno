@@ -307,21 +307,28 @@ impl<'a> QuantizedLinear<'a> {
         input: &backend::DeviceValue,
         backend: &B,
     ) -> Result<Option<LinearTokenOutput>> {
-        if self.tensor_ref.ty != GgmlType::Q2K {
-            return Ok(None);
-        }
-        let raw_data = self.q2_payload_bytes.ok_or_else(|| {
-            Error::gguf(format!(
-                "GGUF tensor {} must be Q2_K for the device Q2 greedy path, got {}",
-                self.tensor_ref.name, self.tensor_ref.ty
-            ))
-        })?;
-        let (token_id, token_score) = crate::try_device!(backend.q2_k_matvec_argmax_device(
-            raw_data,
-            input,
-            self.in_features,
-            self.out_features,
-        ));
+        let (token_id, token_score) = match self.tensor_ref.ty {
+            GgmlType::Q2K => {
+                let raw_data = self.q2_payload_bytes.ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} must be Q2_K for the device Q2 greedy path, got {}",
+                        self.tensor_ref.name, self.tensor_ref.ty
+                    ))
+                })?;
+                crate::try_device!(backend.q2_k_matvec_argmax_device(
+                    raw_data,
+                    input,
+                    self.in_features,
+                    self.out_features,
+                ))
+            }
+            GgmlType::Q8_0 => {
+                let logits = crate::try_device!(self.forward_device(input, backend));
+                let logits = logits.reshape(vec![self.out_features])?;
+                crate::try_device!(backend.argmax_f32_device(&logits))
+            }
+            _ => return Ok(None),
+        };
         Ok(Some(LinearTokenOutput {
             token_id,
             token_score,

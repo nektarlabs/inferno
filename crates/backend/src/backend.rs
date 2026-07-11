@@ -8,6 +8,7 @@ use common::{
     PagedKvView, Result,
 };
 use common::{Device, Tensor};
+use std::path::Path;
 
 use crate::device_value::DeviceValue;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -39,6 +40,91 @@ pub struct RouterTopK {
     pub top_k: usize,
     pub expert_ids: Vec<u32>,
     pub weights: Vec<f32>,
+}
+
+/// Opaque device-resident MoE routing result.
+///
+/// Expert IDs and weights remain in Metal buffers and are consumed directly
+/// by the routed expert kernels. SSD streaming reads only the selected IDs at
+/// the explicit sparse-layer synchronization point.
+#[derive(Debug, Clone)]
+pub struct DeviceRouterTopK {
+    pub(crate) token_count: usize,
+    pub(crate) expert_count: usize,
+    pub(crate) top_k: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) token_indices: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) expert_ids: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) expert_weights: ::metal::Buffer,
+}
+
+impl DeviceRouterTopK {
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub fn expert_count(&self) -> usize {
+        self.expert_count
+    }
+
+    pub fn top_k(&self) -> usize {
+        self.top_k
+    }
+
+    pub fn assignment_count(&self) -> Result<usize> {
+        self.token_count
+            .checked_mul(self.top_k)
+            .ok_or_else(|| Error::backend("device router assignment count overflow"))
+    }
+}
+
+/// Reusable Metal staging for the exact Q2 experts selected by one token.
+///
+/// Address tables follow router assignment order. Routed kernels dereference
+/// those GPU addresses directly, while the resource vectors keep every
+/// selected buffer resident for the command buffer lifetime.
+#[derive(Debug, Clone)]
+pub struct DeviceQ2Experts {
+    pub(crate) assignment_count: usize,
+    pub(crate) cache_hits: usize,
+    pub(crate) cache_misses: usize,
+    pub(crate) gate_expert_stride_bytes: usize,
+    pub(crate) up_expert_stride_bytes: usize,
+    pub(crate) down_expert_stride_bytes: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) gate_addresses: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) up_addresses: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) down_addresses: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) gate_resources: Vec<::metal::Buffer>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) up_resources: Vec<::metal::Buffer>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) down_resources: Vec<::metal::Buffer>,
+}
+
+impl DeviceQ2Experts {
+    pub fn assignment_count(&self) -> usize {
+        self.assignment_count
+    }
+
+    pub fn cache_hits(&self) -> usize {
+        self.cache_hits
+    }
+
+    pub fn cache_misses(&self) -> usize {
+        self.cache_misses
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Q2ExpertSource<'a> {
+    pub bytes: &'a [u8],
+    pub absolute_offset: u64,
 }
 
 /// Device-resident paged KV view for the Metal decode path.
@@ -664,6 +750,32 @@ pub trait Backend {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn q2_k_packed_heads_transposed_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _head_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_packed_heads_transposed_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _head_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Q2_K matvec fused with a residual add; the output takes the residual's
     /// shape.
     fn q2_k_matvec_add_device(
@@ -704,6 +816,63 @@ pub trait Backend {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn q2_k_routed_gate_up_swiglu_device(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_routed_matvec_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn stage_q2_experts_device(
+        &self,
+        _layer_index: usize,
+        _model_path: &Path,
+        _gate_payloads: &[Q2ExpertSource<'_>],
+        _up_payloads: &[Q2ExpertSource<'_>],
+        _down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<Option<DeviceQ2Experts>> {
+        Ok(None)
+    }
+
+    fn q2_k_staged_routed_gate_up_swiglu_device(
+        &self,
+        _experts: &DeviceQ2Experts,
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn q2_k_staged_routed_matvec_device(
+        &self,
+        _experts: &DeviceQ2Experts,
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Output-head matvec + greedy argmax over a device-resident hidden state.
     /// Flushes the batch (this is the end-of-token sink) and returns the
     /// winning token id and score.
@@ -714,6 +883,12 @@ pub trait Backend {
         _in_features: usize,
         _out_features: usize,
     ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+
+    /// Greedy argmax over a device-resident f32 score vector. Flushes the
+    /// batch and returns the winning token id and score.
+    fn argmax_f32_device(&self, _scores: &DeviceValue) -> Result<Option<(u32, f32)>> {
         Ok(None)
     }
 
@@ -899,6 +1074,16 @@ pub trait Backend {
         Ok(None)
     }
 
+    fn moe_topk_combine_residual_device(
+        &self,
+        _shared: &DeviceValue,
+        _residual: &DeviceValue,
+        _expert_outputs: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     fn moe_router_topk_device(
         &self,
         _router_logits: &DeviceValue,
@@ -907,6 +1092,28 @@ pub trait Backend {
         _norm_topk_prob: bool,
         _routed_scaling_factor: f32,
     ) -> Result<Option<RouterTopK>> {
+        Ok(None)
+    }
+
+    fn moe_router_topk_resident_device(
+        &self,
+        _router_logits: &DeviceValue,
+        _correction_bias: &[f32],
+        _top_k: usize,
+        _norm_topk_prob: bool,
+        _routed_scaling_factor: f32,
+    ) -> Result<Option<DeviceRouterTopK>> {
+        Ok(None)
+    }
+
+    /// Completes pending work and reads only the selected expert IDs from a
+    /// resident router result. Inferno uses this single sparse-layer
+    /// synchronization point to prefetch exact Q2 expert ranges from SSD
+    /// before their Metal kernels start touching mmap pages.
+    fn moe_router_expert_ids_device(
+        &self,
+        _routing: &DeviceRouterTopK,
+    ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }
 }
@@ -3314,6 +3521,78 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn q2_k_packed_heads_transposed_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        head_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.packed_heads_transposed_matvec_device(
+                QuantMatvecKind::Q2KTransposed,
+                weights,
+                input,
+                row_count,
+                head_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                row_count,
+                head_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q8_0_packed_heads_transposed_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        head_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return self.packed_heads_transposed_matvec_device(
+                QuantMatvecKind::Q80Transposed,
+                weights,
+                input,
+                row_count,
+                head_count,
+                in_features,
+                out_features,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                row_count,
+                head_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
     fn q2_k_matvec_add_device(
         &self,
         weights: &[u8],
@@ -3462,6 +3741,232 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn q2_k_routed_gate_up_swiglu_device(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_q2_routed_gate_up_input", input, 2)?;
+            validate_exact_shape(
+                "device_q2_routed_gate_up_input_shape",
+                dims,
+                &[routing.token_count, in_features],
+            )?;
+            let assignment_count = routing.assignment_count()?;
+            let buffer = native_metal.batched_q2_k_routed_gate_up_swiglu(
+                gate_weights,
+                up_weights,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                routing.token_count,
+                routing.expert_count,
+                routing.top_k,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                input,
+                routing,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_routed_matvec_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let assignment_count = routing.assignment_count()?;
+            let dims = require_device_rank("device_q2_routed_matvec_input", input, 2)?;
+            validate_exact_shape(
+                "device_q2_routed_matvec_input_shape",
+                dims,
+                &[assignment_count, in_features],
+            )?;
+            let buffer = native_metal.batched_q2_k_routed_matvec(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                routing.token_count,
+                routing.expert_count,
+                routing.top_k,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, routing, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn stage_q2_experts_device(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<Option<DeviceQ2Experts>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .stage_q2_experts(
+                    layer_index,
+                    model_path,
+                    gate_payloads,
+                    up_payloads,
+                    down_payloads,
+                )
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+            );
+            Ok(None)
+        }
+    }
+
+    fn q2_k_staged_routed_gate_up_swiglu_device(
+        &self,
+        experts: &DeviceQ2Experts,
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_q2_staged_gate_up_input", input, 2)?;
+            validate_exact_shape(
+                "device_q2_staged_gate_up_input_shape",
+                dims,
+                &[routing.token_count, in_features],
+            )?;
+            let assignment_count = routing.assignment_count()?;
+            validate_exact_shape(
+                "device_q2_staged_gate_up_assignments",
+                &[experts.assignment_count],
+                &[assignment_count],
+            )?;
+            let buffer = native_metal.batched_q2_k_staged_routed_gate_up_swiglu(
+                experts,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (experts, input, routing, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn q2_k_staged_routed_matvec_device(
+        &self,
+        experts: &DeviceQ2Experts,
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let assignment_count = routing.assignment_count()?;
+            let dims = require_device_rank("device_q2_staged_matvec_input", input, 2)?;
+            validate_exact_shape(
+                "device_q2_staged_matvec_input_shape",
+                dims,
+                &[assignment_count, in_features],
+            )?;
+            validate_exact_shape(
+                "device_q2_staged_matvec_assignments",
+                &[experts.assignment_count],
+                &[assignment_count],
+            )?;
+            let buffer = native_metal.batched_q2_k_staged_routed_matvec(
+                experts,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![assignment_count, out_features],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (experts, input, routing, in_features, out_features);
+            Ok(None)
+        }
+    }
+
     fn q2_k_matvec_argmax_device(
         &self,
         weights: &[u8],
@@ -3489,6 +3994,26 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (weights, input, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn argmax_f32_device(&self, scores: &DeviceValue) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            validate_exact_shape("device_argmax_f32_rank", &[scores.dims().len()], &[1])?;
+            let value_count = scores.element_count()?;
+            let (token_id, token_score) =
+                native_metal.batched_f32_argmax(&scores.buffer, value_count)?;
+            return Ok(Some((token_id, token_score)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = scores;
             Ok(None)
         }
     }
@@ -4469,6 +4994,56 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn moe_topk_combine_residual_device(
+        &self,
+        shared: &DeviceValue,
+        residual: &DeviceValue,
+        expert_outputs: &DeviceValue,
+        routing: &DeviceRouterTopK,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let shared_dims = require_device_rank("device_moe_topk_shared", shared, 2)?;
+            let expert_dims =
+                require_device_rank("device_moe_topk_expert_outputs", expert_outputs, 2)?;
+            validate_exact_shape(
+                "device_moe_topk_residual_values",
+                &[residual.element_count()?],
+                &[shared.element_count()?],
+            )?;
+            validate_exact_shape(
+                "device_moe_topk_token_count",
+                &[shared_dims[0]],
+                &[routing.token_count],
+            )?;
+            validate_exact_shape(
+                "device_moe_topk_expert_shape",
+                expert_dims,
+                &[routing.assignment_count()?, shared_dims[1]],
+            )?;
+            let buffer = native_metal.batched_moe_topk_combine_residual(
+                &shared.buffer,
+                shared.element_count()?,
+                &residual.buffer,
+                residual.element_count()?,
+                &expert_outputs.buffer,
+                expert_outputs.element_count()?,
+                routing,
+                shared_dims[1],
+            )?;
+            return Ok(Some(DeviceValue::new(residual.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (shared, residual, expert_outputs, routing);
+            Ok(None)
+        }
+    }
+
     fn moe_router_topk_device(
         &self,
         router_logits: &DeviceValue,
@@ -4520,6 +5095,70 @@ impl Backend for MetalBackend {
             Ok(None)
         }
     }
+
+    fn moe_router_topk_resident_device(
+        &self,
+        router_logits: &DeviceValue,
+        correction_bias: &[f32],
+        top_k: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    ) -> Result<Option<DeviceRouterTopK>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_resident_moe_router_logits", router_logits, 2)?;
+            let (token_count, expert_count) = (dims[0], dims[1]);
+            validate_exact_shape(
+                "device_resident_moe_router_correction_bias",
+                &[correction_bias.len()],
+                &[expert_count],
+            )?;
+            let routing = native_metal.batched_moe_router_topk_resident(
+                &router_logits.buffer,
+                router_logits.element_count()?,
+                correction_bias,
+                token_count,
+                expert_count,
+                top_k,
+                norm_topk_prob,
+                routed_scaling_factor,
+            )?;
+            return Ok(Some(routing));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                router_logits,
+                correction_bias,
+                top_k,
+                norm_topk_prob,
+                routed_scaling_factor,
+            );
+            Ok(None)
+        }
+    }
+
+    fn moe_router_expert_ids_device(&self, routing: &DeviceRouterTopK) -> Result<Option<Vec<u32>>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .batched_moe_router_expert_ids(routing)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = routing;
+            Ok(None)
+        }
+    }
 }
 
 impl MetalBackend {
@@ -4554,6 +5193,43 @@ impl MetalBackend {
             out_features,
         )?;
         Ok(Some(DeviceValue::new(output_shape, buffer)))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[allow(clippy::too_many_arguments)]
+    fn packed_heads_transposed_matvec_device(
+        &self,
+        kind: QuantMatvecKind,
+        weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        head_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let Some(native_metal) = self.native_metal() else {
+            return Ok(None);
+        };
+        let dims = require_device_rank("device_packed_heads_transposed_input", input, 2)?;
+        validate_exact_shape(
+            "device_packed_heads_transposed_input_shape",
+            dims,
+            &[row_count, in_features],
+        )?;
+        let buffer = native_metal.batched_packed_heads_transposed_matvec(
+            kind,
+            weights,
+            &input.buffer,
+            input.element_count()?,
+            row_count,
+            head_count,
+            in_features,
+            out_features,
+        )?;
+        Ok(Some(DeviceValue::new(
+            vec![row_count, head_count, out_features],
+            buffer,
+        )))
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4620,6 +5296,7 @@ fn backend_operations(has_native_metal: bool) -> Vec<&'static str> {
         operations.push("q2_k_matvec_argmax_f32_tensor");
         operations.push("q2_k_rms_norm_argmax_f32_tensor");
         operations.push("q2_k_matvec_argmax_f32");
+        operations.push("argmax_f32_device");
         operations.push("q2_k_transposed_matvec_f32_tensor");
         operations.push("q2_k_transposed_matvec_f32");
         operations.push("q8_0_matvec_f32_tensor");

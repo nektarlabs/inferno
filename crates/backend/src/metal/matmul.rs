@@ -5,6 +5,7 @@ use tracing::trace;
 use super::{
     buffers::{
         empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
+        ImmutableF32BufferCache,
     },
     command::{dispatch_1d, dispatch_2d, encode_1d, encode_2d},
     library::MetalLibrary,
@@ -22,6 +23,7 @@ pub(crate) struct MetalMatmul {
     matmul_pipeline: ComputePipelineState,
     linear_pipeline: ComputePipelineState,
     linear_gemv_pipeline: ComputePipelineState,
+    weight_buffers: ImmutableF32BufferCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +54,7 @@ impl MetalMatmul {
             matmul_pipeline: compute_pipeline(device, library, MATMUL_KERNEL)?,
             linear_pipeline: compute_pipeline(device, library, LINEAR_KERNEL)?,
             linear_gemv_pipeline: compute_pipeline(device, library, LINEAR_GEMV_KERNEL)?,
+            weight_buffers: ImmutableF32BufferCache::default(),
         })
     }
 
@@ -241,7 +244,7 @@ impl MetalMatmul {
         let output_len = rows
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("batched F32 linear output length overflow"))?;
-        let weight_buffer = f32_buffer(device, weight)?;
+        let weight_buffer = self.weight_buffers.get(device, weight)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
 
         trace!(

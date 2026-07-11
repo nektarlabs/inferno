@@ -1867,7 +1867,8 @@ struct DevicePagedRuntimeCache {
     cold: LayeredColdKvBlockStore,
     dsa_index: Option<LayeredDsaIndexBlockStore>,
     layers: Vec<ColdDeviceLayer>,
-    hot: Option<HotDeviceLayerWindow>,
+    hot_layers: Vec<HotDeviceLayerWindow>,
+    streaming_hot: Option<HotDeviceLayerWindow>,
     prefetch: ColdKvPrefetcher,
     selected_prefetch: SelectedColdKvPrefetcher,
     cached_tokens: usize,
@@ -1890,8 +1891,10 @@ struct HotDeviceLayerWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ColdKvRuntimePolicy {
     block_tokens: usize,
-    hot_layer_slots: usize,
+    hot_all_layers_budget_bytes: usize,
 }
+
+const HOT_ALL_LAYERS_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 impl ColdKvRuntimePolicy {
     fn new(block_tokens: usize) -> Result<Self> {
@@ -1900,7 +1903,7 @@ impl ColdKvRuntimePolicy {
         }
         Ok(Self {
             block_tokens,
-            hot_layer_slots: 1,
+            hot_all_layers_budget_bytes: HOT_ALL_LAYERS_BUDGET_BYTES,
         })
     }
 }
@@ -1964,13 +1967,15 @@ impl DevicePagedRuntimeCache {
             cold,
             dsa_index,
             layers,
-            hot: None,
+            hot_layers: Vec::new(),
+            streaming_hot: None,
             prefetch: ColdKvPrefetcher::new(),
             selected_prefetch: SelectedColdKvPrefetcher::new(),
             cached_tokens: 0,
             profile_step_index: 0,
             policy,
         };
+        cache.initialize_hot_layers(backend, 1)?;
         cache.append_decode(layer_kv_cache, backend)?;
         Ok(cache)
     }
@@ -1980,14 +1985,18 @@ impl DevicePagedRuntimeCache {
     }
 
     fn runtime_kv_memory(&self) -> RuntimeKvMemoryBytes {
-        let hot_bytes = self.hot.as_ref().and_then(|layer| {
-            let layer_bytes = layer
-                .k
-                .byte_count()
-                .ok()?
-                .checked_add(layer.v.byte_count().ok()?)?;
-            u64::try_from(layer_bytes).ok()
-        });
+        let hot_bytes = self
+            .hot_layers
+            .iter()
+            .chain(self.streaming_hot.iter())
+            .try_fold(0_u64, |total, layer| {
+                let layer_bytes = layer
+                    .k
+                    .byte_count()
+                    .ok()?
+                    .checked_add(layer.v.byte_count().ok()?)?;
+                total.checked_add(u64::try_from(layer_bytes).ok()?)
+            });
         let cold_bytes = self.cold.store().stored_bytes().ok().and_then(|kv_bytes| {
             let index_bytes = self
                 .dsa_index
@@ -2018,6 +2027,11 @@ impl DevicePagedRuntimeCache {
         let needed_tokens = append_position
             .checked_add(1)
             .ok_or_else(|| Error::cache("device paged KV decode position overflow"))?;
+        self.prepare_hot_layers_for_append(backend, needed_tokens)?;
+        let batch = self.spec.batch;
+        let attention_heads = self.spec.attention_heads;
+        let key_head_dim = self.spec.key_head_dim;
+        let value_head_dim = self.spec.value_head_dim;
 
         for (layer, append) in self.layers.iter().zip(layer_kv_cache) {
             if layer.layer_index != append.layer_index {
@@ -2068,15 +2082,16 @@ impl DevicePagedRuntimeCache {
                 &host_k,
                 &host_v,
             )?;
-            if let Some(index_key) = append.index_key.as_ref() {
-                validate_dsa_index_key_shape("decode", layer.layer_index, index_key)?;
+            if let Some(index_key_device) = append.index_key.as_ref() {
+                let index_key = backend.device_download_f32_tensor(index_key_device)?;
+                validate_dsa_index_key_shape("decode", layer.layer_index, &index_key)?;
                 let dsa_index = self.dsa_index.as_mut().ok_or_else(|| {
                     Error::cache(format!(
                         "DSA index store missing while appending layer {}",
                         layer.layer_index
                     ))
                 })?;
-                dsa_index.append_decode_layer(layer.layer_index, append_position, index_key)?;
+                dsa_index.append_decode_layer(layer.layer_index, append_position, &index_key)?;
             }
             record_q2_runtime_stage(
                 self.profile_step_index,
@@ -2084,6 +2099,38 @@ impl DevicePagedRuntimeCache {
                 "decode.cold_kv_append",
                 append_started_at.elapsed(),
             );
+        }
+        for append in layer_kv_cache {
+            if let Some(hot) = self
+                .hot_layers
+                .iter_mut()
+                .find(|hot| hot.layer_index == Some(append.layer_index))
+            {
+                copy_logical_kv_tokens(
+                    backend,
+                    &append.cache_k,
+                    1,
+                    &hot.k,
+                    hot.capacity_tokens,
+                    append_position,
+                    1,
+                    batch,
+                    attention_heads,
+                    key_head_dim,
+                )?;
+                copy_logical_kv_tokens(
+                    backend,
+                    &append.cache_v,
+                    1,
+                    &hot.v,
+                    hot.capacity_tokens,
+                    append_position,
+                    1,
+                    batch,
+                    attention_heads,
+                    value_head_dim,
+                )?;
+            }
         }
         self.cold.store_mut().flush()?;
         if let Some(dsa_index) = self.dsa_index.as_mut() {
@@ -2102,6 +2149,37 @@ impl DevicePagedRuntimeCache {
         let started_at = Instant::now();
         let layer_position = self.layer_position(layer_index)?;
         let token_count = self.cached_tokens()?;
+        if let Some(hot) = self
+            .hot_layers
+            .iter()
+            .find(|hot| hot.layer_index == Some(layer_index))
+        {
+            if hot.capacity_tokens < token_count {
+                return Err(Error::cache(format!(
+                    "resident device KV layer {layer_index} has capacity {} for {token_count} tokens",
+                    hot.capacity_tokens
+                )));
+            }
+            let view = DevicePagedKvView {
+                batch: self.spec.batch,
+                attention_heads: self.spec.attention_heads,
+                key_head_dim: self.spec.key_head_dim,
+                value_head_dim: self.spec.value_head_dim,
+                page_size: self.spec.page_size,
+                cached_tokens: token_count,
+                capacity_tokens: hot.capacity_tokens,
+                k: hot.k.clone(),
+                v: hot.v.clone(),
+            };
+            view.validate()?;
+            record_q2_runtime_stage(
+                self.profile_step_index,
+                Some(layer_index),
+                "decode.resident_device_kv_view",
+                started_at.elapsed(),
+            );
+            return Ok(Some(view));
+        }
         let (keys, values) = self
             .prefetch
             .take_or_read(&self.cold, layer_index, 0, token_count)?;
@@ -2114,9 +2192,9 @@ impl DevicePagedRuntimeCache {
         self.prefetch_layer_after(layer_position)?;
 
         let upload_started_at = Instant::now();
-        self.ensure_hot_capacity(backend, token_count)?;
+        self.ensure_streaming_hot_capacity(backend, token_count)?;
         let hot = self
-            .hot
+            .streaming_hot
             .as_mut()
             .ok_or_else(|| Error::cache("cold device KV hot window is not initialized"))?;
         let source_k = require_device_value(
@@ -2314,6 +2392,9 @@ impl DevicePagedRuntimeCache {
     }
 
     fn prefetch_first_layer(&mut self) -> Result<()> {
+        if self.hot_layers.len() == self.layers.len() {
+            return Ok(());
+        }
         if let Some(layer) = self.layers.first() {
             self.prefetch.schedule(
                 self.cold.store().clone_reader()?,
@@ -2360,23 +2441,98 @@ impl DevicePagedRuntimeCache {
         Ok(())
     }
 
-    fn ensure_hot_capacity<B: Backend>(&mut self, backend: &B, needed_tokens: usize) -> Result<()> {
-        validate_exact_shape(
-            "cold_kv_hot_layer_slots",
-            &[self.policy.hot_layer_slots],
-            &[1],
-        )?;
+    fn initialize_hot_layers<B: Backend>(
+        &mut self,
+        backend: &B,
+        needed_tokens: usize,
+    ) -> Result<()> {
+        let needed_capacity =
+            device_capacity_tokens(needed_tokens, self.spec.page_size, self.spec.max_context)?;
+        if self.hot_all_layers_bytes(needed_capacity)? > self.policy.hot_all_layers_budget_bytes {
+            return Ok(());
+        }
+        let layer_indices = self
+            .layers
+            .iter()
+            .map(|layer| layer.layer_index)
+            .collect::<Vec<_>>();
+        let mut hot_layers = Vec::with_capacity(layer_indices.len());
+        for layer_index in layer_indices {
+            hot_layers.push(self.allocate_hot_window(
+                backend,
+                needed_capacity,
+                Some(layer_index),
+            )?);
+        }
+        self.hot_layers = hot_layers;
+        Ok(())
+    }
+
+    fn prepare_hot_layers_for_append<B: Backend>(
+        &mut self,
+        backend: &B,
+        needed_tokens: usize,
+    ) -> Result<()> {
+        if self.hot_layers.is_empty() {
+            return Ok(());
+        }
+        let needed_capacity =
+            device_capacity_tokens(needed_tokens, self.spec.page_size, self.spec.max_context)?;
+        if self.hot_all_layers_bytes(needed_capacity)? > self.policy.hot_all_layers_budget_bytes {
+            self.hot_layers.clear();
+            return Ok(());
+        }
+        if self
+            .hot_layers
+            .iter()
+            .all(|hot| hot.capacity_tokens >= needed_capacity)
+        {
+            return Ok(());
+        }
+
+        let mut grown = Vec::with_capacity(self.hot_layers.len());
+        for hot in &self.hot_layers {
+            let next = self.allocate_hot_window(backend, needed_capacity, hot.layer_index)?;
+            require_device_copy(
+                "resident K/V K growth copy",
+                backend.device_copy_same_dtype(&hot.k, 0, &next.k, 0, hot.k.element_count()?)?,
+            )?;
+            require_device_copy(
+                "resident K/V V growth copy",
+                backend.device_copy_same_dtype(&hot.v, 0, &next.v, 0, hot.v.element_count()?)?,
+            )?;
+            grown.push(next);
+        }
+        self.hot_layers = grown;
+        Ok(())
+    }
+
+    fn ensure_streaming_hot_capacity<B: Backend>(
+        &mut self,
+        backend: &B,
+        needed_tokens: usize,
+    ) -> Result<()> {
         let needed_capacity =
             device_capacity_tokens(needed_tokens, self.spec.page_size, self.spec.max_context)?;
         if self
-            .hot
+            .streaming_hot
             .as_ref()
             .is_some_and(|hot| hot.capacity_tokens >= needed_capacity)
         {
             return Ok(());
         }
 
-        let page_count = needed_capacity / self.spec.page_size;
+        self.streaming_hot = Some(self.allocate_hot_window(backend, needed_capacity, None)?);
+        Ok(())
+    }
+
+    fn allocate_hot_window<B: Backend>(
+        &self,
+        backend: &B,
+        capacity_tokens: usize,
+        layer_index: Option<usize>,
+    ) -> Result<HotDeviceLayerWindow> {
+        let page_count = capacity_tokens / self.spec.page_size;
         let k = require_device_value(
             "cold device KV K hot allocation",
             backend.device_alloc_f32_tensor(&device_cache_shape(
@@ -2397,13 +2553,29 @@ impl DevicePagedRuntimeCache {
                 self.spec.value_head_dim,
             ))?,
         )?;
-        self.hot = Some(HotDeviceLayerWindow {
-            layer_index: None,
+        Ok(HotDeviceLayerWindow {
+            layer_index,
             k,
             v,
-            capacity_tokens: needed_capacity,
-        });
-        Ok(())
+            capacity_tokens,
+        })
+    }
+
+    fn hot_all_layers_bytes(&self, capacity_tokens: usize) -> Result<usize> {
+        self.spec
+            .batch
+            .checked_mul(self.spec.attention_heads)
+            .and_then(|values| values.checked_mul(capacity_tokens))
+            .and_then(|values| {
+                values.checked_mul(
+                    self.spec
+                        .key_head_dim
+                        .checked_add(self.spec.value_head_dim)?,
+                )
+            })
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_mul(self.layers.len()))
+            .ok_or_else(|| Error::cache("resident K/V budget byte count overflow"))
     }
 }
 
@@ -2946,7 +3118,7 @@ fn infer_device_dsa_index_spec(
     else {
         return Ok(None);
     };
-    validate_dsa_index_key_shape("device_seed", 0, first)?;
+    validate_dsa_index_key_dims("device_seed", 0, first.dims())?;
     let dims = first.dims();
     let spec = DsaIndexStoreSpec {
         batch: dims[0],
@@ -2956,7 +3128,7 @@ fn infer_device_dsa_index_spec(
     spec.validate()?;
     for entry in layer_kv_cache {
         if let Some(index_key) = entry.index_key.as_ref() {
-            validate_dsa_index_key_shape("device_seed", entry.layer_index, index_key)?;
+            validate_dsa_index_key_dims("device_seed", entry.layer_index, index_key.dims())?;
             validate_exact_shape(
                 format!("device_seed_dsa_index_layer_{}_spec", entry.layer_index),
                 &[index_key.dims()[0], index_key.dims()[2]],
@@ -2972,7 +3144,10 @@ fn validate_dsa_index_key_shape(
     layer_index: usize,
     index_key: &F32Tensor,
 ) -> Result<()> {
-    let dims = index_key.dims();
+    validate_dsa_index_key_dims(phase, layer_index, index_key.dims())
+}
+
+fn validate_dsa_index_key_dims(phase: &str, layer_index: usize, dims: &[usize]) -> Result<()> {
     if dims.len() != 3 {
         return Err(Error::cache(format!(
             "DSA index key for {phase} layer {layer_index} must be rank 3 [B,T,D], got {dims:?}"
@@ -3474,12 +3649,15 @@ mod tests {
     }
 
     #[test]
-    fn cold_kv_policy_uses_one_hot_layer_slot() {
+    fn cold_kv_policy_bounds_the_all_layer_hot_tier() {
         let policy = ColdKvRuntimePolicy::new(128).unwrap();
         let err = ColdKvRuntimePolicy::new(0).unwrap_err();
 
         assert_eq!(policy.block_tokens, 128);
-        assert_eq!(policy.hot_layer_slots, 1);
+        assert_eq!(
+            policy.hot_all_layers_budget_bytes,
+            HOT_ALL_LAYERS_BUDGET_BYTES
+        );
         assert!(err.to_string().contains("block_tokens"));
     }
 

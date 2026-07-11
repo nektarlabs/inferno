@@ -8,8 +8,8 @@ mod device_value;
 pub mod metal;
 
 pub use backend::{
-    Backend, BackendCapabilities, BackendMemoryReport, DevicePagedKvView, DeviceSelectedKvView,
-    MetalBackend, RouterTopK,
+    Backend, BackendCapabilities, BackendMemoryReport, DevicePagedKvView, DeviceQ2Experts,
+    DeviceRouterTopK, DeviceSelectedKvView, MetalBackend, Q2ExpertSource, RouterTopK,
 };
 pub use device_value::DeviceValue;
 #[cfg(all(target_os = "macos", feature = "metal"))]

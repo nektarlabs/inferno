@@ -108,12 +108,15 @@ impl LayeredDsaIndexBlockStore {
     }
 
     pub fn clone_reader(&self) -> Result<Self> {
-        let mut file = self.file.try_clone().map_err(|error| {
-            Error::cache(format!(
-                "failed to clone DSA index block store {}: {error}",
-                self.path.display()
-            ))
-        })?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|error| {
+                Error::cache(format!(
+                    "failed to open DSA index block store reader {}: {error}",
+                    self.path.display()
+                ))
+            })?;
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             Error::cache(format!(
                 "failed to seek cloned DSA index block store {}: {error}",

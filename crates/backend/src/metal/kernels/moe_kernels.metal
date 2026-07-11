@@ -94,11 +94,12 @@ kernel void moe_router_topk_f32_kernel(
     const device float* correction_bias [[buffer(1)]],
     device uint* expert_ids [[buffer(2)]],
     device float* expert_weights [[buffer(3)]],
-    constant uint& token_count [[buffer(4)]],
-    constant uint& expert_count [[buffer(5)]],
-    constant uint& top_k [[buffer(6)]],
-    constant uint& norm_topk_prob [[buffer(7)]],
-    constant float& routed_scaling_factor [[buffer(8)]],
+    device uint* token_indices [[buffer(4)]],
+    constant uint& token_count [[buffer(5)]],
+    constant uint& expert_count [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    constant uint& norm_topk_prob [[buffer(8)]],
+    constant float& routed_scaling_factor [[buffer(9)]],
     uint token [[thread_position_in_grid]]
 ) {
     if (token >= token_count) {
@@ -155,7 +156,39 @@ kernel void moe_router_topk_f32_kernel(
         if (norm_topk_prob != 0 && weight_sum > 0.0f && isfinite(weight_sum)) {
             weight /= weight_sum;
         }
-        expert_ids[(token * top_k) + rank] = top_ids[rank];
-        expert_weights[(token * top_k) + rank] = weight * routed_scaling_factor;
+        uint assignment = (token * top_k) + rank;
+        expert_ids[assignment] = top_ids[rank];
+        expert_weights[assignment] = weight * routed_scaling_factor;
+        token_indices[assignment] = token;
     }
+}
+
+kernel void moe_topk_combine_residual_f32_kernel(
+    const device float* shared [[buffer(0)]],
+    const device float* residual [[buffer(1)]],
+    const device float* expert_outputs [[buffer(2)]],
+    const device float* expert_weights [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& token_count [[buffer(5)]],
+    constant uint& hidden_size [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint output_values = token_count * hidden_size;
+    if (gid >= output_values) {
+        return;
+    }
+
+    uint token = gid / hidden_size;
+    uint hidden = gid - (token * hidden_size);
+    uint assignment_base = token * top_k;
+    float value = shared[gid] + residual[gid];
+
+    for (uint rank = 0; rank < top_k; rank++) {
+        uint assignment = assignment_base + rank;
+        value += expert_outputs[(assignment * hidden_size) + hidden]
+            * expert_weights[assignment];
+    }
+
+    output[gid] = value;
 }

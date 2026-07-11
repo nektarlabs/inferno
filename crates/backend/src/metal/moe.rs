@@ -19,12 +19,14 @@ use super::{
 const MOE_GATHER_TOKENS_KERNEL: &str = "moe_gather_tokens_f32_kernel";
 const MOE_WEIGHTED_INDEX_ADD_COMBINE_KERNEL: &str = "moe_weighted_index_add_combine_f32_kernel";
 const MOE_WEIGHTED_TOKEN_MAJOR_COMBINE_KERNEL: &str = "moe_weighted_token_major_combine_f32_kernel";
+const MOE_TOPK_COMBINE_RESIDUAL_KERNEL: &str = "moe_topk_combine_residual_f32_kernel";
 const MOE_ROUTER_TOPK_KERNEL: &str = "moe_router_topk_f32_kernel";
 
 pub(crate) struct MetalMoe {
     gather_pipeline: ComputePipelineState,
     combine_pipeline: ComputePipelineState,
     token_major_combine_pipeline: ComputePipelineState,
+    topk_combine_residual_pipeline: ComputePipelineState,
     router_topk_pipeline: ComputePipelineState,
 }
 
@@ -48,9 +50,9 @@ pub struct MetalMoeCombineReport {
 
 #[derive(Debug)]
 pub(crate) struct MetalRouterTopKBuffers {
+    pub(crate) token_indices: Buffer,
     pub(crate) expert_ids: Buffer,
     pub(crate) expert_weights: Buffer,
-    pub(crate) output_len: usize,
 }
 
 impl MetalMoe {
@@ -66,6 +68,11 @@ impl MetalMoe {
                 device,
                 library,
                 MOE_WEIGHTED_TOKEN_MAJOR_COMBINE_KERNEL,
+            )?,
+            topk_combine_residual_pipeline: compute_pipeline(
+                device,
+                library,
+                MOE_TOPK_COMBINE_RESIDUAL_KERNEL,
             )?,
             router_topk_pipeline: compute_pipeline(device, library, MOE_ROUTER_TOPK_KERNEL)?,
         })
@@ -338,6 +345,95 @@ impl MetalMoe {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_topk_combine_residual(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        shared: &Buffer,
+        shared_len: usize,
+        residual: &Buffer,
+        residual_len: usize,
+        expert_outputs: &Buffer,
+        expert_outputs_len: usize,
+        expert_weights: &Buffer,
+        token_count: usize,
+        hidden_size: usize,
+        top_k: usize,
+    ) -> Result<Buffer> {
+        if token_count == 0 || hidden_size == 0 || top_k == 0 {
+            return Err(Error::backend(
+                "MoE top-k combine dimensions must be positive",
+            ));
+        }
+        let output_len = token_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE top-k combine output length overflow"))?;
+        if shared_len != output_len || residual_len != output_len {
+            return Err(Error::backend(format!(
+                "MoE top-k combine shared/residual length mismatch: expected {output_len}, got {shared_len}/{}",
+                residual_len
+            )));
+        }
+        let assignment_count = token_count
+            .checked_mul(top_k)
+            .ok_or_else(|| Error::backend("MoE top-k combine assignment count overflow"))?;
+        let expected_expert_values = assignment_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("MoE top-k combine expert length overflow"))?;
+        if expert_outputs_len != expected_expert_values {
+            return Err(Error::backend(format!(
+                "MoE top-k combine expert output length mismatch: expected {expected_expert_values}, got {expert_outputs_len}"
+            )));
+        }
+        require_f32_capacity(shared, shared_len, "MoE top-k combine shared")?;
+        require_f32_capacity(residual, residual_len, "MoE top-k combine residual")?;
+        require_f32_capacity(
+            expert_outputs,
+            expert_outputs_len,
+            "MoE top-k combine expert outputs",
+        )?;
+        require_f32_capacity(
+            expert_weights,
+            assignment_count,
+            "MoE top-k combine expert weights",
+        )?;
+
+        let output = empty_f32_buffer(device, output_len)?;
+        let token_count_buffer = u32_scalar_buffer(
+            device,
+            u32::try_from(token_count)
+                .map_err(|_| Error::backend("MoE top-k token count exceeds Metal u32 limit"))?,
+        )?;
+        let hidden_size_buffer = u32_scalar_buffer(
+            device,
+            u32::try_from(hidden_size)
+                .map_err(|_| Error::backend("MoE top-k hidden size exceeds Metal u32 limit"))?,
+        )?;
+        let top_k_buffer = u32_scalar_buffer(
+            device,
+            u32::try_from(top_k)
+                .map_err(|_| Error::backend("MoE top-k width exceeds Metal u32 limit"))?,
+        )?;
+
+        encode_1d(
+            command_buffer,
+            &self.topk_combine_residual_pipeline,
+            &[
+                shared,
+                residual,
+                expert_outputs,
+                expert_weights,
+                &output,
+                &token_count_buffer,
+                &hidden_size_buffer,
+                &top_k_buffer,
+            ],
+            output_len,
+        )?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_router_topk(
         &self,
         command_buffer: &CommandBufferRef,
@@ -393,6 +489,7 @@ impl MetalMoe {
             .ok_or_else(|| Error::backend("MoE router top-k output length overflow"))?;
         let expert_ids_buffer = empty_u32_buffer(device, output_len)?;
         let expert_weights_buffer = empty_f32_buffer(device, output_len)?;
+        let token_indices_buffer = empty_u32_buffer(device, output_len)?;
         let correction_bias_buffer = f32_buffer(device, correction_bias)?;
         let token_count_buffer = u32_scalar_buffer(
             device,
@@ -420,6 +517,7 @@ impl MetalMoe {
                 &correction_bias_buffer,
                 &expert_ids_buffer,
                 &expert_weights_buffer,
+                &token_indices_buffer,
                 &token_count_buffer,
                 &expert_count_buffer,
                 &top_k_buffer,
@@ -430,9 +528,9 @@ impl MetalMoe {
         )?;
 
         Ok(MetalRouterTopKBuffers {
+            token_indices: token_indices_buffer,
             expert_ids: expert_ids_buffer,
             expert_weights: expert_weights_buffer,
-            output_len,
         })
     }
 }
@@ -662,6 +760,32 @@ mod tests {
                 "router weight {index} differs: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn resident_router_exposes_ids_at_the_prefetch_boundary() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let logits = vec![0.0_f32, 1.0, -1.0, 2.0, 0.5];
+        let correction_bias = vec![0.0_f32; 5];
+        let logits_buffer = metal.batch_upload_f32(&logits).unwrap();
+        let routing = metal
+            .batched_moe_router_topk_resident(
+                &logits_buffer,
+                logits.len(),
+                &correction_bias,
+                1,
+                5,
+                2,
+                true,
+                1.0,
+            )
+            .unwrap();
+
+        let expert_ids = metal.batched_moe_router_expert_ids(&routing).unwrap();
+
+        assert_eq!(expert_ids, vec![3, 1]);
     }
 
     #[test]

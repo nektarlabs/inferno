@@ -634,8 +634,8 @@ impl<'a> LayerStack<'a> {
     /// Batched device-resident decode driver: uploads the embedding once,
     /// threads GPU-resident hidden states through every layer, and returns
     /// them still on the device so the output head can consume them without a
-    /// host round-trip. Per layer, the only synchronizations are the K/V
-    /// download for the cache append and the MoE router's top-k download.
+    /// host round-trip. MoE router IDs and weights remain device-resident; the
+    /// output-head argmax is the normal end-of-token synchronization point.
     ///
     /// Returns `Ok(None)` when any layer lacks a device path or a layer has no
     /// resident paged past KV; the caller falls back to the eager route.

@@ -414,8 +414,8 @@ mod tests {
     use common::{Device, Tensor};
     use config::Config;
     use gguf::{
-        GgmlType, GgufFile, GgufMetadataValueType, GGML_Q2_K_BLOCK_BYTES, GGUF_MAGIC,
-        GGUF_VERSION_V3,
+        GgmlType, GgufFile, GgufMetadataValueType, GGML_Q2_K_BLOCK_BYTES, GGML_Q8_0_BLOCK_BYTES,
+        GGUF_MAGIC, GGUF_VERSION_V3,
     };
 
     use super::*;
@@ -445,6 +445,29 @@ mod tests {
             output.report.output_projection_peak_decoded_f32_bytes,
             3 * 256 * 4
         );
+    }
+
+    #[test]
+    fn q8_output_head_device_decode_uses_native_argmax_when_metal_available() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_output_head_fixture(GgmlType::Q8_0);
+        let gguf = GgufFile::open(&path).unwrap();
+        let root = root_index(&gguf);
+        let head = OutputHead::open(&gguf, &tiny_config(256, 4), &root, &backend, 3).unwrap();
+        let hidden_states = F32Tensor::new(vec![1.0_f32; 256], [1, 1, 256]).unwrap();
+        let hidden_states = backend
+            .device_upload_f32_tensor(&hidden_states)
+            .unwrap()
+            .expect("native Metal device tensor");
+
+        let token = head
+            .decode_token_device(&hidden_states, &backend)
+            .unwrap()
+            .expect("native Q8_0 output-head token");
+
+        assert_eq!(token.token_id, 3);
     }
 
     #[test]
@@ -577,6 +600,13 @@ mod tests {
                 writer.bytes(&q2_k_block(0xe4, 3));
                 writer.bytes(&q2_k_block(0xe4, 4));
             }
+            GgmlType::Q8_0 => {
+                for row in 1_i8..=4 {
+                    for _ in 0..8 {
+                        writer.bytes(&q8_0_block(0x3c00, row));
+                    }
+                }
+            }
             other => panic!("unsupported fixture tensor type {other}"),
         }
     }
@@ -584,6 +614,7 @@ mod tests {
     fn quantized_payload_bytes(ty: GgmlType, rows: u64) -> u64 {
         match ty {
             GgmlType::Q2K => GGML_Q2_K_BLOCK_BYTES * rows,
+            GgmlType::Q8_0 => GGML_Q8_0_BLOCK_BYTES * rows * 8,
             other => panic!("unsupported fixture tensor type {other}"),
         }
     }
@@ -596,6 +627,13 @@ mod tests {
         block.extend(std::iter::repeat_n(quant_byte, 64));
         block.extend_from_slice(&0x3c00_u16.to_le_bytes());
         block.extend_from_slice(&0x3800_u16.to_le_bytes());
+        block
+    }
+
+    fn q8_0_block(d: u16, value: i8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(GGML_Q8_0_BLOCK_BYTES as usize);
+        block.extend_from_slice(&d.to_le_bytes());
+        block.extend(std::iter::repeat_n(value as u8, 32));
         block
     }
 
