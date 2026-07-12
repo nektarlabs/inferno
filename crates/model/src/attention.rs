@@ -194,6 +194,15 @@ enum DevicePastKvLayout {
 }
 
 impl<'a> HeadProjection<'a> {
+    fn q8_payload(&self, context: &str) -> Result<&'a [u8]> {
+        self.q8_payload_bytes.ok_or_else(|| {
+            Error::gguf(format!(
+                "{context} requires Q8_0 tensor {}, got {}",
+                self.tensor_ref.name, self.tensor_ref.ty
+            ))
+        })
+    }
+
     fn open_output_input_heads(
         gguf: &'a GgufFile,
         tensor_ref: &TensorRef,
@@ -1284,6 +1293,7 @@ impl<'a> Attention<'a> {
         self.indexer.is_some()
     }
 
+    #[cfg(test)]
     pub fn forward<B: Backend>(
         &self,
         config: &Config,
@@ -1291,15 +1301,6 @@ impl<'a> Attention<'a> {
         backend: &B,
     ) -> Result<AttentionOutput> {
         self.forward_with_past_kv(config, hidden_states, backend, None)
-    }
-
-    pub fn forward_tensors<B: Backend>(
-        &self,
-        config: &Config,
-        hidden_states: &Tensor,
-        backend: &B,
-    ) -> Result<AttentionTensors> {
-        self.forward_tensors_with_past_kv(config, hidden_states, backend, None)
     }
 
     pub fn forward_with_past_kv<B: Backend>(
@@ -1929,6 +1930,29 @@ impl<'a> Attention<'a> {
     fn mla_context_device<B: Backend>(
         &self,
         config: &Config,
+        q_no_rope: &DeviceValue,
+        q_rope: &DeviceValue,
+        current_latent_norm: &DeviceValue,
+        current_rope: &DeviceValue,
+        past_kv: &DevicePagedKvView,
+        backend: &B,
+    ) -> Result<Option<DeviceValue>> {
+        backend.q8_0_absorbed_mla_decode_device(
+            self.k_b.q8_payload("absorbed MLA K_b")?,
+            self.v_b.q8_payload("absorbed MLA V_b")?,
+            q_no_rope,
+            q_rope,
+            current_latent_norm,
+            current_rope,
+            past_kv,
+            config.qk_head_dim,
+            config.v_head_dim(),
+        )
+    }
+
+    fn mla_sequence_context_device<B: Backend>(
+        &self,
+        config: &Config,
         batch: usize,
         q_for_attention: &DeviceValue,
         current_k_for_attention: &DeviceValue,
@@ -1936,6 +1960,51 @@ impl<'a> Attention<'a> {
         past_kv: &DevicePagedKvView,
         backend: &B,
     ) -> Result<Option<DeviceValue>> {
+        let (past_k_for_attention, past_v_for_attention) =
+            crate::try_device!(self.mla_past_attention_device(config, batch, past_kv, backend));
+        backend.selected_sequence_attention_device(
+            q_for_attention,
+            &past_k_for_attention,
+            &past_v_for_attention,
+            current_k_for_attention,
+            current_v_for_attention,
+        )
+    }
+
+    fn merge_context_heads_device<B: Backend>(
+        &self,
+        config: &Config,
+        context_heads: &DeviceValue,
+        batch: usize,
+        tokens: usize,
+        backend: &B,
+    ) -> Result<Option<DeviceValue>> {
+        validate_exact_shape(
+            "attention context heads before output projection",
+            context_heads.dims(),
+            &[batch, config.attention_heads, tokens, config.v_head_dim()],
+        )?;
+        let merged_width = config
+            .attention_heads
+            .checked_mul(config.v_head_dim())
+            .ok_or_else(|| Error::model("attention merged head width overflow"))?;
+        if tokens == 1 {
+            return Ok(Some(context_heads.reshape(vec![
+                batch,
+                tokens,
+                merged_width,
+            ])?));
+        }
+        backend.merge_attention_heads_device(context_heads)
+    }
+
+    fn mla_past_attention_device<B: Backend>(
+        &self,
+        config: &Config,
+        batch: usize,
+        past_kv: &DevicePagedKvView,
+        backend: &B,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
         let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
         validate_exact_shape(
             "dense_mla_past_device_kv_shape",
@@ -1953,25 +2022,16 @@ impl<'a> Attention<'a> {
         let past_rope = past
             .v
             .reshape(vec![batch, past.selected_tokens, 1, config.qk_rope_dim])?;
-        let past_latent_norm =
-            crate::try_device!(self.kv_a_norm.forward_device(&past_latent, backend));
         let past_k_no_rope =
-            crate::try_device!(self.k_b.forward_heads_device(&past_latent_norm, backend));
-        let past_v_heads =
-            crate::try_device!(self.v_b.forward_heads_device(&past_latent_norm, backend));
+            crate::try_device!(self.k_b.forward_heads_device(&past_latent, backend));
+        let past_v_heads = crate::try_device!(self.v_b.forward_heads_device(&past_latent, backend));
         let past_k_heads =
             crate::try_device!(backend.combine_rope_tail_device(&past_k_no_rope, &past_rope));
         let past_k_for_attention =
             crate::try_device!(backend.heads_to_attention_layout_device(&past_k_heads));
         let past_v_for_attention =
             crate::try_device!(backend.heads_to_attention_layout_device(&past_v_heads));
-        backend.selected_decode_attention_device(
-            q_for_attention,
-            &past_k_for_attention,
-            &past_v_for_attention,
-            current_k_for_attention,
-            current_v_for_attention,
-        )
+        Ok(Some((past_k_for_attention, past_v_for_attention)))
     }
 
     pub(crate) fn forward_decode_device<B: Backend>(
@@ -1989,7 +2049,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens != 1 {
+        if tokens == 0 || tokens > 3 {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2001,16 +2061,13 @@ impl<'a> Attention<'a> {
         let past_layout =
             validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
         let past_tokens = past_kv.cached_tokens;
-
         let input_norm = crate::try_device!(profile::run_layer_stage(
             self.layer_index,
             "attention.input_norm",
             || self.input_norm.forward_device(hidden_states, backend),
         ));
-        let q_recombined = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.q_projection",
-            || {
+        let (q_no_rope, q_rope_after_rope, q_recombined) = crate::try_device!(
+            profile::run_layer_stage(self.layer_index, "attention.q_projection", || {
                 let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
                 let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
                 let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
@@ -2034,11 +2091,11 @@ impl<'a> Attention<'a> {
                 let q_recombined = crate::try_device!(
                     backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
                 );
-                Ok(Some(q_recombined))
-            },
-        ));
+                Ok(Some((q_no_rope, q_rope_after_rope, q_recombined)))
+            },)
+        );
 
-        let (kv_latent, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
+        let (kv_latent_norm, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
             profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
                 let kv_a_mqa =
                     crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
@@ -2062,7 +2119,7 @@ impl<'a> Attention<'a> {
                 let k_heads = crate::try_device!(
                     backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
                 );
-                Ok(Some((kv_latent, k_rope_after_rope, k_heads, v_heads)))
+                Ok(Some((kv_a_norm, k_rope_after_rope, k_heads, v_heads)))
             },)
         );
 
@@ -2088,7 +2145,7 @@ impl<'a> Attention<'a> {
                 current_v_for_attention.clone(),
             ),
             DevicePastKvLayout::MlaLatent => {
-                let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
+                let cache_k = kv_latent_norm.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
                 let cache_v = crate::try_device!(
                     backend.heads_to_attention_layout_device(&k_rope_after_rope)
                 );
@@ -2096,37 +2153,75 @@ impl<'a> Attention<'a> {
             }
         };
 
-        let context_heads = match past_layout {
-            DevicePastKvLayout::ExpandedHeads => crate::try_device!(profile::run_layer_stage(
-                self.layer_index,
-                "attention.dense_paged_decode",
-                || backend.paged_decode_attention_resident_device(
-                    &q_for_attention,
-                    &current_k_for_attention,
-                    &current_v_for_attention,
-                    past_kv,
-                ),
-            )),
-            DevicePastKvLayout::MlaLatent => crate::try_device!(profile::run_layer_stage(
+        let context_heads = match (past_layout, tokens) {
+            (DevicePastKvLayout::ExpandedHeads, 1) => {
+                crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.dense_paged_decode",
+                    || backend.paged_decode_attention_resident_device(
+                        &q_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                        past_kv,
+                    ),
+                ))
+            }
+            (DevicePastKvLayout::MlaLatent, 1) => crate::try_device!(profile::run_layer_stage(
                 self.layer_index,
                 "attention.dense_mla_decode",
-                || self.mla_context_device(
-                    config,
-                    batch,
-                    &q_for_attention,
-                    &current_k_for_attention,
-                    &current_v_for_attention,
-                    past_kv,
-                    backend,
-                ),
+                || {
+                    self.mla_context_device(
+                        config,
+                        &q_no_rope,
+                        &q_rope_after_rope,
+                        &kv_latent_norm,
+                        &k_rope_after_rope,
+                        past_kv,
+                        backend,
+                    )
+                },
+            )),
+            (DevicePastKvLayout::ExpandedHeads, _) => {
+                let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
+                crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.dense_sequence",
+                    || backend.selected_sequence_attention_device(
+                        &q_for_attention,
+                        &past.k,
+                        &past.v,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                    ),
+                ))
+            }
+            (DevicePastKvLayout::MlaLatent, _) => crate::try_device!(profile::run_layer_stage(
+                self.layer_index,
+                "attention.dense_mla_sequence",
+                || {
+                    self.mla_sequence_context_device(
+                        config,
+                        batch,
+                        &q_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
+                        past_kv,
+                        backend,
+                    )
+                },
             )),
         };
         let output_hidden_states = crate::try_device!(profile::run_layer_stage(
             self.layer_index,
             "attention.output_projection",
             || {
-                let merged_attention_output =
-                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+                let merged_attention_output = crate::try_device!(self.merge_context_heads_device(
+                    config,
+                    &context_heads,
+                    batch,
+                    tokens,
+                    backend,
+                ));
                 self.output.forward_device_add_residual(
                     &merged_attention_output,
                     hidden_states,
@@ -2157,7 +2252,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens != 1 {
+        if tokens == 0 || tokens > 3 {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2165,66 +2260,99 @@ impl<'a> Attention<'a> {
             dims,
             &[batch, tokens, config.hidden_size],
         )?;
+        let sparse_layer = self.layer_index >= config.dense_layers;
 
-        let input_norm = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.input_norm.seed_device",
-            || self.input_norm.forward_device(hidden_states, backend),
+        let input_norm = crate::try_device!(profile::run_sparse_token_device_stage(
+            sparse_layer,
+            profile::TokenProfileStage::SparseInputNorm,
+            backend,
+            || profile::run_layer_stage(
+                self.layer_index,
+                "attention.input_norm.seed_device",
+                || self.input_norm.forward_device(hidden_states, backend),
+            ),
         ));
-        let (kv_latent, k_rope_after_rope, v_heads) = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.kv_projection.seed_device",
+        let (kv_latent_norm, k_rope_after_rope, v_heads) =
+            crate::try_device!(profile::run_sparse_token_device_stage(
+                sparse_layer,
+                profile::TokenProfileStage::SparseKvProjection,
+                backend,
+                || profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.kv_projection.seed_device",
+                    || {
+                        let kv_a_mqa =
+                            crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                        let (kv_latent, k_rope_mqa) =
+                            crate::try_device!(backend.split_kv_mqa_device(
+                                &kv_a_mqa,
+                                self.kv_lora_rank,
+                                config.qk_rope_dim,
+                            ));
+                        let kv_a_norm =
+                            crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+                        let v_heads =
+                            crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                        let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                            &k_rope_mqa,
+                            config.qk_rope_dim,
+                            0,
+                            config.rope_theta as f32,
+                        ));
+                        Ok(Some((kv_a_norm, k_rope_after_rope, v_heads)))
+                    },
+                ),
+            ));
+
+        let (context_heads, cache_v) = crate::try_device!(profile::run_sparse_token_device_stage(
+            sparse_layer,
+            profile::TokenProfileStage::SparseCacheLayout,
+            backend,
             || {
-                let kv_a_mqa =
-                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
-                    &kv_a_mqa,
-                    self.kv_lora_rank,
-                    config.qk_rope_dim,
+                let context_heads = crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.single_token_context.seed_device",
+                    || backend.heads_to_attention_layout_device(&v_heads),
                 ));
-                let kv_a_norm =
-                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-                let v_heads =
-                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
-                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                    &k_rope_mqa,
-                    config.qk_rope_dim,
-                    0,
-                    config.rope_theta as f32,
-                ));
-                Ok(Some((kv_latent, k_rope_after_rope, v_heads)))
+                let cache_v = crate::try_device!(
+                    backend.heads_to_attention_layout_device(&k_rope_after_rope)
+                );
+                Ok(Some((context_heads, cache_v)))
             },
         ));
+        let cache_k = kv_latent_norm.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
 
-        let context_heads = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.single_token_context.seed_device",
-            || backend.heads_to_attention_layout_device(&v_heads),
-        ));
-        let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
-        let cache_v =
-            crate::try_device!(backend.heads_to_attention_layout_device(&k_rope_after_rope));
-
-        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.output_projection.seed_device",
-            || {
-                let merged_attention_output =
-                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
-                self.output.forward_device_add_residual(
-                    &merged_attention_output,
-                    hidden_states,
-                    backend,
-                )
-            },
+        let output_hidden_states = crate::try_device!(profile::run_sparse_token_device_stage(
+            sparse_layer,
+            profile::TokenProfileStage::SparseOutputProjection,
+            backend,
+            || profile::run_layer_stage(
+                self.layer_index,
+                "attention.output_projection.seed_device",
+                || {
+                    let merged_attention_output = crate::try_device!(self
+                        .merge_context_heads_device(
+                            config,
+                            &context_heads,
+                            batch,
+                            tokens,
+                            backend,
+                        ));
+                    self.output.forward_device_add_residual(
+                        &merged_attention_output,
+                        hidden_states,
+                        backend,
+                    )
+                },
+            ),
         ));
 
         let index_key = if let Some(indexer) = self.indexer.as_ref() {
-            Some(crate::try_device!(indexer.key_device(
-                config,
-                hidden_states,
-                0,
+            Some(crate::try_device!(profile::run_sparse_token_device_stage(
+                sparse_layer,
+                profile::TokenProfileStage::SparseDsaIndexer,
                 backend,
+                || indexer.key_device(config, hidden_states, 0, backend),
             )))
         } else {
             None
@@ -2262,7 +2390,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens != 1 {
+        if tokens == 0 || tokens > 3 {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2274,94 +2402,126 @@ impl<'a> Attention<'a> {
         let past_layout =
             validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
         let past_tokens = past_kv.cached_tokens;
+        let full_context = past_tokens
+            .checked_add(tokens)
+            .ok_or_else(|| Error::model("DSA decode key token count overflow"))?
+            <= config.dsa_index_topk;
+        let use_absorbed_mla =
+            past_layout == DevicePastKvLayout::MlaLatent && tokens == 1 && full_context;
 
-        let input_norm = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.input_norm",
-            || self.input_norm.forward_device(hidden_states, backend),
+        let input_norm = crate::try_device!(profile::run_token_device_stage(
+            profile::TokenProfileStage::SparseInputNorm,
+            backend,
+            || profile::run_layer_stage(self.layer_index, "attention.input_norm", || {
+                self.input_norm.forward_device(hidden_states, backend)
+            }),
         ));
-        let (q_recombined, q_resid) = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.q_projection",
-            || {
-                let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
-                let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
-                let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
-                let q_heads = q_b.reshape(vec![
-                    batch,
-                    tokens,
-                    config.attention_heads,
-                    config.qk_head_dim,
-                ])?;
-                let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
-                    &q_heads,
-                    config.qk_no_rope_dim,
-                    config.qk_rope_dim,
-                ));
-                let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                    &q_rope,
-                    config.qk_rope_dim,
-                    past_tokens,
-                    config.rope_theta as f32,
-                ));
-                let q_recombined = crate::try_device!(
-                    backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
-                );
-                Ok(Some((q_recombined, q_a_norm)))
-            },
-        ));
+        let (q_no_rope, q_rope_after_rope, q_recombined, q_resid) =
+            crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::SparseQProjection,
+                backend,
+                || profile::run_layer_stage(self.layer_index, "attention.q_projection", || {
+                    let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+                    let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
+                    let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
+                    let q_heads = q_b.reshape(vec![
+                        batch,
+                        tokens,
+                        config.attention_heads,
+                        config.qk_head_dim,
+                    ])?;
+                    let (q_no_rope, q_rope) = crate::try_device!(backend.split_rope_tail_device(
+                        &q_heads,
+                        config.qk_no_rope_dim,
+                        config.qk_rope_dim,
+                    ));
+                    let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                        &q_rope,
+                        config.qk_rope_dim,
+                        past_tokens,
+                        config.rope_theta as f32,
+                    ));
+                    let q_recombined = crate::try_device!(
+                        backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                    );
+                    Ok(Some((q_no_rope, q_rope_after_rope, q_recombined, q_a_norm)))
+                }),
+            ));
 
-        let (kv_latent, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
-            profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
-                let kv_a_mqa =
-                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
-                    &kv_a_mqa,
-                    self.kv_lora_rank,
-                    config.qk_rope_dim,
-                ));
-                let kv_a_norm =
-                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-                let k_no_rope =
-                    crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
-                let v_heads =
-                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
-                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                    &k_rope_mqa,
-                    config.qk_rope_dim,
-                    past_tokens,
-                    config.rope_theta as f32,
-                ));
-                let k_heads = crate::try_device!(
-                    backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
-                );
-                Ok(Some((kv_latent, k_rope_after_rope, k_heads, v_heads)))
-            },)
-        );
+        let (kv_latent_norm, k_rope_after_rope, k_heads, v_heads) =
+            crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::SparseKvProjection,
+                backend,
+                || profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
+                    let kv_a_mqa =
+                        crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                    let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
+                        &kv_a_mqa,
+                        self.kv_lora_rank,
+                        config.qk_rope_dim,
+                    ));
+                    let kv_a_norm =
+                        crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
+                    let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                        &k_rope_mqa,
+                        config.qk_rope_dim,
+                        past_tokens,
+                        config.rope_theta as f32,
+                    ));
+                    let (k_heads, v_heads) = if use_absorbed_mla {
+                        (None, None)
+                    } else {
+                        let k_no_rope =
+                            crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
+                        let v_heads =
+                            crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                        let k_heads = crate::try_device!(
+                            backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
+                        );
+                        (Some(k_heads), Some(v_heads))
+                    };
+                    Ok(Some((kv_a_norm, k_rope_after_rope, k_heads, v_heads)))
+                }),
+            ));
 
-        let (q_for_attention, current_k_for_attention, current_v_for_attention) = crate::try_device!(
-            profile::run_layer_stage(self.layer_index, "attention.cache_layout", || {
-                let q_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
-                let current_k_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
-                let current_v_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
-                Ok(Some((
-                    q_for_attention,
-                    current_k_for_attention,
-                    current_v_for_attention,
-                )))
-            },)
-        );
+        let (q_for_attention, current_k_for_attention, current_v_for_attention) =
+            crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::SparseCacheLayout,
+                backend,
+                || profile::run_layer_stage(self.layer_index, "attention.cache_layout", || {
+                    if use_absorbed_mla {
+                        return Ok(Some((None, None, None)));
+                    }
+                    let q_for_attention = Some(crate::try_device!(
+                        backend.heads_to_attention_layout_device(&q_recombined)
+                    ));
+                    let current_k_for_attention = Some(crate::try_device!(backend
+                        .heads_to_attention_layout_device(k_heads.as_ref().ok_or_else(|| {
+                            Error::model("expanded attention is missing current K heads")
+                        },)?)));
+                    let current_v_for_attention = Some(crate::try_device!(backend
+                        .heads_to_attention_layout_device(v_heads.as_ref().ok_or_else(|| {
+                            Error::model("expanded attention is missing current V heads")
+                        },)?)));
+                    Ok(Some((
+                        q_for_attention,
+                        current_k_for_attention,
+                        current_v_for_attention,
+                    )))
+                }),
+            ));
 
         let (k_for_cache, v_for_cache) = match past_layout {
             DevicePastKvLayout::ExpandedHeads => (
-                current_k_for_attention.clone(),
-                current_v_for_attention.clone(),
+                current_k_for_attention
+                    .clone()
+                    .ok_or_else(|| Error::model("expanded attention cache is missing current K"))?,
+                current_v_for_attention
+                    .clone()
+                    .ok_or_else(|| Error::model("expanded attention cache is missing current V"))?,
             ),
             DevicePastKvLayout::MlaLatent => {
-                let cache_k = kv_latent.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
+                let cache_k = kv_latent_norm.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
                 let cache_v = crate::try_device!(
                     backend.heads_to_attention_layout_device(&k_rope_after_rope)
                 );
@@ -2371,189 +2531,258 @@ impl<'a> Attention<'a> {
 
         let mut index_key = None;
         let mut next_shared_selection = None;
-        let full_context = past_tokens
-            .checked_add(1)
-            .ok_or_else(|| Error::model("DSA decode key token count overflow"))?
-            <= config.dsa_index_topk;
-        let selected_past_tokens = if let Some(indexer) = self.indexer.as_ref() {
-            if full_context {
-                index_key = Some(crate::try_device!(profile::run_layer_stage(
-                    self.layer_index,
-                    "dsa_indexer.current_key_device",
-                    || indexer.key_device(config, hidden_states, past_tokens, backend),
-                )));
-                Vec::new()
-            } else {
-                let cached_index_keys =
-                    index_keys_for_layer(self.layer_index)?.ok_or_else(|| {
-                        Error::model(format!(
-                            "DSA index keys missing for full sparse attention layer {}",
-                            self.layer_index
-                        ))
-                    })?;
-                let selection = crate::try_device!(profile::run_layer_stage(
-                    self.layer_index,
-                    "dsa_indexer.topk_device",
-                    || indexer.select_decode_topk_device(
-                        config,
-                        hidden_states,
-                        &q_resid,
-                        &cached_index_keys,
-                        past_tokens,
-                        backend,
-                    ),
-                ));
-                index_key = Some(selection.current_key_device);
-                next_shared_selection = Some(selection.token_indices.clone());
-                past_only_selected_indices(&selection.token_indices, past_tokens)?
-            }
-        } else if full_context {
-            Vec::new()
-        } else if let Some(shared_selection) = shared_selection {
-            past_only_selected_indices(shared_selection, past_tokens)?
-        } else {
-            return Err(Error::model(format!(
-                "DSA shared selection missing for sparse attention layer {}",
-                self.layer_index
-            )));
-        };
-
-        let context_heads = if past_tokens == 0 {
-            current_v_for_attention.clone()
-        } else if full_context {
-            match past_layout {
-                DevicePastKvLayout::ExpandedHeads => crate::try_device!(profile::run_layer_stage(
-                    self.layer_index,
-                    "attention.dense_paged_decode",
-                    || backend.paged_decode_attention_resident_device(
-                        &q_for_attention,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
-                        past_kv,
-                    ),
-                )),
-                DevicePastKvLayout::MlaLatent => crate::try_device!(profile::run_layer_stage(
-                    self.layer_index,
-                    "attention.full_context_mla_decode",
-                    || self.mla_context_device(
-                        config,
-                        batch,
-                        &q_for_attention,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
-                        past_kv,
-                        backend,
-                    ),
-                )),
-            }
-        } else {
-            let selected_kv = selected_kv_for_tokens(self.layer_index, &selected_past_tokens)?
-                .ok_or_else(|| {
-                    Error::cache(format!(
-                        "selected device KV missing for sparse attention layer {}",
+        if tokens > 1 && !full_context {
+            return Ok(None);
+        }
+        let selected_past_tokens = crate::try_device!(profile::run_token_device_stage(
+            profile::TokenProfileStage::SparseDsaIndexer,
+            backend,
+            || {
+                let selected_past_tokens = if let Some(indexer) = self.indexer.as_ref() {
+                    if full_context {
+                        index_key = Some(crate::try_device!(profile::run_layer_stage(
+                            self.layer_index,
+                            "dsa_indexer.current_key_device",
+                            || indexer.key_device(config, hidden_states, past_tokens, backend),
+                        )));
+                        Vec::new()
+                    } else {
+                        let cached_index_keys = index_keys_for_layer(self.layer_index)?
+                            .ok_or_else(|| {
+                                Error::model(format!(
+                                    "DSA index keys missing for full sparse attention layer {}",
+                                    self.layer_index
+                                ))
+                            })?;
+                        let selection = crate::try_device!(profile::run_layer_stage(
+                            self.layer_index,
+                            "dsa_indexer.topk_device",
+                            || indexer.select_decode_topk_device(
+                                config,
+                                hidden_states,
+                                &q_resid,
+                                &cached_index_keys,
+                                past_tokens,
+                                backend,
+                            ),
+                        ));
+                        index_key = Some(selection.current_key_device);
+                        next_shared_selection = Some(selection.token_indices.clone());
+                        past_only_selected_indices(&selection.token_indices, past_tokens)?
+                    }
+                } else if full_context {
+                    Vec::new()
+                } else if let Some(shared_selection) = shared_selection {
+                    past_only_selected_indices(shared_selection, past_tokens)?
+                } else {
+                    return Err(Error::model(format!(
+                        "DSA shared selection missing for sparse attention layer {}",
                         self.layer_index
-                    ))
-                })?;
-            selected_kv.validate()?;
-            match past_layout {
-                DevicePastKvLayout::ExpandedHeads => {
-                    validate_exact_shape(
-                        "sparse_selected_device_kv_shape",
-                        &[
-                            selected_kv.batch,
-                            selected_kv.attention_heads,
-                            selected_kv.key_head_dim,
-                            selected_kv.value_head_dim,
-                        ],
-                        &[
-                            batch,
-                            config.attention_heads,
-                            config.qk_head_dim,
-                            config.v_head_dim(),
-                        ],
+                    )));
+                };
+                Ok(Some(selected_past_tokens))
+            },
+        ));
+
+        let context_heads = crate::try_device!(profile::run_token_device_stage(
+            profile::TokenProfileStage::SparseContextAttention,
+            backend,
+            || {
+                let context_heads = if past_tokens == 0 && tokens == 1 {
+                    let (_, _, current_v) = require_expanded_attention_components(
+                        &q_for_attention,
+                        &current_k_for_attention,
+                        &current_v_for_attention,
                     )?;
-                    crate::try_device!(profile::run_layer_stage(
-                        self.layer_index,
-                        "attention.selected_decode",
-                        || backend.selected_decode_attention_device(
-                            &q_for_attention,
-                            &selected_kv.k,
-                            &selected_kv.v,
-                            &current_k_for_attention,
-                            &current_v_for_attention,
-                        ),
-                    ))
-                }
-                DevicePastKvLayout::MlaLatent => {
-                    validate_exact_shape(
-                        "sparse_selected_mla_device_kv_shape",
-                        &[
-                            selected_kv.batch,
-                            selected_kv.attention_heads,
-                            selected_kv.key_head_dim,
-                            selected_kv.value_head_dim,
-                        ],
-                        &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
-                    )?;
-                    let selected_tokens = selected_kv.selected_tokens;
-                    let context = crate::try_device!(profile::run_layer_stage(
-                        self.layer_index,
-                        "attention.selected_mla_decode",
-                        || {
-                            let selected_latent = selected_kv.k.reshape(vec![
-                                batch,
-                                selected_tokens,
-                                self.kv_lora_rank,
-                            ])?;
-                            let selected_rope = selected_kv.v.reshape(vec![
-                                batch,
-                                selected_tokens,
-                                1,
-                                config.qk_rope_dim,
-                            ])?;
-                            let selected_latent_norm = crate::try_device!(self
-                                .kv_a_norm
-                                .forward_device(&selected_latent, backend));
-                            let selected_k_no_rope = crate::try_device!(self
-                                .k_b
-                                .forward_heads_device(&selected_latent_norm, backend));
-                            let selected_v_heads = crate::try_device!(self
-                                .v_b
-                                .forward_heads_device(&selected_latent_norm, backend));
-                            let selected_k_heads = crate::try_device!(backend
-                                .combine_rope_tail_device(&selected_k_no_rope, &selected_rope,));
-                            let selected_k_for_attention = crate::try_device!(
-                                backend.heads_to_attention_layout_device(&selected_k_heads)
-                            );
-                            let selected_v_for_attention = crate::try_device!(
-                                backend.heads_to_attention_layout_device(&selected_v_heads)
-                            );
-                            backend.selected_decode_attention_device(
+                    current_v.clone()
+                } else if full_context {
+                    match (past_layout, tokens) {
+                        (DevicePastKvLayout::ExpandedHeads, 1) => {
+                            let (q, current_k, current_v) = require_expanded_attention_components(
                                 &q_for_attention,
-                                &selected_k_for_attention,
-                                &selected_v_for_attention,
                                 &current_k_for_attention,
                                 &current_v_for_attention,
-                            )
-                        },
-                    ));
-                    context
-                }
-            }
-        };
+                            )?;
+                            crate::try_device!(profile::run_layer_stage(
+                                self.layer_index,
+                                "attention.dense_paged_decode",
+                                || backend.paged_decode_attention_resident_device(
+                                    q, current_k, current_v, past_kv,
+                                ),
+                            ))
+                        }
+                        (DevicePastKvLayout::MlaLatent, 1) => {
+                            crate::try_device!(profile::run_layer_stage(
+                                self.layer_index,
+                                "attention.full_context_mla_decode",
+                                || self.mla_context_device(
+                                    config,
+                                    &q_no_rope,
+                                    &q_rope_after_rope,
+                                    &kv_latent_norm,
+                                    &k_rope_after_rope,
+                                    past_kv,
+                                    backend,
+                                ),
+                            ))
+                        }
+                        (DevicePastKvLayout::ExpandedHeads, _) => {
+                            let (q, current_k, current_v) = require_expanded_attention_components(
+                                &q_for_attention,
+                                &current_k_for_attention,
+                                &current_v_for_attention,
+                            )?;
+                            let past =
+                                crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
+                            crate::try_device!(profile::run_layer_stage(
+                                self.layer_index,
+                                "attention.full_context_sequence",
+                                || backend.selected_sequence_attention_device(
+                                    q, &past.k, &past.v, current_k, current_v,
+                                ),
+                            ))
+                        }
+                        (DevicePastKvLayout::MlaLatent, _) => {
+                            let (q, current_k, current_v) = require_expanded_attention_components(
+                                &q_for_attention,
+                                &current_k_for_attention,
+                                &current_v_for_attention,
+                            )?;
+                            crate::try_device!(profile::run_layer_stage(
+                                self.layer_index,
+                                "attention.full_context_mla_sequence",
+                                || self.mla_sequence_context_device(
+                                    config, batch, q, current_k, current_v, past_kv, backend,
+                                ),
+                            ))
+                        }
+                    }
+                } else {
+                    let selected_kv =
+                        selected_kv_for_tokens(self.layer_index, &selected_past_tokens)?
+                            .ok_or_else(|| {
+                                Error::cache(format!(
+                                    "selected device KV missing for sparse attention layer {}",
+                                    self.layer_index
+                                ))
+                            })?;
+                    selected_kv.validate()?;
+                    match past_layout {
+                        DevicePastKvLayout::ExpandedHeads => {
+                            let (q, current_k, current_v) = require_expanded_attention_components(
+                                &q_for_attention,
+                                &current_k_for_attention,
+                                &current_v_for_attention,
+                            )?;
+                            validate_exact_shape(
+                                "sparse_selected_device_kv_shape",
+                                &[
+                                    selected_kv.batch,
+                                    selected_kv.attention_heads,
+                                    selected_kv.key_head_dim,
+                                    selected_kv.value_head_dim,
+                                ],
+                                &[
+                                    batch,
+                                    config.attention_heads,
+                                    config.qk_head_dim,
+                                    config.v_head_dim(),
+                                ],
+                            )?;
+                            crate::try_device!(profile::run_layer_stage(
+                                self.layer_index,
+                                "attention.selected_decode",
+                                || backend.selected_decode_attention_device(
+                                    q,
+                                    &selected_kv.k,
+                                    &selected_kv.v,
+                                    current_k,
+                                    current_v,
+                                ),
+                            ))
+                        }
+                        DevicePastKvLayout::MlaLatent => {
+                            let (q, current_k, current_v) = require_expanded_attention_components(
+                                &q_for_attention,
+                                &current_k_for_attention,
+                                &current_v_for_attention,
+                            )?;
+                            validate_exact_shape(
+                                "sparse_selected_mla_device_kv_shape",
+                                &[
+                                    selected_kv.batch,
+                                    selected_kv.attention_heads,
+                                    selected_kv.key_head_dim,
+                                    selected_kv.value_head_dim,
+                                ],
+                                &[batch, 1, self.kv_lora_rank, config.qk_rope_dim],
+                            )?;
+                            let selected_tokens = selected_kv.selected_tokens;
+                            let context =
+                                crate::try_device!(profile::run_layer_stage(
+                                    self.layer_index,
+                                    "attention.selected_mla_decode",
+                                    || {
+                                        let selected_latent = selected_kv.k.reshape(vec![
+                                            batch,
+                                            selected_tokens,
+                                            self.kv_lora_rank,
+                                        ])?;
+                                        let selected_rope = selected_kv.v.reshape(vec![
+                                            batch,
+                                            selected_tokens,
+                                            1,
+                                            config.qk_rope_dim,
+                                        ])?;
+                                        let selected_k_no_rope = crate::try_device!(self
+                                            .k_b
+                                            .forward_heads_device(&selected_latent, backend));
+                                        let selected_v_heads = crate::try_device!(self
+                                            .v_b
+                                            .forward_heads_device(&selected_latent, backend));
+                                        let selected_k_heads = crate::try_device!(backend
+                                            .combine_rope_tail_device(
+                                                &selected_k_no_rope,
+                                                &selected_rope,
+                                            ));
+                                        let selected_k_for_attention = crate::try_device!(backend
+                                            .heads_to_attention_layout_device(&selected_k_heads));
+                                        let selected_v_for_attention = crate::try_device!(backend
+                                            .heads_to_attention_layout_device(&selected_v_heads));
+                                        backend.selected_decode_attention_device(
+                                            q,
+                                            &selected_k_for_attention,
+                                            &selected_v_for_attention,
+                                            current_k,
+                                            current_v,
+                                        )
+                                    },
+                                ));
+                            context
+                        }
+                    }
+                };
+                Ok(Some(context_heads))
+            },
+        ));
 
-        let output_hidden_states = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "attention.output_projection",
-            || {
-                let merged_attention_output =
-                    crate::try_device!(backend.merge_attention_heads_device(&context_heads));
+        let output_hidden_states = crate::try_device!(profile::run_token_device_stage(
+            profile::TokenProfileStage::SparseOutputProjection,
+            backend,
+            || profile::run_layer_stage(self.layer_index, "attention.output_projection", || {
+                let merged_attention_output = crate::try_device!(self.merge_context_heads_device(
+                    config,
+                    &context_heads,
+                    batch,
+                    tokens,
+                    backend,
+                ));
                 self.output.forward_device_add_residual(
                     &merged_attention_output,
                     hidden_states,
                     backend,
                 )
-            },
+            },),
         ));
 
         Ok(Some(SparseAttentionDeviceTensors {
@@ -2566,6 +2795,23 @@ impl<'a> Attention<'a> {
             next_shared_selection,
         }))
     }
+}
+
+fn require_expanded_attention_components<'a>(
+    q: &'a Option<DeviceValue>,
+    current_k: &'a Option<DeviceValue>,
+    current_v: &'a Option<DeviceValue>,
+) -> Result<(&'a DeviceValue, &'a DeviceValue, &'a DeviceValue)> {
+    Ok((
+        q.as_ref()
+            .ok_or_else(|| Error::model("expanded attention is missing Q"))?,
+        current_k
+            .as_ref()
+            .ok_or_else(|| Error::model("expanded attention is missing current K"))?,
+        current_v
+            .as_ref()
+            .ok_or_else(|| Error::model("expanded attention is missing current V"))?,
+    ))
 }
 
 fn past_only_selected_indices(token_indices: &[u32], past_tokens: usize) -> Result<Vec<u32>> {

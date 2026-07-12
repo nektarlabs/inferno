@@ -102,6 +102,7 @@ impl<'a> DenseBlock<'a> {
         &self.load_report
     }
 
+    #[cfg(test)]
     pub fn forward<B: Backend>(
         &self,
         config: &Config,
@@ -125,6 +126,7 @@ impl<'a> DenseBlock<'a> {
         self.forward_ffn(config, hidden_states, attention_output, backend)
     }
 
+    #[cfg(test)]
     pub fn forward_tensors<B: Backend>(
         &self,
         config: &Config,
@@ -263,8 +265,18 @@ impl<'a> DenseBlock<'a> {
     ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
         let attention_output =
             match profile::run_layer_stage(self.load_report.layer_index, "dense.attention", || {
-                self.attention
-                    .forward_decode_device(config, hidden_states, backend, past_kv)
+                profile::run_token_device_stage(
+                    profile::TokenProfileStage::DenseAttention,
+                    backend,
+                    || {
+                        self.attention.forward_decode_device(
+                            config,
+                            hidden_states,
+                            backend,
+                            past_kv,
+                        )
+                    },
+                )
             })? {
                 Some(output) => output,
                 None => {
@@ -304,8 +316,14 @@ impl<'a> DenseBlock<'a> {
     ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
         let attention_output =
             match profile::run_layer_stage(self.load_report.layer_index, "dense.attention", || {
-                self.attention
-                    .forward_seed_device(config, hidden_states, backend)
+                profile::run_token_device_stage(
+                    profile::TokenProfileStage::DenseAttention,
+                    backend,
+                    || {
+                        self.attention
+                            .forward_seed_device(config, hidden_states, backend)
+                    },
+                )
             })? {
                 Some(output) => output,
                 None => {

@@ -2,10 +2,17 @@
 
 //! GLM-5.2 production runtime orchestration.
 
+mod cache_budget;
 mod telemetry;
+
+pub use cache_budget::{
+    CacheBudgetAdjustment, CacheBudgetPlan, CacheBudgetSignals, CacheBudgetSpec, ContextTier,
+    DEFAULT_DYNAMIC_CACHE_BUDGET_BYTES,
+};
 
 use std::{
     cell::RefCell,
+    collections::HashSet,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -19,7 +26,7 @@ use std::{
 
 #[cfg(test)]
 use backend::BackendCapabilities;
-use backend::{Backend, DevicePagedKvView, DeviceSelectedKvView};
+use backend::{Backend, DevicePagedKvView, DeviceSelectedKvView, ExpertCacheMetrics};
 #[cfg(test)]
 use cache::LayeredPagedCacheAppendReport;
 use cache::{
@@ -33,9 +40,11 @@ use config::Config;
 use model::ModelGreedyOutput;
 use model::{
     set_layer_profile_context, LayerDeviceKvCacheTensors, LayerKvCacheTensors, Model,
-    ModelTokenSequenceOutput,
+    ModelDeviceTokenSequenceOutput,
 };
-use telemetry::{log_memory_snapshot, RuntimeKvMemoryBytes};
+use telemetry::{
+    capture_memory_snapshot, log_memory_snapshot, RuntimeKvMemoryBytes, RuntimeMemorySnapshot,
+};
 
 pub const DEFAULT_KV_PAGE_SIZE: usize = 128;
 pub const MAX_REFERENCE_PREFILL_ATTENTION_SCORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -46,6 +55,423 @@ const F32_BYTES: u64 = 4;
 const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
+const MTP_DRAFTS_PER_STEP: usize = 1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationOptions {
+    pub speculative_mtp: bool,
+    pub hot_kv_cache_budget_bytes: Option<usize>,
+    pub dynamic_cache_budget: Option<CacheBudgetSpec>,
+    pub profile_token_costs: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvCacheMetrics {
+    pub full_layer_lookups: u64,
+    pub full_layer_hits: u64,
+    pub full_layer_misses: u64,
+    pub selected_row_lookups: u64,
+    pub selected_row_hits: u64,
+    pub selected_row_misses: u64,
+    pub selected_rows: u64,
+    pub page_lookups: u64,
+    pub page_hits: u64,
+    pub page_misses: u64,
+    pub ssd_read_bytes: u64,
+    pub hot_bytes: u64,
+    pub cold_bytes: u64,
+    pub cached_tokens: u64,
+    pub read_nanoseconds: u64,
+    pub write_nanoseconds: u64,
+}
+
+impl KvCacheMetrics {
+    pub fn lookups(self) -> u64 {
+        self.page_lookups
+    }
+
+    pub fn hits(self) -> u64 {
+        self.page_hits
+    }
+
+    pub fn misses(self) -> u64 {
+        self.page_misses
+    }
+
+    pub fn hit_rate(self) -> f64 {
+        let lookups = self.lookups();
+        if lookups == 0 {
+            return 0.0;
+        }
+        self.hits() as f64 / lookups as f64
+    }
+
+    pub fn miss_rate(self) -> f64 {
+        let lookups = self.lookups();
+        if lookups == 0 {
+            return 0.0;
+        }
+        self.misses() as f64 / lookups as f64
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamingGenerationReport {
+    pub kv_cache: KvCacheMetrics,
+    pub cache_budget: Option<CacheBudgetRuntimeReport>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheBudgetRuntimeReport {
+    pub total_bytes: usize,
+    pub expert_slots_per_layer: usize,
+    pub expert_bytes: usize,
+    pub hot_kv_budget_bytes: usize,
+    pub all_layer_hot_bytes: usize,
+    pub all_layers_fit: bool,
+    pub rebalances: usize,
+    pub memory_pressure: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenCostReport {
+    pub step_index: usize,
+    pub prompt_prefill: bool,
+    pub token_id: u32,
+    pub dense_attention_nanoseconds: u64,
+    pub sparse_attention_nanoseconds: u64,
+    pub sparse_input_norm_nanoseconds: u64,
+    pub sparse_q_projection_nanoseconds: u64,
+    pub sparse_kv_projection_nanoseconds: u64,
+    pub sparse_cache_layout_nanoseconds: u64,
+    pub sparse_dsa_indexer_nanoseconds: u64,
+    pub sparse_context_attention_nanoseconds: u64,
+    pub sparse_output_projection_nanoseconds: u64,
+    pub moe_routing_nanoseconds: u64,
+    pub expert_cache_lookup_nanoseconds: u64,
+    pub expert_ssd_load_nanoseconds: u64,
+    pub q2_expert_matmul_gpu_nanoseconds: u64,
+    pub kv_cache_read_nanoseconds: u64,
+    pub kv_cache_write_nanoseconds: u64,
+    pub output_projection_nanoseconds: u64,
+    pub sampling_argmax_nanoseconds: u64,
+    pub total_token_nanoseconds: u64,
+    pub expert_lookups: u64,
+    pub expert_cache_hits: u64,
+    pub expert_cache_misses: u64,
+    pub kv_page_lookups: u64,
+    pub kv_page_hits: u64,
+    pub kv_page_misses: u64,
+    pub expert_ssd_read_bytes: u64,
+    pub kv_ssd_read_bytes: u64,
+}
+
+impl TokenCostReport {
+    pub fn expert_cache_hit_rate(self) -> f64 {
+        rate_u64(self.expert_cache_hits, self.expert_lookups)
+    }
+
+    pub fn kv_page_hit_rate(self) -> f64 {
+        rate_u64(self.kv_page_hits, self.kv_page_lookups)
+    }
+
+    pub fn ssd_read_bytes(self) -> u64 {
+        self.expert_ssd_read_bytes
+            .saturating_add(self.kv_ssd_read_bytes)
+    }
+
+    pub fn sparse_attention_accounted_nanoseconds(self) -> u64 {
+        self.sparse_input_norm_nanoseconds
+            .saturating_add(self.sparse_q_projection_nanoseconds)
+            .saturating_add(self.sparse_kv_projection_nanoseconds)
+            .saturating_add(self.sparse_cache_layout_nanoseconds)
+            .saturating_add(self.sparse_dsa_indexer_nanoseconds)
+            .saturating_add(self.sparse_context_attention_nanoseconds)
+            .saturating_add(self.sparse_output_projection_nanoseconds)
+    }
+
+    pub fn sparse_attention_unattributed_nanoseconds(self) -> u64 {
+        self.sparse_attention_nanoseconds
+            .saturating_sub(self.sparse_attention_accounted_nanoseconds())
+    }
+}
+
+struct TokenCostSnapshot {
+    started_at: Instant,
+    experts: ExpertCacheMetrics,
+    kv: KvCacheMetrics,
+}
+
+struct TokenCostProfileScope;
+
+impl Drop for TokenCostProfileScope {
+    fn drop(&mut self) {
+        model::disable_token_cost_profile();
+    }
+}
+
+impl TokenCostSnapshot {
+    fn capture<B: Backend>(
+        backend: &B,
+        device_cache: &Option<DevicePagedRuntimeCache>,
+    ) -> Result<Self> {
+        Ok(Self {
+            started_at: Instant::now(),
+            experts: backend.expert_cache_metrics()?,
+            kv: device_cache
+                .as_ref()
+                .map(DevicePagedRuntimeCache::cache_metrics)
+                .unwrap_or_default(),
+        })
+    }
+
+    fn finish<B: Backend>(
+        self,
+        step_index: usize,
+        prompt_prefill: bool,
+        token_id: u32,
+        backend: &B,
+        device_cache: &Option<DevicePagedRuntimeCache>,
+    ) -> Result<TokenCostReport> {
+        let experts = backend.expert_cache_metrics()?;
+        let kv = device_cache
+            .as_ref()
+            .map(DevicePagedRuntimeCache::cache_metrics)
+            .unwrap_or_default();
+        let model = model::take_token_cost_profile()?;
+        Ok(TokenCostReport {
+            step_index,
+            prompt_prefill,
+            token_id,
+            dense_attention_nanoseconds: model.dense_attention_nanoseconds,
+            sparse_attention_nanoseconds: model.sparse_attention_nanoseconds,
+            sparse_input_norm_nanoseconds: model.sparse_input_norm_nanoseconds,
+            sparse_q_projection_nanoseconds: model.sparse_q_projection_nanoseconds,
+            sparse_kv_projection_nanoseconds: model.sparse_kv_projection_nanoseconds,
+            sparse_cache_layout_nanoseconds: model.sparse_cache_layout_nanoseconds,
+            sparse_dsa_indexer_nanoseconds: model.sparse_dsa_indexer_nanoseconds,
+            sparse_context_attention_nanoseconds: model.sparse_context_attention_nanoseconds,
+            sparse_output_projection_nanoseconds: model.sparse_output_projection_nanoseconds,
+            moe_routing_nanoseconds: model.moe_routing_nanoseconds,
+            expert_cache_lookup_nanoseconds: experts
+                .lookup_nanoseconds
+                .saturating_sub(self.experts.lookup_nanoseconds),
+            expert_ssd_load_nanoseconds: experts
+                .ssd_load_nanoseconds
+                .saturating_sub(self.experts.ssd_load_nanoseconds),
+            q2_expert_matmul_gpu_nanoseconds: experts
+                .q2_matmul_gpu_nanoseconds
+                .saturating_sub(self.experts.q2_matmul_gpu_nanoseconds),
+            kv_cache_read_nanoseconds: kv.read_nanoseconds.saturating_sub(self.kv.read_nanoseconds),
+            kv_cache_write_nanoseconds: kv
+                .write_nanoseconds
+                .saturating_sub(self.kv.write_nanoseconds),
+            output_projection_nanoseconds: model.output_projection_nanoseconds,
+            sampling_argmax_nanoseconds: model.sampling_argmax_nanoseconds,
+            total_token_nanoseconds: elapsed_nanoseconds_u64(self.started_at.elapsed()),
+            expert_lookups: experts.lookups.saturating_sub(self.experts.lookups),
+            expert_cache_hits: experts.hits.saturating_sub(self.experts.hits),
+            expert_cache_misses: experts.misses.saturating_sub(self.experts.misses),
+            kv_page_lookups: kv.page_lookups.saturating_sub(self.kv.page_lookups),
+            kv_page_hits: kv.page_hits.saturating_sub(self.kv.page_hits),
+            kv_page_misses: kv.page_misses.saturating_sub(self.kv.page_misses),
+            expert_ssd_read_bytes: experts
+                .ssd_read_bytes
+                .saturating_sub(self.experts.ssd_read_bytes),
+            kv_ssd_read_bytes: kv.ssd_read_bytes.saturating_sub(self.kv.ssd_read_bytes),
+        })
+    }
+}
+
+fn log_token_cost(report: TokenCostReport) {
+    tracing::info!(
+        target: "inferno::token_cost",
+        step_index = report.step_index,
+        phase = if report.prompt_prefill { "prefill" } else { "decode" },
+        token_id = report.token_id,
+        dense_attention_ms = report.dense_attention_nanoseconds as f64 / 1_000_000.0,
+        sparse_attention_ms = report.sparse_attention_nanoseconds as f64 / 1_000_000.0,
+        sparse_input_norm_ms = report.sparse_input_norm_nanoseconds as f64 / 1_000_000.0,
+        sparse_q_projection_ms = report.sparse_q_projection_nanoseconds as f64 / 1_000_000.0,
+        sparse_kv_projection_ms = report.sparse_kv_projection_nanoseconds as f64 / 1_000_000.0,
+        sparse_cache_layout_ms = report.sparse_cache_layout_nanoseconds as f64 / 1_000_000.0,
+        sparse_dsa_indexer_ms = report.sparse_dsa_indexer_nanoseconds as f64 / 1_000_000.0,
+        sparse_context_attention_ms = report.sparse_context_attention_nanoseconds as f64 / 1_000_000.0,
+        sparse_output_projection_ms = report.sparse_output_projection_nanoseconds as f64 / 1_000_000.0,
+        sparse_unattributed_ms = report.sparse_attention_unattributed_nanoseconds() as f64 / 1_000_000.0,
+        moe_routing_ms = report.moe_routing_nanoseconds as f64 / 1_000_000.0,
+        expert_cache_lookup_ms = report.expert_cache_lookup_nanoseconds as f64 / 1_000_000.0,
+        expert_ssd_load_ms = report.expert_ssd_load_nanoseconds as f64 / 1_000_000.0,
+        q2_expert_matmul_gpu_ms = report.q2_expert_matmul_gpu_nanoseconds as f64 / 1_000_000.0,
+        kv_cache_read_ms = report.kv_cache_read_nanoseconds as f64 / 1_000_000.0,
+        kv_cache_write_ms = report.kv_cache_write_nanoseconds as f64 / 1_000_000.0,
+        output_projection_ms = report.output_projection_nanoseconds as f64 / 1_000_000.0,
+        sampling_argmax_ms = report.sampling_argmax_nanoseconds as f64 / 1_000_000.0,
+        total_token_ms = report.total_token_nanoseconds as f64 / 1_000_000.0,
+        expert_cache_hit_rate = report.expert_cache_hit_rate(),
+        kv_page_hit_rate = report.kv_page_hit_rate(),
+        ssd_read_bytes = report.ssd_read_bytes(),
+        ssd_read_mb = report.ssd_read_bytes() as f64 / 1_000_000.0,
+        expert_ssd_read_bytes = report.expert_ssd_read_bytes,
+        kv_ssd_read_bytes = report.kv_ssd_read_bytes,
+        expert_loads = report.expert_cache_misses,
+        expert_lookups = report.expert_lookups,
+        kv_page_lookups = report.kv_page_lookups,
+        profiling_sync = true,
+        timings_overlap = true,
+        "generated token cost breakdown"
+    );
+}
+
+const CACHE_SIGNAL_INTERVAL_TOKENS: usize = 8;
+const CACHE_MEMORY_INTERVAL_TOKENS: usize = 128;
+const CACHE_PRESSURE_FREE_BYTES: u64 = 512 * 1024 * 1024;
+const CACHE_PRESSURE_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const CACHE_PRESSURE_SWAP_BYTES: u64 = 1024 * 1024 * 1024;
+const CACHE_PRESSURE_SWAP_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
+
+struct CacheBudgetController {
+    spec: CacheBudgetSpec,
+    current: CacheBudgetPlan,
+    signals: CacheBudgetSignals,
+    last_signal_context: usize,
+    last_memory_context: Option<usize>,
+    last_expert_lookups: u64,
+    last_expert_hits: u64,
+    last_kv_lookups: u64,
+    last_kv_misses: u64,
+    baseline_swap_bytes: Option<u64>,
+    rebalances: usize,
+}
+
+impl CacheBudgetController {
+    fn new(spec: CacheBudgetSpec, context_len: usize) -> Result<Self> {
+        let current = spec.plan(context_len, CacheBudgetSignals::default())?;
+        Ok(Self {
+            spec,
+            current,
+            signals: CacheBudgetSignals::default(),
+            last_signal_context: context_len,
+            last_memory_context: None,
+            last_expert_lookups: 0,
+            last_expert_hits: 0,
+            last_kv_lookups: 0,
+            last_kv_misses: 0,
+            baseline_swap_bytes: None,
+            rebalances: 0,
+        })
+    }
+
+    fn maybe_rebalance<B: Backend>(
+        &mut self,
+        context_len: usize,
+        backend: &B,
+        cache: &mut DevicePagedRuntimeCache,
+    ) -> Result<()> {
+        let context_plan = self.spec.plan(context_len, self.signals)?;
+        let page_changed = context_plan.capacity_tokens != self.current.capacity_tokens;
+        let signal_due = context_len
+            >= self
+                .last_signal_context
+                .saturating_add(CACHE_SIGNAL_INTERVAL_TOKENS);
+        if !page_changed && !signal_due {
+            return Ok(());
+        }
+
+        if signal_due {
+            let experts = backend.expert_cache_metrics()?;
+            let kv = cache.cache_metrics();
+            self.signals.expert_lookups = experts.lookups.saturating_sub(self.last_expert_lookups);
+            self.signals.expert_hits = experts.hits.saturating_sub(self.last_expert_hits);
+            self.signals.kv_lookups = kv.lookups().saturating_sub(self.last_kv_lookups);
+            self.signals.kv_misses = kv.misses().saturating_sub(self.last_kv_misses);
+            self.last_expert_lookups = experts.lookups;
+            self.last_expert_hits = experts.hits;
+            self.last_kv_lookups = kv.lookups();
+            self.last_kv_misses = kv.misses();
+            self.last_signal_context = context_len;
+
+            let memory_due = self.last_memory_context.is_none_or(|last| {
+                context_len >= last.saturating_add(CACHE_MEMORY_INTERVAL_TOKENS)
+            });
+            if memory_due {
+                let memory = capture_memory_snapshot(backend, cache.runtime_kv_memory());
+                let baseline_swap = *self
+                    .baseline_swap_bytes
+                    .get_or_insert(memory.swap_used_bytes.unwrap_or(0));
+                self.signals.memory_pressure = memory_pressure(memory, baseline_swap);
+                self.last_memory_context = Some(context_len);
+            }
+        }
+
+        let next = self.spec.plan(context_len, self.signals)?;
+        if next.expert_slots_per_layer != self.current.expert_slots_per_layer {
+            backend.resize_expert_cache_slots_per_layer(next.expert_slots_per_layer)?;
+        }
+        if next.hot_kv_budget_bytes != self.current.hot_kv_budget_bytes {
+            cache.set_hot_all_layers_budget(next.hot_kv_budget_bytes)?;
+        }
+        if next.expert_slots_per_layer != self.current.expert_slots_per_layer
+            || next.hot_kv_budget_bytes != self.current.hot_kv_budget_bytes
+        {
+            self.rebalances = self.rebalances.saturating_add(1);
+            tracing::info!(
+                target: "inferno::cache_budget",
+                context_len,
+                tier = ?next.tier,
+                adjustment = ?next.adjustment,
+                expert_slots_per_layer = next.expert_slots_per_layer,
+                expert_cache_gb = next.expert_bytes as f64 / 1_000_000_000.0,
+                hot_kv_budget_gb = next.hot_kv_budget_bytes as f64 / 1_000_000_000.0,
+                all_layers_fit = next.all_layers_fit,
+                expert_hit_rate = rate_u64(self.signals.expert_hits, self.signals.expert_lookups),
+                kv_miss_rate = rate_u64(self.signals.kv_misses, self.signals.kv_lookups),
+                memory_pressure = self.signals.memory_pressure,
+                "rebalanced shared expert and hot KV cache budget"
+            );
+        }
+        self.current = next;
+        Ok(())
+    }
+
+    fn report(&self) -> CacheBudgetRuntimeReport {
+        CacheBudgetRuntimeReport {
+            total_bytes: self.spec.total_bytes,
+            expert_slots_per_layer: self.current.expert_slots_per_layer,
+            expert_bytes: self.current.expert_bytes,
+            hot_kv_budget_bytes: self.current.hot_kv_budget_bytes,
+            all_layer_hot_bytes: self.current.all_layer_hot_bytes,
+            all_layers_fit: self.current.all_layers_fit,
+            rebalances: self.rebalances,
+            memory_pressure: self.signals.memory_pressure,
+        }
+    }
+}
+
+fn memory_pressure(snapshot: RuntimeMemorySnapshot, baseline_swap_bytes: u64) -> bool {
+    let swap_used = snapshot.swap_used_bytes.unwrap_or(0);
+    let swap_growth = swap_used.saturating_sub(baseline_swap_bytes);
+    let swap_pressure =
+        swap_used >= CACHE_PRESSURE_SWAP_BYTES || swap_growth >= CACHE_PRESSURE_SWAP_GROWTH_BYTES;
+    let compressed_pressure = snapshot
+        .system_compressed_bytes
+        .is_some_and(|bytes| bytes >= CACHE_PRESSURE_COMPRESSED_BYTES);
+    let low_free_memory = snapshot
+        .system_free_bytes
+        .is_some_and(|bytes| bytes <= CACHE_PRESSURE_FREE_BYTES);
+    swap_pressure || (compressed_pressure && low_free_memory)
+}
+
+fn rate_u64(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    numerator as f64 / denominator as f64
+}
+
+fn elapsed_nanoseconds_u64(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsdKvBenchmarkConfig {
@@ -746,8 +1172,38 @@ pub fn run_generate_streaming_with_stop_tokens<B, F>(
     max_new_tokens: Option<usize>,
     page_size: usize,
     stop_token_ids: &[u32],
-    mut on_token: F,
+    on_token: F,
 ) -> Result<()>
+where
+    B: Backend,
+    F: FnMut(u32) -> Result<()>,
+{
+    run_generate_streaming_with_options(
+        model,
+        config,
+        backend,
+        prompt_token_ids,
+        max_new_tokens,
+        page_size,
+        stop_token_ids,
+        GenerationOptions::default(),
+        on_token,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_generate_streaming_with_options<B, F>(
+    model: &Model<'_>,
+    config: &Config,
+    backend: &B,
+    prompt_token_ids: &[u32],
+    max_new_tokens: Option<usize>,
+    page_size: usize,
+    stop_token_ids: &[u32],
+    options: GenerationOptions,
+    mut on_token: F,
+) -> Result<StreamingGenerationReport>
 where
     B: Backend,
     F: FnMut(u32) -> Result<()>,
@@ -755,7 +1211,7 @@ where
     let generate_started_at = Instant::now();
     let use_streaming_prefill = backend.capabilities().custom_kernels;
     let use_device_kv = use_streaming_prefill;
-    let mtp_available = use_streaming_prefill && !use_device_kv && model.has_mtp_head();
+    let mtp_available = options.speculative_mtp && use_device_kv && model.has_mtp_head();
     let prefill_strategy = if use_streaming_prefill {
         PrefillStrategy::Streaming
     } else {
@@ -769,6 +1225,33 @@ where
         prefill_strategy,
     )?;
     let use_mtp = should_enable_mtp(mtp_available, effective_max_new_tokens);
+    if options.profile_token_costs && use_mtp {
+        return Err(Error::runtime(
+            "per-token cost profiling cannot be combined with speculative MTP because one verification step can emit multiple tokens",
+        ));
+    }
+    let _token_cost_profile_scope = if options.profile_token_costs {
+        model::enable_token_cost_profile()?;
+        Some(TokenCostProfileScope)
+    } else {
+        None
+    };
+    let prefill_cost_snapshot = options
+        .profile_token_costs
+        .then(|| TokenCostSnapshot::capture(backend, &None))
+        .transpose()?;
+    let mut cache_budget_controller = options
+        .dynamic_cache_budget
+        .map(|spec| CacheBudgetController::new(spec, prompt_token_ids.len()))
+        .transpose()?;
+    if let Some(controller) = cache_budget_controller.as_ref() {
+        backend
+            .configure_expert_cache_slots_per_layer(controller.current.expert_slots_per_layer)?;
+    }
+    let initial_hot_kv_budget = cache_budget_controller
+        .as_ref()
+        .map(|controller| controller.current.hot_kv_budget_bytes)
+        .or(options.hot_kv_cache_budget_bytes);
     log_memory_snapshot(
         "generate.start",
         Some(0),
@@ -783,18 +1266,15 @@ where
     } else {
         prompt_token_ids
     };
-    let mut last_main_hidden = None;
+    let mut last_main_hidden_device = None;
     let mut device_seed_layer_kv_cache = None;
     let (mut prefill_token_id, prefill_layer_kv_cache) = if use_device_kv {
         let output = model
             .prefill_seed_device(config, seed_input_ids, backend)?
             .ok_or_else(|| Error::backend("native Metal seed prefill requires device path"))?;
+        last_main_hidden_device = Some(output.hidden_states);
         device_seed_layer_kv_cache = Some(output.layer_kv_cache);
         (output.token_id, Vec::new())
-    } else if use_mtp {
-        let output = model.prefill_next_token_with_hidden(config, seed_input_ids, backend)?;
-        last_main_hidden = Some(output.hidden_states.clone());
-        (output.token_id, output.layer_kv_cache)
     } else {
         let output = model.prefill_next_token(config, seed_input_ids, backend)?;
         (output.token_id, output.layer_kv_cache)
@@ -816,6 +1296,7 @@ where
             page_size,
             seed_layer_kv_cache,
             backend,
+            initial_hot_kv_budget,
         )?)
     } else {
         None
@@ -837,12 +1318,19 @@ where
         runtime_kv_memory(&device_kv_cache, &host_kv_cache),
     );
 
-    let mut mtp_cache = None;
+    let mut mtp_device_cache = None;
 
     if use_streaming_prefill && prompt_token_ids.len() > 1 {
         for (prefill_index, prompt_token_id) in prompt_token_ids.iter().copied().enumerate().skip(1)
         {
             if let Some(cache) = device_kv_cache.as_mut() {
+                if let Some(controller) = cache_budget_controller.as_mut() {
+                    controller.maybe_rebalance(
+                        cache.cached_tokens()?.saturating_add(1),
+                        backend,
+                        cache,
+                    )?;
+                }
                 cache.set_profile_step_index(prefill_index);
             }
             log_memory_snapshot(
@@ -852,36 +1340,34 @@ where
                 runtime_kv_memory(&device_kv_cache, &host_kv_cache),
             );
             if use_mtp {
-                if let Some(hidden) = last_main_hidden.as_ref() {
-                    let _ = draft_next_with_mtp(
+                if let Some(hidden) = last_main_hidden_device.as_ref() {
+                    let _ = run_mtp_device_draft(
                         model,
                         config,
                         backend,
                         hidden,
                         &[prompt_token_id],
-                        &mut mtp_cache,
+                        &mut mtp_device_cache,
                         page_size,
+                        options.hot_kv_cache_budget_bytes,
+                        true,
                     )?;
                 }
-                let cache = host_kv_cache
-                    .as_mut()
-                    .ok_or_else(|| Error::runtime("host KV cache is not initialized"))?;
-                let output = run_cached_token_sequence_without_append(
+                let output = run_cached_token_step(
                     model,
                     config,
                     backend,
                     &[prompt_token_id],
-                    cache,
+                    &mut device_kv_cache,
+                    &mut host_kv_cache,
                     prefill_index,
                     "prefill.decode",
                     "prefill.decode.model",
+                    "prefill.decode.after_model",
+                    "prefill.decode.cache_append",
                 )?;
-                append_layer_kv_cache_token_range(cache, &output.layer_kv_cache, 0, 1)?;
-                prefill_token_id = *output
-                    .token_ids
-                    .first()
-                    .ok_or_else(|| Error::runtime("prefill MTP target produced no token"))?;
-                last_main_hidden = Some(output.hidden_states);
+                prefill_token_id = output.token_id;
+                last_main_hidden_device = output.device_hidden_states;
             } else {
                 prefill_token_id = run_cached_token_step(
                     model,
@@ -895,7 +1381,8 @@ where
                     "prefill.decode.model",
                     "prefill.decode.after_model",
                     "prefill.decode.cache_append",
-                )?;
+                )?
+                .token_id;
             }
             log_memory_snapshot(
                 "prefill.decode.after_cache_append",
@@ -907,6 +1394,9 @@ where
     }
 
     let mut generated_token_count = 1_usize;
+    if let Some(snapshot) = prefill_cost_snapshot {
+        log_token_cost(snapshot.finish(0, true, prefill_token_id, backend, &device_kv_cache)?);
+    }
     on_token(prefill_token_id)?;
     if contains_stop_token(prefill_token_id, stop_token_ids) {
         log_memory_snapshot(
@@ -916,19 +1406,25 @@ where
             runtime_kv_memory(&device_kv_cache, &host_kv_cache),
         );
         record_q2_runtime_stage(0, None, "generate.total", generate_started_at.elapsed());
-        return Ok(());
+        return Ok(streaming_generation_report(
+            &device_kv_cache,
+            &host_kv_cache,
+            cache_budget_controller.as_ref(),
+        ));
     }
 
-    let mut pending_mtp_draft = if use_mtp {
-        match last_main_hidden.as_ref() {
-            Some(hidden) => draft_next_with_mtp(
+    let mut pending_mtp_drafts = if use_mtp {
+        match last_main_hidden_device.as_ref() {
+            Some(hidden) => build_pending_mtp_drafts(
                 model,
                 config,
                 backend,
                 hidden,
                 &[prefill_token_id],
-                &mut mtp_cache,
+                &mut mtp_device_cache,
                 page_size,
+                options.hot_kv_cache_budget_bytes,
+                effective_max_new_tokens.saturating_sub(generated_token_count),
             )?,
             None => None,
         }
@@ -938,10 +1434,21 @@ where
 
     let mut next_input_token_id = prefill_token_id;
     for step_index in 1..effective_max_new_tokens {
+        let token_cost_snapshot = options
+            .profile_token_costs
+            .then(|| TokenCostSnapshot::capture(backend, &device_kv_cache))
+            .transpose()?;
         if max_new_tokens.is_none() && prefill_strategy == PrefillStrategy::Dense {
             validate_reference_memory_bounds(config, prompt_token_ids.len())?;
         }
         if let Some(cache) = device_kv_cache.as_mut() {
+            if let Some(controller) = cache_budget_controller.as_mut() {
+                controller.maybe_rebalance(
+                    cache.cached_tokens()?.saturating_add(1),
+                    backend,
+                    cache,
+                )?;
+            }
             cache.set_profile_step_index(step_index);
         }
         if let Some(cache) = host_kv_cache.as_mut() {
@@ -954,17 +1461,16 @@ where
             runtime_kv_memory(&device_kv_cache, &host_kv_cache),
         );
         if use_mtp {
-            let cache = host_kv_cache
+            let cache = device_kv_cache
                 .as_mut()
-                .ok_or_else(|| Error::runtime("host KV cache is not initialized"))?;
+                .ok_or_else(|| Error::runtime("device KV cache is not initialized"))?;
             let remaining_tokens = effective_max_new_tokens.saturating_sub(generated_token_count);
             let mut input_ids = vec![next_input_token_id];
-            if remaining_tokens >= 2 {
-                if let Some(draft) = pending_mtp_draft {
-                    input_ids.push(draft);
-                }
+            if let Some(pending) = pending_mtp_drafts.take() {
+                let draft_limit = mtp_draft_count(remaining_tokens);
+                input_ids.extend(pending.token_ids.into_iter().take(draft_limit));
             }
-            let output = run_cached_token_sequence_without_append(
+            let output = run_cached_device_token_sequence_without_append(
                 model,
                 config,
                 backend,
@@ -974,36 +1480,46 @@ where
                 "decode",
                 "decode.model",
             )?;
-            let mut accepted_input_rows = 1_usize;
-            let mut emitted = Vec::with_capacity(2);
-            if input_ids.len() == 2 {
-                let draft = input_ids[1];
-                let verified = output.token_ids.first().copied().ok_or_else(|| {
-                    Error::runtime("MTP verification target produced no first token")
-                })?;
-                if verified == draft {
-                    accepted_input_rows = 2;
-                    emitted.push(draft);
-                    if let Some(bonus) = output.token_ids.get(1).copied() {
-                        emitted.push(bonus);
-                    }
-                } else {
-                    emitted.push(verified);
-                }
-            } else {
-                emitted.push(
-                    output
-                        .token_ids
-                        .first()
-                        .copied()
-                        .ok_or_else(|| Error::runtime("decode target produced no token"))?,
+            validate_exact_shape(
+                "MTP target output row count",
+                &[output.token_ids.len(), output.token_scores.len()],
+                &[input_ids.len(), input_ids.len()],
+            )?;
+            let draft_count = input_ids.len() - 1;
+            let mut accepted_drafts = 0_usize;
+            let mut accepted_eos = false;
+            for draft_index in 0..draft_count {
+                let draft = input_ids[draft_index + 1];
+                let verified = output.token_ids[draft_index];
+                let accepted = verified == draft;
+                tracing::debug!(
+                    target: "inferno::mtp",
+                    step_index,
+                    draft_index,
+                    draft_token_id = draft,
+                    verified_token_id = verified,
+                    accepted,
+                    "verified speculative MTP token"
                 );
+                if !accepted {
+                    break;
+                }
+                accepted_drafts += 1;
+                if contains_stop_token(draft, stop_token_ids) {
+                    accepted_eos = true;
+                    break;
+                }
             }
-            append_layer_kv_cache_token_range(
-                cache,
+            let accepted_input_rows = 1 + accepted_drafts;
+            let mut emitted = input_ids[1..accepted_input_rows].to_vec();
+            if !accepted_eos {
+                emitted.push(output.token_ids[accepted_drafts]);
+            }
+            cache.append_decode_prefix(
                 &output.layer_kv_cache,
-                0,
+                input_ids.len(),
                 accepted_input_rows,
+                backend,
             )?;
 
             let mut stopped = false;
@@ -1031,25 +1547,20 @@ where
                 break;
             }
 
-            let accepted_hidden = slice_index_token_range(
-                "mtp_accepted_hidden",
-                &output.hidden_states,
-                0,
-                accepted_input_rows,
-            )?;
-            let accepted_next_tokens = if accepted_input_rows == 2 {
-                vec![input_ids[1], next_input_token_id]
-            } else {
-                vec![next_input_token_id]
-            };
-            pending_mtp_draft = draft_next_with_mtp(
+            let accepted_hidden =
+                slice_device_token_prefix(backend, &output.hidden_states, accepted_input_rows)?;
+            let mut accepted_next_tokens = input_ids[1..accepted_input_rows].to_vec();
+            accepted_next_tokens.push(next_input_token_id);
+            pending_mtp_drafts = build_pending_mtp_drafts(
                 model,
                 config,
                 backend,
                 &accepted_hidden,
                 &accepted_next_tokens,
-                &mut mtp_cache,
+                &mut mtp_device_cache,
                 page_size,
+                options.hot_kv_cache_budget_bytes,
+                effective_max_new_tokens.saturating_sub(generated_token_count),
             )?;
             log_memory_snapshot(
                 "decode.after_cache_append",
@@ -1072,13 +1583,23 @@ where
             "decode.model",
             "decode.after_model",
             "decode.cache_append",
-        )?;
+        )?
+        .token_id;
         log_memory_snapshot(
             "decode.after_cache_append",
             Some(step_index),
             backend,
             runtime_kv_memory(&device_kv_cache, &host_kv_cache),
         );
+        if let Some(snapshot) = token_cost_snapshot {
+            log_token_cost(snapshot.finish(
+                step_index,
+                false,
+                token_id,
+                backend,
+                &device_kv_cache,
+            )?);
+        }
 
         generated_token_count = generated_token_count
             .checked_add(1)
@@ -1097,7 +1618,17 @@ where
         runtime_kv_memory(&device_kv_cache, &host_kv_cache),
     );
     record_q2_runtime_stage(0, None, "generate.total", generate_started_at.elapsed());
-    Ok(())
+    Ok(streaming_generation_report(
+        &device_kv_cache,
+        &host_kv_cache,
+        cache_budget_controller.as_ref(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+struct CachedTokenStepOutput {
+    token_id: u32,
+    device_hidden_states: Option<backend::DeviceValue>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1113,7 +1644,7 @@ fn run_cached_token_step<B: Backend>(
     model_stage: &'static str,
     after_model_memory_stage: &'static str,
     cache_stage: &'static str,
-) -> Result<u32> {
+) -> Result<CachedTokenStepOutput> {
     let decode_started_at = Instant::now();
     set_layer_profile_context(step_index, profile_context)?;
     if let Some(cache) = device_kv_cache.as_mut() {
@@ -1158,7 +1689,10 @@ fn run_cached_token_step<B: Backend>(
             .borrow_mut()
             .append_decode(&decode_output.layer_kv_cache, backend)?;
         record_q2_runtime_stage(step_index, None, cache_stage, cache_started_at.elapsed());
-        Ok(decode_output.token_id)
+        Ok(CachedTokenStepOutput {
+            token_id: decode_output.token_id,
+            device_hidden_states: Some(decode_output.hidden_states),
+        })
     } else {
         let cache = host_kv_cache
             .as_mut()
@@ -1187,95 +1721,190 @@ fn run_cached_token_step<B: Backend>(
             .borrow_mut()
             .append_decode(&decode_output.layer_kv_cache)?;
         record_q2_runtime_stage(step_index, None, cache_stage, cache_started_at.elapsed());
-        Ok(decode_output.token_id)
+        Ok(CachedTokenStepOutput {
+            token_id: decode_output.token_id,
+            device_hidden_states: None,
+        })
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_cached_token_sequence_without_append<B: Backend>(
+fn run_cached_device_token_sequence_without_append<B: Backend>(
     model: &Model<'_>,
     config: &Config,
     backend: &B,
     input_token_ids: &[u32],
-    host_kv_cache: &mut PagedRuntimeCache,
+    device_kv_cache: &mut DevicePagedRuntimeCache,
     step_index: usize,
     profile_context: &'static str,
     model_stage: &'static str,
-) -> Result<ModelTokenSequenceOutput> {
+) -> Result<ModelDeviceTokenSequenceOutput> {
     let decode_started_at = Instant::now();
     set_layer_profile_context(step_index, profile_context)?;
-    let cache_cell = RefCell::new(host_kv_cache);
-    let output = model.decode_token_sequence_with_sparse_past_kv_provider(
-        config,
-        input_token_ids,
-        backend,
-        |layer_index| cache_cell.borrow().past_kv_for_layer(layer_index),
-        |layer_index| {
-            cache_cell
-                .borrow_mut()
-                .dsa_index_keys_for_layer(layer_index)
-        },
-    )?;
+    let cache_cell = RefCell::new(device_kv_cache);
+    let output = model
+        .decode_token_sequence_with_device_paged_kv_provider(
+            config,
+            input_token_ids,
+            backend,
+            |layer_index| {
+                cache_cell
+                    .borrow_mut()
+                    .device_paged_kv_for_layer(layer_index, backend)
+            },
+            |layer_index, token_indices| {
+                cache_cell.borrow_mut().selected_device_kv_for_layer(
+                    layer_index,
+                    token_indices,
+                    backend,
+                )
+            },
+            |layer_index| {
+                cache_cell
+                    .borrow_mut()
+                    .dsa_index_keys_for_layer_device(layer_index, backend)
+            },
+        )?
+        .ok_or_else(|| {
+            Error::backend("native Metal speculative verification requires the two-row device path")
+        })?;
     record_q2_runtime_stage(step_index, None, model_stage, decode_started_at.elapsed());
     Ok(output)
 }
 
-fn draft_next_with_mtp<B: Backend>(
+struct PendingMtpDrafts {
+    token_ids: Vec<u32>,
+}
+
+struct MtpDeviceDraftState {
+    token_id: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mtp_device_draft<B: Backend>(
     model: &Model<'_>,
     config: &Config,
     backend: &B,
-    main_hidden_states: &F32Tensor,
+    main_hidden_states: &backend::DeviceValue,
     next_token_ids: &[u32],
-    mtp_cache: &mut Option<PagedRuntimeCache>,
+    mtp_cache: &mut Option<DevicePagedRuntimeCache>,
     page_size: usize,
-) -> Result<Option<u32>> {
+    hot_kv_cache_budget_bytes: Option<usize>,
+    commit_cache: bool,
+) -> Result<Option<MtpDeviceDraftState>> {
     if !model.has_mtp_head() || next_token_ids.is_empty() {
         return Ok(None);
     }
     let draft = match mtp_cache.as_mut() {
         Some(cache) => {
             let cache_cell = RefCell::new(cache);
-            let past_kv = cache_cell.borrow().past_kv_for_layer(config.num_layers)?;
-            let index_keys = cache_cell
+            let past_kv = cache_cell
                 .borrow_mut()
-                .dsa_index_keys_for_layer(config.num_layers)?;
-            model.draft_next_token_with_mtp(
+                .device_paged_kv_for_layer(config.num_layers, backend)?;
+            model.draft_next_token_with_mtp_device(
                 config,
                 main_hidden_states,
                 next_token_ids,
                 backend,
-                past_kv
-                    .as_ref()
-                    .map(|(cache_k, cache_v)| (cache_k, cache_v)),
-                index_keys.as_ref(),
+                past_kv.as_ref(),
+                |layer_index, token_indices| {
+                    cache_cell.borrow_mut().selected_device_kv_for_layer(
+                        layer_index,
+                        token_indices,
+                        backend,
+                    )
+                },
+                |layer_index| {
+                    cache_cell
+                        .borrow_mut()
+                        .dsa_index_keys_for_layer_device(layer_index, backend)
+                },
             )?
         }
-        None => model.draft_next_token_with_mtp(
+        None => model.draft_next_token_with_mtp_device(
             config,
             main_hidden_states,
             next_token_ids,
             backend,
             None,
-            None,
+            |_layer_index, _token_indices| Ok(None),
+            |_layer_index| Ok(None),
         )?,
     };
     let Some(draft) = draft else {
         return Ok(None);
     };
-    let token_id = draft.token_id;
-    append_or_init_mtp_cache(
+    if commit_cache {
+        match mtp_cache.as_mut() {
+            Some(cache) => cache.append_decode_prefix(
+                &[draft.layer_kv_cache],
+                next_token_ids.len(),
+                next_token_ids.len(),
+                backend,
+            )?,
+            None => {
+                validate_exact_shape(
+                    "device MTP initial token count",
+                    &[next_token_ids.len()],
+                    &[1],
+                )?;
+                *mtp_cache = Some(DevicePagedRuntimeCache::new_from_device_seed(
+                    model.max_context(),
+                    page_size,
+                    &[draft.layer_kv_cache],
+                    backend,
+                    hot_kv_cache_budget_bytes,
+                )?);
+            }
+        }
+    }
+    Ok(Some(MtpDeviceDraftState {
+        token_id: draft.token_id,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pending_mtp_drafts<B: Backend>(
+    model: &Model<'_>,
+    config: &Config,
+    backend: &B,
+    main_hidden_states: &backend::DeviceValue,
+    next_token_ids: &[u32],
+    mtp_cache: &mut Option<DevicePagedRuntimeCache>,
+    page_size: usize,
+    hot_kv_cache_budget_bytes: Option<usize>,
+    remaining_tokens: usize,
+) -> Result<Option<PendingMtpDrafts>> {
+    let draft_count = mtp_draft_count(remaining_tokens);
+    if draft_count == 0 {
+        return Ok(None);
+    }
+    let Some(first) = run_mtp_device_draft(
+        model,
+        config,
+        backend,
+        main_hidden_states,
+        next_token_ids,
         mtp_cache,
-        model.max_context(),
         page_size,
-        draft.layer_kv_cache,
-    )?;
-    Ok(Some(token_id))
+        hot_kv_cache_budget_bytes,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PendingMtpDrafts {
+        token_ids: vec![first.token_id],
+    }))
 }
 
 fn should_enable_mtp(mtp_available: bool, effective_max_new_tokens: usize) -> bool {
     // The prefill pass already emits the first generated token. MTP only helps
     // when decode has room to verify a draft and emit at least one more token.
     mtp_available && effective_max_new_tokens > 2
+}
+
+fn mtp_draft_count(remaining_tokens: usize) -> usize {
+    remaining_tokens.saturating_sub(1).min(MTP_DRAFTS_PER_STEP)
 }
 
 #[cfg(test)]
@@ -1677,6 +2306,28 @@ fn runtime_kv_memory(
     RuntimeKvMemoryBytes::default()
 }
 
+fn streaming_generation_report(
+    device: &Option<DevicePagedRuntimeCache>,
+    host: &Option<PagedRuntimeCache>,
+    budget: Option<&CacheBudgetController>,
+) -> StreamingGenerationReport {
+    if let Some(device) = device.as_ref() {
+        return StreamingGenerationReport {
+            kv_cache: device.cache_metrics(),
+            cache_budget: budget.map(CacheBudgetController::report),
+        };
+    }
+    let memory = runtime_kv_memory(device, host);
+    StreamingGenerationReport {
+        kv_cache: KvCacheMetrics {
+            hot_bytes: memory.hot_bytes.unwrap_or(0),
+            cold_bytes: memory.cold_bytes.unwrap_or(0),
+            ..KvCacheMetrics::default()
+        },
+        cache_budget: budget.map(CacheBudgetController::report),
+    }
+}
+
 struct PagedRuntimeCache {
     storage: LayeredPagedKvCache,
     dsa_index: Option<LayeredDsaIndexBlockStore>,
@@ -1874,6 +2525,7 @@ struct DevicePagedRuntimeCache {
     cached_tokens: usize,
     profile_step_index: usize,
     policy: ColdKvRuntimePolicy,
+    metrics: KvCacheMetrics,
 }
 
 struct ColdDeviceLayer {
@@ -1897,13 +2549,16 @@ struct ColdKvRuntimePolicy {
 const HOT_ALL_LAYERS_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 impl ColdKvRuntimePolicy {
-    fn new(block_tokens: usize) -> Result<Self> {
+    fn new(block_tokens: usize, hot_all_layers_budget_bytes: usize) -> Result<Self> {
         if block_tokens == 0 {
             return Err(Error::cache("cold KV block_tokens must be positive"));
         }
+        if hot_all_layers_budget_bytes == 0 {
+            return Err(Error::cache("hot KV cache budget must be positive"));
+        }
         Ok(Self {
             block_tokens,
-            hot_all_layers_budget_bytes: HOT_ALL_LAYERS_BUDGET_BYTES,
+            hot_all_layers_budget_bytes,
         })
     }
 }
@@ -1935,9 +2590,13 @@ impl DevicePagedRuntimeCache {
         page_size: usize,
         layer_kv_cache: &[LayerDeviceKvCacheTensors],
         backend: &B,
+        hot_kv_cache_budget_bytes: Option<usize>,
     ) -> Result<Self> {
         let spec = device_cache_spec(max_context, page_size, layer_kv_cache)?;
-        let policy = ColdKvRuntimePolicy::new(page_size)?;
+        let policy = ColdKvRuntimePolicy::new(
+            page_size,
+            hot_kv_cache_budget_bytes.unwrap_or(HOT_ALL_LAYERS_BUDGET_BYTES),
+        )?;
         let cold_spec = ColdKvStoreSpec {
             batch: spec.batch,
             attention_heads: spec.attention_heads,
@@ -1974,6 +2633,7 @@ impl DevicePagedRuntimeCache {
             cached_tokens: 0,
             profile_step_index: 0,
             policy,
+            metrics: KvCacheMetrics::default(),
         };
         cache.initialize_hot_layers(backend, 1)?;
         cache.append_decode(layer_kv_cache, backend)?;
@@ -2011,11 +2671,65 @@ impl DevicePagedRuntimeCache {
         }
     }
 
+    fn cache_metrics(&self) -> KvCacheMetrics {
+        let memory = self.runtime_kv_memory();
+        let dsa_index_read_bytes = self
+            .dsa_index
+            .as_ref()
+            .map(LayeredDsaIndexBlockStore::read_bytes)
+            .unwrap_or(0);
+        KvCacheMetrics {
+            ssd_read_bytes: self
+                .cold
+                .store()
+                .read_bytes()
+                .saturating_add(dsa_index_read_bytes),
+            hot_bytes: memory.hot_bytes.unwrap_or(0),
+            cold_bytes: memory.cold_bytes.unwrap_or(0),
+            cached_tokens: u64::try_from(self.cached_tokens).unwrap_or(u64::MAX),
+            ..self.metrics
+        }
+    }
+
+    fn set_hot_all_layers_budget(&mut self, budget_bytes: usize) -> Result<()> {
+        if budget_bytes == 0 {
+            return Err(Error::cache("hot KV cache budget must be positive"));
+        }
+        self.policy.hot_all_layers_budget_bytes = budget_bytes;
+        if !self.hot_layers.is_empty() {
+            let capacity_tokens = self
+                .hot_layers
+                .first()
+                .map(|layer| layer.capacity_tokens)
+                .unwrap_or(0);
+            if self.hot_all_layers_bytes(capacity_tokens)? > budget_bytes {
+                self.hot_layers.clear();
+            }
+        }
+        Ok(())
+    }
+
     fn append_decode<B: Backend>(
         &mut self,
         layer_kv_cache: &[LayerDeviceKvCacheTensors],
         backend: &B,
     ) -> Result<()> {
+        self.append_decode_prefix(layer_kv_cache, 1, 1, backend)
+    }
+
+    fn append_decode_prefix<B: Backend>(
+        &mut self,
+        layer_kv_cache: &[LayerDeviceKvCacheTensors],
+        source_tokens: usize,
+        accepted_tokens: usize,
+        backend: &B,
+    ) -> Result<()> {
+        let write_started = Instant::now();
+        if source_tokens == 0 || accepted_tokens == 0 || accepted_tokens > source_tokens {
+            return Err(Error::cache(format!(
+                "device paged KV append requires 0 < accepted_tokens <= source_tokens, got accepted={accepted_tokens}, source={source_tokens}"
+            )));
+        }
         if layer_kv_cache.len() != self.layers.len() {
             return Err(Error::cache(format!(
                 "device paged KV decode append expected {} layers, got {}",
@@ -2025,7 +2739,7 @@ impl DevicePagedRuntimeCache {
         }
         let append_position = self.cached_tokens()?;
         let needed_tokens = append_position
-            .checked_add(1)
+            .checked_add(accepted_tokens)
             .ok_or_else(|| Error::cache("device paged KV decode position overflow"))?;
         self.prepare_hot_layers_for_append(backend, needed_tokens)?;
         let batch = self.spec.batch;
@@ -2052,7 +2766,7 @@ impl DevicePagedRuntimeCache {
                 &[
                     self.spec.batch,
                     self.spec.attention_heads,
-                    1,
+                    source_tokens,
                     self.spec.key_head_dim,
                 ],
             )?;
@@ -2062,13 +2776,33 @@ impl DevicePagedRuntimeCache {
                 &[
                     self.spec.batch,
                     self.spec.attention_heads,
-                    1,
+                    source_tokens,
                     self.spec.value_head_dim,
                 ],
             )?;
             let download_started_at = Instant::now();
-            let host_k = backend.device_download_f32_tensor(&append.cache_k)?;
-            let host_v = backend.device_download_f32_tensor(&append.cache_v)?;
+            let downloaded_k = backend.device_download_f32_tensor(&append.cache_k)?;
+            let downloaded_v = backend.device_download_f32_tensor(&append.cache_v)?;
+            let host_k = if accepted_tokens == source_tokens {
+                downloaded_k
+            } else {
+                slice_cache_token_range(
+                    "device accepted K/V key prefix",
+                    &downloaded_k,
+                    0,
+                    accepted_tokens,
+                )?
+            };
+            let host_v = if accepted_tokens == source_tokens {
+                downloaded_v
+            } else {
+                slice_cache_token_range(
+                    "device accepted K/V value prefix",
+                    &downloaded_v,
+                    0,
+                    accepted_tokens,
+                )?
+            };
             record_q2_runtime_stage(
                 self.profile_step_index,
                 Some(layer.layer_index),
@@ -2091,7 +2825,19 @@ impl DevicePagedRuntimeCache {
                         layer.layer_index
                     ))
                 })?;
-                dsa_index.append_decode_layer(layer.layer_index, append_position, &index_key)?;
+                for token_offset in 0..accepted_tokens {
+                    let token = slice_index_token_range(
+                        "device accepted DSA index prefix",
+                        &index_key,
+                        token_offset,
+                        1,
+                    )?;
+                    dsa_index.append_decode_layer(
+                        layer.layer_index,
+                        append_position + token_offset,
+                        &token,
+                    )?;
+                }
             }
             record_q2_runtime_stage(
                 self.profile_step_index,
@@ -2109,11 +2855,11 @@ impl DevicePagedRuntimeCache {
                 copy_logical_kv_tokens(
                     backend,
                     &append.cache_k,
-                    1,
+                    source_tokens,
                     &hot.k,
                     hot.capacity_tokens,
                     append_position,
-                    1,
+                    accepted_tokens,
                     batch,
                     attention_heads,
                     key_head_dim,
@@ -2121,11 +2867,11 @@ impl DevicePagedRuntimeCache {
                 copy_logical_kv_tokens(
                     backend,
                     &append.cache_v,
-                    1,
+                    source_tokens,
                     &hot.v,
                     hot.capacity_tokens,
                     append_position,
-                    1,
+                    accepted_tokens,
                     batch,
                     attention_heads,
                     value_head_dim,
@@ -2138,6 +2884,10 @@ impl DevicePagedRuntimeCache {
         }
         self.cached_tokens = needed_tokens;
         self.prefetch_first_layer()?;
+        self.metrics.write_nanoseconds = self
+            .metrics
+            .write_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(write_started.elapsed()));
         Ok(())
     }
 
@@ -2149,11 +2899,16 @@ impl DevicePagedRuntimeCache {
         let started_at = Instant::now();
         let layer_position = self.layer_position(layer_index)?;
         let token_count = self.cached_tokens()?;
+        let page_count = token_count.div_ceil(self.spec.page_size) as u64;
+        self.metrics.full_layer_lookups = self.metrics.full_layer_lookups.saturating_add(1);
+        self.metrics.page_lookups = self.metrics.page_lookups.saturating_add(page_count);
         if let Some(hot) = self
             .hot_layers
             .iter()
             .find(|hot| hot.layer_index == Some(layer_index))
         {
+            self.metrics.full_layer_hits = self.metrics.full_layer_hits.saturating_add(1);
+            self.metrics.page_hits = self.metrics.page_hits.saturating_add(page_count);
             if hot.capacity_tokens < token_count {
                 return Err(Error::cache(format!(
                     "resident device KV layer {layer_index} has capacity {} for {token_count} tokens",
@@ -2178,8 +2933,14 @@ impl DevicePagedRuntimeCache {
                 "decode.resident_device_kv_view",
                 started_at.elapsed(),
             );
+            self.metrics.read_nanoseconds = self
+                .metrics
+                .read_nanoseconds
+                .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
             return Ok(Some(view));
         }
+        self.metrics.full_layer_misses = self.metrics.full_layer_misses.saturating_add(1);
+        self.metrics.page_misses = self.metrics.page_misses.saturating_add(page_count);
         let (keys, values) = self
             .prefetch
             .take_or_read(&self.cold, layer_index, 0, token_count)?;
@@ -2255,6 +3016,10 @@ impl DevicePagedRuntimeCache {
             "decode.cold_device_kv_view",
             started_at.elapsed(),
         );
+        self.metrics.read_nanoseconds = self
+            .metrics
+            .read_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
         Ok(Some(view))
     }
 
@@ -2264,9 +3029,23 @@ impl DevicePagedRuntimeCache {
         token_indices: &[u32],
         backend: &B,
     ) -> Result<Option<DeviceSelectedKvView>> {
+        let total_started = Instant::now();
         if token_indices.is_empty() {
             return Ok(None);
         }
+        self.metrics.selected_row_lookups = self.metrics.selected_row_lookups.saturating_add(1);
+        self.metrics.selected_row_misses = self.metrics.selected_row_misses.saturating_add(1);
+        let selected_pages = token_indices
+            .iter()
+            .map(|token| *token as usize / self.spec.page_size)
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        self.metrics.page_lookups = self.metrics.page_lookups.saturating_add(selected_pages);
+        self.metrics.page_misses = self.metrics.page_misses.saturating_add(selected_pages);
+        self.metrics.selected_rows = self
+            .metrics
+            .selected_rows
+            .saturating_add(u64::try_from(token_indices.len()).unwrap_or(u64::MAX));
         let layer_position = self.layer_position(layer_index)?;
         let read_started_at = Instant::now();
         let selected =
@@ -2337,6 +3116,10 @@ impl DevicePagedRuntimeCache {
         );
 
         view.validate()?;
+        self.metrics.read_nanoseconds = self
+            .metrics
+            .read_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(total_started.elapsed()));
         Ok(Some(view))
     }
 
@@ -2360,6 +3143,7 @@ impl DevicePagedRuntimeCache {
         layer_index: usize,
         backend: &B,
     ) -> Result<Option<backend::DeviceValue>> {
+        let total_started = Instant::now();
         let Some(index_keys) = self.dsa_index_keys_for_layer(layer_index)? else {
             return Ok(None);
         };
@@ -2374,6 +3158,10 @@ impl DevicePagedRuntimeCache {
             "decode.dsa_index_device_upload",
             upload_started_at.elapsed(),
         );
+        self.metrics.read_nanoseconds = self
+            .metrics
+            .read_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(total_started.elapsed()));
         Ok(Some(device))
     }
 
@@ -3203,6 +3991,37 @@ fn require_device_copy(context: &'static str, copied: Option<()>) -> Result<()> 
     copied.ok_or_else(|| Error::backend(format!("{context} requires native Metal device copy")))
 }
 
+fn slice_device_token_prefix<B: Backend>(
+    backend: &B,
+    tensor: &backend::DeviceValue,
+    token_count: usize,
+) -> Result<backend::DeviceValue> {
+    let dims = tensor.dims();
+    validate_exact_shape("device token prefix rank", &[dims.len()], &[3])?;
+    validate_exact_shape("device token prefix batch", &[dims[0]], &[1])?;
+    if token_count == 0 || token_count > dims[1] {
+        return Err(Error::runtime(format!(
+            "device token prefix count {token_count} exceeds source token count {}",
+            dims[1]
+        )));
+    }
+    if token_count == dims[1] {
+        return Ok(tensor.clone());
+    }
+    let output = require_device_value(
+        "device token prefix allocation",
+        backend.device_alloc_f32_tensor(&[1, token_count, dims[2]])?,
+    )?;
+    let element_count = token_count
+        .checked_mul(dims[2])
+        .ok_or_else(|| Error::runtime("device token prefix element count overflow"))?;
+    require_device_copy(
+        "device token prefix copy",
+        backend.device_copy_f32(tensor, 0, &output, 0, element_count)?,
+    )?;
+    Ok(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_logical_kv_tokens<B: Backend>(
     backend: &B,
@@ -3316,94 +4135,6 @@ fn layer_appends(layer_kv_cache: &[LayerKvCacheTensors]) -> Vec<LayerKvCacheAppe
             v: &entry.cache_v,
         })
         .collect()
-}
-
-fn slice_layer_kv_cache_token_range(
-    layer_kv_cache: &[LayerKvCacheTensors],
-    token_start: usize,
-    token_count: usize,
-) -> Result<Vec<LayerKvCacheTensors>> {
-    layer_kv_cache
-        .iter()
-        .map(|entry| {
-            Ok(LayerKvCacheTensors {
-                layer_index: entry.layer_index,
-                layer_kind: entry.layer_kind,
-                cache_k: slice_cache_token_range(
-                    "layer_cache_k",
-                    &entry.cache_k,
-                    token_start,
-                    token_count,
-                )?,
-                cache_v: slice_cache_token_range(
-                    "layer_cache_v",
-                    &entry.cache_v,
-                    token_start,
-                    token_count,
-                )?,
-                index_key: entry
-                    .index_key
-                    .as_ref()
-                    .map(|index_key| {
-                        slice_index_token_range(
-                            "layer_cache_dsa_index",
-                            index_key,
-                            token_start,
-                            token_count,
-                        )
-                    })
-                    .transpose()?,
-            })
-        })
-        .collect()
-}
-
-fn append_layer_kv_cache_token_range(
-    cache: &mut PagedRuntimeCache,
-    layer_kv_cache: &[LayerKvCacheTensors],
-    token_start: usize,
-    token_count: usize,
-) -> Result<()> {
-    for local_token in 0..token_count {
-        let token_slice =
-            slice_layer_kv_cache_token_range(layer_kv_cache, token_start + local_token, 1)?;
-        cache.append_decode(&token_slice)?;
-    }
-    Ok(())
-}
-
-fn append_or_init_mtp_cache(
-    mtp_cache: &mut Option<PagedRuntimeCache>,
-    model_max_context: usize,
-    page_size: usize,
-    layer_kv_cache: LayerKvCacheTensors,
-) -> Result<()> {
-    let token_count = *layer_kv_cache
-        .cache_k
-        .dims()
-        .get(2)
-        .ok_or_else(|| Error::cache("MTP cache K tensor must be rank 4 [B,H,T,D]"))?;
-    if token_count == 0 {
-        return Err(Error::cache("MTP cache append requires at least one token"));
-    }
-    let layers = vec![layer_kv_cache];
-    let mut appended_tokens = 0_usize;
-    if mtp_cache.is_none() {
-        let first = slice_layer_kv_cache_token_range(&layers, 0, 1)?;
-        let mut cache = PagedRuntimeCache::new(model_max_context, page_size, &first)?;
-        cache.append_prefill(&first)?;
-        *mtp_cache = Some(cache);
-        appended_tokens = 1;
-    }
-    let cache = mtp_cache
-        .as_mut()
-        .ok_or_else(|| Error::runtime("MTP cache was not initialized"))?;
-    append_layer_kv_cache_token_range(
-        cache,
-        &layers,
-        appended_tokens,
-        token_count - appended_tokens,
-    )
 }
 
 fn slice_cache_token_range(
@@ -3617,6 +4348,57 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn kv_cache_rates_include_full_and_selected_lookups() {
+        let metrics = KvCacheMetrics {
+            full_layer_lookups: 4,
+            full_layer_hits: 3,
+            full_layer_misses: 1,
+            selected_row_lookups: 6,
+            selected_row_hits: 2,
+            selected_row_misses: 4,
+            page_lookups: 10,
+            page_hits: 5,
+            page_misses: 5,
+            ..KvCacheMetrics::default()
+        };
+
+        assert_eq!(metrics.lookups(), 10);
+        assert_eq!(metrics.hits(), 5);
+        assert_eq!(metrics.misses(), 5);
+        assert_eq!(metrics.hit_rate(), 0.5);
+        assert_eq!(metrics.miss_rate(), 0.5);
+    }
+
+    #[test]
+    fn token_cost_report_uses_per_token_cache_deltas() {
+        let report = TokenCostReport {
+            sparse_attention_nanoseconds: 40,
+            sparse_input_norm_nanoseconds: 2,
+            sparse_q_projection_nanoseconds: 5,
+            sparse_kv_projection_nanoseconds: 7,
+            sparse_cache_layout_nanoseconds: 3,
+            sparse_dsa_indexer_nanoseconds: 4,
+            sparse_context_attention_nanoseconds: 8,
+            sparse_output_projection_nanoseconds: 6,
+            expert_lookups: 10,
+            expert_cache_hits: 3,
+            expert_cache_misses: 7,
+            kv_page_lookups: 8,
+            kv_page_hits: 6,
+            kv_page_misses: 2,
+            expert_ssd_read_bytes: 12,
+            kv_ssd_read_bytes: 5,
+            ..TokenCostReport::default()
+        };
+
+        assert_eq!(report.expert_cache_hit_rate(), 0.3);
+        assert_eq!(report.kv_page_hit_rate(), 0.75);
+        assert_eq!(report.ssd_read_bytes(), 17);
+        assert_eq!(report.sparse_attention_accounted_nanoseconds(), 35);
+        assert_eq!(report.sparse_attention_unattributed_nanoseconds(), 5);
+    }
+
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
@@ -3650,15 +4432,14 @@ mod tests {
 
     #[test]
     fn cold_kv_policy_bounds_the_all_layer_hot_tier() {
-        let policy = ColdKvRuntimePolicy::new(128).unwrap();
-        let err = ColdKvRuntimePolicy::new(0).unwrap_err();
+        let policy = ColdKvRuntimePolicy::new(128, 1_000_000_000).unwrap();
+        let block_error = ColdKvRuntimePolicy::new(0, 1_000_000_000).unwrap_err();
+        let budget_error = ColdKvRuntimePolicy::new(128, 0).unwrap_err();
 
         assert_eq!(policy.block_tokens, 128);
-        assert_eq!(
-            policy.hot_all_layers_budget_bytes,
-            HOT_ALL_LAYERS_BUDGET_BYTES
-        );
-        assert!(err.to_string().contains("block_tokens"));
+        assert_eq!(policy.hot_all_layers_budget_bytes, 1_000_000_000);
+        assert!(block_error.to_string().contains("block_tokens"));
+        assert!(budget_error.to_string().contains("budget"));
     }
 
     #[test]
@@ -4059,6 +4840,14 @@ mod tests {
         assert!(!should_enable_mtp(true, 1));
         assert!(!should_enable_mtp(true, 2));
         assert!(should_enable_mtp(true, 3));
+    }
+
+    #[test]
+    fn mtp_uses_the_artifacts_single_draft_head() {
+        assert_eq!(mtp_draft_count(0), 0);
+        assert_eq!(mtp_draft_count(1), 0);
+        assert_eq!(mtp_draft_count(2), 1);
+        assert_eq!(mtp_draft_count(8), 1);
     }
 
     #[test]

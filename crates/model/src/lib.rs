@@ -42,52 +42,50 @@ pub use artifact_source::{
     antirez_q2_artifact, Artifact, ArtifactFormat, ANTIREZ_Q2_GGUF_FILE, ANTIREZ_Q2_GGUF_REPO_ID,
     ANTIREZ_Q2_GGUF_REPO_URL,
 };
-pub use attention::{
-    Attention, AttentionF32Tensors, AttentionForwardReport, AttentionLoadReport, AttentionOutput,
-};
-pub use dense_block::{
-    DenseBlock, DenseBlockF32Tensors, DenseBlockForwardReport, DenseBlockLoadReport,
-    DenseBlockOutput, DenseBlockTensors,
-};
-pub use dense_ffn::{DenseFfn, DenseFfnForwardReport, DenseFfnLoadReport, DenseFfnOutput};
-pub use embedding::{
-    EmbeddingLookupF32Output, EmbeddingLookupF32Report, EmbeddingLookupOutput,
-    EmbeddingLookupReport, EmbeddingTable,
-};
+pub(crate) use attention::{Attention, AttentionOutput};
+pub use attention::{AttentionForwardReport, AttentionLoadReport};
+pub(crate) use dense_block::DenseBlock;
+pub use dense_block::{DenseBlockForwardReport, DenseBlockLoadReport};
+pub(crate) use dense_ffn::{DenseFfn, DenseFfnOutput};
+pub use dense_ffn::{DenseFfnForwardReport, DenseFfnLoadReport};
+pub use embedding::EmbeddingLookupReport;
+pub(crate) use embedding::{EmbeddingLookupOutput, EmbeddingTable};
 pub use index::{
     AttentionIndex, DenseFfnIndex, FfnIndex, Index, IndexSummary, IndexerIndex, LayerIndex,
     MemoryAdviceReport, MtpIndex, PackedExpertsIndex, RootIndex, SharedExpertIndex, TensorRef,
 };
-pub use indexer::{DsaIndexer, DsaIndexerLoadReport, DsaTopKSelection};
+pub(crate) use indexer::DsaIndexer;
+pub use indexer::DsaIndexerLoadReport;
 pub use kv_types::{LayerDeviceKvCacheTensors, LayerKvCacheReport, LayerKvCacheTensors};
 pub use layer_kind::LayerKind;
+pub(crate) use layer_stack::LayerStack;
 pub use layer_stack::{
-    LayerRuntimeKind, LayerRuntimeReport, LayerStack, LayerStackForwardF32Tensors,
-    LayerStackForwardOutput, LayerStackForwardReport, LayerStackForwardTensors,
-    LayerStackLoadReport,
+    LayerRuntimeKind, LayerRuntimeReport, LayerStackForwardReport, LayerStackLoadReport,
 };
-pub use linear::{
-    LinearForwardReport, LinearGreedyOutput, LinearGreedyReport, LinearOutput, LinearTokenOutput,
-    QuantizedLinear,
-};
+pub(crate) use linear::QuantizedLinear;
+pub use linear::{LinearForwardReport, LinearGreedyReport};
 pub use model::{
-    Model, ModelDeviceTokenOutput, ModelGreedyOutput, ModelGreedyReport, ModelHiddenOutput,
-    ModelHiddenReport, ModelLoadReport, ModelLogitsOutput, ModelLogitsReport, ModelTokenOutput,
-    ModelTokenSequenceOutput, ModelTokenWithHiddenOutput, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    Model, ModelDeviceTokenOutput, ModelDeviceTokenSequenceOutput, ModelGreedyOutput,
+    ModelGreedyReport, ModelHiddenOutput, ModelHiddenReport, ModelLoadReport, ModelLogitsOutput,
+    ModelLogitsReport, ModelTokenOutput, ModelTokenSequenceOutput, ModelTokenWithHiddenOutput,
+    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
-pub use moe_ffn::{MoeFfn, MoeFfnForwardReport, MoeFfnLoadReport, MoeFfnOutput};
-pub use moe_router::{MoeRouter, MoeRouterLoadReport, MoeRoutingOutput, MoeRoutingReport};
-pub use mtp::{MtpDraftOutput, MtpHead, MtpLoadReport};
-pub use output_head::{
-    GreedyOutput, GreedyReport, LogitsOutput, LogitsReport, OutputHead, OutputHeadLoadReport,
-    TokenOutput,
+pub(crate) use moe_ffn::{MoeFfn, MoeFfnOutput};
+pub use moe_ffn::{MoeFfnForwardReport, MoeFfnLoadReport};
+pub(crate) use moe_router::MoeRouter;
+pub use moe_router::MoeRouterLoadReport;
+pub(crate) use mtp::MtpHead;
+pub use mtp::{MtpDeviceDraftOutput, MtpDraftOutput, MtpLoadReport};
+pub use output_head::{GreedyReport, LogitsReport, OutputHeadLoadReport};
+pub(crate) use output_head::{LogitsOutput, OutputHead};
+pub use profile::{
+    disable_token_cost_profile, enable_token_cost_profile, take_token_cost_profile,
+    TokenModelProfile,
 };
 pub use profile::{enable_layer_profile, set_layer_profile_context};
-pub use rms_norm::{
-    RmsNorm, RmsNormF32Output, RmsNormForwardReport, RmsNormLoadReport, RmsNormOutput,
-};
-pub use sparse_block::{
-    SparseBlock, SparseBlockF32Tensors, SparseBlockForwardReport, SparseBlockLoadReport,
-    SparseBlockOutput, SparseBlockTensors,
-};
-pub use weights::{TensorLoadF32Output, TensorLoadOutput, TensorLoadReport, WeightLoader};
+pub(crate) use rms_norm::RmsNorm;
+pub use rms_norm::RmsNormLoadReport;
+pub(crate) use sparse_block::SparseBlock;
+pub use sparse_block::{SparseBlockForwardReport, SparseBlockLoadReport};
+pub use weights::TensorLoadReport;
+pub(crate) use weights::WeightLoader;

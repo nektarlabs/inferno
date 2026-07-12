@@ -110,6 +110,7 @@ impl<'a> SparseBlock<'a> {
         self.attention.has_dsa_indexer()
     }
 
+    #[cfg(test)]
     pub fn forward<B: Backend>(
         &self,
         config: &Config,
@@ -133,6 +134,7 @@ impl<'a> SparseBlock<'a> {
         self.forward_ffn(config, hidden_states, attention_output, backend)
     }
 
+    #[cfg(test)]
     pub fn forward_tensors<B: Backend>(
         &self,
         config: &Config,
@@ -321,14 +323,20 @@ impl<'a> SparseBlock<'a> {
             self.load_report.layer_index,
             "sparse_moe.attention",
             || {
-                self.attention.forward_sparse_decode_device(
-                    config,
-                    hidden_states,
+                profile::run_token_device_stage(
+                    profile::TokenProfileStage::SparseAttention,
                     backend,
-                    past_kv,
-                    selected_kv_for_tokens,
-                    index_keys_for_layer,
-                    shared_selection,
+                    || {
+                        self.attention.forward_sparse_decode_device(
+                            config,
+                            hidden_states,
+                            backend,
+                            past_kv,
+                            selected_kv_for_tokens,
+                            index_keys_for_layer,
+                            shared_selection,
+                        )
+                    },
                 )
             },
         )? {
@@ -375,8 +383,14 @@ impl<'a> SparseBlock<'a> {
             self.load_report.layer_index,
             "sparse_moe.attention",
             || {
-                self.attention
-                    .forward_seed_device(config, hidden_states, backend)
+                profile::run_token_device_stage(
+                    profile::TokenProfileStage::SparseAttention,
+                    backend,
+                    || {
+                        self.attention
+                            .forward_seed_device(config, hidden_states, backend)
+                    },
+                )
             },
         )? {
             Some(output) => output,

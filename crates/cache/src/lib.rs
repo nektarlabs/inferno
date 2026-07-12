@@ -19,6 +19,4 @@ pub use layered_paged::{
     LayerKvCacheAppend, LayerPageStats, LayerPagedCacheAppendReport, LayerPagedKvView,
     LayeredPagedCacheAppendReport, LayeredPagedKvCache, LayeredPagedKvCacheSpec,
 };
-pub use paged::{
-    LogicalTokenLocation, PageStats, PagedCacheAppendReport, PagedKvCache, PagedKvCacheSpec,
-};
+pub use paged::{PageStats, PagedCacheAppendReport};

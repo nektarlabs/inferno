@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [features]
 default = ["metal"]
-metal = ["dep:metal"]
+metal = ["dep:metal", "dep:objc"]
 
 [dependencies]
 common = { path = "../common" }
 libc.workspace = true
 metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
 tracing.workspace = true

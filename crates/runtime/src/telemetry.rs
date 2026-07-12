@@ -75,7 +75,7 @@ pub(crate) fn log_memory_snapshot<B: Backend>(
         return;
     }
 
-    let snapshot = memory_snapshot(backend, runtime_kv);
+    let snapshot = capture_memory_snapshot(backend, runtime_kv);
     if write_memory_snapshot_to_file(stage, step_index, snapshot).is_some() {
         return;
     }
@@ -139,7 +139,7 @@ fn format_gb(bytes: Option<u64>) -> String {
     }
 }
 
-fn memory_snapshot<B: Backend>(
+pub(crate) fn capture_memory_snapshot<B: Backend>(
     backend: &B,
     runtime_kv: RuntimeKvMemoryBytes,
 ) -> RuntimeMemorySnapshot {

@@ -1,6 +1,8 @@
 use backend::{Backend, BackendCapabilities};
+#[cfg(test)]
+use common::Shape;
 use common::Tensor;
-use common::{validate_exact_shape, Error, F32Tensor, Result, Shape};
+use common::{validate_exact_shape, Error, F32Tensor, Result};
 use config::Config;
 use gguf::{GgmlType, GgufFile};
 
@@ -8,6 +10,7 @@ use crate::{TensorLoadReport, TensorRef, WeightLoader};
 
 #[derive(Debug)]
 pub struct RmsNorm {
+    #[cfg(test)]
     tensor_name: String,
     hidden_size: usize,
     eps: f32,
@@ -18,12 +21,14 @@ pub struct RmsNorm {
 #[derive(Debug)]
 pub struct RmsNormOutput {
     pub hidden_states: Tensor,
+    #[cfg(test)]
     pub report: RmsNormForwardReport,
 }
 
 #[derive(Debug)]
 pub struct RmsNormF32Output {
     pub hidden_states: F32Tensor,
+    #[cfg(test)]
     pub report: RmsNormForwardReport,
 }
 
@@ -34,6 +39,7 @@ pub struct RmsNormLoadReport {
     pub weight: TensorLoadReport,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RmsNormForwardReport {
     pub source_tensor_name: String,
@@ -86,6 +92,7 @@ impl RmsNorm {
         };
 
         Ok(Self {
+            #[cfg(test)]
             tensor_name: tensor_ref.name.clone(),
             hidden_size,
             eps,
@@ -99,17 +106,16 @@ impl RmsNorm {
         hidden_states: &Tensor,
         backend: &B,
     ) -> Result<RmsNormOutput> {
-        let input_shape = Shape::new(hidden_states.dims().to_vec());
         let output = self.forward_tensor(hidden_states, backend)?;
-        let output_shape = Shape::new(output.dims().to_vec());
         Ok(RmsNormOutput {
-            hidden_states: output,
+            #[cfg(test)]
             report: RmsNormForwardReport {
                 source_tensor_name: self.tensor_name.clone(),
-                input_shape,
+                input_shape: Shape::new(hidden_states.dims().to_vec()),
                 weight_shape: Shape::new(self.weight.dims().to_vec()),
-                output_shape,
+                output_shape: Shape::new(output.dims().to_vec()),
             },
+            hidden_states: output,
         })
     }
 
@@ -142,6 +148,7 @@ impl RmsNorm {
 
         let output = backend.rms_norm_f32(hidden_states, &self.weight, self.eps)?;
         Ok(RmsNormF32Output {
+            #[cfg(test)]
             report: RmsNormForwardReport {
                 source_tensor_name: self.tensor_name.clone(),
                 input_shape: Shape::new(dims.to_vec()),

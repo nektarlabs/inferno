@@ -1,14 +1,14 @@
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub fn init(enable_telemetry: bool) {
-    let env_filter = match std::env::var("RUST_LOG") {
-        Ok(filter) if enable_telemetry && !filter.contains("inferno::memory") => {
-            EnvFilter::new(format!("{filter},inferno::memory=info"))
-        }
-        Ok(filter) => EnvFilter::new(filter),
-        Err(_) if enable_telemetry => EnvFilter::new("off,inferno::memory=info"),
-        Err(_) => EnvFilter::new("off"),
-    };
+pub fn init(enable_telemetry: bool, enable_token_costs: bool) {
+    let mut filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "off".to_string());
+    if enable_telemetry && !filter.contains("inferno::memory") {
+        filter.push_str(",inferno::memory=info");
+    }
+    if enable_token_costs && !filter.contains("inferno::token_cost") {
+        filter.push_str(",inferno::token_cost=info");
+    }
+    let env_filter = EnvFilter::new(filter);
 
     let _ = fmt()
         .with_env_filter(env_filter)

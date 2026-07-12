@@ -5,7 +5,7 @@ use config::Config;
 use gguf::{GgmlType, GgufFile};
 use tracing::debug;
 
-use crate::{QuantizedLinear, RmsNorm, RmsNormLoadReport, RootIndex};
+use crate::{profile, QuantizedLinear, RmsNorm, RmsNormLoadReport, RootIndex};
 
 #[derive(Debug)]
 pub struct OutputHead<'a> {
@@ -284,11 +284,97 @@ impl<'a> OutputHead<'a> {
             &[self.hidden_size],
         )?;
 
+        if profile::token_cost_profile_enabled() {
+            let selected = crate::try_device!(backend.select_last_token_device(hidden_states));
+            let normalized = crate::try_device!(self.final_norm.forward_device(&selected, backend));
+            backend.device_flush()?;
+            let flat = normalized.reshape(vec![batch, self.hidden_size])?;
+            let logits = crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::OutputProjection,
+                backend,
+                || self.output_projection.forward_device(&flat, backend),
+            ));
+            let logits = logits.reshape(vec![self.vocab_rows])?;
+            let (token_id, token_score) = crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::SamplingArgmax,
+                backend,
+                || backend.argmax_f32_device(&logits),
+            ));
+            return Ok(Some(TokenOutput {
+                token_id,
+                token_score,
+            }));
+        }
+
         let selected = crate::try_device!(backend.select_last_token_device(hidden_states));
         let normalized = crate::try_device!(self.final_norm.forward_device(&selected, backend));
         let flat = normalized.reshape(vec![batch, self.hidden_size])?;
         let token = crate::try_device!(self.output_projection.greedy_token_device(&flat, backend));
 
+        Ok(Some(TokenOutput {
+            token_id: token.token_id,
+            token_score: token.token_score,
+        }))
+    }
+
+    pub(crate) fn decode_tokens_device<B: Backend>(
+        &self,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let dims = hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 GGUF device sequence decode expects hidden states [B, T, H], got {dims:?}"
+            )));
+        }
+        validate_exact_shape(
+            "gguf_device_sequence_output_head_batch_hidden",
+            &[dims[0], dims[2]],
+            &[1, self.hidden_size],
+        )?;
+        let token_count = dims[1];
+        let normalized = crate::try_device!(self.final_norm.forward_device(hidden_states, backend));
+        let flat = normalized.reshape(vec![token_count, self.hidden_size])?;
+
+        if profile::token_cost_profile_enabled() {
+            let logits = crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::OutputProjection,
+                backend,
+                || self.output_projection.forward_device(&flat, backend),
+            ));
+            let logits = logits.reshape(vec![token_count, self.vocab_rows])?;
+            let tokens = crate::try_device!(profile::run_token_device_stage(
+                profile::TokenProfileStage::SamplingArgmax,
+                backend,
+                || backend.argmax_rows_f32_device(&logits, self.vocab_rows),
+            ));
+            return Ok(Some(tokens));
+        }
+
+        self.output_projection.greedy_tokens_device(&flat, backend)
+    }
+
+    pub(crate) fn decode_token_from_normalized_device<B: Backend>(
+        &self,
+        normalized_hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<TokenOutput>> {
+        let dims = normalized_hidden_states.dims();
+        if dims.len() != 3 {
+            return Err(Error::model(format!(
+                "normalized device output-head input must be [B, T, H], got {dims:?}"
+            )));
+        }
+        validate_exact_shape(
+            "normalized_device_output_head_batch_hidden",
+            &[dims[0], dims[2]],
+            &[1, self.hidden_size],
+        )?;
+        let selected =
+            crate::try_device!(backend.select_last_token_device(normalized_hidden_states));
+        let flat = selected.reshape(vec![1, self.hidden_size])?;
+        let token = crate::try_device!(self.output_projection.greedy_token_device(&flat, backend));
         Ok(Some(TokenOutput {
             token_id: token.token_id,
             token_score: token.token_score,

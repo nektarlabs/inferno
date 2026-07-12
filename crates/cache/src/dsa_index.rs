@@ -3,6 +3,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use common::{validate_exact_shape, Error, F32Tensor, Result};
@@ -68,6 +72,7 @@ pub struct LayeredDsaIndexBlockStore {
     index: BTreeMap<DsaIndexBlockKey, usize>,
     layer_indices: Vec<usize>,
     cached_tokens: usize,
+    read_bytes: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +109,7 @@ impl LayeredDsaIndexBlockStore {
             index: BTreeMap::new(),
             layer_indices: Vec::new(),
             cached_tokens: 0,
+            read_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -131,6 +137,7 @@ impl LayeredDsaIndexBlockStore {
             index: self.index.clone(),
             layer_indices: self.layer_indices.clone(),
             cached_tokens: self.cached_tokens,
+            read_bytes: Arc::clone(&self.read_bytes),
         })
     }
 
@@ -152,6 +159,12 @@ impl LayeredDsaIndexBlockStore {
                     self.path.display()
                 ))
             })
+    }
+
+    /// Exact bytes read from the append-only file by this store and all
+    /// readers cloned from it.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -352,6 +365,11 @@ impl LayeredDsaIndexBlockStore {
                 self.path.display()
             ))
         })?;
+        self.read_bytes.fetch_add(
+            u64::try_from(record_len)
+                .map_err(|_| Error::cache("DSA index record length does not fit u64"))?,
+            Ordering::Relaxed,
+        );
         let header = decode_record_header(&record[..RECORD_HEADER_LEN])?;
         validate_record_matches_meta(&header, meta)?;
         decode_f32_payload(
@@ -711,6 +729,7 @@ mod tests {
 
         assert_eq!(read.dims(), &[1, 3, 2]);
         assert_eq!(read.values(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(store.read_bytes(), 2 * RECORD_HEADER_LEN as u64 + 6 * 4);
         std::fs::remove_file(path).ok();
     }
 }

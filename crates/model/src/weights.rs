@@ -1,3 +1,4 @@
+#[cfg(test)]
 use common::{Device, Tensor};
 use common::{Error, F32Tensor, Result, Shape};
 use gguf::{GgmlType, GgufFile, GgufQuantBlockKind};
@@ -14,6 +15,7 @@ pub struct TensorLoadReport {
     pub decoded_f32_bytes: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct TensorLoadOutput {
     pub tensor: Tensor,
@@ -36,6 +38,7 @@ impl<'a> WeightLoader<'a> {
         Self { gguf }
     }
 
+    #[cfg(test)]
     #[tracing::instrument(skip(self, tensor_ref, device), fields(tensor = %tensor_ref.name))]
     pub fn load_tensor_as_f32(
         &self,

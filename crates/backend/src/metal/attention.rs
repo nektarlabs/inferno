@@ -26,8 +26,12 @@ const ATTENTION_CAUSAL_SOFTMAX_KERNEL: &str = "attention_causal_softmax_f32_kern
 const FUSED_DECODE_ATTENTION_KERNEL: &str = "fused_decode_attention_f32_kernel";
 const FUSED_PAGED_DECODE_ATTENTION_KERNEL: &str = "fused_paged_decode_attention_f32_kernel";
 const FUSED_SELECTED_DECODE_ATTENTION_KERNEL: &str = "fused_selected_decode_attention_f32_kernel";
+const FUSED_SELECTED_SEQUENCE_ATTENTION_KERNEL: &str =
+    "fused_selected_sequence_attention_f32_kernel";
 const FUSED_PAGED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
     "fused_paged_decode_attention_f16_kv_kernel";
+const FUSED_PAGED_ABSORBED_MLA_DECODE_F32_KERNEL: &str =
+    "fused_paged_absorbed_mla_decode_f32_kernel";
 const FUSED_SELECTED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
     "fused_selected_decode_attention_f16_kv_kernel";
 const FUSED_DECODE_ATTENTION_THREADS_PER_ROW: usize = 256;
@@ -49,8 +53,10 @@ pub(crate) struct MetalDecodeAttention {
     fused_pipeline: ComputePipelineState,
     fused_paged_pipeline: ComputePipelineState,
     fused_selected_pipeline: ComputePipelineState,
+    fused_selected_sequence_pipeline: ComputePipelineState,
     fused_paged_f16_kv_pipeline: ComputePipelineState,
     fused_selected_f16_kv_pipeline: ComputePipelineState,
+    fused_paged_absorbed_mla_f32_pipeline: ComputePipelineState,
     workspace: Mutex<DecodeAttentionWorkspace>,
 }
 
@@ -451,6 +457,11 @@ impl MetalDecodeAttention {
                 library,
                 FUSED_SELECTED_DECODE_ATTENTION_KERNEL,
             )?,
+            fused_selected_sequence_pipeline: compute_pipeline(
+                device,
+                library,
+                FUSED_SELECTED_SEQUENCE_ATTENTION_KERNEL,
+            )?,
             fused_paged_f16_kv_pipeline: compute_pipeline(
                 device,
                 library,
@@ -460,6 +471,11 @@ impl MetalDecodeAttention {
                 device,
                 library,
                 FUSED_SELECTED_DECODE_ATTENTION_F16_KV_KERNEL,
+            )?,
+            fused_paged_absorbed_mla_f32_pipeline: compute_pipeline(
+                device,
+                library,
+                FUSED_PAGED_ABSORBED_MLA_DECODE_F32_KERNEL,
             )?,
             workspace: Mutex::new(DecodeAttentionWorkspace::default()),
         })
@@ -1094,6 +1110,164 @@ impl MetalDecodeAttention {
         Ok((output_buffer, output_len))
     }
 
+    /// Encodes absorbed MLA decode over normalized latent K/V cache rows.
+    ///
+    /// The no-RoPE query has already been projected into latent space. This
+    /// kernel computes attention in `[latent_dim + rope_dim]` score space and
+    /// returns one attended latent vector per query head. Applying V_b after
+    /// this operation is mathematically equivalent to expanding every cached
+    /// V row first, but its cost no longer grows with context length.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_paged_absorbed_mla_f32(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        q_latent: &Buffer,
+        q_latent_len: usize,
+        q_rope: &Buffer,
+        q_rope_len: usize,
+        current_latent: &Buffer,
+        current_latent_len: usize,
+        current_rope: &Buffer,
+        current_rope_len: usize,
+        past_kv: &DevicePagedKvView,
+        head_count: usize,
+        latent_dim: usize,
+        rope_dim: usize,
+        scale_dim: usize,
+    ) -> Result<(Buffer, usize)> {
+        past_kv.validate()?;
+        if past_kv.attention_heads != 1
+            || past_kv.key_head_dim != latent_dim
+            || past_kv.value_head_dim != rope_dim
+        {
+            return Err(Error::backend(format!(
+                "absorbed MLA cache must be [B,1,T,{latent_dim}] latent and [B,1,T,{rope_dim}] RoPE, got heads={} key_dim={} value_dim={}",
+                past_kv.attention_heads, past_kv.key_head_dim, past_kv.value_head_dim
+            )));
+        }
+        if past_kv.k.dtype() != DType::F32 {
+            return Err(Error::backend(format!(
+                "absorbed MLA currently requires F32 resident cache, got {:?}",
+                past_kv.k.dtype()
+            )));
+        }
+        if head_count == 0 || latent_dim == 0 || rope_dim == 0 || scale_dim == 0 {
+            return Err(Error::backend("absorbed MLA dimensions must be positive"));
+        }
+
+        let batch_count = past_kv.batch;
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .ok_or_else(|| Error::backend("absorbed MLA row count overflow"))?;
+        let expected_q_latent_len = row_count
+            .checked_mul(latent_dim)
+            .ok_or_else(|| Error::backend("absorbed MLA query latent length overflow"))?;
+        let expected_q_rope_len = row_count
+            .checked_mul(rope_dim)
+            .ok_or_else(|| Error::backend("absorbed MLA query RoPE length overflow"))?;
+        let expected_current_latent_len = batch_count
+            .checked_mul(latent_dim)
+            .ok_or_else(|| Error::backend("absorbed MLA current latent length overflow"))?;
+        let expected_current_rope_len = batch_count
+            .checked_mul(rope_dim)
+            .ok_or_else(|| Error::backend("absorbed MLA current RoPE length overflow"))?;
+        validate_exact_shape(
+            "absorbed_mla_q_latent_values",
+            &[q_latent_len],
+            &[expected_q_latent_len],
+        )?;
+        validate_exact_shape(
+            "absorbed_mla_q_rope_values",
+            &[q_rope_len],
+            &[expected_q_rope_len],
+        )?;
+        validate_exact_shape(
+            "absorbed_mla_current_latent_values",
+            &[current_latent_len],
+            &[expected_current_latent_len],
+        )?;
+        validate_exact_shape(
+            "absorbed_mla_current_rope_values",
+            &[current_rope_len],
+            &[expected_current_rope_len],
+        )?;
+        require_f32_capacity(q_latent, q_latent_len, "absorbed MLA query latent")?;
+        require_f32_capacity(q_rope, q_rope_len, "absorbed MLA query RoPE")?;
+        require_f32_capacity(
+            current_latent,
+            current_latent_len,
+            "absorbed MLA current latent",
+        )?;
+        require_f32_capacity(current_rope, current_rope_len, "absorbed MLA current RoPE")?;
+        require_f32_capacity(
+            &past_kv.k.buffer,
+            past_kv.k.element_count()?,
+            "absorbed MLA latent cache",
+        )?;
+        require_f32_capacity(
+            &past_kv.v.buffer,
+            past_kv.v.element_count()?,
+            "absorbed MLA RoPE cache",
+        )?;
+
+        let key_tokens = past_kv
+            .cached_tokens
+            .checked_add(1)
+            .ok_or_else(|| Error::backend("absorbed MLA key token count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            &self.fused_paged_absorbed_mla_f32_pipeline,
+            key_tokens,
+            row_count,
+            "fused paged absorbed MLA decode",
+        )?;
+        let output_len = expected_q_latent_len;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("absorbed MLA batch_count", batch_count)?,
+        )?;
+        let head_count_buffer =
+            u32_scalar_buffer(device, checked_u32("absorbed MLA head_count", head_count)?)?;
+        let past_tokens_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("absorbed MLA past_tokens", past_kv.cached_tokens)?,
+        )?;
+        let page_size_buffer = u32_scalar_buffer(
+            device,
+            checked_u32("absorbed MLA page_size", past_kv.page_size)?,
+        )?;
+        let latent_dim_buffer =
+            u32_scalar_buffer(device, checked_u32("absorbed MLA latent_dim", latent_dim)?)?;
+        let rope_dim_buffer =
+            u32_scalar_buffer(device, checked_u32("absorbed MLA rope_dim", rope_dim)?)?;
+        let scale_dim_buffer =
+            u32_scalar_buffer(device, checked_u32("absorbed MLA scale_dim", scale_dim)?)?;
+
+        encode_1d(
+            command_buffer,
+            &self.fused_paged_absorbed_mla_f32_pipeline,
+            &[
+                q_latent,
+                q_rope,
+                &past_kv.k.buffer,
+                current_latent,
+                &past_kv.v.buffer,
+                current_rope,
+                &output_buffer,
+                &batch_count_buffer,
+                &head_count_buffer,
+                &past_tokens_buffer,
+                &page_size_buffer,
+                &latent_dim_buffer,
+                &rope_dim_buffer,
+                &scale_dim_buffer,
+            ],
+            dispatch_threads,
+        )?;
+        Ok((output_buffer, output_len))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_selected(
         &self,
@@ -1270,6 +1444,145 @@ impl MetalDecodeAttention {
             dispatch_threads,
         )?;
         Ok((output_buffer, output_len))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_selected_sequence(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        q: &Buffer,
+        q_len: usize,
+        selected_k: &Buffer,
+        selected_k_len: usize,
+        selected_v: &Buffer,
+        selected_v_len: usize,
+        current_k: &Buffer,
+        current_k_len: usize,
+        current_v: &Buffer,
+        current_v_len: usize,
+        batch_count: usize,
+        head_count: usize,
+        selected_tokens: usize,
+        query_tokens: usize,
+        head_dim: usize,
+        value_dim: usize,
+    ) -> Result<(Buffer, usize)> {
+        if selected_tokens == 0 || query_tokens == 0 {
+            return Err(Error::backend(
+                "selected sequence attention requires past and query tokens",
+            ));
+        }
+        let visible_keys = selected_tokens
+            .checked_add(query_tokens)
+            .ok_or_else(|| Error::backend("selected sequence key count overflow"))?;
+        if visible_keys > FUSED_DECODE_ATTENTION_MAX_KEYS {
+            return Err(Error::backend(format!(
+                "selected sequence attention key count {visible_keys} exceeds {FUSED_DECODE_ATTENTION_MAX_KEYS}"
+            )));
+        }
+        let expected_qk = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(query_tokens))
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::backend("selected sequence Q/K length overflow"))?;
+        let expected_selected_k = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(selected_tokens))
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::backend("selected sequence past K length overflow"))?;
+        let expected_selected_v = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(selected_tokens))
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| Error::backend("selected sequence past V length overflow"))?;
+        let expected_current_v = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(query_tokens))
+            .and_then(|value| value.checked_mul(value_dim))
+            .ok_or_else(|| Error::backend("selected sequence current V length overflow"))?;
+        validate_exact_shape("selected_sequence_q", &[q_len], &[expected_qk])?;
+        validate_exact_shape(
+            "selected_sequence_past_k",
+            &[selected_k_len],
+            &[expected_selected_k],
+        )?;
+        validate_exact_shape(
+            "selected_sequence_past_v",
+            &[selected_v_len],
+            &[expected_selected_v],
+        )?;
+        validate_exact_shape(
+            "selected_sequence_current_k",
+            &[current_k_len],
+            &[expected_qk],
+        )?;
+        validate_exact_shape(
+            "selected_sequence_current_v",
+            &[current_v_len],
+            &[expected_current_v],
+        )?;
+        require_f32_capacity(q, q_len, "selected sequence Q")?;
+        require_f32_capacity(selected_k, selected_k_len, "selected sequence past K")?;
+        require_f32_capacity(selected_v, selected_v_len, "selected sequence past V")?;
+        require_f32_capacity(current_k, current_k_len, "selected sequence current K")?;
+        require_f32_capacity(current_v, current_v_len, "selected sequence current V")?;
+
+        let output_len = expected_current_v;
+        let row_count = batch_count
+            .checked_mul(head_count)
+            .and_then(|value| value.checked_mul(query_tokens))
+            .ok_or_else(|| Error::backend("selected sequence row count overflow"))?;
+        let dispatch_threads = fused_decode_attention_threads(
+            &self.fused_selected_sequence_pipeline,
+            visible_keys,
+            row_count,
+            "fused selected sequence attention",
+        )?;
+        let output = empty_f32_buffer(device, output_len)?;
+        let batch_count = u32_scalar_buffer(
+            device,
+            checked_u32("selected sequence batch_count", batch_count)?,
+        )?;
+        let head_count = u32_scalar_buffer(
+            device,
+            checked_u32("selected sequence head_count", head_count)?,
+        )?;
+        let selected_tokens = u32_scalar_buffer(
+            device,
+            checked_u32("selected sequence selected_tokens", selected_tokens)?,
+        )?;
+        let query_tokens = u32_scalar_buffer(
+            device,
+            checked_u32("selected sequence query_tokens", query_tokens)?,
+        )?;
+        let head_dim =
+            u32_scalar_buffer(device, checked_u32("selected sequence head_dim", head_dim)?)?;
+        let value_dim = u32_scalar_buffer(
+            device,
+            checked_u32("selected sequence value_dim", value_dim)?,
+        )?;
+
+        encode_1d(
+            command_buffer,
+            &self.fused_selected_sequence_pipeline,
+            &[
+                q,
+                selected_k,
+                current_k,
+                selected_v,
+                current_v,
+                &output,
+                &batch_count,
+                &head_count,
+                &selected_tokens,
+                &query_tokens,
+                &head_dim,
+                &value_dim,
+            ],
+            dispatch_threads,
+        )?;
+        Ok((output, output_len))
     }
 }
 
@@ -1632,7 +1945,7 @@ mod tests {
         };
         let batch_count = 1;
         let head_count = 2;
-        let query_tokens = 2;
+        let query_tokens = 3;
         let key_tokens = 3;
         let head_dim = 4;
         let q = (0..batch_count * head_count * query_tokens * head_dim)
@@ -2176,6 +2489,108 @@ mod tests {
     }
 
     #[test]
+    fn selected_sequence_attention_matches_causal_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let head_count = 2;
+        let past_tokens = 3;
+        let query_tokens = 2;
+        let key_tokens = past_tokens + query_tokens;
+        let head_dim = 4;
+        let value_dim = 3;
+        let q = (0..batch_count * head_count * query_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>();
+        let past_k = (0..batch_count * head_count * past_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>();
+        let past_v = (0..batch_count * head_count * past_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>();
+        let current_k = (0..batch_count * head_count * query_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 40.0)
+            .collect::<Vec<_>>();
+        let current_v = (0..batch_count * head_count * query_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 50.0)
+            .collect::<Vec<_>>();
+        let contiguous_k = append_current_sequence(
+            &past_k,
+            &current_k,
+            batch_count,
+            head_count,
+            past_tokens,
+            query_tokens,
+            head_dim,
+        );
+        let contiguous_v = append_current_sequence(
+            &past_v,
+            &current_v,
+            batch_count,
+            head_count,
+            past_tokens,
+            query_tokens,
+            value_dim,
+        );
+        let scores = cpu_attention_scores(
+            &q,
+            &contiguous_k,
+            batch_count,
+            head_count,
+            query_tokens,
+            key_tokens,
+            head_dim,
+        );
+        let probs = cpu_attention_causal_softmax(
+            &scores,
+            batch_count,
+            head_count,
+            query_tokens,
+            key_tokens,
+            past_tokens,
+        );
+        let expected = cpu_attention_values(
+            &probs,
+            &contiguous_v,
+            batch_count,
+            head_count,
+            query_tokens,
+            key_tokens,
+            value_dim,
+        );
+
+        let q = metal.batch_upload_f32(&q).unwrap();
+        let past_k = metal.batch_upload_f32(&past_k).unwrap();
+        let past_v = metal.batch_upload_f32(&past_v).unwrap();
+        let current_k = metal.batch_upload_f32(&current_k).unwrap();
+        let current_v = metal.batch_upload_f32(&current_v).unwrap();
+        let (output, output_len) = metal
+            .batched_selected_sequence_attention(
+                &q,
+                batch_count * head_count * query_tokens * head_dim,
+                &past_k,
+                batch_count * head_count * past_tokens * head_dim,
+                &past_v,
+                batch_count * head_count * past_tokens * value_dim,
+                &current_k,
+                batch_count * head_count * query_tokens * head_dim,
+                &current_v,
+                batch_count * head_count * query_tokens * value_dim,
+                batch_count,
+                head_count,
+                past_tokens,
+                query_tokens,
+                head_dim,
+                value_dim,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output, output_len).unwrap();
+
+        assert_close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
     fn resident_paged_decode_attention_accepts_f16_kv() {
         let Some(metal) = native_metal_or_skip() else {
             return;
@@ -2575,6 +2990,32 @@ mod tests {
                     (((batch * head_count + head) * key_tokens + past_tokens) * dim) as usize;
                 values[target_base..target_base + dim]
                     .copy_from_slice(&current[current_base..current_base + dim]);
+            }
+        }
+        values
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_current_sequence(
+        past: &[f32],
+        current: &[f32],
+        batch_count: usize,
+        head_count: usize,
+        past_tokens: usize,
+        current_tokens: usize,
+        dim: usize,
+    ) -> Vec<f32> {
+        let total_tokens = past_tokens + current_tokens;
+        let mut values = vec![0.0_f32; batch_count * head_count * total_tokens * dim];
+        for batch in 0..batch_count {
+            for head in 0..head_count {
+                let past_base = (batch * head_count + head) * past_tokens * dim;
+                let current_base = (batch * head_count + head) * current_tokens * dim;
+                let target_base = (batch * head_count + head) * total_tokens * dim;
+                values[target_base..target_base + past_tokens * dim]
+                    .copy_from_slice(&past[past_base..past_base + past_tokens * dim]);
+                values[target_base + past_tokens * dim..target_base + total_tokens * dim]
+                    .copy_from_slice(&current[current_base..current_base + current_tokens * dim]);
             }
         }
         values

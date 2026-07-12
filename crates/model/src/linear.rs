@@ -287,8 +287,15 @@ impl<'a> QuantizedLinear<'a> {
                 ))
             }
             GgmlType::Q8_0 => {
-                let projected = crate::try_device!(self.forward_device(input, backend));
-                crate::try_device!(backend.add_device(residual, &projected))
+                let storage = self.gguf.tensor_quantized_storage(&self.tensor_ref.name)?;
+                crate::try_device!(backend.q8_0_matvec_add_device(
+                    storage.bytes,
+                    input,
+                    residual,
+                    row_count,
+                    self.in_features,
+                    self.out_features,
+                ))
             }
             _ => return Ok(None),
         };
@@ -333,6 +340,26 @@ impl<'a> QuantizedLinear<'a> {
             token_id,
             token_score,
         }))
+    }
+
+    pub(crate) fn greedy_tokens_device<B: Backend>(
+        &self,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        let dims = input.dims();
+        if dims.len() != 2 || dims[1] != self.in_features {
+            return Err(Error::model(format!(
+                "device greedy sequence expects [rows, {}], got {dims:?}",
+                self.in_features
+            )));
+        }
+        let row_count = dims[0];
+        let logits = crate::try_device!(self.forward_device(input, backend));
+        let logits = logits.reshape(vec![row_count, self.out_features])?;
+        let result =
+            crate::try_device!(backend.argmax_rows_f32_device(&logits, self.out_features,));
+        Ok(Some(result))
     }
 
     pub fn forward_f32_tensor_add_residual<B: Backend>(

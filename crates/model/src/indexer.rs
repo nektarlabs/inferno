@@ -48,18 +48,8 @@ pub struct DsaTopKSelection {
 
 #[derive(Debug)]
 pub struct DsaDeviceTopKSelection {
-    pub batch: usize,
-    pub query_tokens: usize,
-    pub key_tokens: usize,
-    pub top_k: usize,
     pub token_indices: Vec<u32>,
     pub current_key_device: DeviceValue,
-}
-
-impl DsaTopKSelection {
-    pub fn dims(&self) -> [usize; 3] {
-        [self.batch, self.query_tokens, self.top_k]
-    }
 }
 
 impl<'a> DsaIndexer<'a> {
@@ -294,10 +284,6 @@ impl<'a> DsaIndexer<'a> {
             .ok_or_else(|| Error::backend("native Metal DSA decode top-k is required"))?;
 
         Ok(Some(DsaDeviceTopKSelection {
-            batch,
-            query_tokens: 1,
-            key_tokens,
-            top_k,
             token_indices,
             current_key_device: current_key,
         }))

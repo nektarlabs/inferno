@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct MoeRouter<'a> {
+    #[cfg(test)]
     layer_index: usize,
     post_attention_norm: RmsNorm,
     router: RouterProjection<'a>,
@@ -34,6 +35,7 @@ enum RouterProjection<'a> {
 #[derive(Debug)]
 struct RouterProjectionOutput {
     output: Tensor,
+    #[cfg(test)]
     chunk_count: usize,
 }
 
@@ -41,6 +43,7 @@ struct RouterProjectionOutput {
 pub struct MoeRoutingOutput {
     pub normed_hidden_states: Tensor,
     pub dispatch_plan: Vec<ExpertDispatch>,
+    #[cfg(test)]
     pub report: MoeRoutingReport,
 }
 
@@ -73,6 +76,7 @@ pub struct MoeRouterLoadReport {
     pub limitations: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoeRoutingReport {
     pub layer_index: usize,
@@ -178,6 +182,7 @@ impl<'a> MoeRouter<'a> {
         };
 
         Ok(Self {
+            #[cfg(test)]
             layer_index,
             post_attention_norm,
             router,
@@ -229,11 +234,7 @@ impl<'a> MoeRouter<'a> {
         let logits_host = router_logits.output.to_vec2::<f32>()?;
         let topk_selections = select_topk(config, &logits_host, &self.correction_bias)?;
         let dispatch_plan = build_dispatch_plan(&topk_selections, config.num_routed_experts)?;
-        let dispatch_expert_count = dispatch_plan.len();
-        let dispatch_assignment_count = dispatch_plan
-            .iter()
-            .map(|dispatch| dispatch.assignments.len())
-            .sum::<usize>();
+        #[cfg(test)]
         let report = MoeRoutingReport {
             layer_index: self.layer_index,
             input_hidden_states_shape: Shape::new(hidden_states.dims().to_vec()),
@@ -243,13 +244,17 @@ impl<'a> MoeRouter<'a> {
             router_logits_chunk_count: router_logits.chunk_count,
             topk_expert_ids_shape: Shape::new(vec![flat_token_count, config.experts_per_token]),
             topk_weights_shape: Shape::new(vec![flat_token_count, config.experts_per_token]),
-            dispatch_expert_count,
-            dispatch_assignment_count,
+            dispatch_expert_count: dispatch_plan.len(),
+            dispatch_assignment_count: dispatch_plan
+                .iter()
+                .map(|dispatch| dispatch.assignments.len())
+                .sum(),
         };
 
         Ok(MoeRoutingOutput {
             normed_hidden_states: normed.hidden_states,
             dispatch_plan,
+            #[cfg(test)]
             report,
         })
     }
@@ -488,6 +493,7 @@ impl<'a> RouterProjection<'a> {
                 let output = router.forward(input, backend)?;
                 Ok(RouterProjectionOutput {
                     output: output.output,
+                    #[cfg(test)]
                     chunk_count: output.report.chunk_count,
                 })
             }
@@ -516,6 +522,7 @@ impl<'a> RouterProjection<'a> {
                 )?;
                 Ok(RouterProjectionOutput {
                     output,
+                    #[cfg(test)]
                     chunk_count: 1,
                 })
             }

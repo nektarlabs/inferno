@@ -14,22 +14,12 @@ pub enum ConfigSource {
     External(PathBuf),
 }
 
-pub fn load_config(path: Option<&Path>) -> Result<(Config, ConfigSource)> {
-    match path {
-        Some(path) => load_config_from_path(path)
-            .map(|config| (config, ConfigSource::External(path.to_path_buf()))),
-        None => {
-            load_embedded_config().map(|config| (config, ConfigSource::EmbeddedInfernoDefaults))
-        }
-    }
-}
-
 pub fn load_embedded_config() -> Result<Config> {
     info!(source = "embedded_defaults", "loading GLM config");
     Config::from_json_str(GLM52_LIKE_CONFIG_JSON)
 }
 
-pub fn load_config_from_path(path: &Path) -> Result<Config> {
+pub fn load_config(path: &Path) -> Result<Config> {
     info!(path = %path.display(), "loading external GLM config");
     let json = fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -43,10 +33,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_config_without_path_uses_embedded_source() {
-        let (config, source) = load_config(None).unwrap();
+    fn missing_external_config_returns_typed_io_error() {
+        let path = Path::new("/missing/inferno/config.json");
+        let error = load_config(path).expect_err("missing config must fail");
 
-        assert_eq!(source, ConfigSource::EmbeddedInfernoDefaults);
-        assert_eq!(config.hidden_size, 6144);
+        assert!(matches!(error, Error::Io { .. }));
+        assert!(error.to_string().contains(path.to_string_lossy().as_ref()));
     }
 }

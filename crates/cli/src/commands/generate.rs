@@ -1,5 +1,5 @@
 use std::{
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -7,17 +7,17 @@ use std::{
 };
 
 use anyhow::Result;
-use backend::MetalBackend;
+use backend::{Backend, ExpertCacheMetrics, MetalBackend};
 use common::{Error, Result as InfernoResult};
 use config::{load_config, Config};
 use gguf::GgufFile;
 use model::{
-    antirez_q2_artifact, enable_layer_profile, Index, IndexSummary, Model,
+    antirez_q2_artifact, enable_layer_profile, FfnIndex, Index, IndexSummary, Model,
     DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_telemetry, enable_memory_telemetry_file, enable_q2_runtime_profile,
-    run_generate_streaming_with_stop_tokens,
+    run_generate_streaming_with_options, GenerationOptions, KvCacheMetrics,
 };
 use tokenizer::{render_user_prompt, Tokenizer, TokenizerMetadata};
 
@@ -34,12 +34,16 @@ pub fn run(
     profile_layers: Option<&Path>,
     measure_tokens_per_second: bool,
     throughput_file: Option<&Path>,
+    profile_token_costs: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
+    speculative_mtp: bool,
 ) -> Result<()> {
-    let discovered_config = discover_config_path(model_path, config_path);
+    let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
-    let (config, _) = load_config(discovered_config.as_deref())?;
+    let config = load_config(&discovered_config)?;
     let artifact = resolve_q2_artifact(model_path)?;
     let gguf = GgufFile::open(&artifact.gguf_path)?;
     let readiness = load_q2_readiness(&gguf, &artifact, &config)?;
@@ -59,7 +63,18 @@ pub fn run(
         &readiness.index.summary,
     )?;
 
+    let expert_cache_budget_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
+    let hot_kv_cache_budget_bytes = cache_gb_to_bytes("hot KV cache", hot_kv_cache_gb)?;
     let backend = MetalBackend::new()?;
+    if let Some(expert_cache_budget_bytes) = expert_cache_budget_bytes {
+        let slots_per_layer = expert_cache_slots_per_layer(
+            &readiness.index,
+            config.num_routed_experts,
+            speculative_mtp,
+            expert_cache_budget_bytes,
+        )?;
+        backend.configure_expert_cache_slots_per_layer(slots_per_layer)?;
+    }
     let model = Model::open_from_index(
         &gguf,
         &config,
@@ -82,7 +97,7 @@ pub fn run(
     let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
     let mut generated_token_count = 0_usize;
     let mut throughput = ThroughputRecorder::start();
-    run_generate_streaming_with_stop_tokens(
+    let generation_report = run_generate_streaming_with_options(
         &model,
         &config,
         &backend,
@@ -90,6 +105,12 @@ pub fn run(
         max_new_tokens,
         page_size,
         &tokenizer_metadata.eos_token_ids,
+        GenerationOptions {
+            speculative_mtp,
+            hot_kv_cache_budget_bytes,
+            dynamic_cache_budget: None,
+            profile_token_costs,
+        },
         |token_id| {
             throughput.record_token();
             generated_token_count = generated_token_count
@@ -110,7 +131,9 @@ pub fn run(
             Ok(())
         },
     )?;
-    let throughput_report = throughput.finish(encoded.token_ids.len());
+    let throughput_report = throughput
+        .finish(encoded.token_ids.len())
+        .with_cache_metrics(backend.expert_cache_metrics()?, generation_report.kv_cache);
     stdout.write_all(b"\n")?;
     if measure_tokens_per_second || throughput_file.is_some() {
         validate_exact_generated_token_count(generated_token_count, &throughput_report)?;
@@ -141,7 +164,7 @@ fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
-        "inferno throughput: prompt_tokens={} generated_tokens={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3}",
+        "inferno throughput: prompt_tokens={} generated_tokens={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_ssd_read_gb={:.3} expert_cache_allocated_gb={:.3} expert_cache_capacity_gb={:.3} kv_lookups={} kv_hits={} kv_misses={} kv_hit_rate={:.4} kv_miss_rate={:.4} kv_selected_rows={} kv_ssd_read_gb={:.3} hot_kv_gb={:.3} cold_kv_gb={:.3}",
         report.prompt_tokens,
         report.generated_tokens,
         report.total_seconds,
@@ -152,7 +175,23 @@ fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()
         report.decode_tokens_per_second,
         report.decode_token_mean_seconds,
         report.decode_token_p50_seconds,
-        report.decode_token_p95_seconds
+        report.decode_token_p95_seconds,
+        report.expert_cache.lookups,
+        report.expert_cache.hits,
+        report.expert_cache.misses,
+        report.expert_cache.hit_rate(),
+        bytes_to_gb(report.expert_cache.ssd_read_bytes),
+        bytes_to_gb(report.expert_cache.allocated_bytes),
+        bytes_to_gb(report.expert_cache.capacity_bytes),
+        report.kv_cache.lookups(),
+        report.kv_cache.hits(),
+        report.kv_cache.misses(),
+        report.kv_cache.hit_rate(),
+        report.kv_cache.miss_rate(),
+        report.kv_cache.selected_rows,
+        bytes_to_gb(report.kv_cache.ssd_read_bytes),
+        bytes_to_gb(report.kv_cache.hot_bytes),
+        bytes_to_gb(report.kv_cache.cold_bytes),
     )
     .map_err(|source| Error::Io {
         path: PathBuf::from("<stderr>"),
@@ -171,6 +210,19 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
             });
         }
     };
+    if !needs_header {
+        let contents = fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let existing_header = contents.lines().next().unwrap_or_default();
+        if existing_header != THROUGHPUT_REPORT_HEADER {
+            return Err(Error::runtime(format!(
+                "throughput report {} uses an incompatible schema; choose a new output file",
+                path.display()
+            )));
+        }
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -180,18 +232,14 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
             source,
         })?;
     if needs_header {
-        writeln!(
-            file,
-            "prompt_tokens\tgenerated_tokens\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds"
-        )
-        .map_err(|source| Error::Io {
+        writeln!(file, "{THROUGHPUT_REPORT_HEADER}").map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
     }
     writeln!(
         file,
-        "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+        "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}",
         report.prompt_tokens,
         report.generated_tokens,
         report.total_seconds,
@@ -202,12 +250,105 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
         report.decode_tokens_per_second,
         report.decode_token_mean_seconds,
         report.decode_token_p50_seconds,
-        report.decode_token_p95_seconds
+        report.decode_token_p95_seconds,
+        report.expert_cache.lookups,
+        report.expert_cache.hits,
+        report.expert_cache.misses,
+        report.expert_cache.hit_rate(),
+        bytes_to_gb(report.expert_cache.ssd_read_bytes),
+        bytes_to_gb(report.expert_cache.allocated_bytes),
+        bytes_to_gb(report.expert_cache.capacity_bytes),
+        report.kv_cache.lookups(),
+        report.kv_cache.hits(),
+        report.kv_cache.misses(),
+        report.kv_cache.hit_rate(),
+        report.kv_cache.miss_rate(),
+        report.kv_cache.selected_rows,
+        bytes_to_gb(report.kv_cache.ssd_read_bytes),
+        bytes_to_gb(report.kv_cache.hot_bytes),
+        bytes_to_gb(report.kv_cache.cold_bytes),
     )
     .map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+const THROUGHPUT_REPORT_HEADER: &str = "prompt_tokens\tgenerated_tokens\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_ssd_read_gb\texpert_cache_allocated_gb\texpert_cache_capacity_gb\tkv_lookups\tkv_hits\tkv_misses\tkv_hit_rate\tkv_miss_rate\tkv_selected_rows\tkv_ssd_read_gb\thot_kv_gb\tcold_kv_gb";
+
+fn bytes_to_gb(bytes: u64) -> f64 {
+    bytes as f64 / 1_000_000_000.0
+}
+
+fn cache_gb_to_bytes(name: &str, value: Option<f64>) -> InfernoResult<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value <= 0.0 {
+        return Err(Error::runtime(format!(
+            "{name} size must be a finite positive number of GB, got {value}"
+        )));
+    }
+    let bytes = value * 1_000_000_000.0;
+    if bytes > usize::MAX as f64 {
+        return Err(Error::runtime(format!(
+            "{name} size {value} GB exceeds this platform's address space"
+        )));
+    }
+    Ok(Some(bytes.floor() as usize))
+}
+
+fn expert_cache_slots_per_layer(
+    index: &Index,
+    expert_count: usize,
+    include_mtp: bool,
+    budget_bytes: usize,
+) -> InfernoResult<usize> {
+    if expert_count == 0 {
+        return Err(Error::weights("routed expert count must be positive"));
+    }
+    let packed = index
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.ffn {
+            FfnIndex::SparseMoe { packed_experts, .. } => Some(packed_experts),
+            FfnIndex::Dense(_) => None,
+        })
+        .ok_or_else(|| Error::weights("GLM index has no routed expert tensors"))?;
+    let expert_count_u64 = u64::try_from(expert_count)
+        .map_err(|_| Error::weights("routed expert count does not fit u64"))?;
+    let bytes_per_expert = [&packed.gate, &packed.up, &packed.down]
+        .into_iter()
+        .try_fold(0_u64, |total, tensor| {
+            if tensor.storage_byte_len % expert_count_u64 != 0 {
+                return Err(Error::weights(format!(
+                    "packed expert tensor {} byte length {} is not divisible by expert count {expert_count}",
+                    tensor.name, tensor.storage_byte_len
+                )));
+            }
+            total
+                .checked_add(tensor.storage_byte_len / expert_count_u64)
+                .ok_or_else(|| Error::weights("Q2 expert triplet byte size overflow"))
+        })?;
+    let routed_layer_count = index
+        .summary
+        .sparse_layer_count
+        .checked_add(usize::from(include_mtp && index.mtp.is_some()))
+        .ok_or_else(|| Error::weights("routed layer count overflow"))?;
+    let bytes_per_layer_slot = usize::try_from(bytes_per_expert)
+        .map_err(|_| Error::weights("Q2 expert triplet byte size does not fit usize"))?;
+    let bytes_per_global_slot = bytes_per_layer_slot
+        .checked_mul(routed_layer_count)
+        .ok_or_else(|| Error::weights("Q2 expert cache layer budget overflow"))?;
+    let slots = budget_bytes / bytes_per_global_slot;
+    if slots == 0 {
+        return Err(Error::runtime(format!(
+            "expert cache budget {:.3} GB is too small; one slot across {routed_layer_count} routed layers requires {:.3} GB",
+            budget_bytes as f64 / 1_000_000_000.0,
+            bytes_per_global_slot as f64 / 1_000_000_000.0,
+        )));
+    }
+    Ok(slots.min(expert_count))
 }
 
 fn tokens_per_second(token_count: usize, elapsed: Duration) -> f64 {
@@ -257,6 +398,8 @@ struct ThroughputReport {
     decode_token_mean_seconds: f64,
     decode_token_p50_seconds: f64,
     decode_token_p95_seconds: f64,
+    expert_cache: ExpertCacheMetrics,
+    kv_cache: KvCacheMetrics,
 }
 
 impl ThroughputReport {
@@ -305,7 +448,19 @@ impl ThroughputReport {
             decode_token_mean_seconds,
             decode_token_p50_seconds,
             decode_token_p95_seconds,
+            expert_cache: ExpertCacheMetrics::default(),
+            kv_cache: KvCacheMetrics::default(),
         }
+    }
+
+    fn with_cache_metrics(
+        mut self,
+        expert_cache: ExpertCacheMetrics,
+        kv_cache: KvCacheMetrics,
+    ) -> Self {
+        self.expert_cache = expert_cache;
+        self.kv_cache = kv_cache;
+        self
     }
 }
 
@@ -513,17 +668,19 @@ fn validate_generation_request(
     Ok(())
 }
 
-fn discover_config_path(model_path: &Path, explicit_config_path: Option<&Path>) -> Option<PathBuf> {
+fn discover_config_path(model_path: &Path, explicit_config_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit_config_path {
-        return Some(path.to_path_buf());
+        return Ok(path.to_path_buf());
     }
-    if model_path.is_dir() {
-        let candidate = model_path.join("config.json");
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    let candidate = model_path.join("config.json");
+    if candidate.exists() {
+        return Ok(candidate);
     }
-    None
+    Err(Error::config(format!(
+        "config path was not provided and {} does not exist",
+        candidate.display()
+    ))
+    .into())
 }
 
 fn discover_tokenizer_path(
@@ -568,6 +725,16 @@ mod tests {
         let rate = tokens_per_second(6, Duration::from_secs(0));
 
         assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn cache_budget_conversion_uses_decimal_gb_and_rejects_invalid_values() {
+        assert_eq!(
+            cache_gb_to_bytes("cache", Some(1.5)).unwrap(),
+            Some(1_500_000_000)
+        );
+        assert!(cache_gb_to_bytes("cache", Some(0.0)).is_err());
+        assert!(cache_gb_to_bytes("cache", Some(f64::NAN)).is_err());
     }
 
     #[test]
@@ -636,6 +803,23 @@ mod tests {
             1
         );
         assert_eq!(contents.lines().count(), 3);
+    }
+
+    #[test]
+    fn append_tokens_per_second_report_rejects_old_schema() {
+        let dir = unique_temp_dir("throughput-old-schema");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("throughput.tsv");
+        fs::write(&path, "prompt_tokens\tgenerated_tokens\n").unwrap();
+        let report = ThroughputReport::from_token_offsets(
+            2,
+            Duration::from_secs(2),
+            &[Duration::from_secs(1)],
+        );
+
+        let error = append_tokens_per_second_report(&path, &report).unwrap_err();
+
+        assert!(error.to_string().contains("incompatible schema"));
     }
 
     #[test]

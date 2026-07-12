@@ -100,6 +100,7 @@ pub struct MetalCombineRopeTailReport {
     pub thread_count: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetalStackHeadOutputsReport {
     pub values: Vec<f32>,
@@ -109,6 +110,7 @@ pub struct MetalStackHeadOutputsReport {
     pub thread_count: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetalLinearizePagedCacheReport {
     pub values: Vec<f32>,
@@ -671,6 +673,7 @@ impl MetalLayout {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn stack_head_outputs(
         &self,
         device: &Device,
@@ -721,6 +724,7 @@ impl MetalLayout {
         })
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn linearize_paged_cache(
         &self,

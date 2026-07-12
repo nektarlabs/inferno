@@ -4,8 +4,8 @@ use config::Config;
 use gguf::{GgmlType, GgufFile};
 
 use crate::{
-    EmbeddingTable, LayerKind, LayerKvCacheTensors, MtpIndex, OutputHead, QuantizedLinear, RmsNorm,
-    RmsNormLoadReport, SparseBlock, SparseBlockLoadReport,
+    EmbeddingTable, LayerDeviceKvCacheTensors, LayerKind, LayerKvCacheTensors, MtpIndex,
+    OutputHead, QuantizedLinear, RmsNorm, RmsNormLoadReport, SparseBlock, SparseBlockLoadReport,
 };
 
 #[derive(Debug)]
@@ -22,6 +22,14 @@ pub struct MtpHead<'a> {
 pub struct MtpDraftOutput {
     pub hidden_states: F32Tensor,
     pub layer_kv_cache: LayerKvCacheTensors,
+    pub token_id: u32,
+    pub token_score: f32,
+}
+
+#[derive(Debug)]
+pub struct MtpDeviceDraftOutput {
+    pub hidden_states: backend::DeviceValue,
+    pub layer_kv_cache: LayerDeviceKvCacheTensors,
     pub token_id: u32,
     pub token_score: f32,
 }
@@ -172,6 +180,112 @@ impl<'a> MtpHead<'a> {
             token_id: token.token_id,
             token_score: token.token_score,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draft_device<B, S, I>(
+        &self,
+        config: &Config,
+        main_hidden_states: &backend::DeviceValue,
+        next_token_ids: &[u32],
+        embedding_table: &EmbeddingTable<'_>,
+        output_head: &OutputHead<'_>,
+        backend: &B,
+        past_kv: Option<&backend::DevicePagedKvView>,
+        selected_kv_for_tokens: &mut S,
+        index_keys_for_layer: &mut I,
+    ) -> Result<Option<MtpDeviceDraftOutput>>
+    where
+        B: Backend,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        let dims = main_hidden_states.dims();
+        validate_exact_shape("gguf_device_mtp_hidden_rank", &[dims.len()], &[3])?;
+        let batch = dims[0];
+        let tokens = dims[1];
+        validate_exact_shape(
+            "gguf_device_mtp_hidden_shape",
+            dims,
+            &[1, tokens, config.hidden_size],
+        )?;
+        validate_exact_shape(
+            "gguf_device_mtp_next_token_count",
+            &[next_token_ids.len()],
+            &[tokens],
+        )?;
+
+        let embeddings = embedding_table.lookup_f32(next_token_ids)?.hidden_states;
+        let embeddings = crate::try_device!(backend.device_upload_f32_tensor(&embeddings));
+        let hnorm = crate::try_device!(self.hnorm.forward_device(main_hidden_states, backend));
+        let enorm = crate::try_device!(self.enorm.forward_device(&embeddings, backend));
+        let fused = crate::try_device!(backend.device_alloc_f32_tensor(&[
+            batch,
+            tokens,
+            config.hidden_size * 2,
+        ]));
+        for token in 0..tokens {
+            let source_offset = token * config.hidden_size;
+            let destination_offset = token * config.hidden_size * 2;
+            require_native(
+                "MTP embedding normalization copy",
+                backend.device_copy_f32(
+                    &enorm,
+                    source_offset,
+                    &fused,
+                    destination_offset,
+                    config.hidden_size,
+                )?,
+            )?;
+            require_native(
+                "MTP hidden normalization copy",
+                backend.device_copy_f32(
+                    &hnorm,
+                    source_offset,
+                    &fused,
+                    destination_offset + config.hidden_size,
+                    config.hidden_size,
+                )?,
+            )?;
+        }
+        let projected = crate::try_device!(self.eh_proj.forward_device(&fused, backend));
+        let block_output = match past_kv {
+            Some(past_kv) => {
+                let (output, _) = crate::try_device!(self.block.forward_sparse_decode_device(
+                    config,
+                    &projected,
+                    backend,
+                    past_kv,
+                    selected_kv_for_tokens,
+                    index_keys_for_layer,
+                    None,
+                ));
+                output
+            }
+            None => {
+                validate_exact_shape("gguf_device_mtp_seed_tokens", &[tokens], &[1])?;
+                crate::try_device!(self.block.forward_seed_device(config, &projected, backend))
+            }
+        };
+        let normalized = crate::try_device!(self
+            .shared_head_norm
+            .forward_device(&block_output.hidden_states, backend));
+        let token = crate::try_device!(
+            output_head.decode_token_from_normalized_device(&normalized, backend)
+        );
+
+        Ok(Some(MtpDeviceDraftOutput {
+            hidden_states: block_output.hidden_states,
+            layer_kv_cache: LayerDeviceKvCacheTensors {
+                layer_index: self.load_report.layer_index,
+                layer_kind: LayerKind::SparseMoe,
+                cache_k: block_output.cache_k,
+                cache_v: block_output.cache_v,
+                index_key: block_output.index_key,
+            },
+            token_id: token.token_id,
+            token_score: token.token_score,
+        }))
     }
 }
 

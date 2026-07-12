@@ -8,7 +8,7 @@ use crate::{
     EmbeddingLookupOutput, EmbeddingLookupReport, EmbeddingTable, GreedyReport, Index,
     IndexSummary, LayerDeviceKvCacheTensors, LayerKvCacheTensors, LayerStack,
     LayerStackForwardReport, LayerStackLoadReport, LogitsOutput, LogitsReport, MemoryAdviceReport,
-    MtpDraftOutput, MtpHead, MtpLoadReport, OutputHead, OutputHeadLoadReport,
+    MtpDeviceDraftOutput, MtpDraftOutput, MtpHead, MtpLoadReport, OutputHead, OutputHeadLoadReport,
 };
 
 pub const DEFAULT_GGUF_OUTPUT_CHUNK_ROWS: usize = 16_384;
@@ -78,9 +78,18 @@ pub struct ModelTokenSequenceOutput {
 
 #[derive(Debug)]
 pub struct ModelDeviceTokenOutput {
+    pub hidden_states: backend::DeviceValue,
     pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
     pub token_id: u32,
     pub token_score: f32,
+}
+
+#[derive(Debug)]
+pub struct ModelDeviceTokenSequenceOutput {
+    pub hidden_states: backend::DeviceValue,
+    pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
+    pub token_ids: Vec<u32>,
+    pub token_scores: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -282,6 +291,38 @@ impl<'a> Model<'a> {
         Ok(Some(draft))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_next_token_with_mtp_device<B, S, I>(
+        &self,
+        config: &Config,
+        main_hidden_states: &backend::DeviceValue,
+        next_token_ids: &[u32],
+        backend: &B,
+        mtp_past_kv: Option<&backend::DevicePagedKvView>,
+        mut selected_kv_for_tokens: S,
+        mut index_keys_for_layer: I,
+    ) -> Result<Option<MtpDeviceDraftOutput>>
+    where
+        B: Backend,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        let Some(mtp_head) = self.mtp_head.as_ref() else {
+            return Ok(None);
+        };
+        mtp_head.draft_device(
+            config,
+            main_hidden_states,
+            next_token_ids,
+            &self.embedding_table,
+            &self.output_head,
+            backend,
+            mtp_past_kv,
+            &mut selected_kv_for_tokens,
+            &mut index_keys_for_layer,
+        )
+    }
+
     pub fn prefill_last_logits<B: Backend>(
         &self,
         config: &Config,
@@ -360,6 +401,7 @@ impl<'a> Model<'a> {
             .ok_or_else(|| Error::backend("device seed output head has no native path"))?;
 
         Ok(Some(ModelDeviceTokenOutput {
+            hidden_states: stack.hidden_states,
             layer_kv_cache: stack.layer_kv_cache,
             token_id: token.token_id,
             token_score: token.token_score,
@@ -558,9 +600,9 @@ impl<'a> Model<'a> {
         config: &Config,
         decode_token_ids: &[u32],
         backend: &B,
-        mut past_kv_for_layer: F,
-        mut selected_kv_for_tokens: S,
-        mut index_keys_for_layer: I,
+        past_kv_for_layer: F,
+        selected_kv_for_tokens: S,
+        index_keys_for_layer: I,
     ) -> Result<Option<ModelDeviceTokenOutput>>
     where
         B: Backend,
@@ -568,57 +610,89 @@ impl<'a> Model<'a> {
         S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
         I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
-        if decode_token_ids.is_empty() {
-            return Err(Error::model(
-                "GLM-5.2 GGUF device paged next-token decode requires at least one token id",
-            ));
+        let Some(output) = self.decode_token_sequence_with_device_paged_kv_provider(
+            config,
+            decode_token_ids,
+            backend,
+            past_kv_for_layer,
+            selected_kv_for_tokens,
+            index_keys_for_layer,
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_exact_shape(
+            "gguf_device_next_token_output_count",
+            &[output.token_ids.len(), output.token_scores.len()],
+            &[1, 1],
+        )?;
+        Ok(Some(ModelDeviceTokenOutput {
+            hidden_states: output.hidden_states,
+            layer_kv_cache: output.layer_kv_cache,
+            token_id: output.token_ids[0],
+            token_score: output.token_scores[0],
+        }))
+    }
+
+    pub fn decode_token_sequence_with_device_paged_kv_provider<B, F, S, I>(
+        &self,
+        config: &Config,
+        decode_token_ids: &[u32],
+        backend: &B,
+        mut past_kv_for_layer: F,
+        mut selected_kv_for_tokens: S,
+        mut index_keys_for_layer: I,
+    ) -> Result<Option<ModelDeviceTokenSequenceOutput>>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        if decode_token_ids.is_empty() || decode_token_ids.len() > 3 {
+            return Err(Error::model(format!(
+                "GLM-5.2 device sequence decode expects one to three token ids, got {}",
+                decode_token_ids.len()
+            )));
         }
         if !backend.capabilities().custom_kernels {
             return Err(Error::backend(
                 "device paged decode requires the Metal Q2 backend",
             ));
         }
-
-        // One shared command buffer per stretch of GPU work. The runtime
-        // owns the resident KV cache and supplies per-layer device views.
-        if decode_token_ids.len() == 1
-            && backend.device_values_supported()
-            && !self
+        if !backend.device_values_supported()
+            || self
                 .device_decode_disabled
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            match self.decode_next_token_paged_device(
-                config,
-                decode_token_ids,
-                backend,
-                &mut past_kv_for_layer,
-                &mut selected_kv_for_tokens,
-                &mut index_keys_for_layer,
-            )? {
-                Some(output) => return Ok(Some(output)),
-                None => {
-                    // Discard any partially encoded work, then permanently
-                    // fall back — the unsupported component will not change
-                    // between tokens.
-                    backend.device_flush()?;
-                    self.device_decode_disabled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(
-                        "device-batched decode path unavailable for this artifact; \
-                         falling back to per-op decode"
-                    );
-                }
-            }
+            return Ok(None);
         }
 
-        Ok(None)
+        let output = self.decode_token_sequence_paged_device(
+            config,
+            decode_token_ids,
+            backend,
+            &mut past_kv_for_layer,
+            &mut selected_kv_for_tokens,
+            &mut index_keys_for_layer,
+        )?;
+        if output.is_none() {
+            backend.device_flush()?;
+            if decode_token_ids.len() == 1 {
+                self.device_decode_disabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "device-batched decode path unavailable for this artifact; \
+                     falling back to per-op decode"
+                );
+            }
+        }
+        Ok(output)
     }
 
-    /// Batched device-resident single-token decode. Embeds on the host (a
-    /// table lookup), then runs every layer and the output head with
-    /// GPU-resident hidden states; the fused argmax at the end flushes the
-    /// final batch and yields the token.
-    fn decode_next_token_paged_device<B, F, S, I>(
+    /// Runs one normal decode row or a two-row speculative verification while
+    /// hidden states, attention, MoE, logits and reductions remain on Metal.
+    fn decode_token_sequence_paged_device<B, F, S, I>(
         &self,
         config: &Config,
         decode_token_ids: &[u32],
@@ -626,7 +700,7 @@ impl<'a> Model<'a> {
         past_kv_for_layer: &mut F,
         selected_kv_for_tokens: &mut S,
         index_keys_for_layer: &mut I,
-    ) -> Result<Option<ModelDeviceTokenOutput>>
+    ) -> Result<Option<ModelDeviceTokenSequenceOutput>>
     where
         B: Backend,
         F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
@@ -643,12 +717,12 @@ impl<'a> Model<'a> {
             index_keys_for_layer,
         ));
 
-        let token = match self
+        let (token_ids, token_scores) = match self
             .output_head
-            .decode_token_device(&stack.hidden_states, backend)?
+            .decode_tokens_device(&stack.hidden_states, backend)?
         {
-            Some(token) => token,
-            None => {
+            Some(tokens) => tokens,
+            None if decode_token_ids.len() == 1 => {
                 // The head has no device path (e.g. a non-Q2_K output
                 // projection): download the final hidden states and finish on
                 // the eager head. The layer stack still ran fully batched.
@@ -657,14 +731,17 @@ impl<'a> Model<'a> {
                     "select_last_token",
                     backend.select_last_token_f32_tensor(&hidden_states)?,
                 )?;
-                self.output_head.decode_token_f32(&selected, backend)?
+                let token = self.output_head.decode_token_f32(&selected, backend)?;
+                (vec![token.token_id], vec![token.token_score])
             }
+            None => return Ok(None),
         };
 
-        Ok(Some(ModelDeviceTokenOutput {
+        Ok(Some(ModelDeviceTokenSequenceOutput {
+            hidden_states: stack.hidden_states,
             layer_kv_cache: stack.layer_kv_cache,
-            token_id: token.token_id,
-            token_score: token.token_score,
+            token_ids,
+            token_scores,
         }))
     }
 

@@ -3,6 +3,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use common::{validate_exact_shape, Error, F32Tensor, Result};
@@ -189,6 +193,7 @@ pub struct ColdKvBlockStore {
     spec: ColdKvStoreSpec,
     blocks: Vec<ColdKvBlockMeta>,
     index: BTreeMap<ColdKvBlockKey, usize>,
+    read_bytes: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -375,6 +380,7 @@ impl ColdKvBlockStore {
             spec,
             blocks: Vec::new(),
             index: BTreeMap::new(),
+            read_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -404,6 +410,7 @@ impl ColdKvBlockStore {
             spec,
             blocks,
             index,
+            read_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -433,6 +440,7 @@ impl ColdKvBlockStore {
             spec: self.spec.clone(),
             blocks: self.blocks.clone(),
             index: self.index.clone(),
+            read_bytes: Arc::clone(&self.read_bytes),
         })
     }
 
@@ -450,6 +458,12 @@ impl ColdKvBlockStore {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Bytes read from the append-only KV file by this store and all cloned
+    /// prefetch readers. This counts record headers and compressed payloads.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
     }
 
     pub fn lookup_block(
@@ -913,6 +927,8 @@ impl ColdKvBlockStore {
                     .map_err(|_| Error::cache("cold KV payload length does not fit usize"))?,
             )
             .ok_or_else(|| Error::cache("cold KV record length overflow"))?;
+        let record_len_u64 = u64::try_from(record_len)
+            .map_err(|_| Error::cache("cold KV record length does not fit u64"))?;
         let mut record = vec![0_u8; record_len];
         self.file.read_exact(&mut record).map_err(|error| {
             Error::cache(format!(
@@ -920,6 +936,7 @@ impl ColdKvBlockStore {
                 self.path.display()
             ))
         })?;
+        self.read_bytes.fetch_add(record_len_u64, Ordering::Relaxed);
         let header = decode_record_header(&record[..RECORD_HEADER_LEN])?;
         validate_record_matches_meta(&header, meta)?;
         Ok(record[RECORD_HEADER_LEN..].to_vec())
@@ -2053,6 +2070,22 @@ mod tests {
         assert!(reader.read_layer_range_contiguous(2, 0, 4).is_err());
         assert!(writer.read_layer_range_contiguous(2, 0, 4).is_ok());
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn read_byte_counter_includes_cloned_prefetch_readers() {
+        let path = temp_path("cold-kv-read-bytes");
+        let mut writer = ColdKvBlockStore::create(&path, spec()).unwrap();
+        let write = writer
+            .write_layer_block(2, 0, &tensor(3, 0.0), &tensor(3, 10.0))
+            .unwrap();
+        let mut reader = writer.clone_reader().unwrap();
+
+        reader.read_layer_block(2, 0).unwrap();
+
+        assert_eq!(writer.read_bytes(), write.total_file_bytes_written);
+        assert_eq!(reader.read_bytes(), write.total_file_bytes_written);
         std::fs::remove_file(path).ok();
     }
 

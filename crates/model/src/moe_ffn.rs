@@ -110,6 +110,13 @@ struct RoutedExpertPrefetchWork<'a> {
     payloads: Vec<Q2ExpertPayload<'a>>,
 }
 
+#[derive(Debug)]
+struct SelectedExpertSources<'a> {
+    gate: Vec<Q2ExpertSource<'a>>,
+    up: Vec<Q2ExpertSource<'a>>,
+    down: Vec<Q2ExpertSource<'a>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrefetchRange {
     offset: u64,
@@ -299,14 +306,13 @@ impl<'a> MoeFfn<'a> {
         work.run(self.routed_gate.gguf, self.layer_index)
     }
 
-    fn stage_selected_routed_expert_ids<B: Backend>(
+    fn selected_routed_expert_sources(
         &self,
         expert_ids: &[u32],
-        backend: &B,
-    ) -> Result<Option<backend::DeviceQ2Experts>> {
+    ) -> Result<SelectedExpertSources<'a>> {
         if expert_ids.is_empty() {
             return Err(Error::moe(
-                "device Q2 expert staging requires selected expert IDs",
+                "device Q2 expert execution requires selected expert IDs",
             ));
         }
         let mut gate_payloads = Vec::with_capacity(expert_ids.len());
@@ -331,13 +337,11 @@ impl<'a> MoeFfn<'a> {
                 absolute_offset: down.absolute_offset,
             });
         }
-        backend.stage_q2_experts_device(
-            self.layer_index,
-            self.routed_gate.gguf.path(),
-            &gate_payloads,
-            &up_payloads,
-            &down_payloads,
-        )
+        Ok(SelectedExpertSources {
+            gate: gate_payloads,
+            up: up_payloads,
+            down: down_payloads,
+        })
     }
 
     fn run_with_async_selected_routed_expert_prefetch<T>(
@@ -752,11 +756,10 @@ impl<'a> MoeFfn<'a> {
         require_native("add", backend.add_f32_tensor(hidden_states, &ffn_delta)?)
     }
 
-    /// Batched device-resident MoE FFN for single-token decode. The router and
-    /// expert math stay on Metal. After top-k, one deliberate synchronization
-    /// reads eight IDs so their exact Q2 ranges can be prefetched sequentially
-    /// from SSD; this avoids demand-faulting random GGUF pages inside the
-    /// expert kernels. `Ok(None)` falls back to the eager path.
+    /// Batched device-resident MoE FFN for one-token decode or three-token MTP
+    /// verification. Router and expert math stay on Metal. After top-k, one
+    /// deliberate synchronization reads the selected IDs so their exact Q2
+    /// ranges can be streamed from SSD before the expert kernels run.
     pub(crate) fn forward_device<B: Backend>(
         &self,
         config: &Config,
@@ -779,74 +782,105 @@ impl<'a> MoeFfn<'a> {
         let flat_token_count = batch
             .checked_mul(tokens)
             .ok_or_else(|| Error::moe("GGUF device MoE FFN flat token count overflow"))?;
-        if flat_token_count != 1 {
+        if flat_token_count == 0 || flat_token_count > 3 {
             return Ok(None);
         }
 
-        let routing = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "sparse_moe.router",
-            || self.router.route_device(config, hidden_states, backend),
+        let (routing, selected_expert_ids) = crate::try_device!(profile::run_token_device_stage(
+            profile::TokenProfileStage::MoeRouting,
+            backend,
+            || {
+                let routing = crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "sparse_moe.router",
+                    || self.router.route_device(config, hidden_states, backend),
+                ));
+                let selected_expert_ids = crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "sparse_moe.router_sync",
+                    || backend.moe_router_expert_ids_device(&routing.topk),
+                ));
+                Ok(Some((routing, selected_expert_ids)))
+            },
         ));
-        let selected_expert_ids = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "sparse_moe.router_sync",
-            || backend.moe_router_expert_ids_device(&routing.topk),
-        ));
-        let staged_experts = crate::try_device!(profile::run_layer_stage(
-            self.layer_index,
-            "sparse_moe.expert_stage",
-            || self.stage_selected_routed_expert_ids(&selected_expert_ids, backend),
-        ));
-        tracing::debug!(
-            layer_index = self.layer_index,
-            cache_hits = staged_experts.cache_hits(),
-            cache_misses = staged_experts.cache_misses(),
-            expert_ids = ?selected_expert_ids,
-            "resolved routed expert cache entries"
-        );
         let flat_tokens = routing
             .normed_hidden_states
             .reshape(vec![flat_token_count, config.hidden_size])?;
-
-        let shared_gate = require_moe_device_stage(
-            "sparse_moe.shared_gate",
-            profile::run_layer_stage(self.layer_index, "sparse_moe.shared_gate.device", || {
-                self.shared_gate.forward_device(&flat_tokens, backend)
-            }),
-        )?;
-        let shared_up = require_moe_device_stage(
-            "sparse_moe.shared_up",
-            profile::run_layer_stage(self.layer_index, "sparse_moe.shared_up.device", || {
-                self.shared_up.forward_device(&flat_tokens, backend)
-            }),
-        )?;
-        let shared_gated = require_moe_device_stage(
-            "sparse_moe.shared_swiglu",
-            profile::run_layer_stage(self.layer_index, "sparse_moe.shared_swiglu.device", || {
-                backend.swiglu_device(&shared_gate, &shared_up)
-            }),
-        )?;
-        let shared_down = require_moe_device_stage(
-            "sparse_moe.shared_down",
-            profile::run_layer_stage(self.layer_index, "sparse_moe.shared_down.device", || {
-                self.shared_down.forward_device(&shared_gated, backend)
-            }),
-        )?;
+        let sources = self.selected_routed_expert_sources(&selected_expert_ids)?;
+        let (routed, shared_down) = thread::scope(|scope| {
+            let routed = scope.spawn(|| {
+                profile::run_layer_stage(self.layer_index, "sparse_moe.routed.ready_first", || {
+                    backend.ready_routed_experts_device(
+                        self.layer_index,
+                        self.routed_gate.gguf.path(),
+                        &sources.gate,
+                        &sources.up,
+                        &sources.down,
+                        &flat_tokens,
+                        &routing.topk,
+                        self.routed_gate_up.in_features,
+                        self.routed_gate_up.out_features,
+                        self.routed_down.out_features,
+                    )
+                })
+            });
+            let shared_result: Result<backend::DeviceValue> = (|| {
+                let shared_gate = require_moe_device_stage(
+                    "sparse_moe.shared_gate",
+                    profile::run_layer_stage(
+                        self.layer_index,
+                        "sparse_moe.shared_gate.device",
+                        || self.shared_gate.forward_device(&flat_tokens, backend),
+                    ),
+                )?;
+                let shared_up = require_moe_device_stage(
+                    "sparse_moe.shared_up",
+                    profile::run_layer_stage(
+                        self.layer_index,
+                        "sparse_moe.shared_up.device",
+                        || self.shared_up.forward_device(&flat_tokens, backend),
+                    ),
+                )?;
+                let shared_gated = require_moe_device_stage(
+                    "sparse_moe.shared_swiglu",
+                    profile::run_layer_stage(
+                        self.layer_index,
+                        "sparse_moe.shared_swiglu.device",
+                        || backend.swiglu_device(&shared_gate, &shared_up),
+                    ),
+                )?;
+                let shared_down = require_moe_device_stage(
+                    "sparse_moe.shared_down",
+                    profile::run_layer_stage(
+                        self.layer_index,
+                        "sparse_moe.shared_down.device",
+                        || self.shared_down.forward_device(&shared_gated, backend),
+                    ),
+                )?;
+                backend.device_flush()?;
+                Ok(shared_down)
+            })();
+            let routed_result = routed
+                .join()
+                .map_err(|_| Error::moe("ready routed expert thread panicked"))?;
+            let routed = require_moe_device_stage("sparse_moe.routed.ready_first", routed_result)?;
+            Ok::<_, Error>((routed, shared_result?))
+        })?;
+        tracing::debug!(
+            layer_index = self.layer_index,
+            selected_experts = routed.selected_experts(),
+            cache_hits = routed.cache_hits(),
+            cache_misses = routed.cache_misses(),
+            transient_experts = routed.transient_experts(),
+            read_bytes = routed.read_bytes(),
+            ready_waves = routed.ready_waves(),
+            expert_ids = ?selected_expert_ids,
+            "completed ready-first routed expert execution"
+        );
         validate_exact_shape(
             "gguf_device_moe_ffn_shared_output",
             shared_down.dims(),
             &[flat_token_count, config.hidden_size],
-        )?;
-
-        let routed = require_moe_device_stage(
-            "sparse_moe.routed",
-            self.forward_single_token_routed_device(
-                &routing.topk,
-                &staged_experts,
-                &flat_tokens,
-                backend,
-            ),
         )?;
 
         let output = require_moe_device_stage(
@@ -854,73 +888,11 @@ impl<'a> MoeFfn<'a> {
             backend.moe_topk_combine_residual_device(
                 &shared_down,
                 hidden_states,
-                &routed,
+                routed.output(),
                 &routing.topk,
             ),
         )?;
         Ok(Some(output))
-    }
-
-    fn forward_single_token_routed_device<B: Backend>(
-        &self,
-        routing: &backend::DeviceRouterTopK,
-        staged_experts: &backend::DeviceQ2Experts,
-        flat_tokens: &backend::DeviceValue,
-        backend: &B,
-    ) -> Result<Option<backend::DeviceValue>> {
-        if routing.assignment_count()? == 0 {
-            return Err(Error::moe(
-                "GLM-5.2 GGUF device MoE FFN routing produced no expert assignments",
-            ));
-        }
-
-        let gated = require_moe_device_stage(
-            "sparse_moe.routed_gate_up_swiglu.multi_expert",
-            profile::run_layer_stage(
-                self.layer_index,
-                "sparse_moe.routed_gate_up_swiglu.multi_expert",
-                || {
-                    backend.q2_k_staged_routed_gate_up_swiglu_device(
-                        staged_experts,
-                        flat_tokens,
-                        routing,
-                        self.routed_gate_up.in_features,
-                        self.routed_gate_up.out_features,
-                    )
-                },
-            ),
-        )?;
-        validate_exact_shape(
-            "gguf_device_moe_multi_expert_gated_shape",
-            gated.dims(),
-            &[
-                routing.assignment_count()?,
-                self.routed_gate_up.out_features,
-            ],
-        )?;
-
-        let expert_outputs = require_moe_device_stage(
-            "sparse_moe.routed_down.multi_expert",
-            profile::run_layer_stage(
-                self.layer_index,
-                "sparse_moe.routed_down.multi_expert",
-                || {
-                    backend.q2_k_staged_routed_matvec_device(
-                        staged_experts,
-                        &gated,
-                        routing,
-                        self.routed_down.in_features,
-                        self.routed_down.out_features,
-                    )
-                },
-            ),
-        )?;
-        validate_exact_shape(
-            "gguf_device_moe_multi_expert_down_shape",
-            expert_outputs.dims(),
-            &[routing.assignment_count()?, self.routed_down.out_features],
-        )?;
-        Ok(Some(expert_outputs))
     }
 
     fn forward_single_token_routed_tensors<B: Backend>(

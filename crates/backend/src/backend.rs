@@ -33,6 +33,39 @@ pub struct BackendMemoryReport {
     pub metal_recommended_max_working_set_bytes: Option<u64>,
 }
 
+/// Cumulative production-path metrics for the routed-expert cache.
+///
+/// A lookup represents one unique expert selected by one sparse layer. If
+/// several token assignments select the same expert in that layer, the weight
+/// triplet is looked up once and the assignments share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExpertCacheMetrics {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub ssd_read_bytes: u64,
+    pub transient_experts: u64,
+    pub ready_waves: u64,
+    pub resident_experts: u64,
+    pub allocated_slots: u64,
+    pub capacity_slots: u64,
+    pub bytes_per_expert: u64,
+    pub allocated_bytes: u64,
+    pub capacity_bytes: u64,
+    pub lookup_nanoseconds: u64,
+    pub ssd_load_nanoseconds: u64,
+    pub q2_matmul_gpu_nanoseconds: u64,
+}
+
+impl ExpertCacheMetrics {
+    pub fn hit_rate(self) -> f64 {
+        if self.lookups == 0 {
+            return 0.0;
+        }
+        self.hits as f64 / self.lookups as f64
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouterTopK {
     pub token_count: usize,
@@ -80,36 +113,29 @@ impl DeviceRouterTopK {
     }
 }
 
-/// Reusable Metal staging for the exact Q2 experts selected by one token.
+/// Routed expert rows produced as selected Q2 weights become available.
 ///
-/// Address tables follow router assignment order. Routed kernels dereference
-/// those GPU addresses directly, while the resource vectors keep every
-/// selected buffer resident for the command buffer lifetime.
+/// `output` preserves router assignment order as
+/// `[token_count * top_k, hidden_size]`, so the normal weighted combine kernel
+/// can consume it without changing model semantics.
 #[derive(Debug, Clone)]
-pub struct DeviceQ2Experts {
-    pub(crate) assignment_count: usize,
-    pub(crate) cache_hits: usize,
-    pub(crate) cache_misses: usize,
-    pub(crate) gate_expert_stride_bytes: usize,
-    pub(crate) up_expert_stride_bytes: usize,
-    pub(crate) down_expert_stride_bytes: usize,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) gate_addresses: ::metal::Buffer,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) up_addresses: ::metal::Buffer,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) down_addresses: ::metal::Buffer,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) gate_resources: Vec<::metal::Buffer>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) up_resources: Vec<::metal::Buffer>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    pub(crate) down_resources: Vec<::metal::Buffer>,
+pub struct DeviceRoutedExperts {
+    output: DeviceValue,
+    selected_experts: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    transient_experts: usize,
+    read_bytes: u64,
+    ready_waves: usize,
 }
 
-impl DeviceQ2Experts {
-    pub fn assignment_count(&self) -> usize {
-        self.assignment_count
+impl DeviceRoutedExperts {
+    pub fn output(&self) -> &DeviceValue {
+        &self.output
+    }
+
+    pub fn selected_experts(&self) -> usize {
+        self.selected_experts
     }
 
     pub fn cache_hits(&self) -> usize {
@@ -118,6 +144,18 @@ impl DeviceQ2Experts {
 
     pub fn cache_misses(&self) -> usize {
         self.cache_misses
+    }
+
+    pub fn transient_experts(&self) -> usize {
+        self.transient_experts
+    }
+
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes
+    }
+
+    pub fn ready_waves(&self) -> usize {
+        self.ready_waves
     }
 }
 
@@ -305,11 +343,20 @@ struct BackendCheckReport {
     pub operations: Vec<BackendOperationReport>,
 }
 
-pub trait Backend {
+pub trait Backend: Sync {
     fn capabilities(&self) -> BackendCapabilities;
     fn device(&self) -> &Device;
     fn memory_report(&self) -> BackendMemoryReport {
         BackendMemoryReport::default()
+    }
+    fn expert_cache_metrics(&self) -> Result<ExpertCacheMetrics> {
+        Ok(ExpertCacheMetrics::default())
+    }
+    fn configure_expert_cache_slots_per_layer(&self, _slots_per_layer: usize) -> Result<()> {
+        Ok(())
+    }
+    fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
+        self.configure_expert_cache_slots_per_layer(slots_per_layer)
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor>;
@@ -790,6 +837,20 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// Q8_0 matvec fused with a residual add; the output takes the residual's
+    /// shape.
+    fn q8_0_matvec_add_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _residual: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
@@ -816,60 +877,22 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// Streams selected Q2 experts through a per-layer cache and executes
+    /// ready groups without waiting for every SSD miss to complete.
     #[allow(clippy::too_many_arguments)]
-    fn q2_k_routed_gate_up_swiglu_device(
-        &self,
-        _gate_weights: &[u8],
-        _up_weights: &[u8],
-        _input: &DeviceValue,
-        _routing: &DeviceRouterTopK,
-        _in_features: usize,
-        _out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        Ok(None)
-    }
-
-    fn q2_k_routed_matvec_device(
-        &self,
-        _weights: &[u8],
-        _input: &DeviceValue,
-        _routing: &DeviceRouterTopK,
-        _in_features: usize,
-        _out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        Ok(None)
-    }
-
-    fn stage_q2_experts_device(
+    fn ready_routed_experts_device(
         &self,
         _layer_index: usize,
         _model_path: &Path,
         _gate_payloads: &[Q2ExpertSource<'_>],
         _up_payloads: &[Q2ExpertSource<'_>],
         _down_payloads: &[Q2ExpertSource<'_>],
-    ) -> Result<Option<DeviceQ2Experts>> {
-        Ok(None)
-    }
-
-    fn q2_k_staged_routed_gate_up_swiglu_device(
-        &self,
-        _experts: &DeviceQ2Experts,
         _input: &DeviceValue,
         _routing: &DeviceRouterTopK,
         _in_features: usize,
+        _intermediate_features: usize,
         _out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        Ok(None)
-    }
-
-    fn q2_k_staged_routed_matvec_device(
-        &self,
-        _experts: &DeviceQ2Experts,
-        _input: &DeviceValue,
-        _routing: &DeviceRouterTopK,
-        _in_features: usize,
-        _out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
+    ) -> Result<Option<DeviceRoutedExperts>> {
         Ok(None)
     }
 
@@ -889,6 +912,16 @@ pub trait Backend {
     /// Greedy argmax over a device-resident f32 score vector. Flushes the
     /// batch and returns the winning token id and score.
     fn argmax_f32_device(&self, _scores: &DeviceValue) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+
+    /// Greedy argmax independently over each row of `[rows, row_width]`.
+    /// The returned vectors contain one token id and score per row.
+    fn argmax_rows_f32_device(
+        &self,
+        _scores: &DeviceValue,
+        _row_width: usize,
+    ) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
         Ok(None)
     }
 
@@ -988,6 +1021,27 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// GLM MLA decode without materializing historical per-head K/V.
+    ///
+    /// Inputs are one no-RoPE and RoPE query per head, one normalized current
+    /// latent, and the normalized latent/RoPE paged cache. The result is
+    /// `[B,H,1,V]`, ready for the attention output projection.
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_absorbed_mla_decode_device(
+        &self,
+        _k_b_weights: &[u8],
+        _v_b_weights: &[u8],
+        _q_no_rope: &DeviceValue,
+        _q_rope: &DeviceValue,
+        _current_latent: &DeviceValue,
+        _current_rope: &DeviceValue,
+        _past_kv: &DevicePagedKvView,
+        _qk_head_dim: usize,
+        _value_dim: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Sparse decode attention over a compact selected KV set plus the
     /// current token. This is the DSA/indexer hot primitive for GLM sparse
     /// layers: callers pass only the K/V rows chosen by the indexer, so the
@@ -997,6 +1051,19 @@ pub trait Backend {
         _q: &DeviceValue,
         _selected_k: &DeviceValue,
         _selected_v: &DeviceValue,
+        _current_k: &DeviceValue,
+        _current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Causal attention for a short speculative token sequence over an
+    /// already-selected or full contiguous past KV set.
+    fn selected_sequence_attention_device(
+        &self,
+        _q: &DeviceValue,
+        _past_k: &DeviceValue,
+        _past_v: &DeviceValue,
         _current_k: &DeviceValue,
         _current_v: &DeviceValue,
     ) -> Result<Option<DeviceValue>> {
@@ -1239,6 +1306,41 @@ impl Backend for MetalBackend {
         }
 
         BackendMemoryReport::default()
+    }
+
+    fn expert_cache_metrics(&self) -> Result<ExpertCacheMetrics> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.expert_cache_metrics();
+            }
+        }
+
+        Ok(ExpertCacheMetrics::default())
+    }
+
+    fn configure_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.configure_expert_cache_slots_per_layer(slots_per_layer);
+            }
+        }
+
+        let _ = slots_per_layer;
+        Ok(())
+    }
+
+    fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.resize_expert_cache_slots_per_layer(slots_per_layer);
+            }
+        }
+
+        let _ = slots_per_layer;
+        Ok(())
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
@@ -3636,6 +3738,49 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn q8_0_matvec_add_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        residual: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape("device_q8_0_matvec_add_rows", &[actual_rows], &[row_count])?;
+            let buffer = native_metal.batched_q8_0_matvec_add(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                &residual.buffer,
+                residual.element_count()?,
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(residual.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                residual,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
@@ -3741,125 +3886,54 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn q2_k_routed_gate_up_swiglu_device(
-        &self,
-        gate_weights: &[u8],
-        up_weights: &[u8],
-        input: &DeviceValue,
-        routing: &DeviceRouterTopK,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let Some(native_metal) = self.native_metal() else {
-                return Ok(None);
-            };
-            let dims = require_device_rank("device_q2_routed_gate_up_input", input, 2)?;
-            validate_exact_shape(
-                "device_q2_routed_gate_up_input_shape",
-                dims,
-                &[routing.token_count, in_features],
-            )?;
-            let assignment_count = routing.assignment_count()?;
-            let buffer = native_metal.batched_q2_k_routed_gate_up_swiglu(
-                gate_weights,
-                up_weights,
-                &input.buffer,
-                input.element_count()?,
-                routing,
-                routing.token_count,
-                routing.expert_count,
-                routing.top_k,
-                in_features,
-                out_features,
-            )?;
-            return Ok(Some(DeviceValue::new(
-                vec![assignment_count, out_features],
-                buffer,
-            )));
-        }
-
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        {
-            let _ = (
-                gate_weights,
-                up_weights,
-                input,
-                routing,
-                in_features,
-                out_features,
-            );
-            Ok(None)
-        }
-    }
-
-    fn q2_k_routed_matvec_device(
-        &self,
-        weights: &[u8],
-        input: &DeviceValue,
-        routing: &DeviceRouterTopK,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let Some(native_metal) = self.native_metal() else {
-                return Ok(None);
-            };
-            let assignment_count = routing.assignment_count()?;
-            let dims = require_device_rank("device_q2_routed_matvec_input", input, 2)?;
-            validate_exact_shape(
-                "device_q2_routed_matvec_input_shape",
-                dims,
-                &[assignment_count, in_features],
-            )?;
-            let buffer = native_metal.batched_q2_k_routed_matvec(
-                weights,
-                &input.buffer,
-                input.element_count()?,
-                routing,
-                routing.token_count,
-                routing.expert_count,
-                routing.top_k,
-                in_features,
-                out_features,
-            )?;
-            return Ok(Some(DeviceValue::new(
-                vec![assignment_count, out_features],
-                buffer,
-            )));
-        }
-
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        {
-            let _ = (weights, input, routing, in_features, out_features);
-            Ok(None)
-        }
-    }
-
-    fn stage_q2_experts_device(
+    fn ready_routed_experts_device(
         &self,
         layer_index: usize,
         model_path: &Path,
         gate_payloads: &[Q2ExpertSource<'_>],
         up_payloads: &[Q2ExpertSource<'_>],
         down_payloads: &[Q2ExpertSource<'_>],
-    ) -> Result<Option<DeviceQ2Experts>> {
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceRoutedExperts>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let Some(native_metal) = self.native_metal() else {
                 return Ok(None);
             };
-            return native_metal
-                .stage_q2_experts(
-                    layer_index,
-                    model_path,
-                    gate_payloads,
-                    up_payloads,
-                    down_payloads,
-                )
-                .map(Some);
+            validate_exact_shape(
+                "ready_routed_experts_input",
+                input.dims(),
+                &[routing.token_count, in_features],
+            )?;
+            let result = native_metal.ready_routed_experts(
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                in_features,
+                intermediate_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceRoutedExperts {
+                output: DeviceValue::new(
+                    vec![routing.assignment_count()?, out_features],
+                    result.output,
+                ),
+                selected_experts: result.selected_experts,
+                cache_hits: result.cache_hits,
+                cache_misses: result.cache_misses,
+                transient_experts: result.transient_experts,
+                read_bytes: result.read_bytes,
+                ready_waves: result.ready_waves,
+            }));
         }
 
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -3870,99 +3944,12 @@ impl Backend for MetalBackend {
                 gate_payloads,
                 up_payloads,
                 down_payloads,
+                input,
+                routing,
+                in_features,
+                intermediate_features,
+                out_features,
             );
-            Ok(None)
-        }
-    }
-
-    fn q2_k_staged_routed_gate_up_swiglu_device(
-        &self,
-        experts: &DeviceQ2Experts,
-        input: &DeviceValue,
-        routing: &DeviceRouterTopK,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let Some(native_metal) = self.native_metal() else {
-                return Ok(None);
-            };
-            let dims = require_device_rank("device_q2_staged_gate_up_input", input, 2)?;
-            validate_exact_shape(
-                "device_q2_staged_gate_up_input_shape",
-                dims,
-                &[routing.token_count, in_features],
-            )?;
-            let assignment_count = routing.assignment_count()?;
-            validate_exact_shape(
-                "device_q2_staged_gate_up_assignments",
-                &[experts.assignment_count],
-                &[assignment_count],
-            )?;
-            let buffer = native_metal.batched_q2_k_staged_routed_gate_up_swiglu(
-                experts,
-                &input.buffer,
-                input.element_count()?,
-                routing,
-                in_features,
-                out_features,
-            )?;
-            return Ok(Some(DeviceValue::new(
-                vec![assignment_count, out_features],
-                buffer,
-            )));
-        }
-
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        {
-            let _ = (experts, input, routing, in_features, out_features);
-            Ok(None)
-        }
-    }
-
-    fn q2_k_staged_routed_matvec_device(
-        &self,
-        experts: &DeviceQ2Experts,
-        input: &DeviceValue,
-        routing: &DeviceRouterTopK,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Option<DeviceValue>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let Some(native_metal) = self.native_metal() else {
-                return Ok(None);
-            };
-            let assignment_count = routing.assignment_count()?;
-            let dims = require_device_rank("device_q2_staged_matvec_input", input, 2)?;
-            validate_exact_shape(
-                "device_q2_staged_matvec_input_shape",
-                dims,
-                &[assignment_count, in_features],
-            )?;
-            validate_exact_shape(
-                "device_q2_staged_matvec_assignments",
-                &[experts.assignment_count],
-                &[assignment_count],
-            )?;
-            let buffer = native_metal.batched_q2_k_staged_routed_matvec(
-                experts,
-                &input.buffer,
-                input.element_count()?,
-                routing,
-                in_features,
-                out_features,
-            )?;
-            return Ok(Some(DeviceValue::new(
-                vec![assignment_count, out_features],
-                buffer,
-            )));
-        }
-
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        {
-            let _ = (experts, input, routing, in_features, out_features);
             Ok(None)
         }
     }
@@ -4014,6 +4001,35 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = scores;
+            Ok(None)
+        }
+    }
+
+    fn argmax_rows_f32_device(
+        &self,
+        scores: &DeviceValue,
+        row_width: usize,
+    ) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            validate_exact_shape("device_argmax_rows_f32_rank", &[scores.dims().len()], &[2])?;
+            validate_exact_shape(
+                "device_argmax_rows_f32_width",
+                &[scores.dims()[1]],
+                &[row_width],
+            )?;
+            let row_count = scores.dims()[0];
+            let result =
+                native_metal.batched_f32_argmax_rows(&scores.buffer, row_count, row_width)?;
+            return Ok(Some(result));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (scores, row_width);
             Ok(None)
         }
     }
@@ -4517,6 +4533,124 @@ impl Backend for MetalBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_absorbed_mla_decode_device(
+        &self,
+        k_b_weights: &[u8],
+        v_b_weights: &[u8],
+        q_no_rope: &DeviceValue,
+        q_rope: &DeviceValue,
+        current_latent: &DeviceValue,
+        current_rope: &DeviceValue,
+        past_kv: &DevicePagedKvView,
+        qk_head_dim: usize,
+        value_dim: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            past_kv.validate()?;
+            let q_no_dims = require_device_rank("device_absorbed_mla_q_no_rope", q_no_rope, 4)?;
+            let q_rope_dims = require_device_rank("device_absorbed_mla_q_rope", q_rope, 4)?;
+            let current_latent_dims =
+                require_device_rank("device_absorbed_mla_current_latent", current_latent, 3)?;
+            let current_rope_dims =
+                require_device_rank("device_absorbed_mla_current_rope", current_rope, 4)?;
+            if q_no_rope.dtype() != DType::F32
+                || q_rope.dtype() != DType::F32
+                || current_latent.dtype() != DType::F32
+                || current_rope.dtype() != DType::F32
+            {
+                return Err(Error::backend(format!(
+                    "absorbed MLA requires F32 query/current tensors, got q_no={:?}, q_rope={:?}, latent={:?}, current_rope={:?}",
+                    q_no_rope.dtype(),
+                    q_rope.dtype(),
+                    current_latent.dtype(),
+                    current_rope.dtype()
+                )));
+            }
+
+            let batch = q_no_dims[0];
+            let head_count = q_no_dims[2];
+            let q_no_rope_dim = q_no_dims[3];
+            let rope_dim = q_rope_dims[3];
+            let latent_dim = current_latent_dims[2];
+            validate_exact_shape(
+                "device_absorbed_mla_q_rope_shape",
+                q_rope_dims,
+                &[batch, 1, head_count, rope_dim],
+            )?;
+            validate_exact_shape(
+                "device_absorbed_mla_current_latent_shape",
+                current_latent_dims,
+                &[batch, 1, latent_dim],
+            )?;
+            validate_exact_shape(
+                "device_absorbed_mla_current_rope_shape",
+                current_rope_dims,
+                &[batch, 1, 1, rope_dim],
+            )?;
+            validate_exact_shape(
+                "device_absorbed_mla_cache_shape",
+                &[
+                    past_kv.batch,
+                    past_kv.attention_heads,
+                    past_kv.key_head_dim,
+                    past_kv.value_head_dim,
+                ],
+                &[batch, 1, latent_dim, rope_dim],
+            )?;
+            if qk_head_dim != q_no_rope_dim + rope_dim {
+                return Err(Error::backend(format!(
+                    "absorbed MLA qk_head_dim {qk_head_dim} must equal no-RoPE {q_no_rope_dim} + RoPE {rope_dim}"
+                )));
+            }
+
+            let (buffer, _) = native_metal.batched_q8_0_absorbed_mla_decode(
+                k_b_weights,
+                v_b_weights,
+                &q_no_rope.buffer,
+                q_no_rope.element_count()?,
+                &q_rope.buffer,
+                q_rope.element_count()?,
+                &current_latent.buffer,
+                current_latent.element_count()?,
+                &current_rope.buffer,
+                current_rope.element_count()?,
+                past_kv,
+                batch,
+                head_count,
+                q_no_rope_dim,
+                rope_dim,
+                latent_dim,
+                value_dim,
+                qk_head_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, head_count, 1, value_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                k_b_weights,
+                v_b_weights,
+                q_no_rope,
+                q_rope,
+                current_latent,
+                current_rope,
+                past_kv,
+                qk_head_dim,
+                value_dim,
+            );
+            Ok(None)
+        }
+    }
+
     fn selected_decode_attention_device(
         &self,
         q: &DeviceValue,
@@ -4620,6 +4754,89 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (q, selected_k, selected_v, current_k, current_v);
+            Ok(None)
+        }
+    }
+
+    fn selected_sequence_attention_device(
+        &self,
+        q: &DeviceValue,
+        past_k: &DeviceValue,
+        past_v: &DeviceValue,
+        current_k: &DeviceValue,
+        current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let q_dims = require_device_rank("device_selected_sequence_q", q, 4)?;
+            let past_k_dims = require_device_rank("device_selected_sequence_past_k", past_k, 4)?;
+            let past_v_dims = require_device_rank("device_selected_sequence_past_v", past_v, 4)?;
+            let current_k_dims =
+                require_device_rank("device_selected_sequence_current_k", current_k, 4)?;
+            let current_v_dims =
+                require_device_rank("device_selected_sequence_current_v", current_v, 4)?;
+            if [q, past_k, past_v, current_k, current_v]
+                .iter()
+                .any(|value| value.dtype() != DType::F32)
+            {
+                return Err(Error::backend(
+                    "selected sequence attention currently requires f32 tensors",
+                ));
+            }
+            let (batch, heads, query_tokens, head_dim) =
+                (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+            let past_tokens = past_k_dims[2];
+            let value_dim = past_v_dims[3];
+            validate_exact_shape(
+                "device_selected_sequence_past_k_shape",
+                past_k_dims,
+                &[batch, heads, past_tokens, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_selected_sequence_past_v_shape",
+                past_v_dims,
+                &[batch, heads, past_tokens, value_dim],
+            )?;
+            validate_exact_shape(
+                "device_selected_sequence_current_k_shape",
+                current_k_dims,
+                &[batch, heads, query_tokens, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_selected_sequence_current_v_shape",
+                current_v_dims,
+                &[batch, heads, query_tokens, value_dim],
+            )?;
+            let (buffer, _) = native_metal.batched_selected_sequence_attention(
+                &q.buffer,
+                q.element_count()?,
+                &past_k.buffer,
+                past_k.element_count()?,
+                &past_v.buffer,
+                past_v.element_count()?,
+                &current_k.buffer,
+                current_k.element_count()?,
+                &current_v.buffer,
+                current_v.element_count()?,
+                batch,
+                heads,
+                past_tokens,
+                query_tokens,
+                head_dim,
+                value_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, heads, query_tokens, value_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (q, past_k, past_v, current_k, current_v);
             Ok(None)
         }
     }
@@ -7778,5 +7995,17 @@ mod tests {
         assert_eq!(report.operations[13].output.dims(), &[1, 2, 2, 4]);
         assert_eq!(report.operations[15].name, "moe_gather_tokens");
         assert_eq!(report.operations[15].output.dims(), &[3, 4]);
+    }
+
+    #[test]
+    fn expert_cache_hit_rate_uses_unique_weight_lookups() {
+        let metrics = ExpertCacheMetrics {
+            lookups: 10,
+            hits: 7,
+            misses: 3,
+            ..ExpertCacheMetrics::default()
+        };
+
+        assert_eq!(metrics.hit_rate(), 0.7);
     }
 }

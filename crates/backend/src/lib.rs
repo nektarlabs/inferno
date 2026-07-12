@@ -5,19 +5,11 @@
 mod backend;
 mod device_value;
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod metal;
+mod metal;
 
 pub use backend::{
-    Backend, BackendCapabilities, BackendMemoryReport, DevicePagedKvView, DeviceQ2Experts,
-    DeviceRouterTopK, DeviceSelectedKvView, MetalBackend, Q2ExpertSource, RouterTopK,
+    Backend, BackendCapabilities, BackendMemoryReport, DevicePagedKvView, DeviceRoutedExperts,
+    DeviceRouterTopK, DeviceSelectedKvView, ExpertCacheMetrics, MetalBackend, Q2ExpertSource,
+    RouterTopK,
 };
 pub use device_value::DeviceValue;
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub use metal::{
-    Metal, MetalAddReport, MetalAttentionCausalSoftmaxReport, MetalAttentionScoresReport,
-    MetalAttentionValuesReport, MetalCombineRopeTailReport, MetalHeadsToAttentionLayoutReport,
-    MetalLinearReport, MetalMatmulReport, MetalMergeAttentionHeadsReport, MetalMoeCombineReport,
-    MetalMoeGatherReport, MetalQ2MatvecAddReport, MetalQ2MatvecArgmaxReport, MetalQ2MatvecReport,
-    MetalRmsNormReport, MetalRopeReport, MetalSelectLastTokenReport, MetalSplitKvMqaReport,
-    MetalSplitRopeTailReport, MetalSwiGluReport,
-};

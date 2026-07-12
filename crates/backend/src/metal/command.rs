@@ -198,6 +198,44 @@ pub(crate) fn encode_1d(
     Ok(())
 }
 
+pub(crate) fn encode_1d_threadgroups(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    buffers: &[&Buffer],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    if threadgroup_count == 0 || threads_per_group == 0 {
+        return Err(Error::backend(
+            "Metal threadgroup dispatch dimensions must be positive",
+        ));
+    }
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1) as usize;
+    if threads_per_group > max_threads {
+        return Err(Error::backend(format!(
+            "Metal threadgroup requires {threads_per_group} threads but pipeline allows {max_threads}"
+        )));
+    }
+    let execution_width = pipeline.thread_execution_width().max(1) as usize;
+    if threads_per_group % execution_width != 0 {
+        return Err(Error::backend(format!(
+            "Metal threadgroup size {threads_per_group} must be divisible by SIMD width {execution_width}"
+        )));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        encoder.set_buffer(index as NSUInteger, Some(buffer), 0);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(threadgroup_count as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
 /// Encodes a 1D kernel that dereferences GPU addresses stored in another
 /// buffer. Metal cannot infer those dependencies, so every indirectly
 /// addressed buffer must be declared explicitly with `use_resource`.

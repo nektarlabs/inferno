@@ -132,7 +132,8 @@ target/release/inferno generate \
   --model models/glm-5.2 \
   --prompt "Tell me the capital of Italy." \
   --telemetry-file /tmp/inferno-memory.log \
-  --measure-tokens-per-second
+  --measure-tokens-per-second \
+  --throughput-file /tmp/inferno-throughput.tsv
 ```
 
 Inspect telemetry while generation is running:
@@ -140,6 +141,28 @@ Inspect telemetry while generation is running:
 ```bash
 tail -f /tmp/inferno-memory.log
 ```
+
+Compare throughput after each optimization:
+
+```bash
+tail -n 5 /tmp/inferno-throughput.tsv
+```
+
+Profile one prefill result and each decode token by subsystem:
+
+```bash
+target/release/inferno generate \
+  --model models/glm-5.2 \
+  --prompt "Tell me the capital of Italy." \
+  --max-new-tokens 3 \
+  --profile-token-costs
+```
+
+This diagnostic mode synchronizes Metal around measured stages. Its reported
+token latency is therefore intentionally higher than normal generation. Use it
+to rank attention, routing, expert SSD loading, expert Q2 math, KV I/O, output
+projection, and argmax costs; use `--measure-tokens-per-second` without
+`--profile-token-costs` for the production throughput baseline.
 
 Limit generation explicitly when needed:
 

@@ -2,11 +2,11 @@
 
 //! Shared production primitives for the GLM inference workspace.
 
-pub mod device;
-pub mod error;
-pub mod f32_tensor;
-pub mod paged_kv;
-pub mod shape;
+mod device;
+mod error;
+mod f32_tensor;
+mod paged_kv;
+mod shape;
 
 pub use device::{BackendKind, DeviceKind, DeviceReport};
 pub use error::{Error, Result};

@@ -1,19 +1,26 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::{self, ErrorKind},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
+    time::Instant,
 };
 
-use ::metal::Buffer;
-use ::metal::{CommandBufferRef, CommandQueue, ComputePipelineState, Device};
+use ::metal::{
+    Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device,
+    MTLCommandBufferStatus,
+};
 use common::{Error, Result};
+use objc::{msg_send, sel, sel_impl};
 use tracing::{debug, trace, warn};
 
-use crate::Q2ExpertSource;
+use crate::{ExpertCacheMetrics, Q2ExpertSource};
 
 use super::{
     buffers::{
@@ -22,7 +29,8 @@ use super::{
         u8_buffer_no_copy, write_f32_buffer, write_u32_buffer,
     },
     command::{
-        dispatch_1d, dispatch_1d_many, encode_1d, encode_1d_with_indirect_reads, Dispatch1d,
+        dispatch_1d, dispatch_1d_many, encode_1d, encode_1d_threadgroups,
+        encode_1d_with_indirect_reads, Dispatch1d,
     },
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -49,21 +57,32 @@ const Q2_K_MATVEC_ADD_KERNEL: &str = "q2_k_matvec_add_f32_kernel";
 const Q2_K_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_gate_up_swiglu_f32_kernel";
 const Q2_K_MULTI_EXPERT_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_multi_expert_gate_up_swiglu_f32_kernel";
 const Q2_K_MULTI_EXPERT_MATVEC_KERNEL: &str = "q2_k_multi_expert_matvec_f32_kernel";
-const Q2_K_ADDRESS_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_address_gate_up_swiglu_f32_kernel";
-const Q2_K_ADDRESS_MATVEC_KERNEL: &str = "q2_k_address_matvec_f32_kernel";
+const Q2_K_READY_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_ready_gate_up_swiglu_f32_kernel";
+const Q2_K_READY_MATVEC_KERNEL: &str = "q2_k_ready_matvec_f32_kernel";
+const Q2_K_READY_SLOT_GATE_UP_SWIGLU_KERNEL: &str = "q2_k_ready_slot_gate_up_swiglu_f32_kernel";
+const Q2_K_READY_SLOT_MATVEC_KERNEL: &str = "q2_k_ready_slot_matvec_f32_kernel";
 const Q2_K_TRANSPOSED_MATVEC_KERNEL: &str = "q2_k_transposed_matvec_f32_kernel";
 const Q2_K_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
     "q2_k_packed_heads_transposed_matvec_f32_kernel";
 const Q8_0_MATVEC_KERNEL: &str = "q8_0_matvec_f32_kernel";
+const Q8_0_MATVEC_TILED_KERNEL: &str = "q8_0_matvec_tiled_f32_kernel";
+const Q8_0_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_matvec_add_tiled_f32_kernel";
 const Q8_0_TRANSPOSED_MATVEC_KERNEL: &str = "q8_0_transposed_matvec_f32_kernel";
 const Q8_0_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
     "q8_0_packed_heads_transposed_matvec_f32_kernel";
+const Q8_0_PACKED_HEADS_MATVEC_KERNEL: &str = "q8_0_packed_heads_matvec_f32_kernel";
 const ARGMAX_F32_KERNEL: &str = "argmax_f32_kernel";
+const ARGMAX_ROWS_F32_KERNEL: &str = "argmax_rows_f32_kernel";
 const Q2_K_SIMD_LANES: usize = 32;
+const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
-const ROUTED_EXPERT_CACHE_SLOTS: usize = 768;
-const ROUTED_EXPERT_ACTIVE_SLOTS: usize = 8;
+// Sixteen Q2 expert triplets per routed layer use about 14.9 GB for the main
+// 75-layer model. On the 64 GB target this measured faster than 10 slots;
+// 21 slots increased macOS memory pressure enough to reduce throughput.
+const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 16;
 const ROUTED_EXPERT_READ_WORKERS: usize = 8;
+const ROUTED_EXPERT_MIN_READY_WAVE: usize = 2;
+static EXPERT_CACHE_LOCK_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct MetalQ2Matvec {
     pipeline: ComputePipelineState,
@@ -71,17 +90,38 @@ pub(crate) struct MetalQ2Matvec {
     gate_up_swiglu_pipeline: ComputePipelineState,
     multi_expert_gate_up_swiglu_pipeline: ComputePipelineState,
     multi_expert_matvec_pipeline: ComputePipelineState,
-    address_gate_up_swiglu_pipeline: ComputePipelineState,
-    address_matvec_pipeline: ComputePipelineState,
+    ready_gate_up_swiglu_pipeline: ComputePipelineState,
+    ready_matvec_pipeline: ComputePipelineState,
+    ready_slot_gate_up_swiglu_pipeline: ComputePipelineState,
+    ready_slot_matvec_pipeline: ComputePipelineState,
     transposed_pipeline: ComputePipelineState,
     packed_heads_transposed_pipeline: ComputePipelineState,
     q8_0_pipeline: ComputePipelineState,
+    q8_0_tiled_pipeline: ComputePipelineState,
+    q8_0_tiled_add_pipeline: ComputePipelineState,
     q8_0_transposed_pipeline: ComputePipelineState,
     q8_0_packed_heads_transposed_pipeline: ComputePipelineState,
+    q8_0_packed_heads_pipeline: ComputePipelineState,
     argmax_pipeline: ComputePipelineState,
+    argmax_rows_pipeline: ComputePipelineState,
     scratch: Mutex<Q2ScratchBuffers>,
-    expert_staging: Mutex<Q2ExpertStagingBuffers>,
+    ready_expert_cache: Mutex<Q2PerLayerExpertCache>,
+    expert_cache_counters: Q2ExpertCacheCounters,
+    expert_queue: CommandQueue,
     weight_buffers: Mutex<HashMap<WeightBufferKey, Buffer>>,
+}
+
+#[derive(Debug, Default)]
+struct Q2ExpertCacheCounters {
+    lookups: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    ssd_read_bytes: AtomicU64,
+    transient_experts: AtomicU64,
+    ready_waves: AtomicU64,
+    lookup_nanoseconds: AtomicU64,
+    ssd_load_nanoseconds: AtomicU64,
+    q2_matmul_gpu_nanoseconds: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,9 +219,22 @@ struct Q2ExpertSlotBuffers {
 }
 
 #[derive(Debug)]
+struct Q2ExpertLayerBuffers {
+    gate: LockedMetalSlab,
+    up: LockedMetalSlab,
+    down: LockedMetalSlab,
+}
+
+#[derive(Debug)]
 struct LockedMetalBuffer {
     buffer: Buffer,
     locked: bool,
+}
+
+#[derive(Debug)]
+struct LockedMetalSlab {
+    buffer: Buffer,
+    locked_ranges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -193,19 +246,94 @@ struct ExpertModelFile {
 #[derive(Debug)]
 struct ExpertReadTask {
     buffer: Buffer,
+    destination_offset: usize,
     absolute_offset: u64,
     byte_len: usize,
 }
 
-#[derive(Debug, Default)]
-struct Q2ExpertStagingBuffers {
-    layout: Option<Q2ExpertCacheLayout>,
-    slots: Vec<Option<Q2ExpertSlotBuffers>>,
+#[derive(Debug, Clone)]
+struct ReadyExpertBuffers {
+    gate: Buffer,
+    up: Buffer,
+    down: Buffer,
+    gate_offset: usize,
+    up_offset: usize,
+    down_offset: usize,
+    slot_index: Option<usize>,
+}
+
+#[derive(Debug)]
+struct ReadyExpertGroup {
+    assignment_indices: Vec<usize>,
+    buffers: ReadyExpertBuffers,
+    read_tasks: Vec<ExpertReadTask>,
+    cache_hit: bool,
+    cached_miss_key: Option<ExpertCacheKey>,
+    transient: bool,
+    _transient_owner: Option<Q2ExpertSlotBuffers>,
+}
+
+#[derive(Debug)]
+struct ReadyExpertSeed<'a> {
+    key: ExpertCacheKey,
+    assignment_indices: Vec<usize>,
+    gate: Q2ExpertSource<'a>,
+    up: Q2ExpertSource<'a>,
+    down: Q2ExpertSource<'a>,
+}
+
+#[derive(Debug)]
+struct Q2ExpertLayerCache {
+    slots: Vec<bool>,
+    storage: Option<Q2ExpertLayerBuffers>,
     entries: HashMap<ExpertCacheKey, usize>,
-    lru: VecDeque<ExpertCacheKey>,
+    probation: VecDeque<ExpertCacheKey>,
+    protected: VecDeque<ExpertCacheKey>,
+    protected_capacity: usize,
     free_slots: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct Q2PerLayerExpertCache {
+    layout: Option<Q2ExpertCacheLayout>,
+    layers: HashMap<usize, Arc<Mutex<Q2ExpertLayerCache>>>,
     model_file: Option<ExpertModelFile>,
-    lock_failure_seen: bool,
+    slots_per_layer: usize,
+}
+
+impl Default for Q2PerLayerExpertCache {
+    fn default() -> Self {
+        Self {
+            layout: None,
+            layers: HashMap::new(),
+            model_file: None,
+            slots_per_layer: ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LayerSlotResolution {
+    Hit(usize),
+    Miss(usize),
+    Transient,
+}
+
+#[derive(Debug)]
+struct SubmittedReadyWave {
+    command_buffer: CommandBuffer,
+    assignment_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadyRoutedExperts {
+    pub(crate) output: Buffer,
+    pub(crate) selected_experts: usize,
+    pub(crate) cache_hits: usize,
+    pub(crate) cache_misses: usize,
+    pub(crate) transient_experts: usize,
+    pub(crate) read_bytes: u64,
+    pub(crate) ready_waves: usize,
 }
 
 #[derive(Debug, Default)]
@@ -245,12 +373,22 @@ impl MetalQ2Matvec {
                 library,
                 Q2_K_MULTI_EXPERT_MATVEC_KERNEL,
             )?,
-            address_gate_up_swiglu_pipeline: compute_pipeline(
+            ready_gate_up_swiglu_pipeline: compute_pipeline(
                 device,
                 library,
-                Q2_K_ADDRESS_GATE_UP_SWIGLU_KERNEL,
+                Q2_K_READY_GATE_UP_SWIGLU_KERNEL,
             )?,
-            address_matvec_pipeline: compute_pipeline(device, library, Q2_K_ADDRESS_MATVEC_KERNEL)?,
+            ready_matvec_pipeline: compute_pipeline(device, library, Q2_K_READY_MATVEC_KERNEL)?,
+            ready_slot_gate_up_swiglu_pipeline: compute_pipeline(
+                device,
+                library,
+                Q2_K_READY_SLOT_GATE_UP_SWIGLU_KERNEL,
+            )?,
+            ready_slot_matvec_pipeline: compute_pipeline(
+                device,
+                library,
+                Q2_K_READY_SLOT_MATVEC_KERNEL,
+            )?,
             transposed_pipeline: compute_pipeline(device, library, Q2_K_TRANSPOSED_MATVEC_KERNEL)?,
             packed_heads_transposed_pipeline: compute_pipeline(
                 device,
@@ -258,6 +396,12 @@ impl MetalQ2Matvec {
                 Q2_K_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL,
             )?,
             q8_0_pipeline: compute_pipeline(device, library, Q8_0_MATVEC_KERNEL)?,
+            q8_0_tiled_pipeline: compute_pipeline(device, library, Q8_0_MATVEC_TILED_KERNEL)?,
+            q8_0_tiled_add_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_MATVEC_ADD_TILED_KERNEL,
+            )?,
             q8_0_transposed_pipeline: compute_pipeline(
                 device,
                 library,
@@ -268,11 +412,140 @@ impl MetalQ2Matvec {
                 library,
                 Q8_0_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL,
             )?,
+            q8_0_packed_heads_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_PACKED_HEADS_MATVEC_KERNEL,
+            )?,
             argmax_pipeline: compute_pipeline(device, library, ARGMAX_F32_KERNEL)?,
+            argmax_rows_pipeline: compute_pipeline(device, library, ARGMAX_ROWS_F32_KERNEL)?,
             scratch: Mutex::new(Q2ScratchBuffers::default()),
-            expert_staging: Mutex::new(Q2ExpertStagingBuffers::default()),
+            ready_expert_cache: Mutex::new(Q2PerLayerExpertCache::default()),
+            expert_cache_counters: Q2ExpertCacheCounters::default(),
+            expert_queue: device.new_command_queue(),
             weight_buffers: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn expert_cache_metrics(&self) -> Result<ExpertCacheMetrics> {
+        let cache = self
+            .ready_expert_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+        let bytes_per_expert = cache
+            .layout
+            .as_ref()
+            .map(|layout| {
+                layout
+                    .gate_stride
+                    .checked_add(layout.up_stride)
+                    .and_then(|bytes| bytes.checked_add(layout.down_stride))
+                    .ok_or_else(|| Error::backend("Q2 expert cache byte size overflow"))
+            })
+            .transpose()?
+            .unwrap_or(0);
+
+        let mut resident_experts = 0_usize;
+        let mut allocated_slots = 0_usize;
+        let mut capacity_slots = 0_usize;
+        for layer in cache.layers.values() {
+            let layer = layer
+                .lock()
+                .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?;
+            resident_experts = resident_experts
+                .checked_add(layer.entries.len())
+                .ok_or_else(|| Error::backend("Q2 resident expert count overflow"))?;
+            allocated_slots = allocated_slots
+                .checked_add(layer.slots.iter().filter(|allocated| **allocated).count())
+                .ok_or_else(|| Error::backend("Q2 allocated expert slot count overflow"))?;
+            capacity_slots = capacity_slots
+                .checked_add(layer.slots.len())
+                .ok_or_else(|| Error::backend("Q2 expert cache capacity count overflow"))?;
+        }
+
+        let allocated_bytes = allocated_slots
+            .checked_mul(bytes_per_expert)
+            .ok_or_else(|| Error::backend("Q2 allocated expert cache bytes overflow"))?;
+        let capacity_bytes = capacity_slots
+            .checked_mul(bytes_per_expert)
+            .ok_or_else(|| Error::backend("Q2 expert cache capacity bytes overflow"))?;
+
+        Ok(ExpertCacheMetrics {
+            lookups: self.expert_cache_counters.lookups.load(Ordering::Relaxed),
+            hits: self.expert_cache_counters.hits.load(Ordering::Relaxed),
+            misses: self.expert_cache_counters.misses.load(Ordering::Relaxed),
+            ssd_read_bytes: self
+                .expert_cache_counters
+                .ssd_read_bytes
+                .load(Ordering::Relaxed),
+            transient_experts: self
+                .expert_cache_counters
+                .transient_experts
+                .load(Ordering::Relaxed),
+            ready_waves: self
+                .expert_cache_counters
+                .ready_waves
+                .load(Ordering::Relaxed),
+            resident_experts: u64::try_from(resident_experts)
+                .map_err(|_| Error::backend("Q2 resident expert count does not fit u64"))?,
+            allocated_slots: u64::try_from(allocated_slots)
+                .map_err(|_| Error::backend("Q2 allocated expert slots do not fit u64"))?,
+            capacity_slots: u64::try_from(capacity_slots)
+                .map_err(|_| Error::backend("Q2 expert cache capacity does not fit u64"))?,
+            bytes_per_expert: u64::try_from(bytes_per_expert)
+                .map_err(|_| Error::backend("Q2 expert byte size does not fit u64"))?,
+            allocated_bytes: u64::try_from(allocated_bytes)
+                .map_err(|_| Error::backend("Q2 allocated expert bytes do not fit u64"))?,
+            capacity_bytes: u64::try_from(capacity_bytes)
+                .map_err(|_| Error::backend("Q2 expert cache bytes do not fit u64"))?,
+            lookup_nanoseconds: self
+                .expert_cache_counters
+                .lookup_nanoseconds
+                .load(Ordering::Relaxed),
+            ssd_load_nanoseconds: self
+                .expert_cache_counters
+                .ssd_load_nanoseconds
+                .load(Ordering::Relaxed),
+            q2_matmul_gpu_nanoseconds: self
+                .expert_cache_counters
+                .q2_matmul_gpu_nanoseconds
+                .load(Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn configure_expert_cache_slots_per_layer(
+        &self,
+        slots_per_layer: usize,
+    ) -> Result<()> {
+        if slots_per_layer == 0 {
+            return Err(Error::backend(
+                "Q2 expert cache requires at least one slot per routed layer",
+            ));
+        }
+        let mut cache = self
+            .ready_expert_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+        if !cache.layers.is_empty() {
+            return Err(Error::backend(
+                "Q2 expert cache capacity must be configured before generation starts",
+            ));
+        }
+        cache.slots_per_layer = slots_per_layer;
+        Ok(())
+    }
+
+    pub(crate) fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
+        if slots_per_layer == 0 {
+            return Err(Error::backend(
+                "Q2 expert cache requires at least one slot per routed layer",
+            ));
+        }
+        let mut cache = self
+            .ready_expert_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+        cache.resize(slots_per_layer)
     }
 
     pub(crate) fn run(
@@ -1124,11 +1397,9 @@ impl MetalQ2Matvec {
         let pipeline = match kind {
             QuantMatvecKind::Q2K => &self.pipeline,
             QuantMatvecKind::Q2KTransposed => &self.transposed_pipeline,
-            QuantMatvecKind::Q80 => &self.q8_0_pipeline,
+            QuantMatvecKind::Q80 => &self.q8_0_tiled_pipeline,
             QuantMatvecKind::Q80Transposed => &self.q8_0_transposed_pipeline,
         };
-        let dispatch_threads =
-            q2_k_cooperative_threads(pipeline, output_len, "batched cooperative quantized matvec")?;
         let weight_buffer = self.weight_buffer(device, weights)?;
         let output_buffer = empty_f32_buffer(device, output_len)?;
         let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
@@ -1149,20 +1420,45 @@ impl MetalQ2Matvec {
             "encoding batched quantized matvec"
         );
 
-        encode_1d(
-            command_buffer,
-            pipeline,
-            &[
-                &weight_buffer.buffer,
-                input,
-                &output_buffer,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-            ],
-            dispatch_threads,
-        )?;
+        let buffers = [
+            &weight_buffer.buffer,
+            input,
+            &output_buffer,
+            &row_count_buffer,
+            &in_features_buffer,
+            &out_features_buffer,
+            &blocks_per_row_buffer,
+        ];
+        if kind == QuantMatvecKind::Q80 {
+            let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
+            let simdgroups_per_output_buffer = u32_scalar_buffer(
+                device,
+                matvec_u32(simdgroups_per_output, "simdgroups_per_output")?,
+            )?;
+            encode_1d_threadgroups(
+                command_buffer,
+                pipeline,
+                &[
+                    buffers[0],
+                    buffers[1],
+                    buffers[2],
+                    buffers[3],
+                    buffers[4],
+                    buffers[5],
+                    buffers[6],
+                    &simdgroups_per_output_buffer,
+                ],
+                output_len,
+                simdgroups_per_output * Q2_K_SIMD_LANES,
+            )?;
+        } else {
+            let dispatch_threads = q2_k_cooperative_threads(
+                pipeline,
+                output_len,
+                "batched cooperative quantized matvec",
+            )?;
+            encode_1d(command_buffer, pipeline, &buffers, dispatch_threads)?;
+        }
         Ok(output_buffer)
     }
 
@@ -1287,6 +1583,97 @@ impl MetalQ2Matvec {
         Ok(output_buffer)
     }
 
+    /// Applies one Q8_0 matrix per head to one input vector per head.
+    ///
+    /// The packed weight layout is `[head_count, out_features, in_features]`.
+    /// Both input and output keep the head dimension explicit, which is what
+    /// absorbed MLA needs for its per-head K_b and V_b projections.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_q8_0_packed_heads_matvec(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        head_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        if row_count == 0 || head_count == 0 || in_features == 0 || out_features == 0 {
+            return Err(Error::backend(
+                "packed-head Q8_0 matvec dimensions must be positive",
+            ));
+        }
+        if in_features % Q8_0_BLOCK_VALUES != 0 {
+            return Err(Error::backend(format!(
+                "packed-head Q8_0 input width {in_features} must be divisible by {Q8_0_BLOCK_VALUES}"
+            )));
+        }
+
+        let expected_input_len = row_count
+            .checked_mul(head_count)
+            .and_then(|rows| rows.checked_mul(in_features))
+            .ok_or_else(|| Error::backend("packed-head Q8_0 input length overflow"))?;
+        validate_exact_len("packed-head Q8_0 input", input_len, expected_input_len)?;
+        require_f32_capacity(input, input_len, "packed-head Q8_0 input")?;
+
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        let blocks_per_head = out_features
+            .checked_mul(blocks_per_row)
+            .ok_or_else(|| Error::backend("packed-head Q8_0 blocks per head overflow"))?;
+        let expected_weight_bytes = head_count
+            .checked_mul(blocks_per_head)
+            .and_then(|blocks| blocks.checked_mul(Q8_0_BLOCK_BYTES))
+            .ok_or_else(|| Error::backend("packed-head Q8_0 weight length overflow"))?;
+        validate_exact_len(
+            "packed-head Q8_0 weights",
+            weights.len(),
+            expected_weight_bytes,
+        )?;
+
+        let output_len = row_count
+            .checked_mul(head_count)
+            .and_then(|rows| rows.checked_mul(out_features))
+            .ok_or_else(|| Error::backend("packed-head Q8_0 output length overflow"))?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.q8_0_packed_heads_pipeline,
+            output_len,
+            "packed-head Q8_0 matvec",
+        )?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
+        let head_count_buffer = u32_scalar_buffer(device, matvec_u32(head_count, "head_count")?)?;
+        let in_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let blocks_per_head_buffer =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_head, "blocks_per_head")?)?;
+
+        encode_1d(
+            command_buffer,
+            &self.q8_0_packed_heads_pipeline,
+            &[
+                &weight_buffer.buffer,
+                input,
+                &output_buffer,
+                &row_count_buffer,
+                &head_count_buffer,
+                &in_features_buffer,
+                &out_features_buffer,
+                &blocks_per_row_buffer,
+                &blocks_per_head_buffer,
+            ],
+            physical_threads,
+        )?;
+        Ok(output_buffer)
+    }
+
     /// Encodes a Q2_K matvec fused with a residual add into an open batched
     /// command buffer. See `encode_matvec` for the batching rules.
     #[allow(clippy::too_many_arguments)]
@@ -1351,6 +1738,68 @@ impl MetalQ2Matvec {
                 &blocks_per_row_buffer,
             ],
             physical_threads,
+        )?;
+        Ok(output_buffer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_q8_0_matvec_add(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual: &Buffer,
+        residual_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        let blocks_per_row =
+            validate_q8_0_matvec_buffer(weights, input_len, row_count, in_features, out_features)?;
+        require_f32_capacity(input, input_len, "Q8_0 matvec add input")?;
+        let output_len = row_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("Q8_0 matvec add output length overflow"))?;
+        if residual_len != output_len {
+            return Err(Error::backend(format!(
+                "Q8_0 matvec add residual length mismatch: expected {output_len}, got {residual_len}"
+            )));
+        }
+        require_f32_capacity(residual, residual_len, "Q8_0 matvec add residual")?;
+
+        let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer =
+            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let simdgroups_per_output_buffer = u32_scalar_buffer(
+            device,
+            matvec_u32(simdgroups_per_output, "simdgroups_per_output")?,
+        )?;
+
+        encode_1d_threadgroups(
+            command_buffer,
+            &self.q8_0_tiled_add_pipeline,
+            &[
+                &weight_buffer.buffer,
+                input,
+                residual,
+                &output_buffer,
+                &row_count_buffer,
+                &in_features_buffer,
+                &out_features_buffer,
+                &blocks_per_row_buffer,
+                &simdgroups_per_output_buffer,
+            ],
+            output_len,
+            simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
         Ok(output_buffer)
     }
@@ -1559,376 +2008,6 @@ impl MetalQ2Matvec {
         Ok(output_buffer)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_routed_gate_up_swiglu(
-        &self,
-        command_buffer: &CommandBufferRef,
-        device: &Device,
-        gate_weights: &[u8],
-        up_weights: &[u8],
-        input: &Buffer,
-        input_len: usize,
-        token_indices: &Buffer,
-        expert_ids: &Buffer,
-        token_count: usize,
-        expert_count: usize,
-        top_k: usize,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Buffer> {
-        let assignment_count = token_count
-            .checked_mul(top_k)
-            .ok_or_else(|| Error::backend("routed gate/up assignment count overflow"))?;
-        if assignment_count == 0 {
-            return Err(Error::backend(
-                "routed gate/up requires at least one assignment",
-            ));
-        }
-        if assignment_count > ROUTED_EXPERT_ACTIVE_SLOTS {
-            return Err(Error::backend(format!(
-                "Q2 expert staging supports at most {ROUTED_EXPERT_ACTIVE_SLOTS} assignments, got {assignment_count}"
-            )));
-        }
-        let (gate_blocks, gate_experts, expert_stride_bytes) = validate_q2_k_packed_experts(
-            gate_weights,
-            in_features,
-            out_features,
-            "Q2_K routed gate",
-        )?;
-        let (up_blocks, up_experts, up_expert_stride_bytes) =
-            validate_q2_k_packed_experts(up_weights, in_features, out_features, "Q2_K routed up")?;
-        if gate_blocks != up_blocks
-            || gate_experts != up_experts
-            || expert_stride_bytes != up_expert_stride_bytes
-        {
-            return Err(Error::backend(
-                "Q2_K routed gate/up packed layouts do not match",
-            ));
-        }
-        validate_exact_len("Q2_K routed expert count", gate_experts, expert_count)?;
-        let expected_input_len = token_count
-            .checked_mul(in_features)
-            .ok_or_else(|| Error::backend("Q2_K routed gate/up input length overflow"))?;
-        validate_exact_len("Q2_K routed gate/up input", input_len, expected_input_len)?;
-        require_f32_capacity(input, input_len, "Q2_K routed gate/up input")?;
-        require_u32_buffer_capacity(token_indices, assignment_count, "Q2_K routed token indices")?;
-        require_u32_buffer_capacity(expert_ids, assignment_count, "Q2_K routed expert ids")?;
-
-        let output_len = assignment_count
-            .checked_mul(out_features)
-            .ok_or_else(|| Error::backend("Q2_K routed gate/up output length overflow"))?;
-        let physical_threads = q2_k_cooperative_threads(
-            &self.multi_expert_gate_up_swiglu_pipeline,
-            output_len,
-            "Q2_K routed gate/up",
-        )?;
-        let gate_weight_buffer = self.weight_buffer(device, gate_weights)?;
-        let up_weight_buffer = self.weight_buffer(device, up_weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(gate_blocks, "blocks_per_row")?)?;
-        let expert_stride_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
-
-        encode_1d(
-            command_buffer,
-            &self.multi_expert_gate_up_swiglu_pipeline,
-            &[
-                &gate_weight_buffer.buffer,
-                &up_weight_buffer.buffer,
-                input,
-                token_indices,
-                expert_ids,
-                &output_buffer,
-                &token_count_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &expert_stride_buffer,
-            ],
-            physical_threads,
-        )?;
-        Ok(output_buffer)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_routed_matvec(
-        &self,
-        command_buffer: &CommandBufferRef,
-        device: &Device,
-        weights: &[u8],
-        input: &Buffer,
-        input_len: usize,
-        expert_ids: &Buffer,
-        token_count: usize,
-        expert_count: usize,
-        top_k: usize,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Buffer> {
-        let assignment_count = token_count
-            .checked_mul(top_k)
-            .ok_or_else(|| Error::backend("routed matvec assignment count overflow"))?;
-        let (blocks_per_row, packed_experts, expert_stride_bytes) =
-            validate_q2_k_packed_experts(weights, in_features, out_features, "Q2_K routed matvec")?;
-        validate_exact_len("Q2_K routed expert count", packed_experts, expert_count)?;
-        let expected_input_len = assignment_count
-            .checked_mul(in_features)
-            .ok_or_else(|| Error::backend("Q2_K routed matvec input length overflow"))?;
-        validate_exact_len("Q2_K routed matvec input", input_len, expected_input_len)?;
-        require_f32_capacity(input, input_len, "Q2_K routed matvec input")?;
-        require_u32_buffer_capacity(expert_ids, assignment_count, "Q2_K routed expert ids")?;
-
-        let output_len = assignment_count
-            .checked_mul(out_features)
-            .ok_or_else(|| Error::backend("Q2_K routed matvec output length overflow"))?;
-        let physical_threads = q2_k_cooperative_threads(
-            &self.multi_expert_matvec_pipeline,
-            output_len,
-            "Q2_K routed matvec",
-        )?;
-        let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
-        let expert_stride_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
-
-        encode_1d(
-            command_buffer,
-            &self.multi_expert_matvec_pipeline,
-            &[
-                &weight_buffer.buffer,
-                input,
-                expert_ids,
-                &output_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &expert_stride_buffer,
-            ],
-            physical_threads,
-        )?;
-        Ok(output_buffer)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_staged_routed_gate_up_swiglu(
-        &self,
-        command_buffer: &CommandBufferRef,
-        device: &Device,
-        experts: &crate::DeviceQ2Experts,
-        input: &Buffer,
-        input_len: usize,
-        token_indices: &Buffer,
-        token_count: usize,
-        top_k: usize,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Buffer> {
-        let assignment_count = token_count
-            .checked_mul(top_k)
-            .ok_or_else(|| Error::backend("staged routed gate/up assignment count overflow"))?;
-        validate_exact_len(
-            "staged routed gate/up assignments",
-            experts.assignment_count,
-            assignment_count,
-        )?;
-        let expected_stride = q2_expert_stride(in_features, out_features)?;
-        validate_exact_len(
-            "staged routed gate stride",
-            experts.gate_expert_stride_bytes,
-            expected_stride,
-        )?;
-        validate_exact_len(
-            "staged routed up stride",
-            experts.up_expert_stride_bytes,
-            expected_stride,
-        )?;
-        let address_bytes = assignment_count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| Error::backend("staged routed address byte length overflow"))?;
-        require_byte_capacity(
-            &experts.gate_addresses,
-            address_bytes,
-            "staged routed gate addresses",
-        )?;
-        require_byte_capacity(
-            &experts.up_addresses,
-            address_bytes,
-            "staged routed up addresses",
-        )?;
-        validate_exact_len(
-            "staged routed gate resources",
-            experts.gate_resources.len(),
-            assignment_count,
-        )?;
-        validate_exact_len(
-            "staged routed up resources",
-            experts.up_resources.len(),
-            assignment_count,
-        )?;
-        let expected_input_len = token_count
-            .checked_mul(in_features)
-            .ok_or_else(|| Error::backend("staged routed gate/up input length overflow"))?;
-        validate_exact_len("staged routed gate/up input", input_len, expected_input_len)?;
-        require_f32_capacity(input, input_len, "staged routed gate/up input")?;
-        require_u32_buffer_capacity(
-            token_indices,
-            assignment_count,
-            "staged routed token indices",
-        )?;
-
-        let output_len = assignment_count
-            .checked_mul(out_features)
-            .ok_or_else(|| Error::backend("staged routed gate/up output length overflow"))?;
-        let physical_threads = q2_k_cooperative_threads(
-            &self.address_gate_up_swiglu_pipeline,
-            output_len,
-            "addressed Q2_K routed gate/up",
-        )?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(in_features / Q2_K_BLOCK_VALUES, "blocks_per_row")?,
-        )?;
-        let indirect_reads = experts
-            .gate_resources
-            .iter()
-            .chain(&experts.up_resources)
-            .collect::<Vec<_>>();
-        encode_1d_with_indirect_reads(
-            command_buffer,
-            &self.address_gate_up_swiglu_pipeline,
-            &[
-                &experts.gate_addresses,
-                &experts.up_addresses,
-                input,
-                token_indices,
-                &output_buffer,
-                &token_count_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-            ],
-            &indirect_reads,
-            physical_threads,
-        )?;
-        Ok(output_buffer)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn encode_staged_routed_matvec(
-        &self,
-        command_buffer: &CommandBufferRef,
-        device: &Device,
-        experts: &crate::DeviceQ2Experts,
-        input: &Buffer,
-        input_len: usize,
-        token_count: usize,
-        top_k: usize,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Buffer> {
-        let assignment_count = token_count
-            .checked_mul(top_k)
-            .ok_or_else(|| Error::backend("staged routed matvec assignment count overflow"))?;
-        validate_exact_len(
-            "staged routed matvec assignments",
-            experts.assignment_count,
-            assignment_count,
-        )?;
-        let expected_stride = q2_expert_stride(in_features, out_features)?;
-        validate_exact_len(
-            "staged routed down stride",
-            experts.down_expert_stride_bytes,
-            expected_stride,
-        )?;
-        let address_bytes = assignment_count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| Error::backend("staged routed down address byte length overflow"))?;
-        require_byte_capacity(
-            &experts.down_addresses,
-            address_bytes,
-            "staged routed down addresses",
-        )?;
-        validate_exact_len(
-            "staged routed down resources",
-            experts.down_resources.len(),
-            assignment_count,
-        )?;
-        let expected_input_len = assignment_count
-            .checked_mul(in_features)
-            .ok_or_else(|| Error::backend("staged routed matvec input length overflow"))?;
-        validate_exact_len("staged routed matvec input", input_len, expected_input_len)?;
-        require_f32_capacity(input, input_len, "staged routed matvec input")?;
-        let output_len = assignment_count
-            .checked_mul(out_features)
-            .ok_or_else(|| Error::backend("staged routed matvec output length overflow"))?;
-        let physical_threads = q2_k_cooperative_threads(
-            &self.address_matvec_pipeline,
-            output_len,
-            "addressed Q2_K routed matvec",
-        )?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(in_features / Q2_K_BLOCK_VALUES, "blocks_per_row")?,
-        )?;
-        let indirect_reads = experts.down_resources.iter().collect::<Vec<_>>();
-        encode_1d_with_indirect_reads(
-            command_buffer,
-            &self.address_matvec_pipeline,
-            &[
-                &experts.down_addresses,
-                input,
-                &output_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-            ],
-            &indirect_reads,
-            physical_threads,
-        )?;
-        Ok(output_buffer)
-    }
-
     /// Encodes the Q2_K output-head matvec plus greedy argmax into an open
     /// batched command buffer. Returns the one-element token id (u32) and token
     /// score (f32) buffers; they hold valid data only after the batch flushes.
@@ -2039,10 +2118,50 @@ impl MetalQ2Matvec {
         Ok((token_id_buffer, token_score_buffer))
     }
 
-    /// Resolves selected experts into a bounded LRU of shared Metal buffers.
-    /// Cache misses read one expert triplet directly from the GGUF; cache hits
-    /// only return its existing slot.
-    pub(crate) fn stage_experts(
+    pub(crate) fn encode_f32_argmax_rows(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        scores: &Buffer,
+        row_count: usize,
+        row_width: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        if row_count == 0 || row_width == 0 {
+            return Err(Error::backend(
+                "row-wise f32 argmax requires non-zero row_count and row_width",
+            ));
+        }
+        let value_count = row_count
+            .checked_mul(row_width)
+            .ok_or_else(|| Error::backend("row-wise f32 argmax value count overflow"))?;
+        require_f32_capacity(scores, value_count, "row-wise f32 argmax scores")?;
+        let threads_per_row = argmax_threads(
+            &self.argmax_rows_pipeline,
+            "batched row-wise f32 greedy argmax",
+        )?;
+        let physical_threads = row_count
+            .checked_mul(threads_per_row)
+            .ok_or_else(|| Error::backend("row-wise f32 argmax thread count overflow"))?;
+        let token_id_buffer = empty_u32_buffer(device, row_count)?;
+        let token_score_buffer = empty_f32_buffer(device, row_count)?;
+        let row_width_buffer = u32_scalar_buffer(device, matvec_u32(row_width, "row_width")?)?;
+
+        encode_1d(
+            command_buffer,
+            &self.argmax_rows_pipeline,
+            &[
+                scores,
+                &token_id_buffer,
+                &token_score_buffer,
+                &row_width_buffer,
+            ],
+            physical_threads,
+        )?;
+        Ok((token_id_buffer, token_score_buffer))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_ready_routed_experts(
         &self,
         device: &Device,
         layer_index: usize,
@@ -2050,147 +2169,980 @@ impl MetalQ2Matvec {
         gate_payloads: &[Q2ExpertSource<'_>],
         up_payloads: &[Q2ExpertSource<'_>],
         down_payloads: &[Q2ExpertSource<'_>],
-    ) -> Result<crate::DeviceQ2Experts> {
-        let assignment_count = gate_payloads.len();
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        token_count: usize,
+        top_k: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<ReadyRoutedExperts> {
+        let assignment_count = token_count
+            .checked_mul(top_k)
+            .ok_or_else(|| Error::backend("ready routed expert assignment count overflow"))?;
         if assignment_count == 0 {
             return Err(Error::backend(
-                "Q2 expert staging requires at least one selected expert",
+                "ready routed expert execution requires at least one assignment",
             ));
         }
         validate_exact_len(
-            "Q2 staged up assignment count",
+            "ready routed gate assignment count",
+            gate_payloads.len(),
+            assignment_count,
+        )?;
+        validate_exact_len(
+            "ready routed up assignment count",
             up_payloads.len(),
             assignment_count,
         )?;
         validate_exact_len(
-            "Q2 staged down assignment count",
+            "ready routed down assignment count",
             down_payloads.len(),
             assignment_count,
         )?;
+        validate_exact_len(
+            "ready routed input",
+            input_len,
+            token_count
+                .checked_mul(in_features)
+                .ok_or_else(|| Error::backend("ready routed input length overflow"))?,
+        )?;
+        require_f32_capacity(input, input_len, "ready routed input")?;
+        require_u32_buffer_capacity(
+            token_indices,
+            assignment_count,
+            "ready routed token indices",
+        )?;
 
-        let gate_stride = uniform_payload_stride(gate_payloads, "Q2 staged gate")?;
-        let up_stride = uniform_payload_stride(up_payloads, "Q2 staged up")?;
-        let down_stride = uniform_payload_stride(down_payloads, "Q2 staged down")?;
+        let gate_stride = uniform_payload_stride(gate_payloads, "ready routed gate")?;
+        let up_stride = uniform_payload_stride(up_payloads, "ready routed up")?;
+        let down_stride = uniform_payload_stride(down_payloads, "ready routed down")?;
+        validate_exact_len(
+            "ready routed gate stride",
+            gate_stride,
+            q2_expert_stride(in_features, intermediate_features)?,
+        )?;
+        validate_exact_len(
+            "ready routed up stride",
+            up_stride,
+            q2_expert_stride(in_features, intermediate_features)?,
+        )?;
+        validate_exact_len(
+            "ready routed down stride",
+            down_stride,
+            q2_expert_stride(intermediate_features, out_features)?,
+        )?;
 
-        let mut staging = self
-            .expert_staging
-            .lock()
-            .map_err(|_| Error::backend("Metal Q2 expert staging lock poisoned"))?;
-        staging.ensure_model_file(model_path)?;
-        staging.ensure_layout(gate_stride, up_stride, down_stride)?;
-        let mut cache_slots = Vec::with_capacity(assignment_count);
-        let mut read_tasks = Vec::with_capacity(assignment_count * 3);
-        let mut cache_hits = 0;
-        let mut cache_misses = 0;
-        for assignment in 0..assignment_count {
-            let key = expert_cache_key(
-                gate_payloads[assignment].bytes,
-                up_payloads[assignment].bytes,
-                down_payloads[assignment].bytes,
-            );
-            let (slot, cache_miss) = staging.resolve_slot(key)?;
-            if cache_miss {
-                cache_misses += 1;
-                if staging.slots[slot].is_none() {
-                    let slot_buffers = Q2ExpertSlotBuffers {
-                        gate: LockedMetalBuffer::new(device, gate_stride, "gate")?,
-                        up: LockedMetalBuffer::new(device, up_stride, "up")?,
-                        down: LockedMetalBuffer::new(device, down_stride, "down")?,
-                    };
-                    if !slot_buffers.all_locked() {
-                        staging.lock_failure_seen = true;
-                    }
-                    staging.slots[slot] = Some(slot_buffers);
-                    if staging.lock_failure_seen && slot + 1 >= ROUTED_EXPERT_ACTIVE_SLOTS {
-                        let capped_slots = slot + 1;
-                        staging.slots.truncate(capped_slots);
-                        staging.free_slots.clear();
-                        warn!(
-                            target: "inferno::expert_cache",
-                            capped_slots,
-                            "capped Q2 expert cache after memory lock failure"
-                        );
-                    }
-                }
-                let slot_buffers = staging.slots[slot].as_ref().ok_or_else(|| {
-                    Error::backend("Metal Q2 expert cache slot was not allocated")
+        let lookup_started = Instant::now();
+        let (layer_cache, model_file, model_path) = {
+            let mut cache = self
+                .ready_expert_cache
+                .lock()
+                .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+            cache.ensure_model_file(model_path)?;
+            cache.ensure_layout(gate_stride, up_stride, down_stride);
+            let layer_cache = cache.layer(layer_index);
+            let model_file = cache
+                .model_file
+                .as_ref()
+                .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?
+                .file
+                .try_clone()
+                .map_err(|source| Error::Io {
+                    path: model_path.to_path_buf(),
+                    source,
                 })?;
-                read_tasks.push(ExpertReadTask {
-                    buffer: slot_buffers.gate.buffer.clone(),
-                    absolute_offset: gate_payloads[assignment].absolute_offset,
-                    byte_len: gate_payloads[assignment].bytes.len(),
-                });
-                read_tasks.push(ExpertReadTask {
-                    buffer: slot_buffers.up.buffer.clone(),
-                    absolute_offset: up_payloads[assignment].absolute_offset,
-                    byte_len: up_payloads[assignment].bytes.len(),
-                });
-                read_tasks.push(ExpertReadTask {
-                    buffer: slot_buffers.down.buffer.clone(),
-                    absolute_offset: down_payloads[assignment].absolute_offset,
-                    byte_len: down_payloads[assignment].bytes.len(),
-                });
-            } else {
-                cache_hits += 1;
-            }
-            cache_slots.push(slot);
-        }
-        let model_file = staging
-            .model_file
-            .as_ref()
-            .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?;
-        if let Err(error) = pread_expert_tasks(&model_file.file, &model_file.path, &read_tasks) {
-            staging.clear_entries();
-            return Err(error);
-        }
-        trace!(
-            target: "inferno::metal",
+            (layer_cache, model_file, model_path.to_path_buf())
+        };
+
+        let mut layer_cache = layer_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?;
+        let slots_per_layer = layer_cache.slots.len();
+        let groups = prepare_ready_expert_groups(
+            device,
+            &mut layer_cache,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+            gate_stride,
+            up_stride,
+            down_stride,
+        )?;
+        let lookup_nanoseconds = elapsed_nanoseconds(lookup_started.elapsed());
+        let cache_hits = groups.iter().filter(|group| group.cache_hit).count();
+        let cache_misses = groups.len() - cache_hits;
+        let transient_experts = groups.iter().filter(|group| group.transient).count();
+        let read_bytes = groups.iter().try_fold(0_u64, |total, group| {
+            group.read_tasks.iter().try_fold(total, |total, task| {
+                total
+                    .checked_add(u64::try_from(task.byte_len).map_err(|_| {
+                        Error::backend("ready routed expert read size does not fit u64")
+                    })?)
+                    .ok_or_else(|| Error::backend("ready routed expert read bytes overflow"))
+            })
+        })?;
+        let cached_miss_keys = groups
+            .iter()
+            .filter_map(|group| group.cached_miss_key)
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let execution = self.execute_ready_expert_groups(
+            device,
+            &model_file,
+            &model_path,
+            &groups,
+            input,
+            input_len,
+            token_indices,
+            token_count,
+            assignment_count,
+            in_features,
+            intermediate_features,
+            out_features,
+        );
+        let (output, ready_waves, first_ready_ms, ssd_load_nanoseconds, q2_matmul_gpu_nanoseconds) =
+            match execution {
+                Ok(output) => output,
+                Err(error) => {
+                    layer_cache.invalidate(&cached_miss_keys);
+                    return Err(error);
+                }
+            };
+
+        self.expert_cache_counters
+            .lookups
+            .fetch_add(groups.len() as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .hits
+            .fetch_add(cache_hits as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .misses
+            .fetch_add(cache_misses as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .ssd_read_bytes
+            .fetch_add(read_bytes, Ordering::Relaxed);
+        self.expert_cache_counters
+            .transient_experts
+            .fetch_add(transient_experts as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .ready_waves
+            .fetch_add(ready_waves as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .lookup_nanoseconds
+            .fetch_add(lookup_nanoseconds, Ordering::Relaxed);
+        self.expert_cache_counters
+            .ssd_load_nanoseconds
+            .fetch_add(ssd_load_nanoseconds, Ordering::Relaxed);
+        self.expert_cache_counters
+            .q2_matmul_gpu_nanoseconds
+            .fetch_add(q2_matmul_gpu_nanoseconds, Ordering::Relaxed);
+
+        debug!(
+            target: "inferno::expert_cache",
             layer_index,
+            selected_experts = groups.len(),
+            assignment_count,
             cache_hits,
             cache_misses,
-            read_bytes = read_tasks.iter().map(|task| task.byte_len).sum::<usize>(),
-            "resolved Q2 routed experts"
+            transient_experts,
+            read_bytes,
+            ready_waves,
+            lookup_ms = lookup_nanoseconds as f64 / 1_000_000.0,
+            ssd_load_ms = ssd_load_nanoseconds as f64 / 1_000_000.0,
+            q2_matmul_gpu_ms = q2_matmul_gpu_nanoseconds as f64 / 1_000_000.0,
+            first_ready_ms,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            slots_per_layer,
+            "completed ready-first Q2 routed experts"
         );
-        let mut gate_addresses = Vec::with_capacity(assignment_count);
-        let mut up_addresses = Vec::with_capacity(assignment_count);
-        let mut down_addresses = Vec::with_capacity(assignment_count);
-        let mut gate_resources = Vec::with_capacity(assignment_count);
-        let mut up_resources = Vec::with_capacity(assignment_count);
-        let mut down_resources = Vec::with_capacity(assignment_count);
-        for &cache_slot in &cache_slots {
-            let slot_buffers = staging.slots[cache_slot].as_ref().ok_or_else(|| {
-                Error::backend("Metal Q2 expert cache slot is unexpectedly empty")
+
+        Ok(ReadyRoutedExperts {
+            output,
+            selected_experts: groups.len(),
+            cache_hits,
+            cache_misses,
+            transient_experts,
+            read_bytes,
+            ready_waves,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ready_expert_groups(
+        &self,
+        device: &Device,
+        model_file: &File,
+        model_path: &Path,
+        groups: &[ReadyExpertGroup],
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        token_count: usize,
+        assignment_count: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<(Buffer, usize, f64, u64, u64)> {
+        let gated_len = assignment_count
+            .checked_mul(intermediate_features)
+            .ok_or_else(|| Error::backend("ready routed gated length overflow"))?;
+        let output_len = assignment_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("ready routed output length overflow"))?;
+        let gated = empty_f32_buffer(device, gated_len)?;
+        let output = empty_f32_buffer(device, output_len)?;
+        let cached = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| group.cache_hit.then_some(index))
+            .collect::<Vec<_>>();
+        let misses = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| (!group.cache_hit).then_some(index))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let mut first_ready_ms = None;
+        let mut waves = Vec::<SubmittedReadyWave>::new();
+
+        let ssd_started = Instant::now();
+        let ssd_finished_nanoseconds = AtomicU64::new(0);
+        let load_result = thread::scope(|scope| -> Result<()> {
+            let (sender, receiver) = mpsc::channel::<(usize, Result<()>)>();
+            let worker_count = misses.len().min(ROUTED_EXPERT_READ_WORKERS);
+            let mut workers = Vec::with_capacity(worker_count);
+            if worker_count > 0 {
+                let jobs_per_worker = misses.len().div_ceil(worker_count);
+                for worker_jobs in misses.chunks(jobs_per_worker) {
+                    let sender = sender.clone();
+                    let ssd_finished_nanoseconds = &ssd_finished_nanoseconds;
+                    workers.push(scope.spawn(move || {
+                        for &group_index in worker_jobs {
+                            let result = pread_ready_expert_group(
+                                model_file,
+                                model_path,
+                                &groups[group_index],
+                            );
+                            ssd_finished_nanoseconds.fetch_max(
+                                elapsed_nanoseconds(ssd_started.elapsed()),
+                                Ordering::Relaxed,
+                            );
+                            if sender.send((group_index, result)).is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+            }
+            drop(sender);
+
+            if !cached.is_empty() {
+                first_ready_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+                waves.push(self.submit_ready_expert_wave(
+                    device,
+                    groups,
+                    &cached,
+                    input,
+                    input_len,
+                    token_indices,
+                    token_count,
+                    assignment_count,
+                    in_features,
+                    intermediate_features,
+                    out_features,
+                    &gated,
+                    &output,
+                )?);
+            }
+
+            let mut first_error = None;
+            let mut completed_misses = 0_usize;
+            let mut pending_ready = Vec::<usize>::new();
+            while let Ok(first) = receiver.recv() {
+                let mut completed = vec![first];
+                completed.extend(receiver.try_iter());
+                let mut ready = Vec::with_capacity(completed.len());
+                for (group_index, result) in completed {
+                    completed_misses += 1;
+                    match result {
+                        Ok(()) => ready.push(group_index),
+                        Err(error) if first_error.is_none() => first_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
+                pending_ready.extend(ready);
+                let minimum_wave_size = if waves.is_empty() {
+                    1
+                } else {
+                    ROUTED_EXPERT_MIN_READY_WAVE
+                };
+                if pending_ready.len() >= minimum_wave_size {
+                    first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+                    waves.push(self.submit_ready_expert_wave(
+                        device,
+                        groups,
+                        &pending_ready,
+                        input,
+                        input_len,
+                        token_indices,
+                        token_count,
+                        assignment_count,
+                        in_features,
+                        intermediate_features,
+                        out_features,
+                        &gated,
+                        &output,
+                    )?);
+                    pending_ready.clear();
+                }
+            }
+
+            if !pending_ready.is_empty() {
+                first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+                waves.push(self.submit_ready_expert_wave(
+                    device,
+                    groups,
+                    &pending_ready,
+                    input,
+                    input_len,
+                    token_indices,
+                    token_count,
+                    assignment_count,
+                    in_features,
+                    intermediate_features,
+                    out_features,
+                    &gated,
+                    &output,
+                )?);
+            }
+
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| Error::backend("Q2 expert read worker thread panicked"))?;
+            }
+            validate_exact_len(
+                "ready routed completed SSD reads",
+                completed_misses,
+                misses.len(),
+            )?;
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
+        });
+        let ssd_load_nanoseconds = if misses.is_empty() {
+            0
+        } else {
+            ssd_finished_nanoseconds.load(Ordering::Relaxed)
+        };
+        let wave_result = wait_ready_expert_waves(&waves);
+        let q2_matmul_gpu_nanoseconds = match (load_result, wave_result) {
+            (Ok(()), Ok(nanoseconds)) => nanoseconds,
+            (Err(error), Ok(_)) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Err(wave_error)) => {
+                debug!(
+                    target: "inferno::expert_cache",
+                    error = %wave_error,
+                    "ready expert Metal wave also failed while handling an SSD load error"
+                );
+                return Err(error);
+            }
+        };
+        Ok((
+            output,
+            waves.len(),
+            first_ready_ms.unwrap_or_default(),
+            ssd_load_nanoseconds,
+            q2_matmul_gpu_nanoseconds,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_ready_expert_wave(
+        &self,
+        device: &Device,
+        groups: &[ReadyExpertGroup],
+        ready_groups: &[usize],
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        token_count: usize,
+        assignment_count: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+        gated: &Buffer,
+        output: &Buffer,
+    ) -> Result<SubmittedReadyWave> {
+        if !ready_groups.is_empty()
+            && ready_groups.iter().all(|&group_index| {
+                groups
+                    .get(group_index)
+                    .and_then(|group| group.buffers.slot_index)
+                    .is_some()
+            })
+        {
+            return self.submit_ready_expert_slot_wave(
+                device,
+                groups,
+                ready_groups,
+                input,
+                input_len,
+                token_indices,
+                token_count,
+                assignment_count,
+                in_features,
+                intermediate_features,
+                out_features,
+                gated,
+                output,
+            );
+        }
+
+        let mut assignment_indices = Vec::<u32>::new();
+        let mut gate_addresses = Vec::<u64>::new();
+        let mut up_addresses = Vec::<u64>::new();
+        let mut down_addresses = Vec::<u64>::new();
+        let mut gate_resources = Vec::<&Buffer>::new();
+        let mut up_resources = Vec::<&Buffer>::new();
+        let mut down_resources = Vec::<&Buffer>::new();
+        for &group_index in ready_groups {
+            let group = groups.get(group_index).ok_or_else(|| {
+                Error::backend(format!(
+                    "ready routed group index {group_index} is out of bounds"
+                ))
             })?;
-            gate_addresses.push(slot_buffers.gate.buffer.gpu_address());
-            up_addresses.push(slot_buffers.up.buffer.gpu_address());
-            down_addresses.push(slot_buffers.down.buffer.gpu_address());
-            gate_resources.push(slot_buffers.gate.buffer.clone());
-            up_resources.push(slot_buffers.up.buffer.clone());
-            down_resources.push(slot_buffers.down.buffer.clone());
+            for &assignment_index in &group.assignment_indices {
+                assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
+                    Error::backend("ready routed assignment index exceeds Metal u32 limit")
+                })?);
+                gate_addresses.push(group.buffers.gate.gpu_address());
+                up_addresses.push(group.buffers.up.gpu_address());
+                down_addresses.push(group.buffers.down.gpu_address());
+                gate_resources.push(&group.buffers.gate);
+                up_resources.push(&group.buffers.up);
+                down_resources.push(&group.buffers.down);
+            }
+        }
+        if assignment_indices.is_empty() {
+            return Err(Error::backend(
+                "ready routed wave requires at least one assignment",
+            ));
         }
         if gate_addresses.iter().any(|address| *address == 0)
             || up_addresses.iter().any(|address| *address == 0)
             || down_addresses.iter().any(|address| *address == 0)
         {
             return Err(Error::backend(
-                "Metal Q2 expert cache requires non-zero GPU buffer addresses",
+                "ready routed expert buffers require non-zero GPU addresses",
             ));
         }
 
-        Ok(crate::DeviceQ2Experts {
+        let gate_addresses = u64_buffer(device, &gate_addresses)?;
+        let up_addresses = u64_buffer(device, &up_addresses)?;
+        let down_addresses = u64_buffer(device, &down_addresses)?;
+        let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
+        let command_buffer = self.expert_queue.new_command_buffer().to_owned();
+        self.encode_ready_gate_up_swiglu(
+            &command_buffer,
+            device,
+            &gate_addresses,
+            &up_addresses,
+            &gate_resources,
+            &up_resources,
+            input,
+            input_len,
+            token_indices,
+            &assignment_indices_buffer,
+            assignment_indices.len(),
+            token_count,
             assignment_count,
-            cache_hits,
-            cache_misses,
-            gate_expert_stride_bytes: gate_stride,
-            up_expert_stride_bytes: up_stride,
-            down_expert_stride_bytes: down_stride,
-            gate_addresses: u64_buffer(device, &gate_addresses)?,
-            up_addresses: u64_buffer(device, &up_addresses)?,
-            down_addresses: u64_buffer(device, &down_addresses)?,
-            gate_resources,
-            up_resources,
-            down_resources,
+            in_features,
+            intermediate_features,
+            gated,
+        )?;
+        self.encode_ready_matvec(
+            &command_buffer,
+            device,
+            &down_addresses,
+            &down_resources,
+            gated,
+            &assignment_indices_buffer,
+            assignment_indices.len(),
+            assignment_count,
+            intermediate_features,
+            out_features,
+            output,
+        )?;
+        command_buffer.commit();
+
+        Ok(SubmittedReadyWave {
+            command_buffer,
+            assignment_count: assignment_indices.len(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_ready_expert_slot_wave(
+        &self,
+        device: &Device,
+        groups: &[ReadyExpertGroup],
+        ready_groups: &[usize],
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        token_count: usize,
+        assignment_count: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+        gated: &Buffer,
+        output: &Buffer,
+    ) -> Result<SubmittedReadyWave> {
+        let first = groups
+            .get(
+                *ready_groups
+                    .first()
+                    .ok_or_else(|| Error::backend("ready routed slot wave has no expert groups"))?,
+            )
+            .ok_or_else(|| Error::backend("ready routed slot wave group is out of bounds"))?;
+        let mut assignment_indices = Vec::<u32>::new();
+        let mut slot_indices = Vec::<u32>::new();
+        for &group_index in ready_groups {
+            let group = groups.get(group_index).ok_or_else(|| {
+                Error::backend(format!(
+                    "ready routed slot group index {group_index} is out of bounds"
+                ))
+            })?;
+            if group.buffers.gate.gpu_address() != first.buffers.gate.gpu_address()
+                || group.buffers.up.gpu_address() != first.buffers.up.gpu_address()
+                || group.buffers.down.gpu_address() != first.buffers.down.gpu_address()
+            {
+                return Err(Error::backend(
+                    "ready routed slot wave mixes different layer slabs",
+                ));
+            }
+            let slot = u32::try_from(group.buffers.slot_index.ok_or_else(|| {
+                Error::backend("ready routed slot wave contains a transient expert")
+            })?)
+            .map_err(|_| Error::backend("ready routed expert slot exceeds Metal u32 limit"))?;
+            for &assignment_index in &group.assignment_indices {
+                assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
+                    Error::backend("ready routed assignment index exceeds Metal u32 limit")
+                })?);
+                slot_indices.push(slot);
+            }
+        }
+        if assignment_indices.is_empty() {
+            return Err(Error::backend(
+                "ready routed slot wave requires at least one assignment",
+            ));
+        }
+
+        let gate_stride = q2_expert_stride(in_features, intermediate_features)?;
+        let up_stride = gate_stride;
+        let down_stride = q2_expert_stride(intermediate_features, out_features)?;
+        let slot_count = (first.buffers.gate.length() as usize) / gate_stride;
+        validate_exact_len(
+            "ready routed up slab byte length",
+            first.buffers.up.length() as usize,
+            slot_count
+                .checked_mul(up_stride)
+                .ok_or_else(|| Error::backend("ready routed up slab byte count overflow"))?,
+        )?;
+        validate_exact_len(
+            "ready routed down slab byte length",
+            first.buffers.down.length() as usize,
+            slot_count
+                .checked_mul(down_stride)
+                .ok_or_else(|| Error::backend("ready routed down slab byte count overflow"))?,
+        )?;
+        if slot_indices.iter().any(|&slot| slot as usize >= slot_count) {
+            return Err(Error::backend(
+                "ready routed expert slot is outside the layer slab",
+            ));
+        }
+
+        let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
+        let slot_indices_buffer = u32_buffer(device, &slot_indices)?;
+        let command_buffer = self.expert_queue.new_command_buffer().to_owned();
+        self.encode_ready_slot_gate_up_swiglu(
+            &command_buffer,
+            device,
+            &first.buffers.gate,
+            &first.buffers.up,
+            input,
+            input_len,
+            token_indices,
+            &assignment_indices_buffer,
+            &slot_indices_buffer,
+            assignment_indices.len(),
+            token_count,
+            assignment_count,
+            slot_count,
+            in_features,
+            intermediate_features,
+            gate_stride,
+            gated,
+        )?;
+        self.encode_ready_slot_matvec(
+            &command_buffer,
+            device,
+            &first.buffers.down,
+            gated,
+            &assignment_indices_buffer,
+            &slot_indices_buffer,
+            assignment_indices.len(),
+            assignment_count,
+            slot_count,
+            intermediate_features,
+            out_features,
+            down_stride,
+            output,
+        )?;
+        command_buffer.commit();
+
+        Ok(SubmittedReadyWave {
+            command_buffer,
+            assignment_count: assignment_indices.len(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ready_gate_up_swiglu(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        gate_addresses: &Buffer,
+        up_addresses: &Buffer,
+        gate_resources: &[&Buffer],
+        up_resources: &[&Buffer],
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        assignment_indices: &Buffer,
+        ready_count: usize,
+        token_count: usize,
+        assignment_count: usize,
+        in_features: usize,
+        out_features: usize,
+        output: &Buffer,
+    ) -> Result<()> {
+        require_f32_capacity(input, input_len, "ready routed gate/up input")?;
+        require_u32_buffer_capacity(
+            token_indices,
+            assignment_count,
+            "ready routed gate/up token indices",
+        )?;
+        require_u32_buffer_capacity(
+            assignment_indices,
+            ready_count,
+            "ready routed gate/up assignment indices",
+        )?;
+        require_f32_capacity(
+            output,
+            assignment_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed gate/up output overflow"))?,
+            "ready routed gate/up output",
+        )?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.ready_gate_up_swiglu_pipeline,
+            ready_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed gate/up thread count overflow"))?,
+            "ready Q2_K routed gate/up",
+        )?;
+        let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
+        let token_count = u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
+        let assignment_count =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let indirect_reads = gate_resources
+            .iter()
+            .chain(up_resources)
+            .copied()
+            .collect::<Vec<_>>();
+        encode_1d_with_indirect_reads(
+            command_buffer,
+            &self.ready_gate_up_swiglu_pipeline,
+            &[
+                gate_addresses,
+                up_addresses,
+                input,
+                token_indices,
+                assignment_indices,
+                output,
+                &token_count,
+                &assignment_count,
+                &ready_count,
+                &in_features,
+                &out_features,
+                &blocks_per_row,
+            ],
+            &indirect_reads,
+            physical_threads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ready_matvec(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weight_addresses: &Buffer,
+        weight_resources: &[&Buffer],
+        input: &Buffer,
+        assignment_indices: &Buffer,
+        ready_count: usize,
+        assignment_count: usize,
+        in_features: usize,
+        out_features: usize,
+        output: &Buffer,
+    ) -> Result<()> {
+        require_u32_buffer_capacity(
+            assignment_indices,
+            ready_count,
+            "ready routed down assignment indices",
+        )?;
+        require_f32_capacity(
+            input,
+            assignment_count
+                .checked_mul(in_features)
+                .ok_or_else(|| Error::backend("ready routed down input overflow"))?,
+            "ready routed down input",
+        )?;
+        require_f32_capacity(
+            output,
+            assignment_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed down output overflow"))?,
+            "ready routed down output",
+        )?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.ready_matvec_pipeline,
+            ready_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed down thread count overflow"))?,
+            "ready Q2_K routed down",
+        )?;
+        let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
+        let assignment_count =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        encode_1d_with_indirect_reads(
+            command_buffer,
+            &self.ready_matvec_pipeline,
+            &[
+                weight_addresses,
+                input,
+                assignment_indices,
+                output,
+                &assignment_count,
+                &ready_count,
+                &in_features,
+                &out_features,
+                &blocks_per_row,
+            ],
+            weight_resources,
+            physical_threads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ready_slot_gate_up_swiglu(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        gate_weights: &Buffer,
+        up_weights: &Buffer,
+        input: &Buffer,
+        input_len: usize,
+        token_indices: &Buffer,
+        assignment_indices: &Buffer,
+        slot_indices: &Buffer,
+        ready_count: usize,
+        token_count: usize,
+        assignment_count: usize,
+        slot_count: usize,
+        in_features: usize,
+        out_features: usize,
+        expert_stride_bytes: usize,
+        output: &Buffer,
+    ) -> Result<()> {
+        let slab_bytes = slot_count
+            .checked_mul(expert_stride_bytes)
+            .ok_or_else(|| Error::backend("ready routed gate/up slab byte count overflow"))?;
+        require_byte_capacity(gate_weights, slab_bytes, "ready routed gate slab")?;
+        require_byte_capacity(up_weights, slab_bytes, "ready routed up slab")?;
+        require_f32_capacity(input, input_len, "ready routed slot gate/up input")?;
+        require_u32_buffer_capacity(
+            token_indices,
+            assignment_count,
+            "ready routed slot token indices",
+        )?;
+        require_u32_buffer_capacity(
+            assignment_indices,
+            ready_count,
+            "ready routed slot assignment indices",
+        )?;
+        require_u32_buffer_capacity(
+            slot_indices,
+            ready_count,
+            "ready routed expert slot indices",
+        )?;
+        require_f32_capacity(
+            output,
+            assignment_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed slot gate/up output overflow"))?,
+            "ready routed slot gate/up output",
+        )?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.ready_slot_gate_up_swiglu_pipeline,
+            ready_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed slot gate/up threads overflow"))?,
+            "ready Q2_K slot gate/up",
+        )?;
+        let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
+        let token_count = u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
+        let assignment_count =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let expert_stride_bytes = u32_scalar_buffer(
+            device,
+            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
+        )?;
+        let slot_count = u32_scalar_buffer(device, matvec_u32(slot_count, "slot_count")?)?;
+        encode_1d(
+            command_buffer,
+            &self.ready_slot_gate_up_swiglu_pipeline,
+            &[
+                gate_weights,
+                up_weights,
+                input,
+                token_indices,
+                assignment_indices,
+                slot_indices,
+                output,
+                &token_count,
+                &assignment_count,
+                &ready_count,
+                &in_features,
+                &out_features,
+                &blocks_per_row,
+                &expert_stride_bytes,
+                &slot_count,
+            ],
+            physical_threads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ready_slot_matvec(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &Buffer,
+        input: &Buffer,
+        assignment_indices: &Buffer,
+        slot_indices: &Buffer,
+        ready_count: usize,
+        assignment_count: usize,
+        slot_count: usize,
+        in_features: usize,
+        out_features: usize,
+        expert_stride_bytes: usize,
+        output: &Buffer,
+    ) -> Result<()> {
+        require_byte_capacity(
+            weights,
+            slot_count
+                .checked_mul(expert_stride_bytes)
+                .ok_or_else(|| Error::backend("ready routed down slab byte count overflow"))?,
+            "ready routed down slab",
+        )?;
+        require_u32_buffer_capacity(
+            assignment_indices,
+            ready_count,
+            "ready routed slot down assignment indices",
+        )?;
+        require_u32_buffer_capacity(
+            slot_indices,
+            ready_count,
+            "ready routed slot down expert indices",
+        )?;
+        require_f32_capacity(
+            input,
+            assignment_count
+                .checked_mul(in_features)
+                .ok_or_else(|| Error::backend("ready routed slot down input overflow"))?,
+            "ready routed slot down input",
+        )?;
+        require_f32_capacity(
+            output,
+            assignment_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed slot down output overflow"))?,
+            "ready routed slot down output",
+        )?;
+        let physical_threads = q2_k_cooperative_threads(
+            &self.ready_slot_matvec_pipeline,
+            ready_count
+                .checked_mul(out_features)
+                .ok_or_else(|| Error::backend("ready routed slot down threads overflow"))?,
+            "ready Q2_K slot down",
+        )?;
+        let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
+        let assignment_count =
+            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
+        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row =
+            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let expert_stride_bytes = u32_scalar_buffer(
+            device,
+            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
+        )?;
+        let slot_count = u32_scalar_buffer(device, matvec_u32(slot_count, "slot_count")?)?;
+        encode_1d(
+            command_buffer,
+            &self.ready_slot_matvec_pipeline,
+            &[
+                weights,
+                input,
+                assignment_indices,
+                slot_indices,
+                output,
+                &assignment_count,
+                &ready_count,
+                &in_features,
+                &out_features,
+                &blocks_per_row,
+                &expert_stride_bytes,
+                &slot_count,
+            ],
+            physical_threads,
+        )
     }
 
     fn weight_buffer(&self, device: &Device, weights: &[u8]) -> Result<WeightBuffer> {
@@ -2218,14 +3170,18 @@ impl LockedMetalBuffer {
     fn new(device: &Device, byte_len: usize, component: &str) -> Result<Self> {
         let buffer = empty_u8_buffer(device, byte_len)?;
         let pointer = buffer.contents();
-        let locked = if pointer.is_null() {
+        let lock_disabled = EXPERT_CACHE_LOCK_WARNING_EMITTED.load(Ordering::Relaxed);
+        let locked = if pointer.is_null() || lock_disabled {
             false
         } else {
             // SAFETY: `pointer` identifies the shared Metal buffer's CPU-visible
             // allocation and remains valid for the lifetime of `buffer`.
             unsafe { libc::mlock(pointer.cast_const(), byte_len) == 0 }
         };
-        if !locked {
+        if !locked
+            && !lock_disabled
+            && !EXPERT_CACHE_LOCK_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+        {
             warn!(
                 target: "inferno::expert_cache",
                 component,
@@ -2239,8 +3195,127 @@ impl LockedMetalBuffer {
 }
 
 impl Q2ExpertSlotBuffers {
-    fn all_locked(&self) -> bool {
-        self.gate.locked && self.up.locked && self.down.locked
+    fn new(
+        device: &Device,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate: LockedMetalBuffer::new(device, gate_stride, "gate")?,
+            up: LockedMetalBuffer::new(device, up_stride, "up")?,
+            down: LockedMetalBuffer::new(device, down_stride, "down")?,
+        })
+    }
+
+    fn ready_buffers(&self) -> ReadyExpertBuffers {
+        ReadyExpertBuffers {
+            gate: self.gate.buffer.clone(),
+            up: self.up.buffer.clone(),
+            down: self.down.buffer.clone(),
+            gate_offset: 0,
+            up_offset: 0,
+            down_offset: 0,
+            slot_index: None,
+        }
+    }
+}
+
+impl Q2ExpertLayerBuffers {
+    fn new(
+        device: &Device,
+        capacity: usize,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<Self> {
+        let slab_bytes = |stride: usize, component: &str| {
+            stride.checked_mul(capacity).ok_or_else(|| {
+                Error::backend(format!("Q2 {component} expert slab byte count overflow"))
+            })
+        };
+        Ok(Self {
+            gate: LockedMetalSlab::new(device, slab_bytes(gate_stride, "gate")?)?,
+            up: LockedMetalSlab::new(device, slab_bytes(up_stride, "up")?)?,
+            down: LockedMetalSlab::new(device, slab_bytes(down_stride, "down")?)?,
+        })
+    }
+
+    fn ready_buffers(
+        &mut self,
+        slot: usize,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<ReadyExpertBuffers> {
+        let gate_offset = slot
+            .checked_mul(gate_stride)
+            .ok_or_else(|| Error::backend("Q2 gate expert slab offset overflow"))?;
+        let up_offset = slot
+            .checked_mul(up_stride)
+            .ok_or_else(|| Error::backend("Q2 up expert slab offset overflow"))?;
+        let down_offset = slot
+            .checked_mul(down_stride)
+            .ok_or_else(|| Error::backend("Q2 down expert slab offset overflow"))?;
+        self.gate.lock_range(gate_offset, gate_stride, "gate")?;
+        self.up.lock_range(up_offset, up_stride, "up")?;
+        self.down.lock_range(down_offset, down_stride, "down")?;
+        Ok(ReadyExpertBuffers {
+            gate: self.gate.buffer.clone(),
+            up: self.up.buffer.clone(),
+            down: self.down.buffer.clone(),
+            gate_offset,
+            up_offset,
+            down_offset,
+            slot_index: Some(slot),
+        })
+    }
+}
+
+impl LockedMetalSlab {
+    fn new(device: &Device, byte_len: usize) -> Result<Self> {
+        Ok(Self {
+            buffer: empty_u8_buffer(device, byte_len)?,
+            locked_ranges: Vec::new(),
+        })
+    }
+
+    fn lock_range(&mut self, offset: usize, byte_len: usize, component: &str) -> Result<()> {
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::backend("Q2 expert slab lock range overflow"))?;
+        if end > self.buffer.length() as usize {
+            return Err(Error::backend(format!(
+                "Q2 {component} expert slab lock ends at {end}, beyond {} bytes",
+                self.buffer.length()
+            )));
+        }
+        if self.locked_ranges.contains(&(offset, byte_len)) {
+            return Ok(());
+        }
+
+        let pointer = self.buffer.contents().cast::<u8>();
+        let lock_disabled = EXPERT_CACHE_LOCK_WARNING_EMITTED.load(Ordering::Relaxed);
+        let locked = if pointer.is_null() || lock_disabled {
+            false
+        } else {
+            // SAFETY: the validated range belongs to this live shared Metal
+            // allocation and remains valid until the slab is dropped.
+            unsafe { libc::mlock(pointer.add(offset).cast_const().cast(), byte_len) == 0 }
+        };
+        if locked {
+            self.locked_ranges.push((offset, byte_len));
+        } else if !lock_disabled && !EXPERT_CACHE_LOCK_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                target: "inferno::expert_cache",
+                component,
+                byte_len,
+                error = %io::Error::last_os_error(),
+                "could not lock Q2 expert slab range; entry remains pageable"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2254,6 +3329,20 @@ impl Drop for LockedMetalBuffer {
             // SAFETY: this unlocks the same live Metal allocation locked in
             // `new`; no CPU pointer is dereferenced.
             let _ = unsafe { libc::munlock(pointer.cast_const(), self.buffer.length() as usize) };
+        }
+    }
+}
+
+impl Drop for LockedMetalSlab {
+    fn drop(&mut self) {
+        let pointer = self.buffer.contents().cast::<u8>();
+        if pointer.is_null() {
+            return;
+        }
+        for &(offset, byte_len) in &self.locked_ranges {
+            // SAFETY: each range was locked by `lock_range` against this live
+            // allocation and no range is recorded twice.
+            let _ = unsafe { libc::munlock(pointer.add(offset).cast_const().cast(), byte_len) };
         }
     }
 }
@@ -2300,7 +3389,18 @@ fn expert_cache_key(gate: &[u8], up: &[u8], down: &[u8]) -> ExpertCacheKey {
     }
 }
 
-impl Q2ExpertStagingBuffers {
+impl Q2PerLayerExpertCache {
+    fn resize(&mut self, slots_per_layer: usize) -> Result<()> {
+        for layer in self.layers.values() {
+            layer
+                .lock()
+                .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?
+                .resize(slots_per_layer)?;
+        }
+        self.slots_per_layer = slots_per_layer;
+        Ok(())
+    }
+
     fn ensure_model_file(&mut self, path: &Path) -> Result<()> {
         if self
             .model_file
@@ -2317,102 +3417,328 @@ impl Q2ExpertStagingBuffers {
             path: path.to_path_buf(),
             file,
         });
-        self.clear_entries();
+        self.layers.clear();
         Ok(())
     }
 
-    fn ensure_layout(
-        &mut self,
-        gate_stride: usize,
-        up_stride: usize,
-        down_stride: usize,
-    ) -> Result<()> {
+    fn ensure_layout(&mut self, gate_stride: usize, up_stride: usize, down_stride: usize) {
         if self.layout.as_ref().is_some_and(|layout| {
             layout.gate_stride == gate_stride
                 && layout.up_stride == up_stride
                 && layout.down_stride == down_stride
         }) {
-            return Ok(());
+            return;
         }
-
         self.layout = Some(Q2ExpertCacheLayout {
             gate_stride,
             up_stride,
             down_stride,
         });
-        self.entries.clear();
-        self.lru.clear();
-        self.slots.clear();
-        self.lock_failure_seen = false;
-        self.slots.resize_with(ROUTED_EXPERT_CACHE_SLOTS, || None);
-        self.free_slots = (0..ROUTED_EXPERT_CACHE_SLOTS).rev().collect();
+        self.layers.clear();
+    }
+
+    fn layer(&mut self, layer_index: usize) -> Arc<Mutex<Q2ExpertLayerCache>> {
+        let slots_per_layer = self.slots_per_layer;
+        Arc::clone(
+            self.layers
+                .entry(layer_index)
+                .or_insert_with(|| Arc::new(Mutex::new(Q2ExpertLayerCache::new(slots_per_layer)))),
+        )
+    }
+}
+
+impl Q2ExpertLayerCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: vec![false; capacity],
+            storage: None,
+            entries: HashMap::new(),
+            probation: VecDeque::new(),
+            protected: VecDeque::new(),
+            protected_capacity: capacity.div_ceil(2),
+            free_slots: (0..capacity).rev().collect(),
+        }
+    }
+
+    fn resize(&mut self, capacity: usize) -> Result<()> {
+        if capacity == 0 {
+            return Err(Error::backend(
+                "Q2 expert layer cache capacity must be positive",
+            ));
+        }
+        let old_capacity = self.slots.len();
+        if capacity == old_capacity {
+            return Ok(());
+        }
+        // Slab offsets depend on capacity. Rebalancing is infrequent, so a
+        // safe cold reset is simpler than copying gigabytes between slabs.
+        *self = Self::new(capacity);
         Ok(())
     }
 
-    fn resolve_slot(&mut self, key: ExpertCacheKey) -> Result<(usize, bool)> {
+    fn resolve_slot(
+        &mut self,
+        key: ExpertCacheKey,
+        selected_keys: &HashSet<ExpertCacheKey>,
+    ) -> Result<LayerSlotResolution> {
         if let Some(&slot) = self.entries.get(&key) {
             self.touch(key);
-            return Ok((slot, false));
+            return Ok(LayerSlotResolution::Hit(slot));
         }
 
         let slot = match self.free_slots.pop() {
             Some(slot) => slot,
             None => {
-                let evicted = self
-                    .lru
-                    .pop_front()
-                    .ok_or_else(|| Error::backend("Q2 expert cache LRU is empty"))?;
+                let Some(evicted) = self.take_evictable(selected_keys) else {
+                    return Ok(LayerSlotResolution::Transient);
+                };
                 self.entries.remove(&evicted).ok_or_else(|| {
-                    Error::backend("Q2 expert cache LRU and entry map are inconsistent")
+                    Error::backend("Q2 layer expert LRU and entry map are inconsistent")
                 })?
             }
         };
         self.entries.insert(key, slot);
-        self.lru.push_back(key);
-        Ok((slot, true))
+        self.insert_new(key);
+        Ok(LayerSlotResolution::Miss(slot))
+    }
+
+    fn buffers(
+        &mut self,
+        device: &Device,
+        slot: usize,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<ReadyExpertBuffers> {
+        let capacity = self.slots.len();
+        let cache_slot = self.slots.get_mut(slot).ok_or_else(|| {
+            Error::backend(format!("Q2 layer expert slot {slot} is out of bounds"))
+        })?;
+        if self.storage.is_none() {
+            self.storage = Some(Q2ExpertLayerBuffers::new(
+                device,
+                capacity,
+                gate_stride,
+                up_stride,
+                down_stride,
+            )?);
+        }
+        let buffers = self
+            .storage
+            .as_mut()
+            .ok_or_else(|| Error::backend("Q2 layer expert slab allocation failed"))?
+            .ready_buffers(slot, gate_stride, up_stride, down_stride)?;
+        *cache_slot = true;
+        Ok(buffers)
     }
 
     fn touch(&mut self, key: ExpertCacheKey) {
-        if let Some(index) = self.lru.iter().position(|candidate| *candidate == key) {
-            self.lru.remove(index);
+        if remove_key(&mut self.probation, key) {
+            self.protected.push_back(key);
+            if self.protected.len() > self.protected_capacity {
+                if let Some(demoted) = self.protected.pop_front() {
+                    self.probation.push_back(demoted);
+                }
+            }
+        } else if remove_key(&mut self.protected, key) {
+            self.protected.push_back(key);
         }
-        self.lru.push_back(key);
     }
 
-    fn clear_entries(&mut self) {
-        self.entries.clear();
-        self.lru.clear();
-        self.free_slots = (0..self.slots.len()).rev().collect();
+    fn insert_new(&mut self, key: ExpertCacheKey) {
+        self.probation.push_back(key);
+    }
+
+    fn take_evictable(
+        &mut self,
+        selected_keys: &HashSet<ExpertCacheKey>,
+    ) -> Option<ExpertCacheKey> {
+        take_unselected(&mut self.probation, selected_keys)
+            .or_else(|| take_unselected(&mut self.protected, selected_keys))
+    }
+
+    fn invalidate(&mut self, keys: &[ExpertCacheKey]) {
+        for key in keys {
+            let Some(slot) = self.entries.remove(key) else {
+                continue;
+            };
+            remove_key(&mut self.probation, *key);
+            remove_key(&mut self.protected, *key);
+            if !self.free_slots.contains(&slot) {
+                self.free_slots.push(slot);
+            }
+        }
     }
 }
 
-fn pread_expert_tasks(file: &File, path: &Path, tasks: &[ExpertReadTask]) -> Result<()> {
-    if tasks.is_empty() {
-        return Ok(());
+fn remove_key(queue: &mut VecDeque<ExpertCacheKey>, key: ExpertCacheKey) -> bool {
+    let Some(index) = queue.iter().position(|candidate| *candidate == key) else {
+        return false;
+    };
+    queue.remove(index);
+    true
+}
+
+fn take_unselected(
+    queue: &mut VecDeque<ExpertCacheKey>,
+    selected_keys: &HashSet<ExpertCacheKey>,
+) -> Option<ExpertCacheKey> {
+    let index = queue
+        .iter()
+        .position(|candidate| !selected_keys.contains(candidate))?;
+    queue.remove(index)
+}
+
+fn prepare_ready_expert_groups<'a>(
+    device: &Device,
+    cache: &mut Q2ExpertLayerCache,
+    gate_payloads: &[Q2ExpertSource<'a>],
+    up_payloads: &[Q2ExpertSource<'a>],
+    down_payloads: &[Q2ExpertSource<'a>],
+    gate_stride: usize,
+    up_stride: usize,
+    down_stride: usize,
+) -> Result<Vec<ReadyExpertGroup>> {
+    let mut seed_indices = HashMap::<ExpertCacheKey, usize>::new();
+    let mut seeds = Vec::<ReadyExpertSeed<'a>>::new();
+    for assignment_index in 0..gate_payloads.len() {
+        let gate = gate_payloads[assignment_index];
+        let up = up_payloads[assignment_index];
+        let down = down_payloads[assignment_index];
+        let key = expert_cache_key(gate.bytes, up.bytes, down.bytes);
+        if let Some(&seed_index) = seed_indices.get(&key) {
+            let seed = &mut seeds[seed_index];
+            if seed.gate.absolute_offset != gate.absolute_offset
+                || seed.up.absolute_offset != up.absolute_offset
+                || seed.down.absolute_offset != down.absolute_offset
+            {
+                return Err(Error::backend(
+                    "duplicate Q2 expert payload addresses use inconsistent file offsets",
+                ));
+            }
+            seed.assignment_indices.push(assignment_index);
+            continue;
+        }
+        seed_indices.insert(key, seeds.len());
+        seeds.push(ReadyExpertSeed {
+            key,
+            assignment_indices: vec![assignment_index],
+            gate,
+            up,
+            down,
+        });
     }
-    let worker_count = tasks.len().min(ROUTED_EXPERT_READ_WORKERS);
-    let tasks_per_worker = tasks.len().div_ceil(worker_count);
-    thread::scope(|scope| -> Result<()> {
-        let mut workers = Vec::with_capacity(worker_count);
-        for worker_tasks in tasks.chunks(tasks_per_worker) {
-            workers.push(scope.spawn(move || -> Result<()> {
-                for task in worker_tasks {
-                    pread_expert_buffer(file, path, task)?;
-                }
-                Ok(())
-            }));
+
+    let selected_keys = seeds.iter().map(|seed| seed.key).collect::<HashSet<_>>();
+    let mut groups = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let resolution = cache.resolve_slot(seed.key, &selected_keys)?;
+        let (buffers, cache_hit, cached_miss_key, transient, transient_owner) = match resolution {
+            LayerSlotResolution::Hit(slot) => (
+                cache.buffers(device, slot, gate_stride, up_stride, down_stride)?,
+                true,
+                None,
+                false,
+                None,
+            ),
+            LayerSlotResolution::Miss(slot) => (
+                cache.buffers(device, slot, gate_stride, up_stride, down_stride)?,
+                false,
+                Some(seed.key),
+                false,
+                None,
+            ),
+            LayerSlotResolution::Transient => {
+                let slot = Q2ExpertSlotBuffers::new(device, gate_stride, up_stride, down_stride)?;
+                (slot.ready_buffers(), false, None, true, Some(slot))
+            }
+        };
+        let read_tasks = if cache_hit {
+            Vec::new()
+        } else {
+            vec![
+                ExpertReadTask {
+                    buffer: buffers.gate.clone(),
+                    destination_offset: buffers.gate_offset,
+                    absolute_offset: seed.gate.absolute_offset,
+                    byte_len: seed.gate.bytes.len(),
+                },
+                ExpertReadTask {
+                    buffer: buffers.up.clone(),
+                    destination_offset: buffers.up_offset,
+                    absolute_offset: seed.up.absolute_offset,
+                    byte_len: seed.up.bytes.len(),
+                },
+                ExpertReadTask {
+                    buffer: buffers.down.clone(),
+                    destination_offset: buffers.down_offset,
+                    absolute_offset: seed.down.absolute_offset,
+                    byte_len: seed.down.bytes.len(),
+                },
+            ]
+        };
+        groups.push(ReadyExpertGroup {
+            assignment_indices: seed.assignment_indices,
+            buffers,
+            read_tasks,
+            cache_hit,
+            cached_miss_key,
+            transient,
+            _transient_owner: transient_owner,
+        });
+    }
+    Ok(groups)
+}
+
+fn pread_ready_expert_group(file: &File, path: &Path, group: &ReadyExpertGroup) -> Result<()> {
+    for task in &group.read_tasks {
+        pread_expert_buffer(file, path, task)?;
+    }
+    Ok(())
+}
+
+fn wait_ready_expert_waves(waves: &[SubmittedReadyWave]) -> Result<u64> {
+    if let Some(last) = waves.last() {
+        last.command_buffer.wait_until_completed();
+    }
+    for (index, wave) in waves.iter().enumerate() {
+        if wave.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(Error::backend(format!(
+                "Q2 ready expert wave {index} with {} assignments did not complete: {:?}",
+                wave.assignment_count,
+                wave.command_buffer.status()
+            )));
         }
-        for worker in workers {
-            worker
-                .join()
-                .map_err(|_| Error::backend("Q2 expert pread worker thread panicked"))??;
-        }
-        Ok(())
+    }
+    waves.iter().try_fold(0_u64, |total, wave| {
+        total
+            .checked_add(command_buffer_gpu_nanoseconds(&wave.command_buffer))
+            .ok_or_else(|| Error::backend("Q2 expert GPU time overflow"))
     })
 }
 
+#[allow(unexpected_cfgs)]
+fn command_buffer_gpu_nanoseconds(command_buffer: &CommandBufferRef) -> u64 {
+    // SAFETY: GPUStartTime and GPUEndTime are read-only MTLCommandBuffer
+    // properties and this function is called only after completion.
+    let start: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+    let end: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return 0;
+    }
+    ((end - start) * 1_000_000_000.0) as u64
+}
+
+fn elapsed_nanoseconds(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn pread_expert_buffer(file: &File, path: &Path, task: &ExpertReadTask) -> Result<()> {
-    require_byte_capacity(&task.buffer, task.byte_len, "Q2 expert pread destination")?;
+    let destination_end = task
+        .destination_offset
+        .checked_add(task.byte_len)
+        .ok_or_else(|| Error::backend("Q2 expert pread destination range overflow"))?;
+    require_byte_capacity(&task.buffer, destination_end, "Q2 expert pread destination")?;
     let pointer = task.buffer.contents().cast::<u8>();
     if pointer.is_null() {
         return Err(Error::backend(
@@ -2422,7 +3748,9 @@ fn pread_expert_buffer(file: &File, path: &Path, task: &ExpertReadTask) -> Resul
     // SAFETY: this shared Metal buffer is exclusively owned by the cache slot,
     // the previous command buffer was flushed before reuse, and capacity was
     // validated above.
-    let mut destination = unsafe { std::slice::from_raw_parts_mut(pointer, task.byte_len) };
+    let mut destination = unsafe {
+        std::slice::from_raw_parts_mut(pointer.add(task.destination_offset), task.byte_len)
+    };
     let mut offset = task.absolute_offset;
     while !destination.is_empty() {
         let read = file
@@ -2580,6 +3908,10 @@ fn q2_k_cooperative_threads(
         .ok_or_else(|| Error::backend(format!("{context} physical thread count overflow")))
 }
 
+fn q8_0_simdgroups_per_output(blocks_per_row: usize) -> usize {
+    blocks_per_row.min(Q8_0_MAX_SIMDGROUPS_PER_OUTPUT).max(1)
+}
+
 fn argmax_threads(pipeline: &ComputePipelineState, context: &str) -> Result<usize> {
     let thread_execution_width = pipeline.thread_execution_width() as usize;
     let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
@@ -2707,17 +4039,125 @@ fn scratch_buffer_with(
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use crate::{metal::Metal, Q2ExpertSource};
+    use crate::{metal::Metal, DevicePagedKvView, DeviceValue, Q2ExpertSource};
 
     use super::{
-        super::validation::{Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES},
+        super::validation::{
+            Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES,
+        },
+        ExpertCacheKey, LayerSlotResolution, Q2ExpertLayerCache, Q2PerLayerExpertCache,
         QuantMatvecKind,
     };
+
+    fn expert_key(seed: usize) -> ExpertCacheKey {
+        ExpertCacheKey {
+            gate_address: seed * 10 + 1,
+            gate_bytes: 4,
+            up_address: seed * 10 + 2,
+            up_bytes: 4,
+            down_address: seed * 10 + 3,
+            down_bytes: 4,
+        }
+    }
+
+    #[test]
+    fn expert_lru_is_partitioned_by_layer() {
+        let mut cache = Q2PerLayerExpertCache::default();
+        let key = expert_key(1);
+        let selected = [key].into_iter().collect();
+        let first_layer = cache.layer(3);
+        let second_layer = cache.layer(4);
+
+        assert!(matches!(
+            first_layer
+                .lock()
+                .unwrap()
+                .resolve_slot(key, &selected)
+                .unwrap(),
+            LayerSlotResolution::Miss(_)
+        ));
+        assert!(matches!(
+            second_layer
+                .lock()
+                .unwrap()
+                .resolve_slot(key, &selected)
+                .unwrap(),
+            LayerSlotResolution::Miss(_)
+        ));
+    }
+
+    #[test]
+    fn expert_lru_uses_configured_capacity_for_new_layers() {
+        let mut cache = Q2PerLayerExpertCache {
+            slots_per_layer: 3,
+            ..Q2PerLayerExpertCache::default()
+        };
+
+        let layer = cache.layer(7);
+
+        assert_eq!(layer.lock().unwrap().slots.len(), 3);
+    }
+
+    #[test]
+    fn expert_lru_evicts_only_unselected_entries() {
+        let mut cache = Q2ExpertLayerCache::new(2);
+        let first = expert_key(1);
+        let second = expert_key(2);
+        let third = expert_key(3);
+        cache.resolve_slot(first, &HashSet::new()).unwrap();
+        cache.resolve_slot(second, &HashSet::new()).unwrap();
+        let selected = [first, third].into_iter().collect();
+
+        assert!(matches!(
+            cache.resolve_slot(third, &selected).unwrap(),
+            LayerSlotResolution::Miss(_)
+        ));
+        assert!(cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&second));
+        assert!(cache.entries.contains_key(&third));
+    }
+
+    #[test]
+    fn expert_lru_uses_transient_slot_when_every_entry_is_selected() {
+        let mut cache = Q2ExpertLayerCache::new(2);
+        let first = expert_key(1);
+        let second = expert_key(2);
+        let third = expert_key(3);
+        cache.resolve_slot(first, &HashSet::new()).unwrap();
+        cache.resolve_slot(second, &HashSet::new()).unwrap();
+        let selected = [first, second, third].into_iter().collect();
+
+        assert!(matches!(
+            cache.resolve_slot(third, &selected).unwrap(),
+            LayerSlotResolution::Transient
+        ));
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn segmented_lru_protects_reused_experts_from_one_time_scans() {
+        let mut cache = Q2ExpertLayerCache::new(3);
+        let reused = expert_key(1);
+        let scan_a = expert_key(2);
+        let scan_b = expert_key(3);
+        let scan_c = expert_key(4);
+        cache.resolve_slot(reused, &HashSet::new()).unwrap();
+        cache.resolve_slot(scan_a, &HashSet::new()).unwrap();
+        cache.resolve_slot(scan_b, &HashSet::new()).unwrap();
+        cache.resolve_slot(reused, &HashSet::new()).unwrap();
+
+        cache.resolve_slot(scan_c, &HashSet::new()).unwrap();
+
+        assert!(cache.entries.contains_key(&reused));
+        assert!(cache.protected.contains(&reused));
+        assert!(!cache.entries.contains_key(&scan_a));
+    }
 
     #[test]
     fn matches_cpu_reference_for_q2_k_matvec() {
@@ -2771,6 +4211,24 @@ mod tests {
         assert_eq!(report.out_features, 3);
         assert_eq!(report.token_id, expected_id);
         assert!((report.token_score - expected_score).abs() <= 1e-4);
+    }
+
+    #[test]
+    fn row_wise_argmax_returns_one_result_per_token() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let scores = [
+            1.0_f32, 9.0, 3.0, 9.0, // tie resolves to token 1
+            -4.0, -2.0, 7.5, 0.0, // token 2
+        ];
+        let scores_buffer = metal.batch_upload_f32(&scores).unwrap();
+
+        let (token_ids, token_scores) =
+            metal.batched_f32_argmax_rows(&scores_buffer, 2, 4).unwrap();
+
+        assert_eq!(token_ids, vec![1, 2]);
+        assert_eq!(token_scores, vec![9.0, 7.5]);
     }
 
     #[test]
@@ -2831,6 +4289,48 @@ mod tests {
         assert_eq!(report.out_features, 2);
         assert_eq!(report.residual_len, 2);
         assert_close(&report.values, &expected, 1e-4);
+    }
+
+    #[test]
+    fn q8_0_tiled_matvec_add_matches_cpu_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let in_features = 64;
+        let out_features = 2;
+        let weights = [
+            q8_0_block(0x3c00, 1),
+            q8_0_block(0x4000, -2),
+            q8_0_block(0x3800, 3),
+            q8_0_block(0x3c00, 1),
+        ]
+        .concat();
+        let input = (0..in_features)
+            .map(|index| (index as f32 - 17.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let residual = vec![0.25_f32, -0.5];
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let residual_buffer = metal.batch_upload_f32(&residual).unwrap();
+
+        let output = metal
+            .batched_q8_0_matvec_add(
+                &weights,
+                &input_buffer,
+                input.len(),
+                &residual_buffer,
+                residual.len(),
+                1,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output, out_features).unwrap();
+        let mut expected = cpu_q8_0_matvec(&weights, &input, 1, in_features, out_features);
+        for (value, residual) in expected.iter_mut().zip(&residual) {
+            *value += residual;
+        }
+
+        assert_close(&actual, &expected, 1e-4);
     }
 
     #[test]
@@ -2996,7 +4496,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_router_experts_match_cpu_combine() {
+    fn ready_router_experts_match_cpu_combine_and_reuse_layer_cache() {
         let Some(metal) = native_metal_or_skip() else {
             return;
         };
@@ -3108,55 +4608,66 @@ mod tests {
                 absolute_offset: down_base + expert as u64 * down_stride as u64,
             })
             .collect::<Vec<_>>();
-        let staged = metal
-            .stage_q2_experts(
+        let first = metal
+            .ready_routed_experts(
                 1,
                 model_file.path(),
                 &gate_sources,
                 &up_sources,
                 &down_sources,
-            )
-            .unwrap();
-        assert_eq!(staged.cache_hits(), 0);
-        assert_eq!(staged.cache_misses(), selected_ids.len());
-        let staged = metal
-            .stage_q2_experts(
-                1,
-                model_file.path(),
-                &gate_sources,
-                &up_sources,
-                &down_sources,
-            )
-            .unwrap();
-        assert_eq!(staged.cache_hits(), selected_ids.len());
-        assert_eq!(staged.cache_misses(), 0);
-        let gated = metal
-            .batched_q2_k_staged_routed_gate_up_swiglu(
-                &staged,
                 &input_buffer,
                 input.len(),
                 &routing,
                 hidden_features,
                 intermediate_features,
+                hidden_features,
             )
             .unwrap();
-        let expert_outputs = metal
-            .batched_q2_k_staged_routed_matvec(
-                &staged,
-                &gated,
-                2 * intermediate_features,
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.cache_misses, selected_ids.len());
+        assert_eq!(first.selected_experts, selected_ids.len());
+        assert!(first.ready_waves >= 1);
+        let ready = metal
+            .ready_routed_experts(
+                1,
+                model_file.path(),
+                &gate_sources,
+                &up_sources,
+                &down_sources,
+                &input_buffer,
+                input.len(),
                 &routing,
+                hidden_features,
                 intermediate_features,
                 hidden_features,
             )
             .unwrap();
+        assert_eq!(ready.cache_hits, selected_ids.len());
+        assert_eq!(ready.cache_misses, 0);
+        let other_layer = metal
+            .ready_routed_experts(
+                2,
+                model_file.path(),
+                &gate_sources,
+                &up_sources,
+                &down_sources,
+                &input_buffer,
+                input.len(),
+                &routing,
+                hidden_features,
+                intermediate_features,
+                hidden_features,
+            )
+            .unwrap();
+        assert_eq!(other_layer.cache_hits, 0);
+        assert_eq!(other_layer.cache_misses, selected_ids.len());
         let combined = metal
             .batched_moe_topk_combine_residual(
                 &shared_buffer,
                 shared.len(),
                 &residual_buffer,
                 residual.len(),
-                &expert_outputs,
+                &ready.output,
                 2 * hidden_features,
                 &routing,
                 hidden_features,
@@ -3337,6 +4848,170 @@ mod tests {
         assert_close(&actual, &expected, 1e-4);
     }
 
+    #[test]
+    fn absorbed_mla_matches_expanded_q8_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch = 1;
+        let heads = 2;
+        let q_no_dim = 32;
+        let rope_dim = 8;
+        let latent_dim = 32;
+        let value_dim = 32;
+        let past_tokens = 2;
+        let page_size = 4;
+
+        let q_no = (0..heads * q_no_dim)
+            .map(|index| (index as f32 - 17.0) * 0.01)
+            .collect::<Vec<_>>();
+        let q_rope = (0..heads * rope_dim)
+            .map(|index| (index as f32 + 1.0) * -0.015)
+            .collect::<Vec<_>>();
+        let current_latent = (0..latent_dim)
+            .map(|index| (index as f32 - 9.0) * 0.02)
+            .collect::<Vec<_>>();
+        let current_rope = (0..rope_dim)
+            .map(|index| (index as f32 + 2.0) * 0.025)
+            .collect::<Vec<_>>();
+        let mut paged_latent = vec![0.0_f32; page_size * latent_dim];
+        let mut paged_rope = vec![0.0_f32; page_size * rope_dim];
+        for token in 0..past_tokens {
+            for dim in 0..latent_dim {
+                paged_latent[token * latent_dim + dim] =
+                    (token * latent_dim + dim + 3) as f32 * 0.007;
+            }
+            for dim in 0..rope_dim {
+                paged_rope[token * rope_dim + dim] = (token * rope_dim + dim + 1) as f32 * -0.011;
+            }
+        }
+
+        let mut k_b = Vec::new();
+        let mut v_b = Vec::new();
+        for head in 0..heads {
+            for output in 0..latent_dim {
+                let quant = ((head + output) % 5) as i8 - 2;
+                k_b.extend(q8_0_block(0x2c00, quant));
+            }
+            for output in 0..value_dim {
+                let quant = ((head * 2 + output) % 7) as i8 - 3;
+                v_b.extend(q8_0_block(0x2800, quant));
+            }
+        }
+
+        let q_no_buffer = metal.batch_upload_f32(&q_no).unwrap();
+        let q_rope_buffer = metal.batch_upload_f32(&q_rope).unwrap();
+        let current_latent_buffer = metal.batch_upload_f32(&current_latent).unwrap();
+        let current_rope_buffer = metal.batch_upload_f32(&current_rope).unwrap();
+        let paged_latent_buffer = metal.batch_upload_f32(&paged_latent).unwrap();
+        let paged_rope_buffer = metal.batch_upload_f32(&paged_rope).unwrap();
+        let past_kv = DevicePagedKvView {
+            batch,
+            attention_heads: 1,
+            key_head_dim: latent_dim,
+            value_head_dim: rope_dim,
+            page_size,
+            cached_tokens: past_tokens,
+            capacity_tokens: page_size,
+            k: DeviceValue::new(
+                vec![1, batch, 1, page_size, latent_dim],
+                paged_latent_buffer,
+            ),
+            v: DeviceValue::new(vec![1, batch, 1, page_size, rope_dim], paged_rope_buffer),
+        };
+
+        let (output, output_len) = metal
+            .batched_q8_0_absorbed_mla_decode(
+                &k_b,
+                &v_b,
+                &q_no_buffer,
+                q_no.len(),
+                &q_rope_buffer,
+                q_rope.len(),
+                &current_latent_buffer,
+                current_latent.len(),
+                &current_rope_buffer,
+                current_rope.len(),
+                &past_kv,
+                batch,
+                heads,
+                q_no_dim,
+                rope_dim,
+                latent_dim,
+                value_dim,
+                q_no_dim + rope_dim,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output, output_len).unwrap();
+
+        let mut expected = Vec::with_capacity(heads * value_dim);
+        let k_head_bytes = latent_dim * Q8_0_BLOCK_BYTES;
+        let v_head_bytes = value_dim * Q8_0_BLOCK_BYTES;
+        for head in 0..heads {
+            let q_start = head * q_no_dim;
+            let q_latent = cpu_q8_0_matvec(
+                &k_b[head * k_head_bytes..(head + 1) * k_head_bytes],
+                &q_no[q_start..q_start + q_no_dim],
+                1,
+                q_no_dim,
+                latent_dim,
+            );
+            let mut scores = Vec::with_capacity(past_tokens + 1);
+            for token in 0..past_tokens {
+                let latent_start = token * latent_dim;
+                let rope_start = token * rope_dim;
+                let latent_score = q_latent
+                    .iter()
+                    .zip(&paged_latent[latent_start..latent_start + latent_dim])
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                let rope_score = q_rope[head * rope_dim..(head + 1) * rope_dim]
+                    .iter()
+                    .zip(&paged_rope[rope_start..rope_start + rope_dim])
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                scores.push((latent_score + rope_score) / ((q_no_dim + rope_dim) as f32).sqrt());
+            }
+            let current_score = q_latent
+                .iter()
+                .zip(&current_latent)
+                .map(|(left, right)| left * right)
+                .sum::<f32>()
+                + q_rope[head * rope_dim..(head + 1) * rope_dim]
+                    .iter()
+                    .zip(&current_rope)
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+            scores.push(current_score / ((q_no_dim + rope_dim) as f32).sqrt());
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator = scores
+                .iter()
+                .map(|score| (score - max_score).exp())
+                .sum::<f32>();
+            let probabilities = scores
+                .iter()
+                .map(|score| (score - max_score).exp() / denominator)
+                .collect::<Vec<_>>();
+            let mut context_latent = vec![0.0_f32; latent_dim];
+            for dim in 0..latent_dim {
+                for token in 0..past_tokens {
+                    context_latent[dim] +=
+                        probabilities[token] * paged_latent[token * latent_dim + dim];
+                }
+                context_latent[dim] += probabilities[past_tokens] * current_latent[dim];
+            }
+            expected.extend(cpu_q8_0_matvec(
+                &v_b[head * v_head_bytes..(head + 1) * v_head_bytes],
+                &context_latent,
+                1,
+                latent_dim,
+                value_dim,
+            ));
+        }
+
+        assert_close(&actual, &expected, 2e-4);
+    }
+
     fn native_metal_or_skip() -> Option<Metal> {
         Metal::new().ok()
     }
@@ -3410,6 +5085,40 @@ mod tests {
             }
         }
 
+        output
+    }
+
+    fn cpu_q8_0_matvec(
+        weights: &[u8],
+        input: &[f32],
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Vec<f32> {
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        let mut output = vec![0.0; row_count * out_features];
+        for input_row in 0..row_count {
+            for output_feature in 0..out_features {
+                let mut sum = 0.0_f32;
+                for block_in_row in 0..blocks_per_row {
+                    let block_index = output_feature * blocks_per_row + block_in_row;
+                    let block_offset = block_index * Q8_0_BLOCK_BYTES;
+                    let block = &weights[block_offset..block_offset + Q8_0_BLOCK_BYTES];
+                    let scale = f16_fixture_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                    let input_offset = input_row * in_features + block_in_row * Q8_0_BLOCK_VALUES;
+                    for value_index in 0..Q8_0_BLOCK_VALUES {
+                        let raw = block[2 + value_index];
+                        let quant = if raw < 128 {
+                            raw as i32
+                        } else {
+                            raw as i32 - 256
+                        };
+                        sum += input[input_offset + value_index] * scale * quant as f32;
+                    }
+                }
+                output[input_row * out_features + output_feature] = sum;
+            }
+        }
         output
     }
 

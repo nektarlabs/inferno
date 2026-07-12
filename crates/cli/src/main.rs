@@ -67,6 +67,18 @@ enum Command {
         #[arg(long)]
         throughput_file: Option<PathBuf>,
 
+        /// Print a synchronized per-token bottleneck breakdown to stderr.
+        #[arg(long, default_value_t = false)]
+        profile_token_costs: bool,
+
+        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        #[arg(long)]
+        expert_cache_gb: Option<f64>,
+
+        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        #[arg(long)]
+        hot_kv_cache_gb: Option<f64>,
+
         /// Emit runtime memory telemetry to stderr during generation.
         #[arg(long, default_value_t = false)]
         enable_telemetry: bool,
@@ -74,12 +86,16 @@ enum Command {
         /// Write runtime memory telemetry to a file instead of interleaving it with streamed text.
         #[arg(long)]
         telemetry_file: Option<PathBuf>,
+
+        /// Enable the experimental GLM multi-token prediction verifier.
+        #[arg(long, default_value_t = false)]
+        speculative_mtp: bool,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    tracing_init::init(cli.telemetry_to_stderr());
+    tracing_init::init(cli.telemetry_to_stderr(), cli.token_costs_to_stderr());
     match cli.command {
         Command::Generate {
             model,
@@ -94,8 +110,12 @@ fn main() -> Result<()> {
             profile_layers,
             measure_tokens_per_second,
             throughput_file,
+            profile_token_costs,
+            expert_cache_gb,
+            hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file,
+            speculative_mtp,
         } => commands::generate::run(
             model.as_path(),
             config.as_deref(),
@@ -109,8 +129,12 @@ fn main() -> Result<()> {
             profile_layers.as_deref(),
             measure_tokens_per_second,
             throughput_file.as_deref(),
+            profile_token_costs,
+            expert_cache_gb,
+            hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file.as_deref(),
+            speculative_mtp,
         )?,
     }
 
@@ -125,6 +149,15 @@ impl Cli {
                 telemetry_file,
                 ..
             } => *enable_telemetry && telemetry_file.is_none(),
+        }
+    }
+
+    fn token_costs_to_stderr(&self) -> bool {
+        match &self.command {
+            Command::Generate {
+                profile_token_costs,
+                ..
+            } => *profile_token_costs,
         }
     }
 }
@@ -297,6 +330,70 @@ mod tests {
             ..
         } = cli.command;
         assert!(measure_tokens_per_second);
+    }
+
+    #[test]
+    fn generate_accepts_synchronized_token_cost_profile() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--profile-token-costs",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            profile_token_costs,
+            ..
+        } = cli.command;
+        assert!(profile_token_costs);
+    }
+
+    #[test]
+    fn generate_accepts_cache_budget_overrides() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--expert-cache-gb",
+            "9.5",
+            "--hot-kv-cache-gb",
+            "2.0",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            ..
+        } = cli.command;
+        assert_eq!(expert_cache_gb, Some(9.5));
+        assert_eq!(hot_kv_cache_gb, Some(2.0));
+    }
+
+    #[test]
+    fn generate_accepts_speculative_mtp_flag() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--speculative-mtp",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            speculative_mtp, ..
+        } = cli.command;
+        assert!(speculative_mtp);
     }
 
     #[test]

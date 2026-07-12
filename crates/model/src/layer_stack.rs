@@ -162,6 +162,7 @@ impl<'a> LayerStack<'a> {
         &self.report
     }
 
+    #[cfg(test)]
     pub fn forward<B: Backend>(
         &self,
         config: &Config,
@@ -277,6 +278,7 @@ impl<'a> LayerStack<'a> {
         })
     }
 
+    #[cfg(test)]
     pub fn forward_tensors<B: Backend>(
         &self,
         config: &Config,

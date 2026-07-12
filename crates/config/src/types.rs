@@ -1,9 +1,6 @@
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 
-use crate::{
-    summary::{ArchitectureSummary, ShapeSummary},
-    validation::validate_config,
-};
+use crate::validation::validate_config;
 use common::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,14 +238,6 @@ impl Config {
                 Some(IndexerLayerKind::Shared)
             }
         })
-    }
-
-    pub fn architecture_summary(&self) -> ArchitectureSummary {
-        ArchitectureSummary::from_config(self)
-    }
-
-    pub fn shape_summary(&self, batch: usize, tokens: usize) -> Result<ShapeSummary> {
-        ShapeSummary::from_config(self, batch, tokens)
     }
 }
 

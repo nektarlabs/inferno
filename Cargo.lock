@@ -88,6 +88,7 @@ dependencies = [
  "common",
  "libc",
  "metal",
+ "objc",
  "tracing",
 ]
 
@@ -207,7 +208,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tracing",
 ]
 
 [[package]]

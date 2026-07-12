@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
-use common::{validate_exact_shape, Error, F32Tensor, PagedKvPageView, PagedKvView, Result, Shape};
-use config::Config;
+use common::{validate_exact_shape, Error, F32Tensor, PagedKvPageView, PagedKvView, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagedKvCacheSpec {
@@ -14,19 +13,6 @@ pub struct PagedKvCacheSpec {
 }
 
 impl PagedKvCacheSpec {
-    pub fn from_config(config: &Config, batch: usize, page_size: usize) -> Result<Self> {
-        let spec = Self {
-            batch,
-            attention_heads: config.attention_heads,
-            key_head_dim: config.qk_head_dim,
-            value_head_dim: config.v_head_dim(),
-            max_context: config.max_context,
-            page_size,
-        };
-        spec.validate()?;
-        Ok(spec)
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.batch == 0 {
             return Err(Error::cache("batch must be positive"));
@@ -115,15 +101,7 @@ impl PagedKvCache {
         })
     }
 
-    pub fn spec(&self) -> &PagedKvCacheSpec {
-        &self.spec
-    }
-
     pub fn cached_tokens(&self) -> usize {
-        self.cached_tokens
-    }
-
-    pub fn next_position(&self) -> usize {
         self.cached_tokens
     }
 
@@ -139,7 +117,11 @@ impl PagedKvCache {
             .ok_or_else(|| Error::cache(format!("K page {page_index} does not exist")))
     }
 
-    pub fn token_location(&self, logical_token_index: usize) -> Result<&LogicalTokenLocation> {
+    #[cfg(test)]
+    pub(crate) fn token_location(
+        &self,
+        logical_token_index: usize,
+    ) -> Result<&LogicalTokenLocation> {
         self.token_locations
             .get(logical_token_index)
             .ok_or_else(|| {
@@ -148,10 +130,6 @@ impl PagedKvCache {
                     self.cached_tokens
                 ))
             })
-    }
-
-    pub fn token_locations(&self) -> &[LogicalTokenLocation] {
-        &self.token_locations
     }
 
     pub fn page_stats(&self) -> Vec<PageStats> {
@@ -236,24 +214,6 @@ impl PagedKvCache {
             reconstruct_pages("K", &self.pages, &self.k_pages)?,
             reconstruct_pages("V", &self.pages, &self.v_pages)?,
         ))
-    }
-
-    pub fn decode_attention_scores_shape(&self, decode_tokens: usize) -> Result<Shape> {
-        if decode_tokens == 0 {
-            return Err(Error::cache("decode_tokens must be positive"));
-        }
-        if self.cached_tokens == 0 {
-            return Err(Error::cache(
-                "cannot build decode attention shape for an empty paged cache",
-            ));
-        }
-
-        Ok(Shape::new(vec![
-            self.spec.batch,
-            self.spec.attention_heads,
-            decode_tokens,
-            self.cached_tokens,
-        ]))
     }
 
     fn append(
