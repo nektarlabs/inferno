@@ -46,28 +46,169 @@ experiment is testing.
 
 ## Memory Strategy
 
-Inferno treats SSD as part of the runtime memory hierarchy for KV cache.
+Inferno treats unified memory and SSD as two levels of one runtime memory
+hierarchy. Always-used model tensors remain memory-mapped, routed experts use a
+bounded Metal cache, and request KV uses an SSD-backed cold tier with a Metal
+working set.
 
-The native Metal decode path stores request KV in an append-only SSD block
-store and streams the current layer's past K/V into a reusable Metal hot window
-before attention. The cold store is indexed by:
+### KV cache
+
+GLM-5.2 uses MLA, so Inferno caches the compressed 512-value latent and the
+64-value RoPE component instead of expanded K/V for all 64 attention heads. At
+batch size 1, the logical cache shapes for one layer are:
+
+```txt
+latent KV:  [1, 1, T, 512]
+RoPE state: [1, 1, T, 64]
+```
+
+The authoritative history is a Q8 row-compressed, append-only SSD block store.
+Its in-memory index addresses records by:
 
 ```txt
 layer_index + tensor_kind(key/value) + token_start + token_count
 ```
 
-The current policy is deliberately narrow:
+The Metal hot tier has two modes:
 
 ```txt
-cold tier: append-only Q8 row-compressed SSD block store
-hot tier:  one reusable Metal layer window
-prefetch:  next layer's full past K/V range
-eviction:  overwrite the hot layer window when the next layer is loaded
+short context: keep every layer's cache resident when it fits the hot budget
+long context:  reuse one Metal window and stream layers from SSD
 ```
 
-This keeps all layer histories out of resident Metal memory while preserving
-full dense attention correctness. Older K/V is not dropped; it is streamed from
-the cold store when that layer needs it.
+The default hot budget is 512 MiB. With the current 78-layer model, batch size
+1, 128-token pages, and F32 hot storage, this keeps approximately 2,944 tokens
+resident across all layers. When the next page no longer fits, Inferno releases
+the all-layer tier and reuses one layer-sized Metal window. A background reader
+prefetches the next layer while the current layer executes.
+
+For long-context sparse attention, DSA reads only the selected Q8 rows from SSD
+and decodes them into Metal buffers. The complete history is retained; changing
+tiers never discards previous tokens. The temporary KV and DSA index files are
+removed when generation ends.
+
+Each accepted latent/RoPE row is read from shared Metal storage, encoded as Q8
+on the CPU, and appended to the SSD store. Apple Silicon uses unified memory,
+so this read is a small host-memory copy after GPU synchronization rather than
+a transfer across a discrete-GPU bus. The store writes record headers and Q8
+payloads with vectored I/O, avoiding a second combined-record allocation.
+
+Two alternatives were measured on the target model and rejected: direct GPU
+Q8 encoding took approximately 1.347 ms per complete 78-layer token append,
+and a zero-copy CPU view took approximately 0.517 ms. The retained path took
+approximately 0.417 ms. Kernel dispatch and synchronization cost more than the
+small F32 copy in this MLA-compressed workload. Full cold-tier misses still
+reconstruct F32 rows before upload and remain a separate optimization target.
+
+### Routed expert cache
+
+The 256 routed experts per sparse layer remain in the GGUF artifact on SSD.
+Inferno caches selected Q2 gate, up, and down matrices in shared Metal slabs.
+The default is 16 expert slots per routed layer, approximately 14.9 GB for the
+75 main sparse layers.
+
+Each layer uses a segmented LRU:
+
+```txt
+probation: newly loaded or weakly reused experts
+protected: experts promoted after reuse
+```
+
+Cache hits execute directly from the resident Metal slot. On a miss, parallel
+`pread` workers load the gate and up matrices first. Metal starts their fused
+SwiGLU projection while the same workers continue loading the down matrices.
+All ready gate/up waves are queued before the down waves, which overlaps SSD
+reads with useful GPU work without changing the result. The cache never evicts
+an expert selected by the current token; if every slot is temporarily
+protected, that expert uses a one-shot transient buffer.
+
+### Budget control
+
+The CLI currently uses fixed, independent budgets:
+
+```txt
+expert cache: 16 slots per routed layer
+hot KV cache: 512 MiB
+```
+
+They can be overridden with `--expert-cache-gb` and `--hot-kv-cache-gb`.
+Because Apple Silicon uses unified memory, both allocations consume the same
+physical RAM. Their sum must leave enough space for dense weights,
+intermediates, macOS, and filesystem cache; excessive values can trigger swap
+and reduce throughput.
+
+Inferno also contains a dynamic controller that can rebalance RAM between KV
+and experts using context length, hit rates, and memory pressure. It is not yet
+enabled by the `generate` CLI path, so normal runs do not currently resize the
+two caches automatically.
+
+## Measured Results
+
+Performance is not yet production-ready. These numbers are a reproducible
+snapshot of the current implementation, not a guarantee for other prompts,
+machines, thermal states, or filesystem-cache conditions.
+
+Test conditions:
+
+```txt
+date:             2026-07-13
+revision:         cbf1a78 plus staged expert I/O
+hardware:         Apple Silicon MacBook Pro, 64 GB unified memory
+build:            cargo build --release
+model:            GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
+prompt:           "Hi" (13 tokens after chat-template rendering)
+generated tokens: 8
+cache settings:   defaults; speculative MTP disabled
+```
+
+| Runtime | Run | Time to first token | Decode throughput | End-to-end throughput |
+| --- | --- | ---: | ---: | ---: |
+| Previous ready-first path | Warm baseline | 28.351 s | **1.447 tokens/s** | 0.241 tokens/s |
+| Staged gate/up/down path | Measurement 1 | 30.106 s | **1.505 tokens/s** | 0.230 tokens/s |
+| Staged gate/up/down path | Measurement 2 | 31.850 s | **1.493 tokens/s** | 0.219 tokens/s |
+
+The two staged measurements average **1.499 decode tokens/s**. All three runs
+reported an expert-cache hit rate of 46.71%, 14.864 GB of expert-cache
+capacity, and 79.210 GB of logical expert reads. For this short prompt, all KV
+remained resident: the measured KV hit rate was 100%, with 0 GB read from the
+KV SSD tier.
+
+`Decode throughput` excludes prefill and the first generated token. It is the
+best measure of steady token generation. `End-to-end throughput` divides all
+generated tokens by total command time and therefore includes model startup,
+prefill, and time to first token.
+
+Reproduce the measurement with:
+
+```bash
+target/release/inferno generate \
+  --model models/glm-5.2 \
+  --prompt "Hi" \
+  --max-new-tokens 8 \
+  --measure-tokens-per-second \
+  --throughput-file /tmp/inferno-throughput.tsv
+```
+
+Run the command twice to compare cold and warm macOS filesystem-cache states.
+The TSV output preserves the full timing, expert-cache, KV-cache, and SSD-read
+metrics for later comparisons.
+
+### Current throughput limit
+
+The GGUF directory contains approximately 20.49 GB of always-active Q8 weights,
+0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. On the first
+measured decode step, 291 of 600 expert requests missed the Metal cache. Those
+misses required 3.60 GB of expert data and about 0.61 seconds of SSD loading in
+synchronized profiling mode.
+
+A three-token-per-second target allows only 0.333 seconds per token. At the
+measured expert-read rate, it would require either more than 10.8 GB/s of
+sustained selected-expert reads or approximately 73% expert-cache hits before
+accounting for attention, routing, and Metal compute. The current 64 GB memory
+budget and observed routing sequence do not provide that hit rate. Reaching the
+target therefore requires a change that reduces expert bytes per accepted
+token, such as a validated lower-bit expert format or effective speculative
+decoding; KV tuning alone cannot close this short-context gap.
 
 ## Model
 
