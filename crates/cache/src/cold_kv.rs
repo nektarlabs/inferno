@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, IoSlice, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -837,17 +837,18 @@ impl ColdKvBlockStore {
             payload_len: header.payload_len,
         };
         validate_no_overlap(&self.index, &meta)?;
-        let mut record = encode_record_header(&header)?;
-        record.extend_from_slice(payload);
-        self.file.write_all(&record).map_err(|error| {
+        let header_bytes = encode_record_header(&header)?;
+        write_record_bytes(&mut self.file, &header_bytes, payload).map_err(|error| {
             Error::cache(format!(
                 "failed to write cold KV block store {}: {error}",
                 self.path.display()
             ))
         })?;
         insert_indexed_meta(&mut self.blocks, &mut self.index, meta)?;
-        u64::try_from(record.len())
-            .map_err(|_| Error::cache("cold KV record length does not fit u64"))
+        u64::try_from(header_bytes.len())
+            .ok()
+            .and_then(|header_len| header_len.checked_add(header.payload_len))
+            .ok_or_else(|| Error::cache("cold KV record length does not fit u64"))
     }
 
     fn find_block_by_start(
@@ -941,6 +942,35 @@ impl ColdKvBlockStore {
         validate_record_matches_meta(&header, meta)?;
         Ok(record[RECORD_HEADER_LEN..].to_vec())
     }
+}
+
+fn write_record_bytes(file: &mut File, header: &[u8], payload: &[u8]) -> io::Result<()> {
+    let mut header_offset = 0_usize;
+    let mut payload_offset = 0_usize;
+    while header_offset < header.len() || payload_offset < payload.len() {
+        let written = if header_offset < header.len() {
+            file.write_vectored(&[
+                IoSlice::new(&header[header_offset..]),
+                IoSlice::new(&payload[payload_offset..]),
+            ])?
+        } else {
+            file.write(&payload[payload_offset..])?
+        };
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to append complete cold KV record",
+            ));
+        }
+
+        let remaining_header = header.len() - header_offset;
+        let header_written = written.min(remaining_header);
+        header_offset += header_written;
+        payload_offset = payload_offset
+            .checked_add(written - header_written)
+            .ok_or_else(|| io::Error::other("cold KV payload write offset overflow"))?;
+    }
+    Ok(())
 }
 
 fn rebuild_block_index(

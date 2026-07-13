@@ -81,7 +81,6 @@ const ARGMAX_THREADS_PER_VECTOR: usize = 256;
 // 21 slots increased macOS memory pressure enough to reduce throughput.
 const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 16;
 const ROUTED_EXPERT_READ_WORKERS: usize = 8;
-const ROUTED_EXPERT_MIN_READY_WAVE: usize = 2;
 static EXPERT_CACHE_LOCK_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct MetalQ2Matvec {
@@ -271,6 +270,12 @@ struct ReadyExpertGroup {
     cached_miss_key: Option<ExpertCacheKey>,
     transient: bool,
     _transient_owner: Option<Q2ExpertSlotBuffers>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyExpertPhase {
+    GateUp,
+    Down,
 }
 
 #[derive(Debug)]
@@ -2411,7 +2416,7 @@ impl MetalQ2Matvec {
         let ssd_started = Instant::now();
         let ssd_finished_nanoseconds = AtomicU64::new(0);
         let load_result = thread::scope(|scope| -> Result<()> {
-            let (sender, receiver) = mpsc::channel::<(usize, Result<()>)>();
+            let (sender, receiver) = mpsc::channel::<(usize, ReadyExpertPhase, Result<()>)>();
             let worker_count = misses.len().min(ROUTED_EXPERT_READ_WORKERS);
             let mut workers = Vec::with_capacity(worker_count);
             if worker_count > 0 {
@@ -2421,7 +2426,23 @@ impl MetalQ2Matvec {
                     let ssd_finished_nanoseconds = &ssd_finished_nanoseconds;
                     workers.push(scope.spawn(move || {
                         for &group_index in worker_jobs {
-                            let result = pread_ready_expert_group(
+                            let gate_up_result = pread_ready_expert_gate_up(
+                                model_file,
+                                model_path,
+                                &groups[group_index],
+                            );
+                            let gate_up_succeeded = gate_up_result.is_ok();
+                            if sender
+                                .send((group_index, ReadyExpertPhase::GateUp, gate_up_result))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if !gate_up_succeeded {
+                                continue;
+                            }
+
+                            let down_result = pread_ready_expert_down(
                                 model_file,
                                 model_path,
                                 &groups[group_index],
@@ -2430,7 +2451,10 @@ impl MetalQ2Matvec {
                                 elapsed_nanoseconds(ssd_started.elapsed()),
                                 Ordering::Relaxed,
                             );
-                            if sender.send((group_index, result)).is_err() {
+                            if sender
+                                .send((group_index, ReadyExpertPhase::Down, down_result))
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -2455,36 +2479,44 @@ impl MetalQ2Matvec {
                     out_features,
                     &gated,
                     &output,
+                    ReadyExpertPhase::GateUp,
                 )?);
             }
 
             let mut first_error = None;
-            let mut completed_misses = 0_usize;
-            let mut pending_ready = Vec::<usize>::new();
+            let mut completed_gate_up = 0_usize;
+            let mut completed_down = 0_usize;
+            let mut pending_down = cached.clone();
             while let Ok(first) = receiver.recv() {
                 let mut completed = vec![first];
                 completed.extend(receiver.try_iter());
-                let mut ready = Vec::with_capacity(completed.len());
-                for (group_index, result) in completed {
-                    completed_misses += 1;
-                    match result {
-                        Ok(()) => ready.push(group_index),
-                        Err(error) if first_error.is_none() => first_error = Some(error),
-                        Err(_) => {}
+                let mut pending_gate_up = Vec::new();
+                for (group_index, phase, result) in completed {
+                    match phase {
+                        ReadyExpertPhase::GateUp => {
+                            completed_gate_up += 1;
+                            match result {
+                                Ok(()) => pending_gate_up.push(group_index),
+                                Err(error) if first_error.is_none() => first_error = Some(error),
+                                Err(_) => {}
+                            }
+                        }
+                        ReadyExpertPhase::Down => {
+                            completed_down += 1;
+                            match result {
+                                Ok(()) => pending_down.push(group_index),
+                                Err(error) if first_error.is_none() => first_error = Some(error),
+                                Err(_) => {}
+                            }
+                        }
                     }
                 }
-                pending_ready.extend(ready);
-                let minimum_wave_size = if waves.is_empty() {
-                    1
-                } else {
-                    ROUTED_EXPERT_MIN_READY_WAVE
-                };
-                if pending_ready.len() >= minimum_wave_size {
+                if !pending_gate_up.is_empty() {
                     first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
                     waves.push(self.submit_ready_expert_wave(
                         device,
                         groups,
-                        &pending_ready,
+                        &pending_gate_up,
                         input,
                         input_len,
                         token_indices,
@@ -2495,17 +2527,35 @@ impl MetalQ2Matvec {
                         out_features,
                         &gated,
                         &output,
+                        ReadyExpertPhase::GateUp,
                     )?);
-                    pending_ready.clear();
+                }
+                if completed_gate_up == misses.len() && !pending_down.is_empty() {
+                    waves.push(self.submit_ready_expert_wave(
+                        device,
+                        groups,
+                        &pending_down,
+                        input,
+                        input_len,
+                        token_indices,
+                        token_count,
+                        assignment_count,
+                        in_features,
+                        intermediate_features,
+                        out_features,
+                        &gated,
+                        &output,
+                        ReadyExpertPhase::Down,
+                    )?);
+                    pending_down.clear();
                 }
             }
 
-            if !pending_ready.is_empty() {
-                first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+            if !pending_down.is_empty() {
                 waves.push(self.submit_ready_expert_wave(
                     device,
                     groups,
-                    &pending_ready,
+                    &pending_down,
                     input,
                     input_len,
                     token_indices,
@@ -2516,6 +2566,7 @@ impl MetalQ2Matvec {
                     out_features,
                     &gated,
                     &output,
+                    ReadyExpertPhase::Down,
                 )?);
             }
 
@@ -2525,10 +2576,17 @@ impl MetalQ2Matvec {
                     .map_err(|_| Error::backend("Q2 expert read worker thread panicked"))?;
             }
             validate_exact_len(
-                "ready routed completed SSD reads",
-                completed_misses,
+                "ready routed completed gate/up SSD reads",
+                completed_gate_up,
                 misses.len(),
             )?;
+            if first_error.is_none() {
+                validate_exact_len(
+                    "ready routed completed down SSD reads",
+                    completed_down,
+                    misses.len(),
+                )?;
+            }
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -2578,6 +2636,7 @@ impl MetalQ2Matvec {
         out_features: usize,
         gated: &Buffer,
         output: &Buffer,
+        phase: ReadyExpertPhase,
     ) -> Result<SubmittedReadyWave> {
         if !ready_groups.is_empty()
             && ready_groups.iter().all(|&group_index| {
@@ -2601,6 +2660,7 @@ impl MetalQ2Matvec {
                 out_features,
                 gated,
                 output,
+                phase,
             );
         }
 
@@ -2648,37 +2708,39 @@ impl MetalQ2Matvec {
         let down_addresses = u64_buffer(device, &down_addresses)?;
         let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
         let command_buffer = self.expert_queue.new_command_buffer().to_owned();
-        self.encode_ready_gate_up_swiglu(
-            &command_buffer,
-            device,
-            &gate_addresses,
-            &up_addresses,
-            &gate_resources,
-            &up_resources,
-            input,
-            input_len,
-            token_indices,
-            &assignment_indices_buffer,
-            assignment_indices.len(),
-            token_count,
-            assignment_count,
-            in_features,
-            intermediate_features,
-            gated,
-        )?;
-        self.encode_ready_matvec(
-            &command_buffer,
-            device,
-            &down_addresses,
-            &down_resources,
-            gated,
-            &assignment_indices_buffer,
-            assignment_indices.len(),
-            assignment_count,
-            intermediate_features,
-            out_features,
-            output,
-        )?;
+        match phase {
+            ReadyExpertPhase::GateUp => self.encode_ready_gate_up_swiglu(
+                &command_buffer,
+                device,
+                &gate_addresses,
+                &up_addresses,
+                &gate_resources,
+                &up_resources,
+                input,
+                input_len,
+                token_indices,
+                &assignment_indices_buffer,
+                assignment_indices.len(),
+                token_count,
+                assignment_count,
+                in_features,
+                intermediate_features,
+                gated,
+            )?,
+            ReadyExpertPhase::Down => self.encode_ready_matvec(
+                &command_buffer,
+                device,
+                &down_addresses,
+                &down_resources,
+                gated,
+                &assignment_indices_buffer,
+                assignment_indices.len(),
+                assignment_count,
+                intermediate_features,
+                out_features,
+                output,
+            )?,
+        }
         command_buffer.commit();
 
         Ok(SubmittedReadyWave {
@@ -2703,6 +2765,7 @@ impl MetalQ2Matvec {
         out_features: usize,
         gated: &Buffer,
         output: &Buffer,
+        phase: ReadyExpertPhase,
     ) -> Result<SubmittedReadyWave> {
         let first = groups
             .get(
@@ -2771,40 +2834,42 @@ impl MetalQ2Matvec {
         let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
         let slot_indices_buffer = u32_buffer(device, &slot_indices)?;
         let command_buffer = self.expert_queue.new_command_buffer().to_owned();
-        self.encode_ready_slot_gate_up_swiglu(
-            &command_buffer,
-            device,
-            &first.buffers.gate,
-            &first.buffers.up,
-            input,
-            input_len,
-            token_indices,
-            &assignment_indices_buffer,
-            &slot_indices_buffer,
-            assignment_indices.len(),
-            token_count,
-            assignment_count,
-            slot_count,
-            in_features,
-            intermediate_features,
-            gate_stride,
-            gated,
-        )?;
-        self.encode_ready_slot_matvec(
-            &command_buffer,
-            device,
-            &first.buffers.down,
-            gated,
-            &assignment_indices_buffer,
-            &slot_indices_buffer,
-            assignment_indices.len(),
-            assignment_count,
-            slot_count,
-            intermediate_features,
-            out_features,
-            down_stride,
-            output,
-        )?;
+        match phase {
+            ReadyExpertPhase::GateUp => self.encode_ready_slot_gate_up_swiglu(
+                &command_buffer,
+                device,
+                &first.buffers.gate,
+                &first.buffers.up,
+                input,
+                input_len,
+                token_indices,
+                &assignment_indices_buffer,
+                &slot_indices_buffer,
+                assignment_indices.len(),
+                token_count,
+                assignment_count,
+                slot_count,
+                in_features,
+                intermediate_features,
+                gate_stride,
+                gated,
+            )?,
+            ReadyExpertPhase::Down => self.encode_ready_slot_matvec(
+                &command_buffer,
+                device,
+                &first.buffers.down,
+                gated,
+                &assignment_indices_buffer,
+                &slot_indices_buffer,
+                assignment_indices.len(),
+                assignment_count,
+                slot_count,
+                intermediate_features,
+                out_features,
+                down_stride,
+                output,
+            )?,
+        }
         command_buffer.commit();
 
         Ok(SubmittedReadyWave {
@@ -3690,11 +3755,24 @@ fn prepare_ready_expert_groups<'a>(
     Ok(groups)
 }
 
-fn pread_ready_expert_group(file: &File, path: &Path, group: &ReadyExpertGroup) -> Result<()> {
-    for task in &group.read_tasks {
+fn pread_ready_expert_gate_up(file: &File, path: &Path, group: &ReadyExpertGroup) -> Result<()> {
+    validate_exact_len(
+        "ready routed expert read task count",
+        group.read_tasks.len(),
+        3,
+    )?;
+    for task in &group.read_tasks[..2] {
         pread_expert_buffer(file, path, task)?;
     }
     Ok(())
+}
+
+fn pread_ready_expert_down(file: &File, path: &Path, group: &ReadyExpertGroup) -> Result<()> {
+    let task = group
+        .read_tasks
+        .get(2)
+        .ok_or_else(|| Error::backend("ready routed expert has no down read task"))?;
+    pread_expert_buffer(file, path, task)
 }
 
 fn wait_ready_expert_waves(waves: &[SubmittedReadyWave]) -> Result<u64> {
