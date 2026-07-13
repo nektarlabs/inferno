@@ -9,7 +9,7 @@ use std::{
 use anyhow::Result;
 use backend::{Backend, ExpertCacheMetrics, MetalBackend};
 use common::{Error, Result as InfernoResult};
-use config::{load_config, Config};
+use config::{load_config, load_generation_config, Config};
 use gguf::GgufFile;
 use model::{
     antirez_q2_artifact, enable_layer_profile, FfnIndex, Index, IndexSummary, Model,
@@ -19,7 +19,7 @@ use runtime::{
     enable_memory_telemetry, enable_memory_telemetry_file, enable_q2_runtime_profile,
     run_generate_streaming_with_options, GenerationOptions, KvCacheMetrics,
 };
-use tokenizer::{render_user_prompt, Tokenizer, TokenizerMetadata};
+use tokenizer::{render_user_prompt, Tokenizer};
 
 pub fn run(
     model_path: &Path,
@@ -43,18 +43,18 @@ pub fn run(
 ) -> Result<()> {
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
+    let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
     let config = load_config(&discovered_config)?;
     let artifact = resolve_q2_artifact(model_path)?;
     let gguf = GgufFile::open(&artifact.gguf_path)?;
     let readiness = load_q2_readiness(&gguf, &artifact, &config)?;
 
     let tokenizer = Tokenizer::from_file(&discovered_tokenizer)?;
-    let tokenizer_metadata = tokenizer.metadata();
     let rendered_prompt = render_user_prompt(prompt);
     let encoded = tokenizer.encode(&rendered_prompt.rendered, add_special_tokens)?;
     validate_generation_request(
         &config,
-        &tokenizer_metadata,
+        &generation_config.eos_token_ids,
         &encoded.token_ids,
         max_new_tokens,
         page_size,
@@ -104,7 +104,7 @@ pub fn run(
         &encoded.token_ids,
         max_new_tokens,
         page_size,
-        &tokenizer_metadata.eos_token_ids,
+        &generation_config.eos_token_ids,
         GenerationOptions {
             speculative_mtp,
             hot_kv_cache_budget_bytes,
@@ -567,7 +567,7 @@ fn load_q2_readiness(
 
 fn validate_generation_request(
     config: &Config,
-    tokenizer_metadata: &TokenizerMetadata,
+    eos_token_ids: &[u32],
     prompt_token_ids: &[u32],
     max_new_tokens: Option<usize>,
     page_size: usize,
@@ -592,8 +592,7 @@ fn validate_generation_request(
         ))
         .into());
     }
-    if let Some(token_id) = tokenizer_metadata
-        .eos_token_ids
+    if let Some(token_id) = eos_token_ids
         .iter()
         .copied()
         .find(|token_id| *token_id as usize >= config.vocab_size)
@@ -876,7 +875,7 @@ mod tests {
 
         let err = validate_generation_request(
             &config,
-            &tokenizer_metadata(16),
+            &[1],
             &[1],
             Some(1),
             0,
@@ -896,7 +895,7 @@ mod tests {
 
         let err = validate_generation_request(
             &config,
-            &tokenizer_metadata(16),
+            &[1],
             &[1, 2],
             Some(2),
             1,
@@ -910,16 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn generation_request_allows_model_vocab_padding_rows() {
+    fn generation_request_accepts_eos_id_inside_model_vocab() {
         let mut config = tiny_config_with_experts(128, 1);
         config.vocab_size = 32;
         let index = tiny_index_summary();
-        let mut metadata = tokenizer_metadata(24);
-        metadata.eos_token_ids = vec![23];
 
         validate_generation_request(
             &config,
-            &metadata,
+            &[23],
             &[1, 2],
             Some(1),
             1,
@@ -935,12 +932,10 @@ mod tests {
         let mut config = tiny_config_with_experts(128, 1);
         config.vocab_size = 32;
         let index = tiny_index_summary();
-        let mut metadata = tokenizer_metadata(24);
-        metadata.eos_token_ids = vec![32];
 
         let err = validate_generation_request(
             &config,
-            &metadata,
+            &[32],
             &[1, 2],
             Some(1),
             1,
@@ -951,17 +946,6 @@ mod tests {
         .expect_err("EOS outside model vocab must fail");
 
         assert!(err.to_string().contains("EOS token id"));
-    }
-
-    fn tokenizer_metadata(vocab_size_with_added_tokens: usize) -> TokenizerMetadata {
-        TokenizerMetadata {
-            vocab_size: vocab_size_with_added_tokens,
-            vocab_size_with_added_tokens,
-            added_tokens_count: 0,
-            encode_special_tokens: false,
-            special_tokens: Vec::new(),
-            eos_token_ids: Vec::new(),
-        }
     }
 
     fn tiny_index_summary() -> IndexSummary {

@@ -6839,7 +6839,7 @@ fn reference_rope_slice(
     )?;
 
     let mut output = vec![0.0_f32; input_values.len()];
-    let half = rope_dim / 2;
+    let pair_count = rope_dim / 2;
 
     for batch_index in 0..batch {
         for token_index in 0..tokens {
@@ -6849,13 +6849,18 @@ fn reference_rope_slice(
             for head_index in 0..heads {
                 let base = ((batch_index * tokens + token_index) * heads + head_index) * rope_dim;
                 for dim_index in 0..rope_dim {
-                    let freq_index = dim_index % half;
-                    let inv_freq = 1.0_f32 / theta.powf(freq_index as f32 / half as f32);
-                    let angle = position as f32 * inv_freq;
-                    let rotated = if dim_index < half {
-                        -input_values[base + dim_index + half]
+                    let pair_index = dim_index / 2;
+                    let partner_dim = if dim_index % 2 == 0 {
+                        dim_index + 1
                     } else {
-                        input_values[base + dim_index - half]
+                        dim_index - 1
+                    };
+                    let inv_freq = 1.0_f32 / theta.powf(pair_index as f32 / pair_count as f32);
+                    let angle = position as f32 * inv_freq;
+                    let rotated = if dim_index % 2 == 0 {
+                        -input_values[base + partner_dim]
+                    } else {
+                        input_values[base + partner_dim]
                     };
                     output[base + dim_index] =
                         input_values[base + dim_index] * angle.cos() + rotated * angle.sin();
@@ -7878,6 +7883,26 @@ mod tests {
 
         assert_ne!(zero_values, four_values);
         assert_ne!(four_values, different_theta_values);
+    }
+
+    #[test]
+    fn rope_slice_reference_rotates_adjacent_glm_pairs() {
+        let backend = cpu_backend();
+        let input = Tensor::new(vec![1.0_f32, 2.0, 3.0, 4.0], (1, 1, 1, 4)).unwrap();
+
+        let output = backend.rope_slice(&input, 4, 1, 10_000.0).unwrap();
+        let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let slow_angle = 1.0_f32 / 10_000.0_f32.sqrt();
+        let expected = [
+            1.0 * 1.0_f32.cos() - 2.0 * 1.0_f32.sin(),
+            2.0 * 1.0_f32.cos() + 1.0 * 1.0_f32.sin(),
+            3.0 * slow_angle.cos() - 4.0 * slow_angle.sin(),
+            4.0 * slow_angle.cos() + 3.0 * slow_angle.sin(),
+        ];
+
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]

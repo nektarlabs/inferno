@@ -273,7 +273,7 @@ mod tests {
         theta: f32,
     ) -> Vec<f32> {
         let mut output = vec![0.0; input.len()];
-        let half = rope_dim / 2;
+        let pair_count = rope_dim / 2;
 
         for batch in 0..batch_count {
             for token in 0..token_count {
@@ -281,13 +281,14 @@ mod tests {
                 for head in 0..head_count {
                     let base = ((batch * token_count + token) * head_count + head) * rope_dim;
                     for dim in 0..rope_dim {
-                        let freq_index = dim % half;
-                        let inv_freq = 1.0 / theta.powf(freq_index as f32 / half as f32);
+                        let pair_index = dim / 2;
+                        let partner_dim = if dim % 2 == 0 { dim + 1 } else { dim - 1 };
+                        let inv_freq = 1.0 / theta.powf(pair_index as f32 / pair_count as f32);
                         let angle = position as f32 * inv_freq;
-                        let rotated = if dim < half {
-                            -input[base + dim + half]
+                        let rotated = if dim % 2 == 0 {
+                            -input[base + partner_dim]
                         } else {
-                            input[base + dim - half]
+                            input[base + partner_dim]
                         };
                         output[base + dim] =
                             input[base + dim] * angle.cos() + rotated * angle.sin();

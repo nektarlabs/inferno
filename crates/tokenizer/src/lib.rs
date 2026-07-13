@@ -17,7 +17,6 @@ pub struct TokenizerMetadata {
     pub added_tokens_count: usize,
     pub encode_special_tokens: bool,
     pub special_tokens: Vec<SpecialTokenInfo>,
-    pub eos_token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,15 +105,12 @@ impl Tokenizer {
             .collect::<Vec<_>>();
         special_tokens.sort_by_key(|token| token.id);
 
-        let eos_token_ids = infer_eos_token_ids(&special_tokens);
-
         TokenizerMetadata {
             vocab_size: self.tokenizer.get_vocab_size(false),
             vocab_size_with_added_tokens: self.tokenizer.get_vocab_size(true),
             added_tokens_count: added_tokens.len(),
             encode_special_tokens: self.tokenizer.get_encode_special_tokens(),
             special_tokens,
-            eos_token_ids,
         }
     }
 
@@ -147,28 +143,6 @@ impl Tokenizer {
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id)
     }
-
-    pub fn eos_token_ids(&self) -> Vec<u32> {
-        self.metadata().eos_token_ids
-    }
-}
-
-fn infer_eos_token_ids(special_tokens: &[SpecialTokenInfo]) -> Vec<u32> {
-    let mut ids = special_tokens
-        .iter()
-        .filter(|token| is_eos_token_content(&token.content))
-        .map(|token| token.id)
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-fn is_eos_token_content(content: &str) -> bool {
-    matches!(
-        content,
-        "</s>" | "<eos>" | "<|eos|>" | "<|endoftext|>" | "<|end_of_text|>" | "<|eot_id|>"
-    )
 }
 
 #[cfg(test)]
@@ -246,8 +220,6 @@ mod tests {
             .special_tokens
             .iter()
             .any(|token| token.content == "</s>"));
-        assert_eq!(metadata.eos_token_ids, vec![4]);
-        assert_eq!(tokenizer.eos_token_ids(), vec![4]);
     }
 
     #[test]

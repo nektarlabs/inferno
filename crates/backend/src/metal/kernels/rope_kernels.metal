@@ -22,14 +22,17 @@ kernel void rope_slice_f32_kernel(
     uint head = (gid / rope_dim) % head_count;
     uint token = (gid / (rope_dim * head_count)) % token_count;
     uint batch = gid / (rope_dim * head_count * token_count);
-    uint half_dim = rope_dim / 2;
-    uint freq_index = dim % half_dim;
+    uint pair_count = rope_dim / 2;
+    uint pair_index = dim / 2;
+    bool is_even = (dim & 1u) == 0u;
+    uint partner_dim = is_even ? dim + 1u : dim - 1u;
     uint position = position_offset + token;
     uint base = (((batch * token_count + token) * head_count + head) * rope_dim);
 
-    float inv_freq = 1.0f / pow(theta, float(freq_index) / float(half_dim));
+    // GLM-DSA uses normal RoPE: adjacent values form each rotary pair.
+    float inv_freq = 1.0f / pow(theta, float(pair_index) / float(pair_count));
     float angle = float(position) * inv_freq;
-    float rotated = dim < half_dim ? -input[base + dim + half_dim] : input[base + dim - half_dim];
+    float rotated = is_even ? -input[base + partner_dim] : input[base + partner_dim];
 
     output[gid] = input[gid] * cos(angle) + rotated * sin(angle);
 }
