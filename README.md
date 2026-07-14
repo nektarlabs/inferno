@@ -148,14 +148,13 @@ two caches automatically.
 
 ## Measured Results
 
-Performance is not yet production-ready. These numbers are a reproducible
-snapshot of the current implementation, not a guarantee for other prompts,
-machines, thermal states, or filesystem-cache conditions.
+Performance is not yet production-ready. Results are reported with their exact
+revision and machine state because repeated expert streaming is sensitive to
+filesystem-cache, thermal, and memory conditions.
 
 Test conditions:
 
 ```txt
-date:             2026-07-14
 hardware:         Apple Silicon MacBook Pro, 64 GB unified memory
 build:            cargo build --release
 model:            GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
@@ -165,23 +164,34 @@ MoE execution:    top-8, matching the artifact
 cache settings:   defaults; speculative MTP disabled
 ```
 
-| Engine metric | Current median |
-| --- | ---: |
-| Time to first token | 57.182 s |
-| Decode throughput | **0.430 tokens/s** |
-| End-to-end throughput | **0.109 tokens/s** |
+### Reference top-8 benchmark
 
-These are the median results from three complete Inferno runs. Decode
-throughput measures generation after the first token and is the primary engine
-speed reported by this project. The current measured Inferno speed is therefore
-**0.430 tokens/s** for this test workload.
+The retained reference was measured on 2026-07-13 at revision `cbf1a78` plus
+the staged expert-I/O path that became `1fafb61`:
 
-Individual top-8 decode results ranged from 0.357 to 0.573 tokens/s. Every run
-performed 12,000 routed-expert requests, reported a 41.56% expert-cache hit
-rate, and read 86.865 GB of logical expert data. The configured expert-cache
-capacity was 14.864 GB. For this short prompt, all KV remained resident: KV hit
-rate was 100%, with 0 GB read from the KV SSD tier. These cache values are
-diagnostic measurements, not the engine throughput result.
+| Runtime | Run | Time to first token | Decode throughput | End-to-end throughput |
+| --- | --- | ---: | ---: | ---: |
+| Previous ready-first path | Warm baseline | 28.351 s | 1.447 tokens/s | 0.241 tokens/s |
+| Staged gate/up/down path | Measurement 1 | 30.106 s | **1.505 tokens/s** | 0.230 tokens/s |
+| Staged gate/up/down path | Measurement 2 | 31.850 s | **1.493 tokens/s** | 0.219 tokens/s |
+
+The two staged measurements average **1.499 decode tokens/s**. All runs used
+exact top-8 routing. They reported a 46.71% expert-cache hit rate, 79.210 GB of
+logical expert reads, 14.864 GB of expert-cache capacity, and a 100% KV hit
+rate for this short prompt.
+
+### Degraded-state diagnostic
+
+On 2026-07-14, revision `d0183f0` produced 0.573, 0.430, and 0.357 decode
+tokens/s, with a median of **0.430 tokens/s**. These runs reported a 41.56%
+expert-cache hit rate and 86.865 GB of logical expert reads.
+
+This lower result is not attributed solely to the current revision. The exact
+historical `cbf1a78` binary was rebuilt and rerun under the same degraded
+machine state: it achieved 0.502 tokens/s while reproducing its historical
+46.71% hit rate and 79.210 GB read count. The same revision previously measured
+1.447 tokens/s. This controlled comparison shows a substantial environmental
+effect that must be isolated before establishing a new reference baseline.
 
 `Decode throughput` excludes prefill and the first generated token. It is the
 best measure of steady token generation. `End-to-end throughput` divides all
@@ -214,16 +224,16 @@ quality can be considered validated.
 ### Current throughput limit
 
 The GGUF directory contains approximately 20.49 GB of always-active Q8 weights,
-0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. In each
-current top-8 benchmark, 7,013 of 12,000 expert requests missed the Metal cache.
-Those misses required 86.865 GB of logical expert reads over the complete run.
+0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. The reference
+top-8 benchmark read 79.210 GB of logical expert data; the degraded diagnostic
+read 86.865 GB.
 
 A three-token-per-second target allows only 0.333 seconds per token. At the
-current median of 0.430 decode tokens/s, one token takes approximately 2.326
-seconds. The short-prompt KV hit rate is already 100%, so the immediate limit is
-still the routed-expert path rather than KV capacity. Further performance work
-must reduce or amortize expert misses while preserving the artifact's exact
-top-8 routing behavior.
+1.499 tokens/s reference, one token takes approximately 0.667 seconds. The
+short-prompt KV hit rate is already 100%, so the immediate limit remains the
+routed-expert and sparse-attention paths rather than KV capacity. Further work
+must reduce or amortize expert misses and projection time while preserving the
+artifact's exact top-8 routing behavior.
 
 ## Model
 
