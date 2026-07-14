@@ -2061,6 +2061,7 @@ impl<'a> Attention<'a> {
         let past_layout =
             validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
         let past_tokens = past_kv.cached_tokens;
+        let use_absorbed_mla = should_use_dense_absorbed_mla(past_layout, tokens);
         let input_norm = crate::try_device!(profile::run_layer_stage(
             self.layer_index,
             "attention.input_norm",
@@ -2106,31 +2107,44 @@ impl<'a> Attention<'a> {
                 ));
                 let kv_a_norm =
                     crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-                let k_no_rope =
-                    crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
-                let v_heads =
-                    crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
                 let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
                     &k_rope_mqa,
                     config.qk_rope_dim,
                     past_tokens,
                     config.rope_theta as f32,
                 ));
-                let k_heads = crate::try_device!(
-                    backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
-                );
+                let (k_heads, v_heads) = if use_absorbed_mla {
+                    (None, None)
+                } else {
+                    let k_no_rope =
+                        crate::try_device!(self.k_b.forward_heads_device(&kv_a_norm, backend));
+                    let v_heads =
+                        crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
+                    let k_heads = crate::try_device!(
+                        backend.combine_rope_tail_device(&k_no_rope, &k_rope_after_rope)
+                    );
+                    (Some(k_heads), Some(v_heads))
+                };
                 Ok(Some((kv_a_norm, k_rope_after_rope, k_heads, v_heads)))
             },)
         );
 
         let (q_for_attention, current_k_for_attention, current_v_for_attention) = crate::try_device!(
             profile::run_layer_stage(self.layer_index, "attention.cache_layout", || {
-                let q_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&q_recombined));
-                let current_k_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&k_heads));
-                let current_v_for_attention =
-                    crate::try_device!(backend.heads_to_attention_layout_device(&v_heads));
+                if use_absorbed_mla {
+                    return Ok(Some((None, None, None)));
+                }
+                let q_for_attention = Some(crate::try_device!(
+                    backend.heads_to_attention_layout_device(&q_recombined)
+                ));
+                let current_k_for_attention = Some(crate::try_device!(backend
+                    .heads_to_attention_layout_device(k_heads.as_ref().ok_or_else(|| {
+                        Error::model("expanded dense attention is missing current K heads")
+                    })?)));
+                let current_v_for_attention = Some(crate::try_device!(backend
+                    .heads_to_attention_layout_device(v_heads.as_ref().ok_or_else(|| {
+                        Error::model("expanded dense attention is missing current V heads")
+                    })?)));
                 Ok(Some((
                     q_for_attention,
                     current_k_for_attention,
@@ -2141,8 +2155,12 @@ impl<'a> Attention<'a> {
 
         let (k_for_cache, v_for_cache) = match past_layout {
             DevicePastKvLayout::ExpandedHeads => (
-                current_k_for_attention.clone(),
-                current_v_for_attention.clone(),
+                current_k_for_attention
+                    .clone()
+                    .ok_or_else(|| Error::model("expanded dense attention is missing cache K"))?,
+                current_v_for_attention
+                    .clone()
+                    .ok_or_else(|| Error::model("expanded dense attention is missing cache V"))?,
             ),
             DevicePastKvLayout::MlaLatent => {
                 let cache_k = kv_latent_norm.reshape(vec![batch, 1, tokens, self.kv_lora_rank])?;
@@ -2159,9 +2177,15 @@ impl<'a> Attention<'a> {
                     self.layer_index,
                     "attention.dense_paged_decode",
                     || backend.paged_decode_attention_resident_device(
-                        &q_for_attention,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
+                        q_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("expanded dense attention is missing query layout")
+                        })?,
+                        current_k_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("expanded dense attention is missing current K layout")
+                        })?,
+                        current_v_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("expanded dense attention is missing current V layout")
+                        })?,
                         past_kv,
                     ),
                 ))
@@ -2187,11 +2211,17 @@ impl<'a> Attention<'a> {
                     self.layer_index,
                     "attention.dense_sequence",
                     || backend.selected_sequence_attention_device(
-                        &q_for_attention,
+                        q_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense sequence attention is missing query layout")
+                        })?,
                         &past.k,
                         &past.v,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
+                        current_k_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense sequence attention is missing current K layout")
+                        })?,
+                        current_v_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense sequence attention is missing current V layout")
+                        })?,
                     ),
                 ))
             }
@@ -2202,9 +2232,15 @@ impl<'a> Attention<'a> {
                     self.mla_sequence_context_device(
                         config,
                         batch,
-                        &q_for_attention,
-                        &current_k_for_attention,
-                        &current_v_for_attention,
+                        q_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense MLA sequence attention is missing query layout")
+                        })?,
+                        current_k_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense MLA sequence attention is missing current K layout")
+                        })?,
+                        current_v_for_attention.as_ref().ok_or_else(|| {
+                            Error::model("dense MLA sequence attention is missing current V layout")
+                        })?,
                         past_kv,
                         backend,
                     )
@@ -3060,6 +3096,10 @@ fn validate_device_past_kv_layout(
     )))
 }
 
+fn should_use_dense_absorbed_mla(layout: DevicePastKvLayout, tokens: usize) -> bool {
+    layout == DevicePastKvLayout::MlaLatent && tokens == 1
+}
+
 fn mla_latent_cache(kv_latent: &Tensor) -> Result<Tensor> {
     let dims = kv_latent.dims();
     if dims.len() != 3 {
@@ -3247,6 +3287,22 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn dense_absorbed_mla_is_limited_to_single_token_latent_decode() {
+        assert!(should_use_dense_absorbed_mla(
+            DevicePastKvLayout::MlaLatent,
+            1
+        ));
+        assert!(!should_use_dense_absorbed_mla(
+            DevicePastKvLayout::MlaLatent,
+            2
+        ));
+        assert!(!should_use_dense_absorbed_mla(
+            DevicePastKvLayout::ExpandedHeads,
+            1
+        ));
+    }
 
     #[test]
     fn q2_attention_runs_decode_with_past_kv() {

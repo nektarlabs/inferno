@@ -3,10 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
-        ImmutableF32BufferCache,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity, ImmutableF32BufferCache},
     command::{dispatch_1d, dispatch_2d, encode_1d, encode_2d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -24,6 +22,7 @@ pub(crate) struct MetalMatmul {
     linear_pipeline: ComputePipelineState,
     linear_gemv_pipeline: ComputePipelineState,
     weight_buffers: ImmutableF32BufferCache,
+    arena: MetalArena,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,12 +48,13 @@ pub struct MetalLinearReport {
 }
 
 impl MetalMatmul {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
             matmul_pipeline: compute_pipeline(device, library, MATMUL_KERNEL)?,
             linear_pipeline: compute_pipeline(device, library, LINEAR_KERNEL)?,
             linear_gemv_pipeline: compute_pipeline(device, library, LINEAR_GEMV_KERNEL)?,
             weight_buffers: ImmutableF32BufferCache::default(),
+            arena,
         })
     }
 
@@ -82,10 +82,10 @@ impl MetalMatmul {
 
         let lhs_buffer = f32_buffer(device, lhs)?;
         let rhs_buffer = f32_buffer(device, rhs)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
-        let inner_buffer = u32_scalar_buffer(device, inner_u32)?;
-        let cols_buffer = u32_scalar_buffer(device, cols_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let rows_buffer = self.arena.u32(rows_u32)?;
+        let inner_buffer = self.arena.u32(inner_u32)?;
+        let cols_buffer = self.arena.u32(cols_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -149,7 +149,7 @@ impl MetalMatmul {
 
         let input_buffer = f32_buffer(device, input)?;
         let weight_buffer = f32_buffer(device, weight)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
         trace!(
             target: "inferno::metal",
             rows,
@@ -161,8 +161,8 @@ impl MetalMatmul {
         if rows == 1 && in_features % 4 == 0 {
             let in_features_vec4 = u32::try_from(in_features / 4)
                 .map_err(|_| Error::backend("linear in_features/4 exceed Metal u32 limit"))?;
-            let in_features_vec4_buffer = u32_scalar_buffer(device, in_features_vec4)?;
-            let out_features_buffer = u32_scalar_buffer(device, out_features_u32)?;
+            let in_features_vec4_buffer = self.arena.u32(in_features_vec4)?;
+            let out_features_buffer = self.arena.u32(out_features_u32)?;
 
             dispatch_1d(
                 queue,
@@ -177,9 +177,9 @@ impl MetalMatmul {
                 out_features,
             )?;
         } else {
-            let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
-            let in_features_buffer = u32_scalar_buffer(device, in_features_u32)?;
-            let out_features_buffer = u32_scalar_buffer(device, out_features_u32)?;
+            let rows_buffer = self.arena.u32(rows_u32)?;
+            let in_features_buffer = self.arena.u32(in_features_u32)?;
+            let out_features_buffer = self.arena.u32(out_features_u32)?;
 
             dispatch_2d(
                 queue,
@@ -245,7 +245,7 @@ impl MetalMatmul {
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("batched F32 linear output length overflow"))?;
         let weight_buffer = self.weight_buffers.get(device, weight)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
 
         trace!(
             target: "inferno::metal",
@@ -262,8 +262,8 @@ impl MetalMatmul {
             let out_features_u32 = u32::try_from(out_features).map_err(|_| {
                 Error::backend("batched F32 linear out_features exceeds Metal u32 limit")
             })?;
-            let in_features_vec4_buffer = u32_scalar_buffer(device, in_features_vec4)?;
-            let out_features_buffer = u32_scalar_buffer(device, out_features_u32)?;
+            let in_features_vec4_buffer = self.arena.u32(in_features_vec4)?;
+            let out_features_buffer = self.arena.u32(out_features_u32)?;
             encode_1d(
                 command_buffer,
                 &self.linear_gemv_pipeline,
@@ -285,9 +285,9 @@ impl MetalMatmul {
             let out_features_u32 = u32::try_from(out_features).map_err(|_| {
                 Error::backend("batched F32 linear out_features exceeds Metal u32 limit")
             })?;
-            let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
-            let in_features_buffer = u32_scalar_buffer(device, in_features_u32)?;
-            let out_features_buffer = u32_scalar_buffer(device, out_features_u32)?;
+            let rows_buffer = self.arena.u32(rows_u32)?;
+            let in_features_buffer = self.arena.u32(in_features_u32)?;
+            let out_features_buffer = self.arena.u32(out_features_u32)?;
             encode_2d(
                 command_buffer,
                 &self.linear_pipeline,

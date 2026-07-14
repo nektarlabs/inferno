@@ -6,10 +6,10 @@ use common::{validate_exact_shape, DType, Error, PagedKvView, Result};
 use tracing::trace;
 
 use super::{
+    arena::MetalArena,
     buffers::{
         empty_f32_buffer, empty_u32_buffer, f32_buffer, read_f32_buffer, require_f16_capacity,
-        require_f32_capacity, u32_scalar_buffer, write_f32_buffer, write_f32_buffer_at,
-        write_u32_buffer,
+        require_f32_capacity, write_f32_buffer, write_f32_buffer_at, write_u32_buffer,
     },
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
@@ -38,18 +38,22 @@ const FUSED_DECODE_ATTENTION_THREADS_PER_ROW: usize = 256;
 const FUSED_DECODE_ATTENTION_MAX_KEYS: usize = 4096;
 
 pub(crate) struct MetalAttentionScores {
+    arena: MetalArena,
     pipeline: ComputePipelineState,
 }
 
 pub(crate) struct MetalAttentionValues {
+    arena: MetalArena,
     pipeline: ComputePipelineState,
 }
 
 pub(crate) struct MetalAttentionCausalSoftmax {
+    arena: MetalArena,
     pipeline: ComputePipelineState,
 }
 
 pub(crate) struct MetalDecodeAttention {
+    arena: MetalArena,
     fused_pipeline: ComputePipelineState,
     fused_paged_pipeline: ComputePipelineState,
     fused_selected_pipeline: ComputePipelineState,
@@ -159,8 +163,9 @@ struct WorkspaceBuffer {
 }
 
 impl MetalAttentionScores {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             pipeline: compute_pipeline(device, library, ATTENTION_SCORES_KERNEL)?,
         })
     }
@@ -205,12 +210,12 @@ impl MetalAttentionScores {
 
         let q_buffer = f32_buffer(device, q)?;
         let k_buffer = f32_buffer(device, k)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
-        let query_tokens_buffer = u32_scalar_buffer(device, query_tokens_u32)?;
-        let key_tokens_buffer = u32_scalar_buffer(device, key_tokens_u32)?;
-        let head_dim_buffer = u32_scalar_buffer(device, head_dim_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let head_count_buffer = self.arena.u32(head_count_u32)?;
+        let query_tokens_buffer = self.arena.u32(query_tokens_u32)?;
+        let key_tokens_buffer = self.arena.u32(key_tokens_u32)?;
+        let head_dim_buffer = self.arena.u32(head_dim_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -253,8 +258,9 @@ impl MetalAttentionScores {
 }
 
 impl MetalAttentionValues {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             pipeline: compute_pipeline(device, library, ATTENTION_VALUES_KERNEL)?,
         })
     }
@@ -299,12 +305,12 @@ impl MetalAttentionValues {
 
         let probs_buffer = f32_buffer(device, probs)?;
         let values_buffer = f32_buffer(device, values)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
-        let query_tokens_buffer = u32_scalar_buffer(device, query_tokens_u32)?;
-        let key_tokens_buffer = u32_scalar_buffer(device, key_tokens_u32)?;
-        let value_dim_buffer = u32_scalar_buffer(device, value_dim_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let head_count_buffer = self.arena.u32(head_count_u32)?;
+        let query_tokens_buffer = self.arena.u32(query_tokens_u32)?;
+        let key_tokens_buffer = self.arena.u32(key_tokens_u32)?;
+        let value_dim_buffer = self.arena.u32(value_dim_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -347,8 +353,9 @@ impl MetalAttentionValues {
 }
 
 impl MetalAttentionCausalSoftmax {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             pipeline: compute_pipeline(device, library, ATTENTION_CAUSAL_SOFTMAX_KERNEL)?,
         })
     }
@@ -397,12 +404,12 @@ impl MetalAttentionCausalSoftmax {
             .ok_or_else(|| Error::backend("attention causal softmax output length overflow"))?;
 
         let scores_buffer = f32_buffer(device, scores)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
-        let query_tokens_buffer = u32_scalar_buffer(device, query_tokens_u32)?;
-        let key_tokens_buffer = u32_scalar_buffer(device, key_tokens_u32)?;
-        let past_tokens_buffer = u32_scalar_buffer(device, past_tokens_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let head_count_buffer = self.arena.u32(head_count_u32)?;
+        let query_tokens_buffer = self.arena.u32(query_tokens_u32)?;
+        let key_tokens_buffer = self.arena.u32(key_tokens_u32)?;
+        let past_tokens_buffer = self.arena.u32(past_tokens_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -444,8 +451,9 @@ impl MetalAttentionCausalSoftmax {
 }
 
 impl MetalDecodeAttention {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             fused_pipeline: compute_pipeline(device, library, FUSED_DECODE_ATTENTION_KERNEL)?,
             fused_paged_pipeline: compute_pipeline(
                 device,
@@ -727,8 +735,8 @@ impl MetalDecodeAttention {
         let (q_buffer, reused_q_buffer) = workspace.q_buffer(device, q)?.clone_for_dispatch();
         drop(workspace);
 
-        let page_k_buffer = empty_f32_buffer(device, page_k_len)?;
-        let page_v_buffer = empty_f32_buffer(device, page_v_len)?;
+        let page_k_buffer = self.arena.empty_f32(page_k_len)?;
+        let page_v_buffer = self.arena.empty_f32(page_v_len)?;
         let current_k_buffer = f32_buffer(device, current_k)?;
         let current_v_buffer = f32_buffer(device, current_v)?;
         let page_upload = write_all_paged_kv_to_buffers(past_kv, &page_k_buffer, &page_v_buffer)?;
@@ -800,7 +808,7 @@ impl MetalDecodeAttention {
     pub(crate) fn encode_paged(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         q: &Buffer,
         q_len: usize,
         current_k: &Buffer,
@@ -867,33 +875,30 @@ impl MetalDecodeAttention {
         let page_v_len =
             page_buffer_len(page_count, batch_count, head_count, page_size, value_dim)?;
 
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention batch_count", batch_count)?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention head_count", head_count)?,
-        )?;
-        let page_size_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention page_size", page_size)?,
-        )?;
-        let head_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention head_dim", head_dim)?,
-        )?;
-        let value_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention value_dim", value_dim)?,
-        )?;
-        let past_tokens_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("paged decode attention past_tokens", past_tokens)?,
-        )?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let page_k_buffer = empty_f32_buffer(device, page_k_len)?;
-        let page_v_buffer = empty_f32_buffer(device, page_v_len)?;
+        let batch_count_buffer = self.arena.u32(checked_u32(
+            "paged decode attention batch_count",
+            batch_count,
+        )?)?;
+        let head_count_buffer = self.arena.u32(checked_u32(
+            "paged decode attention head_count",
+            head_count,
+        )?)?;
+        let page_size_buffer = self
+            .arena
+            .u32(checked_u32("paged decode attention page_size", page_size)?)?;
+        let head_dim_buffer = self
+            .arena
+            .u32(checked_u32("paged decode attention head_dim", head_dim)?)?;
+        let value_dim_buffer = self
+            .arena
+            .u32(checked_u32("paged decode attention value_dim", value_dim)?)?;
+        let past_tokens_buffer = self.arena.u32(checked_u32(
+            "paged decode attention past_tokens",
+            past_tokens,
+        )?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let page_k_buffer = self.arena.empty_f32(page_k_len)?;
+        let page_v_buffer = self.arena.empty_f32(page_v_len)?;
         write_all_paged_kv_to_buffers(past_kv, &page_k_buffer, &page_v_buffer)?;
 
         trace!(
@@ -938,7 +943,7 @@ impl MetalDecodeAttention {
     pub(crate) fn encode_paged_resident(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         q: &Buffer,
         q_len: usize,
         current_k: &Buffer,
@@ -1048,31 +1053,31 @@ impl MetalDecodeAttention {
             "fused resident paged decode attention",
         )?;
 
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention batch_count", batch_count)?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention head_count", head_count)?,
-        )?;
-        let page_size_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention page_size", page_size)?,
-        )?;
-        let value_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention value_dim", value_dim)?,
-        )?;
-        let head_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention head_dim", head_dim)?,
-        )?;
-        let past_tokens_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("resident paged decode attention past_tokens", past_tokens)?,
-        )?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention batch_count",
+            batch_count,
+        )?)?;
+        let head_count_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention head_count",
+            head_count,
+        )?)?;
+        let page_size_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention page_size",
+            page_size,
+        )?)?;
+        let value_dim_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention value_dim",
+            value_dim,
+        )?)?;
+        let head_dim_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention head_dim",
+            head_dim,
+        )?)?;
+        let past_tokens_buffer = self.arena.u32(checked_u32(
+            "resident paged decode attention past_tokens",
+            past_tokens,
+        )?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
 
         trace!(
             target: "inferno::metal",
@@ -1121,7 +1126,7 @@ impl MetalDecodeAttention {
     pub(crate) fn encode_paged_absorbed_mla_f32(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         q_latent: &Buffer,
         q_latent_len: usize,
         q_rope: &Buffer,
@@ -1222,27 +1227,29 @@ impl MetalDecodeAttention {
             "fused paged absorbed MLA decode",
         )?;
         let output_len = expected_q_latent_len;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("absorbed MLA batch_count", batch_count)?,
-        )?;
-        let head_count_buffer =
-            u32_scalar_buffer(device, checked_u32("absorbed MLA head_count", head_count)?)?;
-        let past_tokens_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("absorbed MLA past_tokens", past_kv.cached_tokens)?,
-        )?;
-        let page_size_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("absorbed MLA page_size", past_kv.page_size)?,
-        )?;
-        let latent_dim_buffer =
-            u32_scalar_buffer(device, checked_u32("absorbed MLA latent_dim", latent_dim)?)?;
-        let rope_dim_buffer =
-            u32_scalar_buffer(device, checked_u32("absorbed MLA rope_dim", rope_dim)?)?;
-        let scale_dim_buffer =
-            u32_scalar_buffer(device, checked_u32("absorbed MLA scale_dim", scale_dim)?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA batch_count", batch_count)?)?;
+        let head_count_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA head_count", head_count)?)?;
+        let past_tokens_buffer = self.arena.u32(checked_u32(
+            "absorbed MLA past_tokens",
+            past_kv.cached_tokens,
+        )?)?;
+        let page_size_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA page_size", past_kv.page_size)?)?;
+        let latent_dim_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA latent_dim", latent_dim)?)?;
+        let rope_dim_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA rope_dim", rope_dim)?)?;
+        let scale_dim_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA scale_dim", scale_dim)?)?;
 
         encode_1d(
             command_buffer,
@@ -1272,7 +1279,7 @@ impl MetalDecodeAttention {
     pub(crate) fn encode_selected(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         q: &Buffer,
         q_len: usize,
         selected_k: &Buffer,
@@ -1403,27 +1410,26 @@ impl MetalDecodeAttention {
             row_count,
             "fused selected decode attention",
         )?;
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("selected decode attention batch_count", batch_count)?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("selected decode attention head_count", head_count)?,
-        )?;
-        let selected_tokens_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("selected decode attention selected_tokens", selected_tokens)?,
-        )?;
-        let head_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("selected decode attention head_dim", head_dim)?,
-        )?;
-        let value_dim_buffer = u32_scalar_buffer(
-            device,
-            checked_u32("selected decode attention value_dim", value_dim)?,
-        )?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let batch_count_buffer = self.arena.u32(checked_u32(
+            "selected decode attention batch_count",
+            batch_count,
+        )?)?;
+        let head_count_buffer = self.arena.u32(checked_u32(
+            "selected decode attention head_count",
+            head_count,
+        )?)?;
+        let selected_tokens_buffer = self.arena.u32(checked_u32(
+            "selected decode attention selected_tokens",
+            selected_tokens,
+        )?)?;
+        let head_dim_buffer = self
+            .arena
+            .u32(checked_u32("selected decode attention head_dim", head_dim)?)?;
+        let value_dim_buffer = self.arena.u32(checked_u32(
+            "selected decode attention value_dim",
+            value_dim,
+        )?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
 
         encode_1d(
             command_buffer,
@@ -1450,7 +1456,7 @@ impl MetalDecodeAttention {
     pub(crate) fn encode_selected_sequence(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         q: &Buffer,
         q_len: usize,
         selected_k: &Buffer,
@@ -1539,29 +1545,26 @@ impl MetalDecodeAttention {
             row_count,
             "fused selected sequence attention",
         )?;
-        let output = empty_f32_buffer(device, output_len)?;
-        let batch_count = u32_scalar_buffer(
-            device,
-            checked_u32("selected sequence batch_count", batch_count)?,
-        )?;
-        let head_count = u32_scalar_buffer(
-            device,
-            checked_u32("selected sequence head_count", head_count)?,
-        )?;
-        let selected_tokens = u32_scalar_buffer(
-            device,
-            checked_u32("selected sequence selected_tokens", selected_tokens)?,
-        )?;
-        let query_tokens = u32_scalar_buffer(
-            device,
-            checked_u32("selected sequence query_tokens", query_tokens)?,
-        )?;
-        let head_dim =
-            u32_scalar_buffer(device, checked_u32("selected sequence head_dim", head_dim)?)?;
-        let value_dim = u32_scalar_buffer(
-            device,
-            checked_u32("selected sequence value_dim", value_dim)?,
-        )?;
+        let output = self.arena.empty_f32(output_len)?;
+        let batch_count = self
+            .arena
+            .u32(checked_u32("selected sequence batch_count", batch_count)?)?;
+        let head_count = self
+            .arena
+            .u32(checked_u32("selected sequence head_count", head_count)?)?;
+        let selected_tokens = self.arena.u32(checked_u32(
+            "selected sequence selected_tokens",
+            selected_tokens,
+        )?)?;
+        let query_tokens = self
+            .arena
+            .u32(checked_u32("selected sequence query_tokens", query_tokens)?)?;
+        let head_dim = self
+            .arena
+            .u32(checked_u32("selected sequence head_dim", head_dim)?)?;
+        let value_dim = self
+            .arena
+            .u32(checked_u32("selected sequence value_dim", value_dim)?)?;
 
         encode_1d(
             command_buffer,

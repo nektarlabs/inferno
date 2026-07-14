@@ -3,9 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity},
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -26,6 +25,7 @@ const STACK_HEAD_OUTPUT_KERNEL: &str = "stack_head_output_f32_kernel";
 const LINEARIZE_PAGED_CACHE_KERNEL: &str = "linearize_paged_cache_f32_kernel";
 
 pub(crate) struct MetalLayout {
+    arena: MetalArena,
     select_last_token_pipeline: ComputePipelineState,
     heads_to_attention_layout_pipeline: ComputePipelineState,
     merge_attention_heads_pipeline: ComputePipelineState,
@@ -123,8 +123,9 @@ pub struct MetalLinearizePagedCacheReport {
 }
 
 impl MetalLayout {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             select_last_token_pipeline: compute_pipeline(
                 device,
                 library,
@@ -182,10 +183,10 @@ impl MetalLayout {
             .map_err(|_| Error::backend("select_last_token hidden_size exceeds Metal u32 limit"))?;
 
         let hidden_states_buffer = f32_buffer(device, hidden_states)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let hidden_size_buffer = self.arena.u32(hidden_size_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -239,32 +240,20 @@ impl MetalLayout {
         let output_len =
             attention_head_value_count(batch_count, token_count, head_count, head_dim)?;
 
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(batch_count).map_err(|_| {
-                Error::backend("heads_to_attention_layout batch_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count).map_err(|_| {
-                Error::backend("heads_to_attention_layout token_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_count).map_err(|_| {
-                Error::backend("heads_to_attention_layout head_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_dim).map_err(|_| {
-                Error::backend("heads_to_attention_layout head_dim exceeds Metal u32 limit")
-            })?,
-        )?;
+        let batch_count_buffer = self.arena.u32(u32::try_from(batch_count).map_err(|_| {
+            Error::backend("heads_to_attention_layout batch_count exceeds Metal u32 limit")
+        })?)?;
+        let token_count_buffer = self.arena.u32(u32::try_from(token_count).map_err(|_| {
+            Error::backend("heads_to_attention_layout token_count exceeds Metal u32 limit")
+        })?)?;
+        let head_count_buffer = self.arena.u32(u32::try_from(head_count).map_err(|_| {
+            Error::backend("heads_to_attention_layout head_count exceeds Metal u32 limit")
+        })?)?;
+        let head_dim_buffer = self.arena.u32(u32::try_from(head_dim).map_err(|_| {
+            Error::backend("heads_to_attention_layout head_dim exceeds Metal u32 limit")
+        })?)?;
         let input_buffer = f32_buffer(device, input)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
 
         trace!(
             target: "inferno::metal",
@@ -315,32 +304,20 @@ impl MetalLayout {
         let output_len =
             attention_head_value_count(batch_count, token_count, head_count, head_dim)?;
 
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(batch_count).map_err(|_| {
-                Error::backend("merge_attention_heads batch_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_count).map_err(|_| {
-                Error::backend("merge_attention_heads head_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count).map_err(|_| {
-                Error::backend("merge_attention_heads token_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_dim).map_err(|_| {
-                Error::backend("merge_attention_heads head_dim exceeds Metal u32 limit")
-            })?,
-        )?;
+        let batch_count_buffer = self.arena.u32(u32::try_from(batch_count).map_err(|_| {
+            Error::backend("merge_attention_heads batch_count exceeds Metal u32 limit")
+        })?)?;
+        let head_count_buffer = self.arena.u32(u32::try_from(head_count).map_err(|_| {
+            Error::backend("merge_attention_heads head_count exceeds Metal u32 limit")
+        })?)?;
+        let token_count_buffer = self.arena.u32(u32::try_from(token_count).map_err(|_| {
+            Error::backend("merge_attention_heads token_count exceeds Metal u32 limit")
+        })?)?;
+        let head_dim_buffer = self.arena.u32(u32::try_from(head_dim).map_err(|_| {
+            Error::backend("merge_attention_heads head_dim exceeds Metal u32 limit")
+        })?)?;
         let input_buffer = f32_buffer(device, input)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
 
         trace!(
             target: "inferno::metal",
@@ -404,37 +381,25 @@ impl MetalLayout {
             .ok_or_else(|| Error::backend("split_rope_tail thread count overflow"))?;
 
         let input_buffer = f32_buffer(device, input)?;
-        let no_rope_buffer = empty_f32_buffer(device, no_rope_len)?;
-        let rope_buffer = empty_f32_buffer(device, rope_len)?;
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(batch_count).map_err(|_| {
-                Error::backend("split_rope_tail batch_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count).map_err(|_| {
-                Error::backend("split_rope_tail token_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_count).map_err(|_| {
+        let no_rope_buffer = self.arena.empty_f32(no_rope_len)?;
+        let rope_buffer = self.arena.empty_f32(rope_len)?;
+        let batch_count_buffer = self.arena.u32(u32::try_from(batch_count).map_err(|_| {
+            Error::backend("split_rope_tail batch_count exceeds Metal u32 limit")
+        })?)?;
+        let token_count_buffer = self.arena.u32(u32::try_from(token_count).map_err(|_| {
+            Error::backend("split_rope_tail token_count exceeds Metal u32 limit")
+        })?)?;
+        let head_count_buffer =
+            self.arena.u32(u32::try_from(head_count).map_err(|_| {
                 Error::backend("split_rope_tail head_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let no_rope_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(no_rope_dim).map_err(|_| {
-                Error::backend("split_rope_tail no_rope_dim exceeds Metal u32 limit")
-            })?,
-        )?;
-        let rope_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(rope_dim)
-                .map_err(|_| Error::backend("split_rope_tail rope_dim exceeds Metal u32 limit"))?,
-        )?;
+            })?)?;
+        let no_rope_dim_buffer = self.arena.u32(u32::try_from(no_rope_dim).map_err(|_| {
+            Error::backend("split_rope_tail no_rope_dim exceeds Metal u32 limit")
+        })?)?;
+        let rope_dim_buffer =
+            self.arena.u32(u32::try_from(rope_dim).map_err(|_| {
+                Error::backend("split_rope_tail rope_dim exceeds Metal u32 limit")
+            })?)?;
 
         trace!(
             target: "inferno::metal",
@@ -501,28 +466,25 @@ impl MetalLayout {
             .ok_or_else(|| Error::backend("split_kv_mqa thread count overflow"))?;
 
         let input_buffer = f32_buffer(device, input)?;
-        let latent_buffer = empty_f32_buffer(device, latent_len)?;
-        let rope_buffer = empty_f32_buffer(device, rope_len)?;
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(batch_count)
-                .map_err(|_| Error::backend("split_kv_mqa batch_count exceeds Metal u32 limit"))?,
-        )?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count)
-                .map_err(|_| Error::backend("split_kv_mqa token_count exceeds Metal u32 limit"))?,
-        )?;
-        let kv_lora_rank_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(kv_lora_rank)
-                .map_err(|_| Error::backend("split_kv_mqa kv_lora_rank exceeds Metal u32 limit"))?,
-        )?;
-        let rope_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(rope_dim)
-                .map_err(|_| Error::backend("split_kv_mqa rope_dim exceeds Metal u32 limit"))?,
-        )?;
+        let latent_buffer = self.arena.empty_f32(latent_len)?;
+        let rope_buffer = self.arena.empty_f32(rope_len)?;
+        let batch_count_buffer =
+            self.arena.u32(u32::try_from(batch_count).map_err(|_| {
+                Error::backend("split_kv_mqa batch_count exceeds Metal u32 limit")
+            })?)?;
+        let token_count_buffer =
+            self.arena.u32(u32::try_from(token_count).map_err(|_| {
+                Error::backend("split_kv_mqa token_count exceeds Metal u32 limit")
+            })?)?;
+        let kv_lora_rank_buffer =
+            self.arena.u32(u32::try_from(kv_lora_rank).map_err(|_| {
+                Error::backend("split_kv_mqa kv_lora_rank exceeds Metal u32 limit")
+            })?)?;
+        let rope_dim_buffer =
+            self.arena
+                .u32(u32::try_from(rope_dim).map_err(|_| {
+                    Error::backend("split_kv_mqa rope_dim exceeds Metal u32 limit")
+                })?)?;
 
         trace!(
             target: "inferno::metal",
@@ -593,43 +555,27 @@ impl MetalLayout {
 
         let no_rope_buffer = f32_buffer(device, no_rope)?;
         let rope_buffer = f32_buffer(device, rope)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(batch_count).map_err(|_| {
-                Error::backend("combine_rope_tail batch_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count).map_err(|_| {
-                Error::backend("combine_rope_tail token_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let head_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(head_count).map_err(|_| {
-                Error::backend("combine_rope_tail head_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let rope_head_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(rope_head_count).map_err(|_| {
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = self.arena.u32(u32::try_from(batch_count).map_err(|_| {
+            Error::backend("combine_rope_tail batch_count exceeds Metal u32 limit")
+        })?)?;
+        let token_count_buffer = self.arena.u32(u32::try_from(token_count).map_err(|_| {
+            Error::backend("combine_rope_tail token_count exceeds Metal u32 limit")
+        })?)?;
+        let head_count_buffer = self.arena.u32(u32::try_from(head_count).map_err(|_| {
+            Error::backend("combine_rope_tail head_count exceeds Metal u32 limit")
+        })?)?;
+        let rope_head_count_buffer =
+            self.arena.u32(u32::try_from(rope_head_count).map_err(|_| {
                 Error::backend("combine_rope_tail rope_head_count exceeds Metal u32 limit")
-            })?,
-        )?;
-        let no_rope_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(no_rope_dim).map_err(|_| {
-                Error::backend("combine_rope_tail no_rope_dim exceeds Metal u32 limit")
-            })?,
-        )?;
-        let rope_dim_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(rope_dim).map_err(|_| {
+            })?)?;
+        let no_rope_dim_buffer = self.arena.u32(u32::try_from(no_rope_dim).map_err(|_| {
+            Error::backend("combine_rope_tail no_rope_dim exceeds Metal u32 limit")
+        })?)?;
+        let rope_dim_buffer =
+            self.arena.u32(u32::try_from(rope_dim).map_err(|_| {
                 Error::backend("combine_rope_tail rope_dim exceeds Metal u32 limit")
-            })?,
-        )?;
+            })?)?;
 
         trace!(
             target: "inferno::metal",
@@ -690,15 +636,15 @@ impl MetalLayout {
         let output_len = input_len
             .checked_mul(head_count)
             .ok_or_else(|| Error::backend("stack_head_outputs output length overflow"))?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = layout_u32_buffer(device, row_count, "row_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = layout_u32_buffer(&self.arena, row_count, "row_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         for (head_index, values) in head_outputs.iter().enumerate() {
             require_layout_input_len("stack_head_outputs head", values.len(), input_len)?;
             let input_buffer = f32_buffer(device, values)?;
-            let head_index_buffer = layout_u32_buffer(device, head_index, "head_index")?;
+            let head_index_buffer = layout_u32_buffer(&self.arena, head_index, "head_index")?;
             dispatch_1d(
                 queue,
                 &self.stack_head_output_pipeline,
@@ -749,12 +695,12 @@ impl MetalLayout {
         let output_len = paged_cache_output_len(batch_count, head_count, cached_tokens, head_dim)?;
         require_nonzero_output("linearize_paged_cache", output_len)?;
         let input = f32_buffer(device, paged)?;
-        let output = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let cached_tokens_buffer = layout_u32_buffer(device, cached_tokens, "cached_tokens")?;
-        let page_size_buffer = layout_u32_buffer(device, page_size, "page_size")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let cached_tokens_buffer = layout_u32_buffer(&self.arena, cached_tokens, "cached_tokens")?;
+        let page_size_buffer = layout_u32_buffer(&self.arena, page_size, "page_size")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         dispatch_1d(
             queue,
@@ -795,7 +741,7 @@ impl MetalLayout {
     pub(crate) fn encode_select_last_token(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         hidden_states: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -813,10 +759,10 @@ impl MetalLayout {
             .ok_or_else(|| Error::backend("select_last_token output length overflow"))?;
         require_nonzero_output("select_last_token", output_len)?;
 
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let hidden_size_buffer = layout_u32_buffer(device, hidden_size, "hidden_size")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let hidden_size_buffer = layout_u32_buffer(&self.arena, hidden_size, "hidden_size")?;
 
         encode_1d(
             command_buffer,
@@ -836,7 +782,7 @@ impl MetalLayout {
     pub(crate) fn encode_heads_to_attention_layout(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -850,11 +796,11 @@ impl MetalLayout {
         require_f32_capacity(input, input_len, "heads_to_attention_layout input")?;
         require_nonzero_output("heads_to_attention_layout", output_len)?;
 
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         encode_1d(
             command_buffer,
@@ -875,7 +821,7 @@ impl MetalLayout {
     pub(crate) fn encode_merge_attention_heads(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -889,11 +835,11 @@ impl MetalLayout {
         require_f32_capacity(input, input_len, "merge_attention_heads input")?;
         require_nonzero_output("merge_attention_heads", output_len)?;
 
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         encode_1d(
             command_buffer,
@@ -915,7 +861,7 @@ impl MetalLayout {
     pub(crate) fn encode_split_rope_tail(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -934,13 +880,13 @@ impl MetalLayout {
         require_f32_capacity(input, input_len, "split_rope_tail input")?;
         require_nonzero_output("split_rope_tail", thread_count)?;
 
-        let no_rope_buffer = empty_f32_buffer(device, no_rope_len)?;
-        let rope_buffer = empty_f32_buffer(device, rope_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let no_rope_dim_buffer = layout_u32_buffer(device, no_rope_dim, "no_rope_dim")?;
-        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+        let no_rope_buffer = self.arena.empty_f32(no_rope_len)?;
+        let rope_buffer = self.arena.empty_f32(rope_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let no_rope_dim_buffer = layout_u32_buffer(&self.arena, no_rope_dim, "no_rope_dim")?;
+        let rope_dim_buffer = layout_u32_buffer(&self.arena, rope_dim, "rope_dim")?;
 
         encode_1d(
             command_buffer,
@@ -963,7 +909,7 @@ impl MetalLayout {
     pub(crate) fn encode_split_kv_mqa(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -986,12 +932,12 @@ impl MetalLayout {
         require_f32_capacity(input, input_len, "split_kv_mqa input")?;
         require_nonzero_output("split_kv_mqa", thread_count)?;
 
-        let latent_buffer = empty_f32_buffer(device, latent_len)?;
-        let rope_buffer = empty_f32_buffer(device, rope_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let kv_lora_rank_buffer = layout_u32_buffer(device, kv_lora_rank, "kv_lora_rank")?;
-        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+        let latent_buffer = self.arena.empty_f32(latent_len)?;
+        let rope_buffer = self.arena.empty_f32(rope_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let kv_lora_rank_buffer = layout_u32_buffer(&self.arena, kv_lora_rank, "kv_lora_rank")?;
+        let rope_dim_buffer = layout_u32_buffer(&self.arena, rope_dim, "rope_dim")?;
 
         encode_1d(
             command_buffer,
@@ -1014,7 +960,7 @@ impl MetalLayout {
     pub(crate) fn encode_combine_rope_tail(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         no_rope: &Buffer,
         no_rope_len: usize,
         rope: &Buffer,
@@ -1051,13 +997,14 @@ impl MetalLayout {
             attention_head_value_count(batch_count, token_count, head_count, total_dim)?;
         require_nonzero_output("combine_rope_tail", output_len)?;
 
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let token_count_buffer = layout_u32_buffer(device, token_count, "token_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let rope_head_count_buffer = layout_u32_buffer(device, rope_head_count, "rope_head_count")?;
-        let no_rope_dim_buffer = layout_u32_buffer(device, no_rope_dim, "no_rope_dim")?;
-        let rope_dim_buffer = layout_u32_buffer(device, rope_dim, "rope_dim")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let token_count_buffer = layout_u32_buffer(&self.arena, token_count, "token_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let rope_head_count_buffer =
+            layout_u32_buffer(&self.arena, rope_head_count, "rope_head_count")?;
+        let no_rope_dim_buffer = layout_u32_buffer(&self.arena, no_rope_dim, "no_rope_dim")?;
+        let rope_dim_buffer = layout_u32_buffer(&self.arena, rope_dim, "rope_dim")?;
 
         encode_1d(
             command_buffer,
@@ -1081,7 +1028,7 @@ impl MetalLayout {
     pub(crate) fn encode_stack_head_outputs(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         head_outputs: &[&Buffer],
         row_count: usize,
         head_dim: usize,
@@ -1094,14 +1041,14 @@ impl MetalLayout {
         let output_len = input_len
             .checked_mul(head_count)
             .ok_or_else(|| Error::backend("stack_head_outputs output length overflow"))?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = layout_u32_buffer(device, row_count, "row_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = layout_u32_buffer(&self.arena, row_count, "row_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         for (head_index, head_output) in head_outputs.iter().enumerate() {
             require_f32_capacity(head_output, input_len, "stack_head_outputs head input")?;
-            let head_index_buffer = layout_u32_buffer(device, head_index, "head_index")?;
+            let head_index_buffer = layout_u32_buffer(&self.arena, head_index, "head_index")?;
             encode_1d(
                 command_buffer,
                 &self.stack_head_output_pipeline,
@@ -1124,7 +1071,7 @@ impl MetalLayout {
     pub(crate) fn encode_linearize_paged_cache(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         paged: &Buffer,
         paged_len: usize,
         batch_count: usize,
@@ -1145,12 +1092,12 @@ impl MetalLayout {
         require_f32_capacity(paged, paged_len, "linearize_paged_cache input")?;
         let output_len = paged_cache_output_len(batch_count, head_count, cached_tokens, head_dim)?;
         require_nonzero_output("linearize_paged_cache", output_len)?;
-        let output = empty_f32_buffer(device, output_len)?;
-        let batch_count_buffer = layout_u32_buffer(device, batch_count, "batch_count")?;
-        let head_count_buffer = layout_u32_buffer(device, head_count, "head_count")?;
-        let cached_tokens_buffer = layout_u32_buffer(device, cached_tokens, "cached_tokens")?;
-        let page_size_buffer = layout_u32_buffer(device, page_size, "page_size")?;
-        let head_dim_buffer = layout_u32_buffer(device, head_dim, "head_dim")?;
+        let output = self.arena.empty_f32(output_len)?;
+        let batch_count_buffer = layout_u32_buffer(&self.arena, batch_count, "batch_count")?;
+        let head_count_buffer = layout_u32_buffer(&self.arena, head_count, "head_count")?;
+        let cached_tokens_buffer = layout_u32_buffer(&self.arena, cached_tokens, "cached_tokens")?;
+        let page_size_buffer = layout_u32_buffer(&self.arena, page_size, "page_size")?;
+        let head_dim_buffer = layout_u32_buffer(&self.arena, head_dim, "head_dim")?;
 
         encode_1d(
             command_buffer,
@@ -1170,10 +1117,10 @@ impl MetalLayout {
     }
 }
 
-fn layout_u32_buffer(device: &Device, value: usize, label: &str) -> Result<Buffer> {
+fn layout_u32_buffer(arena: &MetalArena, value: usize, label: &str) -> Result<Buffer> {
     let value = u32::try_from(value)
         .map_err(|_| Error::backend(format!("layout {label} exceeds Metal u32 limit")))?;
-    u32_scalar_buffer(device, value)
+    arena.u32(value)
 }
 
 fn require_layout_input_len(name: &str, input_len: usize, expected: usize) -> Result<()> {

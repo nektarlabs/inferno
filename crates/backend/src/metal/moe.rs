@@ -3,10 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, empty_u32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer,
-        require_f32_capacity, u32_buffer, u32_scalar_buffer,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity, u32_buffer},
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -23,6 +21,7 @@ const MOE_TOPK_COMBINE_RESIDUAL_KERNEL: &str = "moe_topk_combine_residual_f32_ke
 const MOE_ROUTER_TOPK_KERNEL: &str = "moe_router_topk_f32_kernel";
 
 pub(crate) struct MetalMoe {
+    arena: MetalArena,
     gather_pipeline: ComputePipelineState,
     combine_pipeline: ComputePipelineState,
     token_major_combine_pipeline: ComputePipelineState,
@@ -56,8 +55,9 @@ pub(crate) struct MetalRouterTopKBuffers {
 }
 
 impl MetalMoe {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             gather_pipeline: compute_pipeline(device, library, MOE_GATHER_TOKENS_KERNEL)?,
             combine_pipeline: compute_pipeline(
                 device,
@@ -108,10 +108,10 @@ impl MetalMoe {
 
         let flat_tokens_buffer = f32_buffer(device, flat_tokens)?;
         let token_indices_buffer = u32_buffer(device, token_indices)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
-        let assignment_count_buffer = u32_scalar_buffer(device, assignment_count_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let hidden_size_buffer = self.arena.u32(hidden_size_u32)?;
+        let assignment_count_buffer = self.arena.u32(assignment_count_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -182,9 +182,9 @@ impl MetalMoe {
         let token_indices_buffer = u32_buffer(device, token_indices)?;
         let expert_outputs_buffer = f32_buffer(device, expert_outputs)?;
         let expert_weights_buffer = f32_buffer(device, expert_weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let hidden_size_buffer = self.arena.u32(hidden_size_u32)?;
         let token_major_assignments_per_token =
             token_major_assignments_per_token(token_indices, token_count, assignment_count);
         let combine_count_u32 = match token_major_assignments_per_token {
@@ -193,7 +193,7 @@ impl MetalMoe {
             })?,
             None => assignment_count_u32,
         };
-        let combine_count_buffer = u32_scalar_buffer(device, combine_count_u32)?;
+        let combine_count_buffer = self.arena.u32(combine_count_u32)?;
         let combine_pipeline = if token_major_assignments_per_token.is_some() {
             &self.token_major_combine_pipeline
         } else {
@@ -308,9 +308,9 @@ impl MetalMoe {
 
         let token_indices_buffer = u32_buffer(device, token_indices)?;
         let expert_weights_buffer = f32_buffer(device, expert_weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let hidden_size_buffer = self.arena.u32(hidden_size_u32)?;
         let token_major_assignments_per_token =
             token_major_assignments_per_token(token_indices, token_count, assignment_count);
         let combine_count_u32 = match token_major_assignments_per_token {
@@ -319,7 +319,7 @@ impl MetalMoe {
             })?,
             None => assignment_count_u32,
         };
-        let combine_count_buffer = u32_scalar_buffer(device, combine_count_u32)?;
+        let combine_count_buffer = self.arena.u32(combine_count_u32)?;
         let combine_pipeline = if token_major_assignments_per_token.is_some() {
             &self.token_major_combine_pipeline
         } else {
@@ -348,7 +348,7 @@ impl MetalMoe {
     pub(crate) fn encode_topk_combine_residual(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         shared: &Buffer,
         shared_len: usize,
         residual: &Buffer,
@@ -398,19 +398,18 @@ impl MetalMoe {
             "MoE top-k combine expert weights",
         )?;
 
-        let output = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(token_count)
-                .map_err(|_| Error::backend("MoE top-k token count exceeds Metal u32 limit"))?,
-        )?;
-        let hidden_size_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(hidden_size)
-                .map_err(|_| Error::backend("MoE top-k hidden size exceeds Metal u32 limit"))?,
-        )?;
-        let top_k_buffer = u32_scalar_buffer(
-            device,
+        let output = self.arena.empty_f32(output_len)?;
+        let token_count_buffer =
+            self.arena
+                .u32(u32::try_from(token_count).map_err(|_| {
+                    Error::backend("MoE top-k token count exceeds Metal u32 limit")
+                })?)?;
+        let hidden_size_buffer =
+            self.arena
+                .u32(u32::try_from(hidden_size).map_err(|_| {
+                    Error::backend("MoE top-k hidden size exceeds Metal u32 limit")
+                })?)?;
+        let top_k_buffer = self.arena.u32(
             u32::try_from(top_k)
                 .map_err(|_| Error::backend("MoE top-k width exceeds Metal u32 limit"))?,
         )?;
@@ -487,27 +486,24 @@ impl MetalMoe {
         let output_len = token_count
             .checked_mul(top_k)
             .ok_or_else(|| Error::backend("MoE router top-k output length overflow"))?;
-        let expert_ids_buffer = empty_u32_buffer(device, output_len)?;
-        let expert_weights_buffer = empty_f32_buffer(device, output_len)?;
-        let token_indices_buffer = empty_u32_buffer(device, output_len)?;
+        let expert_ids_buffer = self.arena.empty_u32(output_len)?;
+        let expert_weights_buffer = self.arena.empty_f32(output_len)?;
+        let token_indices_buffer = self.arena.empty_u32(output_len)?;
         let correction_bias_buffer = f32_buffer(device, correction_bias)?;
-        let token_count_buffer = u32_scalar_buffer(
-            device,
+        let token_count_buffer = self.arena.u32(
             u32::try_from(token_count)
                 .map_err(|_| Error::backend("MoE router token_count exceeds Metal u32 limit"))?,
         )?;
-        let expert_count_buffer = u32_scalar_buffer(
-            device,
-            u32::try_from(expert_count)
-                .map_err(|_| Error::backend("MoE router expert_count exceeds Metal u32 limit"))?,
-        )?;
-        let top_k_buffer = u32_scalar_buffer(
-            device,
+        let expert_count_buffer =
+            self.arena.u32(u32::try_from(expert_count).map_err(|_| {
+                Error::backend("MoE router expert_count exceeds Metal u32 limit")
+            })?)?;
+        let top_k_buffer = self.arena.u32(
             u32::try_from(top_k)
                 .map_err(|_| Error::backend("MoE router top_k exceeds Metal u32 limit"))?,
         )?;
-        let norm_topk_prob_buffer = u32_scalar_buffer(device, u32::from(norm_topk_prob))?;
-        let routed_scaling_factor_buffer = f32_scalar_buffer(device, routed_scaling_factor)?;
+        let norm_topk_prob_buffer = self.arena.u32(u32::from(norm_topk_prob))?;
+        let routed_scaling_factor_buffer = self.arena.f32(routed_scaling_factor)?;
 
         encode_1d(
             command_buffer,

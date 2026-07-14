@@ -12,8 +12,8 @@ use common::{Error, Result as InfernoResult};
 use config::{load_config, load_generation_config, Config};
 use gguf::GgufFile;
 use model::{
-    antirez_q2_artifact, enable_layer_profile, FfnIndex, Index, IndexSummary, Model,
-    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    antirez_q2_artifact, enable_layer_profile, validate_routing_policy, FfnIndex, Index,
+    IndexSummary, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_telemetry, enable_memory_telemetry_file, enable_q2_runtime_profile,
@@ -47,6 +47,7 @@ pub fn run(
     let config = load_config(&discovered_config)?;
     let artifact = resolve_q2_artifact(model_path)?;
     let gguf = GgufFile::open(&artifact.gguf_path)?;
+    validate_routing_policy(&config, &gguf)?;
     let readiness = load_q2_readiness(&gguf, &artifact, &config)?;
 
     let tokenizer = Tokenizer::from_file(&discovered_tokenizer)?;
@@ -132,7 +133,7 @@ pub fn run(
         },
     )?;
     let throughput_report = throughput
-        .finish(encoded.token_ids.len())
+        .finish(encoded.token_ids.len(), config.experts_per_token)
         .with_cache_metrics(backend.expert_cache_metrics()?, generation_report.kv_cache);
     stdout.write_all(b"\n")?;
     if measure_tokens_per_second || throughput_file.is_some() {
@@ -164,9 +165,10 @@ fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
-        "inferno throughput: prompt_tokens={} generated_tokens={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_ssd_read_gb={:.3} expert_cache_allocated_gb={:.3} expert_cache_capacity_gb={:.3} kv_lookups={} kv_hits={} kv_misses={} kv_hit_rate={:.4} kv_miss_rate={:.4} kv_selected_rows={} kv_ssd_read_gb={:.3} hot_kv_gb={:.3} cold_kv_gb={:.3}",
+        "inferno throughput: prompt_tokens={} generated_tokens={} routed_experts_per_token={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_ssd_read_gb={:.3} expert_cache_allocated_gb={:.3} expert_cache_capacity_gb={:.3} kv_lookups={} kv_hits={} kv_misses={} kv_hit_rate={:.4} kv_miss_rate={:.4} kv_selected_rows={} kv_ssd_read_gb={:.3} hot_kv_gb={:.3} cold_kv_gb={:.3}",
         report.prompt_tokens,
         report.generated_tokens,
+        report.routed_experts_per_token,
         report.total_seconds,
         report.total_tokens_per_second,
         report.time_to_first_token_seconds,
@@ -239,9 +241,10 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
     }
     writeln!(
         file,
-        "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}",
+        "{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}",
         report.prompt_tokens,
         report.generated_tokens,
+        report.routed_experts_per_token,
         report.total_seconds,
         report.total_tokens_per_second,
         report.time_to_first_token_seconds,
@@ -274,7 +277,7 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
     })
 }
 
-const THROUGHPUT_REPORT_HEADER: &str = "prompt_tokens\tgenerated_tokens\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_ssd_read_gb\texpert_cache_allocated_gb\texpert_cache_capacity_gb\tkv_lookups\tkv_hits\tkv_misses\tkv_hit_rate\tkv_miss_rate\tkv_selected_rows\tkv_ssd_read_gb\thot_kv_gb\tcold_kv_gb";
+const THROUGHPUT_REPORT_HEADER: &str = "prompt_tokens\tgenerated_tokens\trouted_experts_per_token\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_ssd_read_gb\texpert_cache_allocated_gb\texpert_cache_capacity_gb\tkv_lookups\tkv_hits\tkv_misses\tkv_hit_rate\tkv_miss_rate\tkv_selected_rows\tkv_ssd_read_gb\thot_kv_gb\tcold_kv_gb";
 
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
@@ -376,9 +379,10 @@ impl ThroughputRecorder {
         self.token_offsets.push(self.started_at.elapsed());
     }
 
-    fn finish(self, prompt_tokens: usize) -> ThroughputReport {
+    fn finish(self, prompt_tokens: usize, routed_experts_per_token: usize) -> ThroughputReport {
         ThroughputReport::from_token_offsets(
             prompt_tokens,
+            routed_experts_per_token,
             self.started_at.elapsed(),
             &self.token_offsets,
         )
@@ -389,6 +393,7 @@ impl ThroughputRecorder {
 struct ThroughputReport {
     prompt_tokens: usize,
     generated_tokens: usize,
+    routed_experts_per_token: usize,
     total_seconds: f64,
     total_tokens_per_second: f64,
     time_to_first_token_seconds: f64,
@@ -405,6 +410,7 @@ struct ThroughputReport {
 impl ThroughputReport {
     fn from_token_offsets(
         prompt_tokens: usize,
+        routed_experts_per_token: usize,
         total_elapsed: Duration,
         token_offsets: &[Duration],
     ) -> Self {
@@ -439,6 +445,7 @@ impl ThroughputReport {
         Self {
             prompt_tokens,
             generated_tokens,
+            routed_experts_per_token,
             total_seconds,
             total_tokens_per_second,
             time_to_first_token_seconds,
@@ -740,6 +747,7 @@ mod tests {
     fn throughput_report_separates_first_token_from_decode_rate() {
         let report = ThroughputReport::from_token_offsets(
             5,
+            8,
             Duration::from_secs(10),
             &[
                 Duration::from_secs(4),
@@ -751,6 +759,7 @@ mod tests {
 
         assert_eq!(report.prompt_tokens, 5);
         assert_eq!(report.generated_tokens, 4);
+        assert_eq!(report.routed_experts_per_token, 8);
         assert_eq!(report.total_seconds, 10.0);
         assert_eq!(report.total_tokens_per_second, 0.4);
         assert_eq!(report.time_to_first_token_seconds, 4.0);
@@ -766,6 +775,7 @@ mod tests {
     fn throughput_report_handles_single_generated_token() {
         let report = ThroughputReport::from_token_offsets(
             3,
+            8,
             Duration::from_secs(5),
             &[Duration::from_secs(5)],
         );
@@ -786,6 +796,7 @@ mod tests {
         let path = dir.join("throughput.tsv");
         let report = ThroughputReport::from_token_offsets(
             2,
+            8,
             Duration::from_secs(2),
             &[Duration::from_secs(1)],
         );
@@ -812,6 +823,7 @@ mod tests {
         fs::write(&path, "prompt_tokens\tgenerated_tokens\n").unwrap();
         let report = ThroughputReport::from_token_offsets(
             2,
+            8,
             Duration::from_secs(2),
             &[Duration::from_secs(1)],
         );

@@ -3,10 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, require_f32_capacity,
-        u32_scalar_buffer,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity},
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -17,6 +15,7 @@ const ROPE_SLICE_KERNEL: &str = "rope_slice_f32_kernel";
 
 pub(crate) struct MetalRope {
     pipeline: ComputePipelineState,
+    arena: MetalArena,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,9 +31,10 @@ pub struct MetalRopeReport {
 }
 
 impl MetalRope {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
             pipeline: compute_pipeline(device, library, ROPE_SLICE_KERNEL)?,
+            arena,
         })
     }
 
@@ -72,13 +72,13 @@ impl MetalRope {
             .map_err(|_| Error::backend("RoPE position_offset exceeds Metal u32 limit"))?;
 
         let input_buffer = f32_buffer(device, input)?;
-        let output_buffer = empty_f32_buffer(device, input.len())?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
-        let rope_dim_buffer = u32_scalar_buffer(device, rope_dim_u32)?;
-        let position_offset_buffer = u32_scalar_buffer(device, position_offset_u32)?;
-        let theta_buffer = f32_scalar_buffer(device, theta)?;
+        let output_buffer = self.arena.empty_f32(input.len())?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let head_count_buffer = self.arena.u32(head_count_u32)?;
+        let rope_dim_buffer = self.arena.u32(rope_dim_u32)?;
+        let position_offset_buffer = self.arena.u32(position_offset_u32)?;
+        let theta_buffer = self.arena.f32(theta)?;
 
         trace!(
             target: "inferno::metal",
@@ -128,7 +128,7 @@ impl MetalRope {
     pub(crate) fn encode(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         input_len: usize,
         batch_count: usize,
@@ -160,13 +160,13 @@ impl MetalRope {
         let position_offset_u32 = u32::try_from(position_offset)
             .map_err(|_| Error::backend("RoPE position_offset exceeds Metal u32 limit"))?;
 
-        let output_buffer = empty_f32_buffer(device, input_len)?;
-        let batch_count_buffer = u32_scalar_buffer(device, batch_count_u32)?;
-        let token_count_buffer = u32_scalar_buffer(device, token_count_u32)?;
-        let head_count_buffer = u32_scalar_buffer(device, head_count_u32)?;
-        let rope_dim_buffer = u32_scalar_buffer(device, rope_dim_u32)?;
-        let position_offset_buffer = u32_scalar_buffer(device, position_offset_u32)?;
-        let theta_buffer = f32_scalar_buffer(device, theta)?;
+        let output_buffer = self.arena.empty_f32(input_len)?;
+        let batch_count_buffer = self.arena.u32(batch_count_u32)?;
+        let token_count_buffer = self.arena.u32(token_count_u32)?;
+        let head_count_buffer = self.arena.u32(head_count_u32)?;
+        let rope_dim_buffer = self.arena.u32(rope_dim_u32)?;
+        let position_offset_buffer = self.arena.u32(position_offset_u32)?;
+        let theta_buffer = self.arena.f32(theta)?;
 
         trace!(
             target: "inferno::metal",

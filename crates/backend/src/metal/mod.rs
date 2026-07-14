@@ -1,4 +1,5 @@
 mod activation;
+mod arena;
 mod attention;
 mod batch;
 mod buffers;

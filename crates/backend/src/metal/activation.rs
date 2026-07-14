@@ -3,9 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, f32_buffer, read_f32_buffer, require_f32_capacity, u32_scalar_buffer,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity},
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -18,6 +17,7 @@ const ADD_KERNEL: &str = "add_f32_kernel";
 pub(crate) struct MetalActivation {
     swiglu_pipeline: ComputePipelineState,
     add_pipeline: ComputePipelineState,
+    arena: MetalArena,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,10 +35,11 @@ pub struct MetalAddReport {
 }
 
 impl MetalActivation {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
             swiglu_pipeline: compute_pipeline(device, library, SWIGLU_KERNEL)?,
             add_pipeline: compute_pipeline(device, library, ADD_KERNEL)?,
+            arena,
         })
     }
 
@@ -57,8 +58,8 @@ impl MetalActivation {
 
         let gate_buffer = f32_buffer(device, gate)?;
         let up_buffer = f32_buffer(device, up)?;
-        let output_buffer = empty_f32_buffer(device, value_count)?;
-        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+        let output_buffer = self.arena.empty_f32(value_count)?;
+        let value_count_buffer = self.arena.u32(value_count_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -102,8 +103,8 @@ impl MetalActivation {
 
         let lhs_buffer = f32_buffer(device, lhs)?;
         let rhs_buffer = f32_buffer(device, rhs)?;
-        let output_buffer = empty_f32_buffer(device, value_count)?;
-        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+        let output_buffer = self.arena.empty_f32(value_count)?;
+        let value_count_buffer = self.arena.u32(value_count_u32)?;
 
         trace!(
             target: "inferno::metal",
@@ -138,7 +139,7 @@ impl MetalActivation {
     pub(crate) fn encode_add(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         lhs: &Buffer,
         lhs_len: usize,
         rhs: &Buffer,
@@ -157,8 +158,8 @@ impl MetalActivation {
 
         let value_count_u32 = u32::try_from(lhs_len)
             .map_err(|_| Error::backend("add value_count exceeds Metal u32 limit"))?;
-        let output_buffer = empty_f32_buffer(device, lhs_len)?;
-        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+        let output_buffer = self.arena.empty_f32(lhs_len)?;
+        let value_count_buffer = self.arena.u32(value_count_u32)?;
 
         encode_1d(
             command_buffer,
@@ -174,7 +175,7 @@ impl MetalActivation {
     pub(crate) fn encode_swiglu(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         gate: &Buffer,
         gate_len: usize,
         up: &Buffer,
@@ -193,8 +194,8 @@ impl MetalActivation {
 
         let value_count_u32 = u32::try_from(gate_len)
             .map_err(|_| Error::backend("SwiGLU value_count exceeds Metal u32 limit"))?;
-        let output_buffer = empty_f32_buffer(device, gate_len)?;
-        let value_count_buffer = u32_scalar_buffer(device, value_count_u32)?;
+        let output_buffer = self.arena.empty_f32(gate_len)?;
+        let value_count_buffer = self.arena.u32(value_count_u32)?;
 
         encode_1d(
             command_buffer,

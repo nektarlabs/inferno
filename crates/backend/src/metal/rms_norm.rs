@@ -3,10 +3,8 @@ use common::{Error, Result};
 use tracing::trace;
 
 use super::{
-    buffers::{
-        empty_f32_buffer, f32_buffer, f32_scalar_buffer, read_f32_buffer, require_f32_capacity,
-        u32_scalar_buffer, ImmutableF32BufferCache,
-    },
+    arena::MetalArena,
+    buffers::{f32_buffer, read_f32_buffer, require_f32_capacity, ImmutableF32BufferCache},
     command::{dispatch_1d, encode_1d},
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -20,6 +18,7 @@ const RMS_NORM_SIMD_LANES: usize = 32;
 pub(crate) struct MetalRmsNorm {
     pipeline: ComputePipelineState,
     weight_buffers: ImmutableF32BufferCache,
+    arena: MetalArena,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,10 +46,11 @@ pub(crate) struct MetalRmsNormPrepared {
 }
 
 impl MetalRmsNorm {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
             pipeline: compute_pipeline(device, library, RMS_NORM_KERNEL)?,
             weight_buffers: ImmutableF32BufferCache::default(),
+            arena,
         })
     }
 
@@ -137,10 +137,10 @@ impl MetalRmsNorm {
         Ok(MetalRmsNormPrepared {
             input_buffer: f32_buffer(device, input)?,
             weight_buffer: f32_buffer(device, weight)?,
-            output_buffer: empty_f32_buffer(device, input.len())?,
-            rows_buffer: u32_scalar_buffer(device, rows_u32)?,
-            hidden_size_buffer: u32_scalar_buffer(device, hidden_size_u32)?,
-            eps_buffer: f32_scalar_buffer(device, eps)?,
+            output_buffer: self.arena.empty_f32(input.len())?,
+            rows_buffer: self.arena.u32(rows_u32)?,
+            hidden_size_buffer: self.arena.u32(hidden_size_u32)?,
+            eps_buffer: self.arena.f32(eps)?,
             input_len: input.len(),
         })
     }
@@ -173,10 +173,10 @@ impl MetalRmsNorm {
         // norm in every token. The eager reference path still copies its
         // potentially short-lived test inputs.
         let weight_buffer = self.weight_buffers.get(device, weight)?;
-        let output_buffer = empty_f32_buffer(device, input_len)?;
-        let rows_buffer = u32_scalar_buffer(device, rows_u32)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, hidden_size_u32)?;
-        let eps_buffer = f32_scalar_buffer(device, eps)?;
+        let output_buffer = self.arena.empty_f32(input_len)?;
+        let rows_buffer = self.arena.u32(rows_u32)?;
+        let hidden_size_buffer = self.arena.u32(hidden_size_u32)?;
+        let eps_buffer = self.arena.f32(eps)?;
         let physical_threads = rms_norm_threads(&self.pipeline, rows)?;
 
         trace!(

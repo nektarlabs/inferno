@@ -38,6 +38,10 @@ The runtime is being shaped around one hard target first: the Antirez GLM-5.2 Q2
 GGUF artifact, paged KV cache by default, sparse MoE routing, and Metal-focused
 execution for the bottlenecks that matter.
 
+The artifact declares eight routed experts per token, and Inferno executes all
+eight. Startup fails if `config.json` or the GGUF metadata declares a different
+routing count, preventing an accidental quality-changing approximation.
+
 This is not a general model zoo. Inferno keeps the inference path small,
 explicit, and optimized for Q2 GLM-5.2-style execution so it can become fast
 enough for real local use while staying simple enough to audit end to end. That
@@ -103,9 +107,9 @@ reconstruct F32 rows before upload and remain a separate optimization target.
 ### Routed expert cache
 
 The 256 routed experts per sparse layer remain in the GGUF artifact on SSD.
-Inferno caches selected Q2 gate, up, and down matrices in shared Metal slabs.
-The default is 16 expert slots per routed layer, approximately 14.9 GB for the
-75 main sparse layers.
+Inferno executes the artifact's exact top-8 routing and caches selected Q2 gate,
+up, and down matrices in shared Metal slabs. The default is 16 expert slots per
+routed layer, approximately 14.9 GB for the 75 main sparse layers.
 
 Each layer uses a segmented LRU:
 
@@ -151,27 +155,33 @@ machines, thermal states, or filesystem-cache conditions.
 Test conditions:
 
 ```txt
-date:             2026-07-13
-revision:         cbf1a78 plus staged expert I/O
+date:             2026-07-14
 hardware:         Apple Silicon MacBook Pro, 64 GB unified memory
 build:            cargo build --release
 model:            GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
 prompt:           "Hi" (13 tokens after chat-template rendering)
 generated tokens: 8
+MoE execution:    top-8, matching the artifact
 cache settings:   defaults; speculative MTP disabled
 ```
 
-| Runtime | Run | Time to first token | Decode throughput | End-to-end throughput |
-| --- | --- | ---: | ---: | ---: |
-| Previous ready-first path | Warm baseline | 28.351 s | **1.447 tokens/s** | 0.241 tokens/s |
-| Staged gate/up/down path | Measurement 1 | 30.106 s | **1.505 tokens/s** | 0.230 tokens/s |
-| Staged gate/up/down path | Measurement 2 | 31.850 s | **1.493 tokens/s** | 0.219 tokens/s |
+| Engine metric | Current median |
+| --- | ---: |
+| Time to first token | 57.182 s |
+| Decode throughput | **0.430 tokens/s** |
+| End-to-end throughput | **0.109 tokens/s** |
 
-The two staged measurements average **1.499 decode tokens/s**. All three runs
-reported an expert-cache hit rate of 46.71%, 14.864 GB of expert-cache
-capacity, and 79.210 GB of logical expert reads. For this short prompt, all KV
-remained resident: the measured KV hit rate was 100%, with 0 GB read from the
-KV SSD tier.
+These are the median results from three complete Inferno runs. Decode
+throughput measures generation after the first token and is the primary engine
+speed reported by this project. The current measured Inferno speed is therefore
+**0.430 tokens/s** for this test workload.
+
+Individual top-8 decode results ranged from 0.357 to 0.573 tokens/s. Every run
+performed 12,000 routed-expert requests, reported a 41.56% expert-cache hit
+rate, and read 86.865 GB of logical expert data. The configured expert-cache
+capacity was 14.864 GB. For this short prompt, all KV remained resident: KV hit
+rate was 100%, with 0 GB read from the KV SSD tier. These cache values are
+diagnostic measurements, not the engine throughput result.
 
 `Decode throughput` excludes prefill and the first generated token. It is the
 best measure of steady token generation. `End-to-end throughput` divides all
@@ -189,26 +199,31 @@ target/release/inferno generate \
   --throughput-file /tmp/inferno-throughput.tsv
 ```
 
-Run the command twice to compare cold and warm macOS filesystem-cache states.
-The TSV output preserves the full timing, expert-cache, KV-cache, and SSD-read
-metrics for later comparisons.
+Run the command at least three times to expose variation caused by macOS
+filesystem-cache state and system load. Compare medians rather than selecting
+the fastest run. The TSV output preserves the full timing, expert-cache,
+KV-cache, SSD-read, and routed-expert-count metrics for later comparisons.
+
+### Quality smoke checks
+
+Inferno loads the model's complete EOS list from `generation_config.json` and
+uses GLM's adjacent-pair RoPE layout. The exact top-8 path still requires a
+repeatable reference-logit comparison and a larger evaluation suite before
+quality can be considered validated.
 
 ### Current throughput limit
 
 The GGUF directory contains approximately 20.49 GB of always-active Q8 weights,
-0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. On the first
-measured decode step, 291 of 600 expert requests missed the Metal cache. Those
-misses required 3.60 GB of expert data and about 0.61 seconds of SSD loading in
-synchronized profiling mode.
+0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. In each
+current top-8 benchmark, 7,013 of 12,000 expert requests missed the Metal cache.
+Those misses required 86.865 GB of logical expert reads over the complete run.
 
 A three-token-per-second target allows only 0.333 seconds per token. At the
-measured expert-read rate, it would require either more than 10.8 GB/s of
-sustained selected-expert reads or approximately 73% expert-cache hits before
-accounting for attention, routing, and Metal compute. The current 64 GB memory
-budget and observed routing sequence do not provide that hit rate. Reaching the
-target therefore requires a change that reduces expert bytes per accepted
-token, such as a validated lower-bit expert format or effective speculative
-decoding; KV tuning alone cannot close this short-context gap.
+current median of 0.430 decode tokens/s, one token takes approximately 2.326
+seconds. The short-prompt KV hit rate is already 100%, so the immediate limit is
+still the routed-expert path rather than KV capacity. Further performance work
+must reduce or amortize expert misses while preserving the artifact's exact
+top-8 routing behavior.
 
 ## Model
 

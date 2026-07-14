@@ -55,10 +55,6 @@ pub(crate) fn f32_buffer_no_copy(device: &Device, values: &[f32]) -> Result<Buff
     ))
 }
 
-pub(crate) fn u32_scalar_buffer(device: &Device, value: u32) -> Result<Buffer> {
-    buffer_with_data(device, &[value])
-}
-
 pub(crate) fn u32_buffer(device: &Device, values: &[u32]) -> Result<Buffer> {
     buffer_with_data(device, values)
 }
@@ -82,10 +78,6 @@ pub(crate) fn empty_u8_buffer(device: &Device, len: usize) -> Result<Buffer> {
 pub(crate) fn empty_u32_buffer(device: &Device, len: usize) -> Result<Buffer> {
     let bytes = byte_len::<u32>(len)?;
     Ok(device.new_buffer(bytes as u64, BUFFER_OPTIONS))
-}
-
-pub(crate) fn f32_scalar_buffer(device: &Device, value: f32) -> Result<Buffer> {
-    buffer_with_data(device, &[value])
 }
 
 pub(crate) fn empty_f32_buffer(device: &Device, len: usize) -> Result<Buffer> {

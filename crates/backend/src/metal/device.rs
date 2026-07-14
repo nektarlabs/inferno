@@ -5,6 +5,7 @@ use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, Error, PagedKvView, Result};
 
 use super::activation::MetalActivation;
+use super::arena::MetalArena;
 use super::attention::{
     MetalAttentionCausalSoftmax, MetalAttentionScores, MetalAttentionValues, MetalDecodeAttention,
 };
@@ -45,19 +46,21 @@ impl Metal {
         let device = select_native_device()?;
         let queue = device.new_command_queue();
         let library = MetalLibrary::compile(&device)?;
-        let attention_scores = MetalAttentionScores::new(&device, &library)?;
-        let attention_values = MetalAttentionValues::new(&device, &library)?;
-        let attention_causal_softmax = MetalAttentionCausalSoftmax::new(&device, &library)?;
-        let decode_attention = MetalDecodeAttention::new(&device, &library)?;
-        let activation = MetalActivation::new(&device, &library)?;
-        let cast = MetalCast::new(&device, &library)?;
-        let layout = MetalLayout::new(&device, &library)?;
-        let matmul = MetalMatmul::new(&device, &library)?;
-        let q2_matvec = MetalQ2Matvec::new(&device, &library)?;
-        let rms_norm = MetalRmsNorm::new(&device, &library)?;
-        let rope = MetalRope::new(&device, &library)?;
-        let moe = MetalMoe::new(&device, &library)?;
-        let dsa = MetalDsa::new(&device, &library)?;
+        let arena = MetalArena::new(&device)?;
+        let attention_scores = MetalAttentionScores::new(&device, &library, arena.clone())?;
+        let attention_values = MetalAttentionValues::new(&device, &library, arena.clone())?;
+        let attention_causal_softmax =
+            MetalAttentionCausalSoftmax::new(&device, &library, arena.clone())?;
+        let decode_attention = MetalDecodeAttention::new(&device, &library, arena.clone())?;
+        let activation = MetalActivation::new(&device, &library, arena.clone())?;
+        let cast = MetalCast::new(&device, &library, arena.clone())?;
+        let layout = MetalLayout::new(&device, &library, arena.clone())?;
+        let matmul = MetalMatmul::new(&device, &library, arena.clone())?;
+        let q2_matvec = MetalQ2Matvec::new(&device, &library, arena.clone())?;
+        let rms_norm = MetalRmsNorm::new(&device, &library, arena.clone())?;
+        let rope = MetalRope::new(&device, &library, arena.clone())?;
+        let moe = MetalMoe::new(&device, &library, arena.clone())?;
+        let dsa = MetalDsa::new(&device, &library, arena)?;
 
         Ok(Self {
             device,

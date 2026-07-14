@@ -33,6 +33,7 @@ mod moe_ffn;
 mod moe_router;
 mod mtp;
 mod output_head;
+mod policy;
 mod profile;
 mod rms_norm;
 mod sparse_block;
@@ -78,6 +79,7 @@ pub(crate) use mtp::MtpHead;
 pub use mtp::{MtpDeviceDraftOutput, MtpDraftOutput, MtpLoadReport};
 pub use output_head::{GreedyReport, LogitsReport, OutputHeadLoadReport};
 pub(crate) use output_head::{LogitsOutput, OutputHead};
+pub use policy::{validate_routing_policy, ROUTED_EXPERTS_PER_TOKEN};
 pub use profile::{
     disable_token_cost_profile, enable_token_cost_profile, take_token_cost_profile,
     TokenModelProfile,

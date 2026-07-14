@@ -2,9 +2,9 @@ use ::metal::{Buffer, CommandBufferRef, ComputePipelineState, Device};
 use common::{Error, Result};
 
 use super::{
+    arena::MetalArena,
     buffers::{
-        empty_f16_buffer, empty_f32_buffer, read_f16_buffer_as_f32, read_f32_buffer,
-        require_byte_capacity, require_f32_capacity, u32_scalar_buffer,
+        read_f16_buffer_as_f32, read_f32_buffer, require_byte_capacity, require_f32_capacity,
     },
     command::encode_1d,
     library::MetalLibrary,
@@ -17,25 +17,27 @@ const Q8_ROWS_TO_F32_KERNEL: &str = "q8_rows_to_f32_kernel";
 pub(crate) struct MetalCast {
     f32_to_f16: ComputePipelineState,
     q8_rows_to_f32: ComputePipelineState,
+    arena: MetalArena,
 }
 
 impl MetalCast {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
             f32_to_f16: compute_pipeline(device, library, F32_TO_F16_KERNEL)?,
             q8_rows_to_f32: compute_pipeline(device, library, Q8_ROWS_TO_F32_KERNEL)?,
+            arena,
         })
     }
 
     pub(crate) fn encode_f32_to_f16(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         input: &Buffer,
         len: usize,
     ) -> Result<Buffer> {
-        let output = empty_f16_buffer(device, len)?;
-        let len_buffer = u32_scalar_len(device, len, "batched f32 to f16 cast")?;
+        let output = self.arena.empty_f16(len)?;
+        let len_buffer = u32_scalar_len(&self.arena, len, "batched f32 to f16 cast")?;
         require_f32_capacity(input, len, "batched f32 to f16 input")?;
         encode_1d(
             command_buffer,
@@ -49,7 +51,7 @@ impl MetalCast {
     pub(crate) fn encode_q8_rows_to_f32(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         payload: &Buffer,
         payload_len: usize,
         row_count: usize,
@@ -59,9 +61,9 @@ impl MetalCast {
         let output_len = row_count
             .checked_mul(dim)
             .ok_or_else(|| Error::backend("Q8 row f32 output length overflow"))?;
-        let output = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_len(device, row_count, "Q8 row decode row_count")?;
-        let dim_buffer = u32_scalar_len(device, dim, "Q8 row decode dim")?;
+        let output = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = u32_scalar_len(&self.arena, row_count, "Q8 row decode row_count")?;
+        let dim_buffer = u32_scalar_len(&self.arena, dim, "Q8 row decode dim")?;
         encode_1d(
             command_buffer,
             &self.q8_rows_to_f32,
@@ -80,10 +82,10 @@ impl MetalCast {
     }
 }
 
-fn u32_scalar_len(device: &Device, len: usize, context: &str) -> Result<Buffer> {
+fn u32_scalar_len(arena: &MetalArena, len: usize, context: &str) -> Result<Buffer> {
     let len = u32::try_from(len)
         .map_err(|_| Error::backend(format!("{context} length exceeds Metal u32 limit")))?;
-    u32_scalar_buffer(device, len)
+    arena.u32(len)
 }
 
 fn validate_q8_rows_payload(

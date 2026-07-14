@@ -2,10 +2,8 @@ use ::metal::{Buffer, CommandBufferRef, ComputePipelineState, Device};
 use common::{validate_exact_shape, Error, Result};
 
 use super::{
-    buffers::{
-        empty_f32_buffer, empty_u32_buffer, f32_scalar_buffer, read_u32_buffer,
-        require_f32_capacity, u32_scalar_buffer, ImmutableF32BufferCache,
-    },
+    arena::MetalArena,
+    buffers::{read_u32_buffer, require_f32_capacity, ImmutableF32BufferCache},
     command::encode_1d,
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -19,6 +17,7 @@ const INDEXER_LAYER_NORM_EPS: f32 = 1e-6;
 const MAX_DSA_TOP_K: usize = 2048;
 
 pub(crate) struct MetalDsa {
+    arena: MetalArena,
     key_norm_rope_pipeline: ComputePipelineState,
     query_weights_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
@@ -33,8 +32,9 @@ pub(crate) struct MetalDsaTopKBuffers {
 }
 
 impl MetalDsa {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             key_norm_rope_pipeline: compute_pipeline(device, library, DSA_KEY_NORM_ROPE_KERNEL)?,
             query_weights_pipeline: compute_pipeline(device, library, DSA_QUERY_WEIGHTS_KERNEL)?,
             scores_pipeline: compute_pipeline(device, library, DSA_SCORES_KERNEL)?,
@@ -78,20 +78,21 @@ impl MetalDsa {
         validate_exact_shape("DSA raw key len", &[raw_key_len], &[expected_len])?;
         require_f32_capacity(raw_key, raw_key_len, "DSA raw key")?;
 
-        let output = empty_f32_buffer(device, expected_len)?;
+        let output = self.arena.empty_f32(expected_len)?;
         let weight = self.weight_buffers.get(device, weight)?;
         let bias = self.weight_buffers.get(device, bias)?;
         let row_count = batch
             .checked_mul(tokens)
             .ok_or_else(|| Error::backend("DSA key norm/RoPE row count overflow"))?;
-        let row_count_buffer = u32_scalar_buffer(device, to_u32(row_count, "DSA row_count")?)?;
-        let token_count_buffer = u32_scalar_buffer(device, to_u32(tokens, "DSA token_count")?)?;
-        let head_dim_buffer = u32_scalar_buffer(device, to_u32(head_dim, "DSA head_dim")?)?;
-        let rope_dim_buffer = u32_scalar_buffer(device, to_u32(rope_dim, "DSA rope_dim")?)?;
-        let position_offset_buffer =
-            u32_scalar_buffer(device, to_u32(position_offset, "DSA position_offset")?)?;
-        let theta_buffer = f32_scalar_buffer(device, theta)?;
-        let eps_buffer = f32_scalar_buffer(device, INDEXER_LAYER_NORM_EPS)?;
+        let row_count_buffer = self.arena.u32(to_u32(row_count, "DSA row_count")?)?;
+        let token_count_buffer = self.arena.u32(to_u32(tokens, "DSA token_count")?)?;
+        let head_dim_buffer = self.arena.u32(to_u32(head_dim, "DSA head_dim")?)?;
+        let rope_dim_buffer = self.arena.u32(to_u32(rope_dim, "DSA rope_dim")?)?;
+        let position_offset_buffer = self
+            .arena
+            .u32(to_u32(position_offset, "DSA position_offset")?)?;
+        let theta_buffer = self.arena.f32(theta)?;
+        let eps_buffer = self.arena.f32(INDEXER_LAYER_NORM_EPS)?;
 
         encode_1d(
             command_buffer,
@@ -212,15 +213,13 @@ impl MetalDsa {
         )?;
 
         let weights_proj = self.weight_buffers.get(device, weights_proj)?;
-        let q_output = empty_f32_buffer(device, expected_q)?;
-        let weights = empty_f32_buffer(
-            device,
+        let q_output = self.arena.empty_f32(expected_q)?;
+        let weights = self.arena.empty_f32(
             batch
                 .checked_mul(heads)
                 .ok_or_else(|| Error::backend("DSA decode weights length overflow"))?,
         )?;
-        let scores = empty_f32_buffer(
-            device,
+        let scores = self.arena.empty_f32(
             batch
                 .checked_mul(key_tokens)
                 .ok_or_else(|| Error::backend("DSA decode scores length overflow"))?,
@@ -228,16 +227,17 @@ impl MetalDsa {
         let output_len = batch
             .checked_mul(top_k)
             .ok_or_else(|| Error::backend("DSA top-k output length overflow"))?;
-        let token_ids = empty_u32_buffer(device, output_len)?;
+        let token_ids = self.arena.empty_u32(output_len)?;
 
-        let batch_buffer = u32_scalar_buffer(device, to_u32(batch, "DSA batch")?)?;
-        let hidden_size_buffer = u32_scalar_buffer(device, to_u32(hidden_size, "DSA hidden")?)?;
-        let heads_buffer = u32_scalar_buffer(device, to_u32(heads, "DSA heads")?)?;
-        let head_dim_buffer = u32_scalar_buffer(device, to_u32(head_dim, "DSA head_dim")?)?;
-        let rope_dim_buffer = u32_scalar_buffer(device, to_u32(rope_dim, "DSA rope_dim")?)?;
-        let position_offset_buffer =
-            u32_scalar_buffer(device, to_u32(position_offset, "DSA position_offset")?)?;
-        let theta_buffer = f32_scalar_buffer(device, theta)?;
+        let batch_buffer = self.arena.u32(to_u32(batch, "DSA batch")?)?;
+        let hidden_size_buffer = self.arena.u32(to_u32(hidden_size, "DSA hidden")?)?;
+        let heads_buffer = self.arena.u32(to_u32(heads, "DSA heads")?)?;
+        let head_dim_buffer = self.arena.u32(to_u32(head_dim, "DSA head_dim")?)?;
+        let rope_dim_buffer = self.arena.u32(to_u32(rope_dim, "DSA rope_dim")?)?;
+        let position_offset_buffer = self
+            .arena
+            .u32(to_u32(position_offset, "DSA position_offset")?)?;
+        let theta_buffer = self.arena.f32(theta)?;
 
         encode_1d(
             command_buffer,
@@ -261,8 +261,7 @@ impl MetalDsa {
                 .ok_or_else(|| Error::backend("DSA query thread count overflow"))?,
         )?;
 
-        let past_tokens_buffer =
-            u32_scalar_buffer(device, to_u32(past_tokens, "DSA past_tokens")?)?;
+        let past_tokens_buffer = self.arena.u32(to_u32(past_tokens, "DSA past_tokens")?)?;
         encode_1d(
             command_buffer,
             &self.scores_pipeline,
@@ -282,8 +281,8 @@ impl MetalDsa {
                 .ok_or_else(|| Error::backend("DSA score thread count overflow"))?,
         )?;
 
-        let key_tokens_buffer = u32_scalar_buffer(device, to_u32(key_tokens, "DSA key_tokens")?)?;
-        let top_k_buffer = u32_scalar_buffer(device, to_u32(top_k, "DSA top_k")?)?;
+        let key_tokens_buffer = self.arena.u32(to_u32(key_tokens, "DSA key_tokens")?)?;
+        let top_k_buffer = self.arena.u32(to_u32(top_k, "DSA top_k")?)?;
         encode_1d(
             command_buffer,
             &self.topk_pipeline,

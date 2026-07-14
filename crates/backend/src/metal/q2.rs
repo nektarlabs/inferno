@@ -23,10 +23,11 @@ use tracing::{debug, trace, warn};
 use crate::{ExpertCacheMetrics, Q2ExpertSource};
 
 use super::{
+    arena::MetalArena,
     buffers::{
         empty_f32_buffer, empty_u32_buffer, empty_u8_buffer, read_f32_buffer, read_u32_buffer,
-        require_byte_capacity, require_f32_capacity, u32_buffer, u32_scalar_buffer, u64_buffer,
-        u8_buffer_no_copy, write_f32_buffer, write_u32_buffer,
+        require_byte_capacity, require_f32_capacity, u32_buffer, u64_buffer, u8_buffer_no_copy,
+        write_f32_buffer, write_u32_buffer,
     },
     command::{
         dispatch_1d, dispatch_1d_many, encode_1d, encode_1d_threadgroups,
@@ -84,6 +85,7 @@ const ROUTED_EXPERT_READ_WORKERS: usize = 8;
 static EXPERT_CACHE_LOCK_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct MetalQ2Matvec {
+    arena: MetalArena,
     pipeline: ComputePipelineState,
     add_pipeline: ComputePipelineState,
     gate_up_swiglu_pipeline: ComputePipelineState,
@@ -363,8 +365,9 @@ struct ScratchBufferRef {
 }
 
 impl MetalQ2Matvec {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary) -> Result<Self> {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
+            arena,
             pipeline: compute_pipeline(device, library, Q2_K_MATVEC_KERNEL)?,
             add_pipeline: compute_pipeline(device, library, Q2_K_MATVEC_ADD_KERNEL)?,
             gate_up_swiglu_pipeline: compute_pipeline(device, library, Q2_K_GATE_UP_SWIGLU_KERNEL)?,
@@ -1406,14 +1409,13 @@ impl MetalQ2Matvec {
             QuantMatvecKind::Q80Transposed => &self.q8_0_transposed_pipeline,
         };
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -1436,10 +1438,9 @@ impl MetalQ2Matvec {
         ];
         if kind == QuantMatvecKind::Q80 {
             let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
-            let simdgroups_per_output_buffer = u32_scalar_buffer(
-                device,
-                matvec_u32(simdgroups_per_output, "simdgroups_per_output")?,
-            )?;
+            let simdgroups_per_output_buffer = self
+                .arena
+                .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
             encode_1d_threadgroups(
                 command_buffer,
                 pipeline,
@@ -1545,19 +1546,17 @@ impl MetalQ2Matvec {
         let physical_threads =
             q2_k_cooperative_threads(pipeline, output_len, "packed-head transposed matvec")?;
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let head_count_buffer = u32_scalar_buffer(device, matvec_u32(head_count, "head_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_input_row_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(blocks_per_input_row, "blocks_per_input_row")?,
-        )?;
-        let blocks_per_head_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_head, "blocks_per_head")?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let head_count_buffer = self.arena.u32(matvec_u32(head_count, "head_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_input_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_input_row, "blocks_per_input_row")?)?;
+        let blocks_per_head_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_head, "blocks_per_head")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -1648,17 +1647,17 @@ impl MetalQ2Matvec {
             "packed-head Q8_0 matvec",
         )?;
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let head_count_buffer = u32_scalar_buffer(device, matvec_u32(head_count, "head_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
-        let blocks_per_head_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_head, "blocks_per_head")?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let head_count_buffer = self.arena.u32(matvec_u32(head_count, "head_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let blocks_per_head_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_head, "blocks_per_head")?)?;
 
         encode_1d(
             command_buffer,
@@ -1711,14 +1710,13 @@ impl MetalQ2Matvec {
         require_f32_capacity(residual, residual_len, "Q2_K matvec add residual")?;
 
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -1776,18 +1774,16 @@ impl MetalQ2Matvec {
 
         let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
-        let simdgroups_per_output_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(simdgroups_per_output, "simdgroups_per_output")?,
-        )?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let simdgroups_per_output_buffer = self
+            .arena
+            .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
 
         encode_1d_threadgroups(
             command_buffer,
@@ -1877,21 +1873,17 @@ impl MetalQ2Matvec {
         let up_weight_buffer = self.weight_buffer(device, up_weights)?;
         let token_indices_buffer = u32_buffer(device, token_indices)?;
         let expert_ids_buffer = u32_buffer(device, expert_ids)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let token_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(gate_blocks, "blocks_per_row")?)?;
-        let expert_stride_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let token_count_buffer = self.arena.u32(matvec_u32(token_count, "token_count")?)?;
+        let assignment_count_buffer = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self.arena.u32(matvec_u32(gate_blocks, "blocks_per_row")?)?;
+        let expert_stride_buffer = self
+            .arena
+            .u32(matvec_u32(expert_stride_bytes, "expert_stride_bytes")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -1971,19 +1963,18 @@ impl MetalQ2Matvec {
 
         let weight_buffer = self.weight_buffer(device, weights)?;
         let expert_ids_buffer = u32_buffer(device, expert_ids)?;
-        let output_buffer = empty_f32_buffer(device, output_len)?;
-        let assignment_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
-        let expert_stride_buffer = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
+        let output_buffer = self.arena.empty_f32(output_len)?;
+        let assignment_count_buffer = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let expert_stride_buffer = self
+            .arena
+            .u32(matvec_u32(expert_stride_bytes, "expert_stride_bytes")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -2044,17 +2035,16 @@ impl MetalQ2Matvec {
         let argmax_threads = argmax_threads(&self.argmax_pipeline, "batched Q2_K greedy argmax")?;
 
         let weight_buffer = self.weight_buffer(device, weights)?;
-        let logits_buffer = empty_f32_buffer(device, output_len)?;
-        let token_id_buffer = empty_u32_buffer(device, 1)?;
-        let token_score_buffer = empty_f32_buffer(device, 1)?;
-        let row_count_buffer = u32_scalar_buffer(device, matvec_u32(row_count, "row_count")?)?;
-        let in_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features_buffer =
-            u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row_buffer =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row, "blocks_per_row")?)?;
-        let output_len_buffer = u32_scalar_buffer(device, matvec_u32(output_len, "output_len")?)?;
+        let logits_buffer = self.arena.empty_f32(output_len)?;
+        let token_id_buffer = self.arena.empty_u32(1)?;
+        let token_score_buffer = self.arena.empty_f32(1)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let output_len_buffer = self.arena.u32(matvec_u32(output_len, "output_len")?)?;
 
         trace!(
             target: "inferno::metal",
@@ -2095,7 +2085,7 @@ impl MetalQ2Matvec {
     pub(crate) fn encode_f32_argmax(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         scores: &Buffer,
         value_count: usize,
     ) -> Result<(Buffer, Buffer)> {
@@ -2104,10 +2094,9 @@ impl MetalQ2Matvec {
         }
         require_f32_capacity(scores, value_count, "f32 argmax scores")?;
         let argmax_threads = argmax_threads(&self.argmax_pipeline, "batched f32 greedy argmax")?;
-        let token_id_buffer = empty_u32_buffer(device, 1)?;
-        let token_score_buffer = empty_f32_buffer(device, 1)?;
-        let value_count_buffer =
-            u32_scalar_buffer(device, matvec_u32(value_count, "value_count")?)?;
+        let token_id_buffer = self.arena.empty_u32(1)?;
+        let token_score_buffer = self.arena.empty_f32(1)?;
+        let value_count_buffer = self.arena.u32(matvec_u32(value_count, "value_count")?)?;
 
         encode_1d(
             command_buffer,
@@ -2126,7 +2115,7 @@ impl MetalQ2Matvec {
     pub(crate) fn encode_f32_argmax_rows(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         scores: &Buffer,
         row_count: usize,
         row_width: usize,
@@ -2147,9 +2136,9 @@ impl MetalQ2Matvec {
         let physical_threads = row_count
             .checked_mul(threads_per_row)
             .ok_or_else(|| Error::backend("row-wise f32 argmax thread count overflow"))?;
-        let token_id_buffer = empty_u32_buffer(device, row_count)?;
-        let token_score_buffer = empty_f32_buffer(device, row_count)?;
-        let row_width_buffer = u32_scalar_buffer(device, matvec_u32(row_width, "row_width")?)?;
+        let token_id_buffer = self.arena.empty_u32(row_count)?;
+        let token_score_buffer = self.arena.empty_f32(row_count)?;
+        let row_width_buffer = self.arena.u32(matvec_u32(row_width, "row_width")?)?;
 
         encode_1d(
             command_buffer,
@@ -2397,8 +2386,8 @@ impl MetalQ2Matvec {
         let output_len = assignment_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("ready routed output length overflow"))?;
-        let gated = empty_f32_buffer(device, gated_len)?;
-        let output = empty_f32_buffer(device, output_len)?;
+        let gated = self.arena.empty_f32(gated_len)?;
+        let output = self.arena.empty_f32(output_len)?;
         let cached = groups
             .iter()
             .enumerate()
@@ -2882,7 +2871,7 @@ impl MetalQ2Matvec {
     fn encode_ready_gate_up_swiglu(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         gate_addresses: &Buffer,
         up_addresses: &Buffer,
         gate_resources: &[&Buffer],
@@ -2924,14 +2913,16 @@ impl MetalQ2Matvec {
             "ready Q2_K routed gate/up",
         )?;
         let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
-        let token_count = u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
-        let assignment_count =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
-        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let token_count = self.arena.u32(matvec_u32(token_count, "token_count")?)?;
+        let assignment_count = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row = self
+            .arena
+            .u32(matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
         let indirect_reads = gate_resources
             .iter()
             .chain(up_resources)
@@ -2963,7 +2954,7 @@ impl MetalQ2Matvec {
     fn encode_ready_matvec(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         weight_addresses: &Buffer,
         weight_resources: &[&Buffer],
         input: &Buffer,
@@ -3001,13 +2992,15 @@ impl MetalQ2Matvec {
             "ready Q2_K routed down",
         )?;
         let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
-        let assignment_count =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
-        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let assignment_count = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row = self
+            .arena
+            .u32(matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
         encode_1d_with_indirect_reads(
             command_buffer,
             &self.ready_matvec_pipeline,
@@ -3031,7 +3024,7 @@ impl MetalQ2Matvec {
     fn encode_ready_slot_gate_up_swiglu(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         gate_weights: &Buffer,
         up_weights: &Buffer,
         input: &Buffer,
@@ -3084,19 +3077,20 @@ impl MetalQ2Matvec {
             "ready Q2_K slot gate/up",
         )?;
         let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
-        let token_count = u32_scalar_buffer(device, matvec_u32(token_count, "token_count")?)?;
-        let assignment_count =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
-        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
-        let expert_stride_bytes = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
-        let slot_count = u32_scalar_buffer(device, matvec_u32(slot_count, "slot_count")?)?;
+        let token_count = self.arena.u32(matvec_u32(token_count, "token_count")?)?;
+        let assignment_count = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row = self
+            .arena
+            .u32(matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let expert_stride_bytes = self
+            .arena
+            .u32(matvec_u32(expert_stride_bytes, "expert_stride_bytes")?)?;
+        let slot_count = self.arena.u32(matvec_u32(slot_count, "slot_count")?)?;
         encode_1d(
             command_buffer,
             &self.ready_slot_gate_up_swiglu_pipeline,
@@ -3125,7 +3119,7 @@ impl MetalQ2Matvec {
     fn encode_ready_slot_matvec(
         &self,
         command_buffer: &CommandBufferRef,
-        device: &Device,
+        _device: &Device,
         weights: &Buffer,
         input: &Buffer,
         assignment_indices: &Buffer,
@@ -3177,18 +3171,19 @@ impl MetalQ2Matvec {
             "ready Q2_K slot down",
         )?;
         let blocks_per_row_value = in_features / Q2_K_BLOCK_VALUES;
-        let assignment_count =
-            u32_scalar_buffer(device, matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = u32_scalar_buffer(device, matvec_u32(ready_count, "ready_count")?)?;
-        let in_features = u32_scalar_buffer(device, matvec_u32(in_features, "in_features")?)?;
-        let out_features = u32_scalar_buffer(device, matvec_u32(out_features, "out_features")?)?;
-        let blocks_per_row =
-            u32_scalar_buffer(device, matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
-        let expert_stride_bytes = u32_scalar_buffer(
-            device,
-            matvec_u32(expert_stride_bytes, "expert_stride_bytes")?,
-        )?;
-        let slot_count = u32_scalar_buffer(device, matvec_u32(slot_count, "slot_count")?)?;
+        let assignment_count = self
+            .arena
+            .u32(matvec_u32(assignment_count, "assignment_count")?)?;
+        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row = self
+            .arena
+            .u32(matvec_u32(blocks_per_row_value, "blocks_per_row")?)?;
+        let expert_stride_bytes = self
+            .arena
+            .u32(matvec_u32(expert_stride_bytes, "expert_stride_bytes")?)?;
+        let slot_count = self.arena.u32(matvec_u32(slot_count, "slot_count")?)?;
         encode_1d(
             command_buffer,
             &self.ready_slot_matvec_pipeline,
