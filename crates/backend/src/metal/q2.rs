@@ -14,7 +14,7 @@ use std::{
 
 use ::metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device,
-    MTLCommandBufferStatus,
+    MTLCommandBufferStatus, SharedEvent,
 };
 use common::{Error, Result};
 use objc::{msg_send, sel, sel_impl};
@@ -109,6 +109,9 @@ pub(crate) struct MetalQ2Matvec {
     ready_expert_cache: Mutex<Q2PerLayerExpertCache>,
     expert_cache_counters: Q2ExpertCacheCounters,
     expert_queue: CommandQueue,
+    expert_completion_event: SharedEvent,
+    next_expert_completion_value: AtomicU64,
+    pending_expert_submissions: Mutex<Vec<PendingExpertSubmission>>,
     weight_buffers: Mutex<HashMap<WeightBufferKey, Buffer>>,
 }
 
@@ -333,8 +336,18 @@ struct SubmittedReadyWave {
 }
 
 #[derive(Debug)]
+struct PendingExpertSubmission {
+    completion_value: u64,
+    waves: Vec<SubmittedReadyWave>,
+    marker: CommandBuffer,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReadyRoutedExperts {
+    /// Expert rows are device-resident but may still be executing when this
+    /// value returns. Consumers must wait on `completion_value` on the GPU.
     pub(crate) output: Buffer,
+    pub(crate) completion_value: u64,
     pub(crate) selected_experts: usize,
     pub(crate) cache_hits: usize,
     pub(crate) cache_misses: usize,
@@ -431,6 +444,9 @@ impl MetalQ2Matvec {
             ready_expert_cache: Mutex::new(Q2PerLayerExpertCache::default()),
             expert_cache_counters: Q2ExpertCacheCounters::default(),
             expert_queue: device.new_command_queue(),
+            expert_completion_event: device.new_shared_event(),
+            next_expert_completion_value: AtomicU64::new(0),
+            pending_expert_submissions: Mutex::new(Vec::new()),
             weight_buffers: Mutex::new(HashMap::new()),
         })
     }
@@ -2297,7 +2313,7 @@ impl MetalQ2Matvec {
             intermediate_features,
             out_features,
         );
-        let (output, ready_waves, first_ready_ms, ssd_load_nanoseconds, q2_matmul_gpu_nanoseconds) =
+        let (output, ready_waves, first_ready_ms, ssd_load_nanoseconds, completion_value) =
             match execution {
                 Ok(output) => output,
                 Err(error) => {
@@ -2330,10 +2346,6 @@ impl MetalQ2Matvec {
         self.expert_cache_counters
             .ssd_load_nanoseconds
             .fetch_add(ssd_load_nanoseconds, Ordering::Relaxed);
-        self.expert_cache_counters
-            .q2_matmul_gpu_nanoseconds
-            .fetch_add(q2_matmul_gpu_nanoseconds, Ordering::Relaxed);
-
         debug!(
             target: "inferno::expert_cache",
             layer_index,
@@ -2346,7 +2358,8 @@ impl MetalQ2Matvec {
             ready_waves,
             lookup_ms = lookup_nanoseconds as f64 / 1_000_000.0,
             ssd_load_ms = ssd_load_nanoseconds as f64 / 1_000_000.0,
-            q2_matmul_gpu_ms = q2_matmul_gpu_nanoseconds as f64 / 1_000_000.0,
+            completion_value,
+            gpu_timing_deferred = true,
             first_ready_ms,
             elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
             slots_per_layer,
@@ -2355,6 +2368,7 @@ impl MetalQ2Matvec {
 
         Ok(ReadyRoutedExperts {
             output,
+            completion_value,
             selected_experts: groups.len(),
             cache_hits,
             cache_misses,
@@ -2586,27 +2600,132 @@ impl MetalQ2Matvec {
         } else {
             ssd_finished_nanoseconds.load(Ordering::Relaxed)
         };
-        let wave_result = wait_ready_expert_waves(&waves);
-        let q2_matmul_gpu_nanoseconds = match (load_result, wave_result) {
-            (Ok(()), Ok(nanoseconds)) => nanoseconds,
-            (Err(error), Ok(_)) => return Err(error),
-            (Ok(()), Err(error)) => return Err(error),
-            (Err(error), Err(wave_error)) => {
+        if let Err(error) = load_result {
+            if let Err(wave_error) = wait_ready_expert_waves(&waves) {
                 debug!(
                     target: "inferno::expert_cache",
                     error = %wave_error,
                     "ready expert Metal wave also failed while handling an SSD load error"
                 );
-                return Err(error);
             }
-        };
+            return Err(error);
+        }
+        let ready_waves = waves.len();
+        let completion_value = self.submit_ready_expert_completion(waves)?;
         Ok((
             output,
-            waves.len(),
+            ready_waves,
             first_ready_ms.unwrap_or_default(),
             ssd_load_nanoseconds,
-            q2_matmul_gpu_nanoseconds,
+            completion_value,
         ))
+    }
+
+    fn submit_ready_expert_completion(&self, waves: Vec<SubmittedReadyWave>) -> Result<u64> {
+        if waves.is_empty() {
+            return Err(Error::backend(
+                "ready routed expert execution produced no Metal waves",
+            ));
+        }
+        let previous = self
+            .next_expert_completion_value
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| Error::backend("routed expert completion value overflow"))?;
+        let completion_value = previous + 1;
+        let marker = self.expert_queue.new_command_buffer().to_owned();
+        marker.encode_signal_event(&self.expert_completion_event, completion_value);
+        marker.commit();
+
+        self.pending_expert_submissions
+            .lock()
+            .map_err(|_| Error::backend("pending routed expert submission lock poisoned"))?
+            .push(PendingExpertSubmission {
+                completion_value,
+                waves,
+                marker,
+            });
+        trace!(
+            target: "inferno::metal",
+            completion_value,
+            "submitted asynchronous routed expert completion marker"
+        );
+        Ok(completion_value)
+    }
+
+    /// Encodes a GPU-side wait immediately before work that consumes routed
+    /// expert output. This does not block the CPU or drain either queue.
+    pub(crate) fn encode_ready_expert_wait(
+        &self,
+        command_buffer: &CommandBufferRef,
+        completion_value: u64,
+    ) -> Result<()> {
+        if completion_value == 0
+            || completion_value > self.next_expert_completion_value.load(Ordering::Acquire)
+        {
+            return Err(Error::backend(format!(
+                "invalid routed expert completion value {completion_value}"
+            )));
+        }
+        command_buffer.encode_wait_for_event(&self.expert_completion_event, completion_value);
+        trace!(
+            target: "inferno::metal",
+            completion_value,
+            "encoded routed expert GPU dependency"
+        );
+        Ok(())
+    }
+
+    /// Validates expert-queue work at an existing host synchronization point.
+    /// The main queue normally already waited for each shared-event value, so
+    /// waiting for the final marker here does not add a new pipeline barrier.
+    pub(crate) fn finish_ready_expert_submissions(&self) -> Result<()> {
+        let submissions = {
+            let mut pending = self
+                .pending_expert_submissions
+                .lock()
+                .map_err(|_| Error::backend("pending routed expert submission lock poisoned"))?;
+            std::mem::take(&mut *pending)
+        };
+        let Some(last) = submissions.last() else {
+            return Ok(());
+        };
+
+        last.marker.wait_until_completed();
+        let mut gpu_nanoseconds = 0_u64;
+        for submission in &submissions {
+            for (wave_index, wave) in submission.waves.iter().enumerate() {
+                if wave.command_buffer.status() != MTLCommandBufferStatus::Completed {
+                    return Err(Error::backend(format!(
+                        "Q2 ready expert completion {} wave {wave_index} with {} assignments did not complete: {:?}",
+                        submission.completion_value,
+                        wave.assignment_count,
+                        wave.command_buffer.status()
+                    )));
+                }
+                gpu_nanoseconds = gpu_nanoseconds
+                    .checked_add(command_buffer_gpu_nanoseconds(&wave.command_buffer))
+                    .ok_or_else(|| Error::backend("Q2 expert GPU time overflow"))?;
+            }
+            if submission.marker.status() != MTLCommandBufferStatus::Completed {
+                return Err(Error::backend(format!(
+                    "Q2 ready expert completion marker {} did not complete: {:?}",
+                    submission.completion_value,
+                    submission.marker.status()
+                )));
+            }
+        }
+        self.expert_cache_counters
+            .q2_matmul_gpu_nanoseconds
+            .fetch_add(gpu_nanoseconds, Ordering::Relaxed);
+        trace!(
+            target: "inferno::metal",
+            submission_count = submissions.len(),
+            gpu_ms = gpu_nanoseconds as f64 / 1_000_000.0,
+            "validated asynchronous routed expert submissions"
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4734,6 +4853,9 @@ mod tests {
             .unwrap();
         assert_eq!(other_layer.cache_hits, 0);
         assert_eq!(other_layer.cache_misses, selected_ids.len());
+        metal
+            .batched_wait_for_ready_routed_experts(ready.completion_value)
+            .unwrap();
         let combined = metal
             .batched_moe_topk_combine_residual(
                 &shared_buffer,

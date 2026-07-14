@@ -1214,9 +1214,28 @@ impl Metal {
     // commits and waits. See `BatchSlot` for the safety rules.
     // ------------------------------------------------------------------
 
+    /// Commits the open batch without waiting for the GPU.
+    pub fn batch_submit(&self) -> Result<()> {
+        self.batch.submit()
+    }
+
     /// Commits the open batch, if any, and waits for the GPU to finish it.
+    /// Routed-expert submissions are validated after the main queue reaches
+    /// the same synchronization point.
     pub fn batch_flush(&self) -> Result<()> {
-        self.batch.flush()
+        let batch_result = self.batch.flush();
+        let expert_result = self.q2_matvec.finish_ready_expert_submissions();
+        match (batch_result, expert_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(expert_error)) => {
+                tracing::debug!(
+                    error = %expert_error,
+                    "routed expert submission also failed while flushing the main Metal queue"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Uploads host values into a fresh device buffer. Safe while a batch is
@@ -1261,7 +1280,7 @@ impl Metal {
     /// Reads values out of a device buffer, synchronizing the open batch
     /// first so every encoded kernel that may write the buffer has completed.
     pub(crate) fn batch_read_f32(&self, buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
-        self.batch.flush()?;
+        self.batch_flush()?;
         self.cast.read_f32(buffer, len)
     }
 
@@ -1269,7 +1288,7 @@ impl Metal {
     /// CPU side. This is for validation/cold-tier serialization, not the hot
     /// decode path.
     pub(crate) fn batch_read_f16_as_f32(&self, buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
-        self.batch.flush()?;
+        self.batch_flush()?;
         self.cast.read_f16_as_f32(buffer, len)
     }
 
@@ -1516,6 +1535,19 @@ impl Metal {
         )
     }
 
+    /// Adds a GPU-side dependency immediately before a routed-expert consumer.
+    /// The CPU does not wait here: Metal starts subsequent work as soon as the
+    /// expert queue signals that every output row is complete.
+    pub(crate) fn batched_wait_for_ready_routed_experts(
+        &self,
+        completion_value: u64,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec
+                .encode_ready_expert_wait(command_buffer, completion_value)
+        })
+    }
+
     /// Encodes the output-head matvec + greedy argmax against a device-resident
     /// hidden state, then flushes the whole batch and returns the chosen token.
     /// This is the natural end-of-token synchronization point.
@@ -1540,7 +1572,7 @@ impl Metal {
                     out_features,
                 )
             })?;
-        self.batch.flush()?;
+        self.batch_flush()?;
         let token_id = read_u32_buffer(&token_id_buffer, 1)?
             .into_iter()
             .next()
@@ -1564,7 +1596,7 @@ impl Metal {
                 self.q2_matvec
                     .encode_f32_argmax(command_buffer, &self.device, scores, value_count)
             })?;
-        self.batch.flush()?;
+        self.batch_flush()?;
         let token_id = read_u32_buffer(&token_id_buffer, 1)?
             .into_iter()
             .next()
@@ -1592,7 +1624,7 @@ impl Metal {
                     row_width,
                 )
             })?;
-        self.batch.flush()?;
+        self.batch_flush()?;
         Ok((
             read_u32_buffer(&token_id_buffer, row_count)?,
             read_f32_buffer(&token_score_buffer, row_count)?,
@@ -1966,7 +1998,7 @@ impl Metal {
             norm_topk_prob,
             routed_scaling_factor,
         )?;
-        self.batch.flush()?;
+        self.batch_flush()?;
         let output_len = routing.assignment_count()?;
         let expert_ids = read_u32_buffer(&routing.expert_ids, output_len)?;
         let expert_weights = read_f32_buffer(&routing.expert_weights, output_len)?;
@@ -1977,7 +2009,7 @@ impl Metal {
         &self,
         routing: &DeviceRouterTopK,
     ) -> Result<Vec<u32>> {
-        self.batch.flush()?;
+        self.batch_flush()?;
         read_u32_buffer(&routing.expert_ids, routing.assignment_count()?)
     }
 
@@ -2059,7 +2091,7 @@ impl Metal {
                 top_k,
             )
         })?;
-        self.batch.flush()?;
+        self.batch_flush()?;
         MetalDsa::read_token_ids(&buffers.token_ids, buffers.output_len)
     }
 

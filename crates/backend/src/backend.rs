@@ -117,10 +117,13 @@ impl DeviceRouterTopK {
 ///
 /// `output` preserves router assignment order as
 /// `[token_count * top_k, hidden_size]`, so the normal weighted combine kernel
-/// can consume it without changing model semantics.
+/// can consume it without changing model semantics. On the asynchronous Metal
+/// path, the backend must encode this result's completion dependency before a
+/// consumer reads `output`.
 #[derive(Debug, Clone)]
 pub struct DeviceRoutedExperts {
     output: DeviceValue,
+    completion_value: u64,
     selected_experts: usize,
     cache_hits: usize,
     cache_misses: usize,
@@ -664,11 +667,11 @@ pub trait Backend: Sync {
     // tensors on the GPU as `DeviceValue` handles and defer execution: each
     // call encodes its kernel into a shared command buffer instead of
     // committing one command buffer per op and blocking on it. The GPU runs
-    // the accumulated work only when the host actually needs values —
-    // `device_download_f32_tensor`, `device_flush`, or a fused sink such as
-    // `q2_k_matvec_argmax_device`. Chaining `DeviceValue`s through these ops
-    // is what removes the per-kernel synchronization stall from the decode
-    // hot path.
+    // the accumulated work when `device_submit` starts it or when the host
+    // actually needs values through `device_download_f32_tensor`,
+    // `device_flush`, or a fused sink such as `q2_k_matvec_argmax_device`.
+    // Chaining `DeviceValue`s through these ops removes the per-kernel
+    // synchronization stall from the decode hot path.
     //
     // Backends without device-resident execution keep the `Ok(None)` defaults
     // and callers fall back to the eager paths.
@@ -684,6 +687,12 @@ pub trait Backend: Sync {
     /// when nothing is pending or the backend has no device-resident path.
     fn device_flush(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Submits pending device work without waiting for completion. Backends
+    /// without asynchronous queue support preserve correctness by flushing.
+    fn device_submit(&self) -> Result<()> {
+        self.device_flush()
     }
 
     /// Copies a host tensor into GPU memory, returning a handle usable with
@@ -894,6 +903,12 @@ pub trait Backend: Sync {
         _out_features: usize,
     ) -> Result<Option<DeviceRoutedExperts>> {
         Ok(None)
+    }
+
+    /// Inserts a device-side dependency before consuming routed-expert rows.
+    /// The default backend has no asynchronous routed-expert path.
+    fn wait_for_routed_experts_device(&self, _routed: &DeviceRoutedExperts) -> Result<()> {
+        Ok(())
     }
 
     /// Output-head matvec + greedy argmax over a device-resident hidden state.
@@ -3248,6 +3263,16 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn device_submit(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.batch_submit();
+            }
+        }
+        Ok(())
+    }
+
     fn device_upload_f32_tensor(&self, tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -3927,6 +3952,7 @@ impl Backend for MetalBackend {
                     vec![routing.assignment_count()?, out_features],
                     result.output,
                 ),
+                completion_value: result.completion_value,
                 selected_experts: result.selected_experts,
                 cache_hits: result.cache_hits,
                 cache_misses: result.cache_misses,
@@ -3951,6 +3977,22 @@ impl Backend for MetalBackend {
                 out_features,
             );
             Ok(None)
+        }
+    }
+
+    fn wait_for_routed_experts_device(&self, routed: &DeviceRoutedExperts) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(());
+            };
+            return native_metal.batched_wait_for_ready_routed_experts(routed.completion_value);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = routed;
+            Ok(())
         }
     }
 

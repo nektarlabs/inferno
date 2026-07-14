@@ -9,23 +9,30 @@ use tracing::trace;
 ///
 /// Ops on the batched (device-resident) path encode their kernels into this
 /// shared command buffer instead of committing one command buffer per kernel.
-/// The GPU only runs the accumulated work when `flush` commits the buffer and
-/// blocks until completion. Dependent kernels inside one batch are ordered by
-/// Metal's automatic hazard tracking on the shared-storage buffers they touch,
-/// which is the same guarantee the existing `dispatch_1d_many` chains rely on.
+/// `submit` starts the accumulated work without a host wait; `flush` submits
+/// anything still open and waits for every retained submission. Dependent
+/// kernels inside one batch are ordered by Metal's automatic hazard tracking
+/// on the shared-storage buffers they touch, which is the same guarantee the
+/// existing `dispatch_1d_many` chains rely on.
 ///
 /// Safety invariant for callers: CPU code must not read from or write into any
 /// buffer referenced by an already-encoded kernel until `flush` has returned.
 /// Ops therefore allocate fresh output buffers while a batch is open instead
 /// of recycling pooled scratch buffers.
+#[derive(Default)]
+struct BatchState {
+    open: Option<CommandBuffer>,
+    submitted: Vec<CommandBuffer>,
+}
+
 pub(crate) struct BatchSlot {
-    inner: Mutex<Option<CommandBuffer>>,
+    inner: Mutex<BatchState>,
 }
 
 impl BatchSlot {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(BatchState::default()),
         }
     }
 
@@ -40,39 +47,70 @@ impl BatchSlot {
             .inner
             .lock()
             .map_err(|_| Error::backend("Metal batch command buffer lock poisoned"))?;
-        let command_buffer = match guard.as_ref() {
+        let command_buffer = match guard.open.as_ref() {
             Some(command_buffer) => command_buffer,
             None => {
                 trace!(target: "inferno::metal", "opening new batched command buffer");
-                guard.insert(queue.new_command_buffer().to_owned())
+                guard.open.insert(queue.new_command_buffer().to_owned())
             }
         };
         encode(command_buffer)
     }
 
-    /// Commits the open command buffer, if any, and blocks until the GPU has
-    /// completed every kernel encoded since the previous flush.
+    /// Commits the open command buffer without waiting for the GPU.
+    ///
+    /// Submitted buffers remain retained until `flush` validates them. A new
+    /// command buffer can therefore be opened immediately while queue order
+    /// preserves dependencies between the two submissions.
+    pub(crate) fn submit(&self) -> Result<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| Error::backend("Metal batch command buffer lock poisoned"))?;
+        let Some(command_buffer) = guard.open.take() else {
+            return Ok(());
+        };
+
+        trace!(target: "inferno::metal", "submitting batched command buffer");
+        command_buffer.commit();
+        guard.submitted.push(command_buffer);
+        Ok(())
+    }
+
+    /// Commits the open command buffer, if any, and blocks until every batch
+    /// submitted since the previous flush has completed.
     pub(crate) fn flush(&self) -> Result<()> {
-        let command_buffer = {
+        let command_buffers = {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| Error::backend("Metal batch command buffer lock poisoned"))?;
-            guard.take()
+            if let Some(command_buffer) = guard.open.take() {
+                trace!(target: "inferno::metal", "submitting final batched command buffer");
+                command_buffer.commit();
+                guard.submitted.push(command_buffer);
+            }
+            std::mem::take(&mut guard.submitted)
         };
-        let Some(command_buffer) = command_buffer else {
+        let Some(last) = command_buffers.last() else {
             return Ok(());
         };
 
-        trace!(target: "inferno::metal", "flushing batched command buffer");
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        match command_buffer.status() {
-            MTLCommandBufferStatus::Completed => Ok(()),
-            status => Err(Error::backend(format!(
-                "Metal batched command buffer did not complete: {status:?}"
-            ))),
+        trace!(
+            target: "inferno::metal",
+            submission_count = command_buffers.len(),
+            "waiting for submitted Metal batches"
+        );
+        last.wait_until_completed();
+        for (index, command_buffer) in command_buffers.iter().enumerate() {
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(Error::backend(format!(
+                    "Metal batched command buffer {index} did not complete: {:?}",
+                    command_buffer.status()
+                )));
+            }
         }
+        Ok(())
     }
 }
 
@@ -142,6 +180,28 @@ mod tests {
             .unwrap();
         let read = metal.batch_read_f32(&doubled, values.len()).unwrap();
         assert_eq!(read, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    /// Queue ordering must preserve data dependencies across an asynchronous
+    /// submission boundary without requiring an intermediate CPU wait.
+    #[test]
+    fn submitted_batch_feeds_next_batch_without_host_wait() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let values = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let input = metal.batch_upload_f32(&values).unwrap();
+        let first = metal
+            .batched_add(&input, values.len(), &input, values.len())
+            .unwrap();
+
+        metal.batch_submit().unwrap();
+
+        let second = metal
+            .batched_add(&first, values.len(), &input, values.len())
+            .unwrap();
+        let output = metal.batch_read_f32(&second, values.len()).unwrap();
+        assert_eq!(output, vec![3.0, 6.0, 9.0, 12.0]);
     }
 
     fn native_metal_or_skip() -> Option<Metal> {

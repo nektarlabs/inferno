@@ -857,14 +857,31 @@ impl<'a> MoeFfn<'a> {
                         || self.shared_down.forward_device(&shared_gated, backend),
                     ),
                 )?;
-                backend.device_flush()?;
+                // Start the shared-expert command buffer immediately. Routed
+                // SSD reads and expert kernels continue independently; the
+                // weighted combine adds the precise cross-queue dependency.
+                backend.device_submit()?;
                 Ok(shared_down)
             })();
             let routed_result = routed
                 .join()
                 .map_err(|_| Error::moe("ready routed expert thread panicked"))?;
-            let routed = require_moe_device_stage("sparse_moe.routed.ready_first", routed_result)?;
-            Ok::<_, Error>((routed, shared_result?))
+            let routed =
+                match require_moe_device_stage("sparse_moe.routed.ready_first", routed_result) {
+                    Ok(routed) => routed,
+                    Err(error) => {
+                        backend.device_flush()?;
+                        return Err(error);
+                    }
+                };
+            let shared_down = match shared_result {
+                Ok(shared_down) => shared_down,
+                Err(error) => {
+                    backend.device_flush()?;
+                    return Err(error);
+                }
+            };
+            Ok::<_, Error>((routed, shared_down))
         })?;
         tracing::debug!(
             layer_index = self.layer_index,
@@ -883,6 +900,7 @@ impl<'a> MoeFfn<'a> {
             &[flat_token_count, config.hidden_size],
         )?;
 
+        backend.wait_for_routed_experts_device(&routed)?;
         let output = require_moe_device_stage(
             "sparse_moe.weighted_combine_residual",
             backend.moe_topk_combine_residual_device(
