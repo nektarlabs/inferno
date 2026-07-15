@@ -42,11 +42,54 @@ The artifact declares eight routed experts per token, and Inferno executes all
 eight. Startup fails if `config.json` or the GGUF metadata declares a different
 routing count, preventing an accidental quality-changing approximation.
 
+Multi-token prediction is part of the default generation path when the model
+metadata exposes the GLM-5.2 MTP head and enables shared index selection. It is
+not an optional approximation and does not reduce the top-8 MoE contract.
+
 This is not a general model zoo. Inferno keeps the inference path small,
 explicit, and optimized for Q2 GLM-5.2-style execution so it can become fast
 enough for real local use while staying simple enough to audit end to end. That
 is the ambition — whether it gets all the way there is exactly what the
 experiment is testing.
+
+## Multi-Token Prediction
+
+Inferno uses the GLM-5.2 MTP head to propose up to seven tokens before asking
+the main model to verify them. MTP is enabled automatically when the loaded
+artifact and configuration expose the required tensors and metadata; no CLI
+flag is required.
+
+One MTP generation step follows this sequence:
+
+```txt
+committed hidden state
+  -> MTP draft step 0
+  -> up to six additional shared-head draft steps
+  -> one causal target-model verification
+  -> accept matching prefix
+  -> commit accepted KV rows only
+```
+
+For `D <= 7` draft tokens, the main shapes are:
+
+```txt
+draft token ids:       [D]
+verifier input ids:    [1, 1 + D]
+verifier hidden state: [1, 1 + D, 6144]
+verified token ids:    [1 + D]
+```
+
+The first MTP draft computes the DSA top-k token selection. **IndexShare**
+reuses that selection for the remaining draft steps instead of running the
+indexer repeatedly. The first draft also establishes the fixed compressed MLA
+state used by the MTP sequence. **KVShare** lets later drafts query that state
+without appending speculative K/V rows.
+
+The target model verifies the current token and all drafts together as a short
+causal sequence. Drafts are accepted from left to right until the first
+mismatch. Rejected drafts are discarded, and only the verified prefix is
+appended to the request KV cache. This preserves greedy target-model semantics
+while amortizing one full backbone pass across multiple accepted tokens.
 
 ## Memory Strategy
 
@@ -108,8 +151,9 @@ reconstruct F32 rows before upload and remain a separate optimization target.
 
 The 256 routed experts per sparse layer remain in the GGUF artifact on SSD.
 Inferno executes the artifact's exact top-8 routing and caches selected Q2 gate,
-up, and down matrices in shared Metal slabs. The default is 16 expert slots per
-routed layer, approximately 14.9 GB for the 75 main sparse layers.
+up, and down matrices in shared Metal slabs. The default is 12 expert slots per
+routed layer, approximately 11.3 GB including the main sparse layers and MTP
+head.
 
 Each layer uses a segmented LRU:
 
@@ -124,14 +168,15 @@ SwiGLU projection while the same workers continue loading the down matrices.
 All ready gate/up waves are queued before the down waves, which overlaps SSD
 reads with useful GPU work without changing the result. The cache never evicts
 an expert selected by the current token; if every slot is temporarily
-protected, that expert uses a one-shot transient buffer.
+protected, overflow experts use a bounded staging slab that is reused after
+the current layer completes.
 
 ### Budget control
 
 The CLI currently uses fixed, independent budgets:
 
 ```txt
-expert cache: 16 slots per routed layer
+expert cache: 12 slots per routed layer
 hot KV cache: 512 MiB
 ```
 
@@ -146,53 +191,11 @@ and experts using context length, hit rates, and memory pressure. It is not yet
 enabled by the `generate` CLI path, so normal runs do not currently resize the
 two caches automatically.
 
-## Measured Results
+## Performance
 
-Performance is not yet production-ready. Results are reported with their exact
-revision and machine state because repeated expert streaming is sensitive to
-filesystem-cache, thermal, and memory conditions.
-
-Test conditions:
-
-```txt
-hardware:         Apple Silicon MacBook Pro, 64 GB unified memory
-build:            cargo build --release
-model:            GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
-prompt:           "Hi" (13 tokens after chat-template rendering)
-generated tokens: 8
-MoE execution:    top-8, matching the artifact
-cache settings:   defaults; speculative MTP disabled
-```
-
-### Reference top-8 benchmark
-
-The retained reference was measured on 2026-07-13 at revision `cbf1a78` plus
-the staged expert-I/O path that became `1fafb61`:
-
-| Runtime | Run | Time to first token | Decode throughput | End-to-end throughput |
-| --- | --- | ---: | ---: | ---: |
-| Previous ready-first path | Warm baseline | 28.351 s | 1.447 tokens/s | 0.241 tokens/s |
-| Staged gate/up/down path | Measurement 1 | 30.106 s | **1.505 tokens/s** | 0.230 tokens/s |
-| Staged gate/up/down path | Measurement 2 | 31.850 s | **1.493 tokens/s** | 0.219 tokens/s |
-
-The two staged measurements average **1.499 decode tokens/s**. All runs used
-exact top-8 routing. They reported a 46.71% expert-cache hit rate, 79.210 GB of
-logical expert reads, 14.864 GB of expert-cache capacity, and a 100% KV hit
-rate for this short prompt.
-
-### Current throughput limit
-
-The GGUF directory contains approximately 20.49 GB of always-active Q8 weights,
-0.55 GB of F32 tensors, and 240.99 GB of routed Q2 expert weights. The reference
-top-8 benchmark read 79.210 GB of logical expert data; the degraded diagnostic
-read 86.865 GB.
-
-A three-token-per-second target allows only 0.333 seconds per token. At the
-1.499 tokens/s reference, one token takes approximately 0.667 seconds. The
-short-prompt KV hit rate is already 100%, so the immediate limit remains the
-routed-expert and sparse-attention paths rather than KV capacity. Further work
-must reduce or amortize expert misses and projection time while preserving the
-artifact's exact top-8 routing behavior.
+| Best decode tokens/s |
+| ---: |
+| 1.5 |
 
 ## Model
 
@@ -250,6 +253,10 @@ target/release/inferno generate \
   --prompt "Tell me the capital of Italy."
 ```
 
+MTP, IndexShare, and KVShare are selected automatically from the model
+metadata. Generation falls back to ordinary single-token verification only
+when MTP is unavailable or too few output tokens remain to benefit from it.
+
 Run with telemetry and throughput measurement:
 
 ```bash
@@ -272,6 +279,9 @@ Compare throughput after each optimization:
 ```bash
 tail -n 5 /tmp/inferno-throughput.tsv
 ```
+
+The throughput report also includes the number of MTP verification passes,
+drafted tokens, accepted drafts, and the resulting acceptance rate.
 
 Profile one prefill result and each decode token by subsystem:
 

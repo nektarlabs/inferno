@@ -309,10 +309,13 @@ impl<'a> SparseBlock<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
+        next_sparse_block: Option<&SparseBlock<'_>>,
         past_kv: &backend::DevicePagedKvView,
         selected_kv_for_tokens: &mut S,
         index_keys_for_layer: &mut I,
         shared_selection: Option<&[u32]>,
+        query_position: Option<usize>,
+        include_current_kv: bool,
     ) -> Result<Option<(crate::kv_types::BlockDeviceTensors, Option<Vec<u32>>)>>
     where
         B: Backend,
@@ -335,6 +338,8 @@ impl<'a> SparseBlock<'a> {
                             selected_kv_for_tokens,
                             index_keys_for_layer,
                             shared_selection,
+                            query_position,
+                            include_current_kv,
                         )
                     },
                 )
@@ -350,8 +355,12 @@ impl<'a> SparseBlock<'a> {
         };
         let output_hidden_states =
             match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
-                self.ffn
-                    .forward_device(config, &attention_output.tensors.hidden_states, backend)
+                self.ffn.forward_device(
+                    config,
+                    &attention_output.tensors.hidden_states,
+                    backend,
+                    next_sparse_block.map(|block| &block.ffn),
+                )
             })? {
                 Some(output) => output,
                 None => {
@@ -378,6 +387,7 @@ impl<'a> SparseBlock<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
+        next_sparse_block: Option<&SparseBlock<'_>>,
     ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
         let attention_output = match profile::run_layer_stage(
             self.load_report.layer_index,
@@ -403,8 +413,12 @@ impl<'a> SparseBlock<'a> {
         };
         let output_hidden_states =
             match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
-                self.ffn
-                    .forward_device(config, &attention_output.hidden_states, backend)
+                self.ffn.forward_device(
+                    config,
+                    &attention_output.hidden_states,
+                    backend,
+                    next_sparse_block.map(|block| &block.ffn),
+                )
             })? {
                 Some(output) => output,
                 None => {
@@ -682,6 +696,8 @@ mod tests {
             index_head_dim: 128,
             index_n_heads: 32,
             index_topk_freq: 4,
+            index_skip_topk_offset: 3,
+            index_share_for_mtp_iteration: true,
             indexer_rope_interleave: true,
             indexer_types: Vec::new(),
             num_nextn_predict_layers: 0,

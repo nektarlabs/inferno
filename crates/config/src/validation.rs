@@ -83,6 +83,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
         )));
     }
 
+    if config.num_nextn_predict_layers == 1 && !config.index_share_for_mtp_iteration {
+        return Err(Error::config(
+            "GLM-5.2 MTP requires index_share_for_mtp_iteration=true",
+        ));
+    }
+
+    if config.index_share_for_mtp_iteration && config.index_skip_topk_offset == 0 {
+        return Err(Error::config(
+            "GLM-5.2 IndexShare requires a positive index_skip_topk_offset",
+        ));
+    }
+
     if config.rms_norm_eps <= 0.0 {
         return Err(Error::config("rms_norm_eps must be positive"));
     }
@@ -161,5 +173,14 @@ mod tests {
 
         let err = validate_config(&config).expect_err("multiple MTP heads should fail");
         assert!(err.to_string().contains("num_nextn_predict_layers"));
+    }
+
+    #[test]
+    fn rejects_mtp_without_index_share() {
+        let mut config = Config::from_json_str(GLM52_LIKE_CONFIG_JSON).unwrap();
+        config.index_share_for_mtp_iteration = false;
+
+        let err = validate_config(&config).expect_err("MTP without IndexShare should fail");
+        assert!(err.to_string().contains("index_share_for_mtp_iteration"));
     }
 }

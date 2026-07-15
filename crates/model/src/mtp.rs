@@ -20,7 +20,8 @@ pub struct MtpHead<'a> {
 
 #[derive(Debug)]
 pub struct MtpDraftOutput {
-    pub hidden_states: F32Tensor,
+    /// Post-shared-head-norm state recycled into the next MTP iteration.
+    pub recycle_hidden_states: F32Tensor,
     pub layer_kv_cache: LayerKvCacheTensors,
     pub token_id: u32,
     pub token_score: f32,
@@ -28,8 +29,10 @@ pub struct MtpDraftOutput {
 
 #[derive(Debug)]
 pub struct MtpDeviceDraftOutput {
-    pub hidden_states: backend::DeviceValue,
+    /// Post-shared-head-norm state recycled into the next MTP iteration.
+    pub recycle_hidden_states: backend::DeviceValue,
     pub layer_kv_cache: LayerDeviceKvCacheTensors,
+    pub shared_selection: Option<Vec<u32>>,
     pub token_id: u32,
     pub token_score: f32,
 }
@@ -169,7 +172,7 @@ impl<'a> MtpHead<'a> {
         let token = output_head.decode_token_from_normalized_f32(&normalized, backend)?;
 
         Ok(MtpDraftOutput {
-            hidden_states: block_output.hidden_states,
+            recycle_hidden_states: normalized,
             layer_kv_cache: LayerKvCacheTensors {
                 layer_index: self.load_report.layer_index,
                 layer_kind: LayerKind::SparseMoe,
@@ -194,6 +197,9 @@ impl<'a> MtpHead<'a> {
         past_kv: Option<&backend::DevicePagedKvView>,
         selected_kv_for_tokens: &mut S,
         index_keys_for_layer: &mut I,
+        shared_selection: Option<&[u32]>,
+        query_position: Option<usize>,
+        include_current_kv: bool,
     ) -> Result<Option<MtpDeviceDraftOutput>>
     where
         B: Backend,
@@ -251,22 +257,32 @@ impl<'a> MtpHead<'a> {
         let projected = crate::try_device!(self.eh_proj.forward_device(&fused, backend));
         let block_output = match past_kv {
             Some(past_kv) => {
-                let (output, _) = crate::try_device!(self.block.forward_sparse_decode_device(
-                    config,
-                    &projected,
-                    backend,
-                    past_kv,
-                    selected_kv_for_tokens,
-                    index_keys_for_layer,
-                    None,
-                ));
-                output
+                let (output, next_shared_selection) =
+                    crate::try_device!(self.block.forward_sparse_decode_device(
+                        config,
+                        &projected,
+                        backend,
+                        None,
+                        past_kv,
+                        selected_kv_for_tokens,
+                        index_keys_for_layer,
+                        shared_selection,
+                        query_position,
+                        include_current_kv,
+                    ));
+                (output, next_shared_selection)
             }
             None => {
                 validate_exact_shape("gguf_device_mtp_seed_tokens", &[tokens], &[1])?;
-                crate::try_device!(self.block.forward_seed_device(config, &projected, backend))
+                (
+                    crate::try_device!(self
+                        .block
+                        .forward_seed_device(config, &projected, backend, None,)),
+                    None,
+                )
             }
         };
+        let (block_output, shared_selection) = block_output;
         let normalized = crate::try_device!(self
             .shared_head_norm
             .forward_device(&block_output.hidden_states, backend));
@@ -275,7 +291,7 @@ impl<'a> MtpHead<'a> {
         );
 
         Ok(Some(MtpDeviceDraftOutput {
-            hidden_states: block_output.hidden_states,
+            recycle_hidden_states: normalized,
             layer_kv_cache: LayerDeviceKvCacheTensors {
                 layer_index: self.load_report.layer_index,
                 layer_kind: LayerKind::SparseMoe,
@@ -283,6 +299,7 @@ impl<'a> MtpHead<'a> {
                 cache_v: block_output.cache_v,
                 index_key: block_output.index_key,
             },
+            shared_selection,
             token_id: token.token_id,
             token_score: token.token_score,
         }))

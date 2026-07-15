@@ -30,8 +30,8 @@ const FUSED_SELECTED_SEQUENCE_ATTENTION_KERNEL: &str =
     "fused_selected_sequence_attention_f32_kernel";
 const FUSED_PAGED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
     "fused_paged_decode_attention_f16_kv_kernel";
-const FUSED_PAGED_ABSORBED_MLA_DECODE_F32_KERNEL: &str =
-    "fused_paged_absorbed_mla_decode_f32_kernel";
+const FUSED_PAGED_ABSORBED_MLA_SEQUENCE_F32_KERNEL: &str =
+    "fused_paged_absorbed_mla_sequence_f32_kernel";
 const FUSED_SELECTED_DECODE_ATTENTION_F16_KV_KERNEL: &str =
     "fused_selected_decode_attention_f16_kv_kernel";
 const FUSED_DECODE_ATTENTION_THREADS_PER_ROW: usize = 256;
@@ -483,7 +483,7 @@ impl MetalDecodeAttention {
             fused_paged_absorbed_mla_f32_pipeline: compute_pipeline(
                 device,
                 library,
-                FUSED_PAGED_ABSORBED_MLA_DECODE_F32_KERNEL,
+                FUSED_PAGED_ABSORBED_MLA_SEQUENCE_F32_KERNEL,
             )?,
             workspace: Mutex::new(DecodeAttentionWorkspace::default()),
         })
@@ -1115,7 +1115,8 @@ impl MetalDecodeAttention {
         Ok((output_buffer, output_len))
     }
 
-    /// Encodes absorbed MLA decode over normalized latent K/V cache rows.
+    /// Encodes absorbed MLA for a short causal sequence over normalized latent
+    /// K/V cache rows.
     ///
     /// The no-RoPE query has already been projected into latent space. This
     /// kernel computes attention in `[latent_dim + rope_dim]` score space and
@@ -1136,6 +1137,7 @@ impl MetalDecodeAttention {
         current_rope: &Buffer,
         current_rope_len: usize,
         past_kv: &DevicePagedKvView,
+        query_tokens: usize,
         head_count: usize,
         latent_dim: usize,
         rope_dim: usize,
@@ -1157,13 +1159,19 @@ impl MetalDecodeAttention {
                 past_kv.k.dtype()
             )));
         }
-        if head_count == 0 || latent_dim == 0 || rope_dim == 0 || scale_dim == 0 {
+        if query_tokens == 0
+            || head_count == 0
+            || latent_dim == 0
+            || rope_dim == 0
+            || scale_dim == 0
+        {
             return Err(Error::backend("absorbed MLA dimensions must be positive"));
         }
 
         let batch_count = past_kv.batch;
         let row_count = batch_count
-            .checked_mul(head_count)
+            .checked_mul(query_tokens)
+            .and_then(|rows| rows.checked_mul(head_count))
             .ok_or_else(|| Error::backend("absorbed MLA row count overflow"))?;
         let expected_q_latent_len = row_count
             .checked_mul(latent_dim)
@@ -1172,10 +1180,12 @@ impl MetalDecodeAttention {
             .checked_mul(rope_dim)
             .ok_or_else(|| Error::backend("absorbed MLA query RoPE length overflow"))?;
         let expected_current_latent_len = batch_count
-            .checked_mul(latent_dim)
+            .checked_mul(query_tokens)
+            .and_then(|rows| rows.checked_mul(latent_dim))
             .ok_or_else(|| Error::backend("absorbed MLA current latent length overflow"))?;
         let expected_current_rope_len = batch_count
-            .checked_mul(rope_dim)
+            .checked_mul(query_tokens)
+            .and_then(|rows| rows.checked_mul(rope_dim))
             .ok_or_else(|| Error::backend("absorbed MLA current RoPE length overflow"))?;
         validate_exact_shape(
             "absorbed_mla_q_latent_values",
@@ -1218,13 +1228,13 @@ impl MetalDecodeAttention {
 
         let key_tokens = past_kv
             .cached_tokens
-            .checked_add(1)
+            .checked_add(query_tokens)
             .ok_or_else(|| Error::backend("absorbed MLA key token count overflow"))?;
         let dispatch_threads = fused_decode_attention_threads(
             &self.fused_paged_absorbed_mla_f32_pipeline,
             key_tokens,
             row_count,
-            "fused paged absorbed MLA decode",
+            "fused paged absorbed MLA sequence",
         )?;
         let output_len = expected_q_latent_len;
         let output_buffer = self.arena.empty_f32(output_len)?;
@@ -1234,6 +1244,9 @@ impl MetalDecodeAttention {
         let head_count_buffer = self
             .arena
             .u32(checked_u32("absorbed MLA head_count", head_count)?)?;
+        let query_tokens_buffer = self
+            .arena
+            .u32(checked_u32("absorbed MLA query_tokens", query_tokens)?)?;
         let past_tokens_buffer = self.arena.u32(checked_u32(
             "absorbed MLA past_tokens",
             past_kv.cached_tokens,
@@ -1264,6 +1277,7 @@ impl MetalDecodeAttention {
                 &output_buffer,
                 &batch_count_buffer,
                 &head_count_buffer,
+                &query_tokens_buffer,
                 &past_tokens_buffer,
                 &page_size_buffer,
                 &latent_dim_buffer,
@@ -1296,6 +1310,7 @@ impl MetalDecodeAttention {
         selected_tokens: usize,
         head_dim: usize,
         value_dim: usize,
+        include_current_kv: bool,
     ) -> Result<(Buffer, usize)> {
         if selected_tokens == 0 {
             return Err(Error::backend(
@@ -1303,7 +1318,7 @@ impl MetalDecodeAttention {
             ));
         }
         let key_tokens = selected_tokens
-            .checked_add(1)
+            .checked_add(usize::from(include_current_kv))
             .ok_or_else(|| Error::backend("selected decode attention key token count overflow"))?;
         let expected_q_len = batch_count
             .checked_mul(head_count)
@@ -1429,6 +1444,7 @@ impl MetalDecodeAttention {
             "selected decode attention value_dim",
             value_dim,
         )?)?;
+        let include_current_kv_buffer = self.arena.u32(u32::from(include_current_kv))?;
         let output_buffer = self.arena.empty_f32(output_len)?;
 
         encode_1d(
@@ -1446,6 +1462,7 @@ impl MetalDecodeAttention {
                 &selected_tokens_buffer,
                 &head_dim_buffer,
                 &value_dim_buffer,
+                &include_current_kv_buffer,
             ],
             dispatch_threads,
         )?;
@@ -2484,11 +2501,63 @@ mod tests {
                 selected_tokens,
                 head_dim,
                 value_dim,
+                true,
             )
             .unwrap();
         let actual = metal.batch_read_f32(&output_buffer, output_len).unwrap();
 
         assert_close(&actual, &expected, 1e-5);
+
+        let history_scores = cpu_attention_scores(
+            &q,
+            &selected_k,
+            batch_count,
+            head_count,
+            1,
+            selected_tokens,
+            head_dim,
+        );
+        let history_probs = cpu_attention_causal_softmax(
+            &history_scores,
+            batch_count,
+            head_count,
+            1,
+            selected_tokens,
+            selected_tokens - 1,
+        );
+        let expected_history = cpu_attention_values(
+            &history_probs,
+            &selected_v,
+            batch_count,
+            head_count,
+            1,
+            selected_tokens,
+            value_dim,
+        );
+        let (history_buffer, history_len) = metal
+            .batched_selected_decode_attention(
+                &q_buffer,
+                q.len(),
+                &selected_k_buffer,
+                selected_k.len(),
+                &selected_v_buffer,
+                selected_v.len(),
+                DType::F32,
+                &current_k_buffer,
+                current_k.len(),
+                &current_v_buffer,
+                current_v.len(),
+                batch_count,
+                head_count,
+                selected_tokens,
+                head_dim,
+                value_dim,
+                false,
+            )
+            .unwrap();
+        let actual_history = metal.batch_read_f32(&history_buffer, history_len).unwrap();
+
+        assert_close(&actual_history, &expected_history, 1e-5);
     }
 
     #[test]
@@ -2499,7 +2568,9 @@ mod tests {
         let batch_count = 1;
         let head_count = 2;
         let past_tokens = 3;
-        let query_tokens = 2;
+        // Match the largest GLM-5.2 MTP verifier batch: one target row and
+        // seven speculative rows. Every row must remain causal at this width.
+        let query_tokens = 8;
         let key_tokens = past_tokens + query_tokens;
         let head_dim = 4;
         let value_dim = 3;
@@ -2812,6 +2883,7 @@ mod tests {
                 selected_tokens,
                 head_dim,
                 value_dim,
+                true,
             )
             .unwrap();
         let actual = metal.batch_read_f32(&output_buffer, output_len).unwrap();

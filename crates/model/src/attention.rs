@@ -1920,13 +1920,14 @@ impl<'a> Attention<'a> {
         })
     }
 
-    /// Batched device-resident decode attention: every kernel is encoded into
+    /// Batched device-resident MLA attention: every kernel is encoded into
     /// the backend's open batch and intermediate tensors never leave the GPU.
     /// Past K/V is read from the resident Metal cache, and the current
     /// token's K/V is returned as device handles for append.
     ///
-    /// Returns `Ok(None)` when any component has no device path (the caller
-    /// falls back to the eager route); requires a single decode token.
+    /// Returns `Ok(None)` when any component has no device path. The current
+    /// rows form a short causal sequence, used by normal decode and MTP target
+    /// verification.
     fn mla_context_device<B: Backend>(
         &self,
         config: &Config,
@@ -1937,7 +1938,7 @@ impl<'a> Attention<'a> {
         past_kv: &DevicePagedKvView,
         backend: &B,
     ) -> Result<Option<DeviceValue>> {
-        backend.q8_0_absorbed_mla_decode_device(
+        let context = crate::try_device!(backend.q8_0_absorbed_mla_device(
             self.k_b.q8_payload("absorbed MLA K_b")?,
             self.v_b.q8_payload("absorbed MLA V_b")?,
             q_no_rope,
@@ -1947,7 +1948,8 @@ impl<'a> Attention<'a> {
             past_kv,
             config.qk_head_dim,
             config.v_head_dim(),
-        )
+        ));
+        backend.heads_to_attention_layout_device(&context)
     }
 
     fn mla_sequence_context_device<B: Backend>(
@@ -2049,7 +2051,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > 3 {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2089,9 +2091,13 @@ impl<'a> Attention<'a> {
                     past_tokens,
                     config.rope_theta as f32,
                 ));
-                let q_recombined = crate::try_device!(
-                    backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
-                );
+                let q_recombined = if use_absorbed_mla {
+                    None
+                } else {
+                    Some(crate::try_device!(
+                        backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                    ))
+                };
                 Ok(Some((q_no_rope, q_rope_after_rope, q_recombined)))
             },)
         );
@@ -2134,9 +2140,10 @@ impl<'a> Attention<'a> {
                 if use_absorbed_mla {
                     return Ok(Some((None, None, None)));
                 }
-                let q_for_attention = Some(crate::try_device!(
-                    backend.heads_to_attention_layout_device(&q_recombined)
-                ));
+                let q_for_attention = Some(crate::try_device!(backend
+                    .heads_to_attention_layout_device(q_recombined.as_ref().ok_or_else(
+                        || Error::model("expanded dense attention is missing recombined query"),
+                    )?)));
                 let current_k_for_attention = Some(crate::try_device!(backend
                     .heads_to_attention_layout_device(k_heads.as_ref().ok_or_else(|| {
                         Error::model("expanded dense attention is missing current K heads")
@@ -2190,21 +2197,23 @@ impl<'a> Attention<'a> {
                     ),
                 ))
             }
-            (DevicePastKvLayout::MlaLatent, 1) => crate::try_device!(profile::run_layer_stage(
-                self.layer_index,
-                "attention.dense_mla_decode",
-                || {
-                    self.mla_context_device(
-                        config,
-                        &q_no_rope,
-                        &q_rope_after_rope,
-                        &kv_latent_norm,
-                        &k_rope_after_rope,
-                        past_kv,
-                        backend,
-                    )
-                },
-            )),
+            (DevicePastKvLayout::MlaLatent, _) if use_absorbed_mla => {
+                crate::try_device!(profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.dense_mla_absorbed",
+                    || {
+                        self.mla_context_device(
+                            config,
+                            &q_no_rope,
+                            &q_rope_after_rope,
+                            &kv_latent_norm,
+                            &k_rope_after_rope,
+                            past_kv,
+                            backend,
+                        )
+                    },
+                ))
+            }
             (DevicePastKvLayout::ExpandedHeads, _) => {
                 let past = crate::try_device!(backend.paged_kv_contiguous_device(past_kv));
                 crate::try_device!(profile::run_layer_stage(
@@ -2288,7 +2297,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > 3 {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2412,6 +2421,8 @@ impl<'a> Attention<'a> {
         selected_kv_for_tokens: &mut S,
         index_keys_for_layer: &mut I,
         shared_selection: Option<&[u32]>,
+        query_position: Option<usize>,
+        include_current_kv: bool,
     ) -> Result<Option<SparseAttentionDeviceTensors>>
     where
         B: Backend,
@@ -2426,7 +2437,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > 3 {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2438,10 +2449,22 @@ impl<'a> Attention<'a> {
         let past_layout =
             validate_device_past_kv_layout(past_kv, batch, config, self.kv_lora_rank)?;
         let past_tokens = past_kv.cached_tokens;
-        let full_context = past_tokens
-            .checked_add(tokens)
-            .ok_or_else(|| Error::model("DSA decode key token count overflow"))?
-            <= config.dsa_index_topk;
+        let query_position = query_position.unwrap_or(past_tokens);
+        if query_position < past_tokens {
+            return Err(Error::model(format!(
+                "sparse decode query position {query_position} precedes {past_tokens} cached tokens"
+            )));
+        }
+        if !include_current_kv && tokens != 1 {
+            return Err(Error::model(
+                "KVShare history-only attention requires exactly one query token",
+            ));
+        }
+        let full_context = include_current_kv
+            && query_position
+                .checked_add(tokens)
+                .ok_or_else(|| Error::model("DSA decode key token count overflow"))?
+                <= config.dsa_index_topk;
         let use_absorbed_mla =
             past_layout == DevicePastKvLayout::MlaLatent && tokens == 1 && full_context;
 
@@ -2474,7 +2497,7 @@ impl<'a> Attention<'a> {
                     let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
                         &q_rope,
                         config.qk_rope_dim,
-                        past_tokens,
+                        query_position,
                         config.rope_theta as f32,
                     ));
                     let q_recombined = crate::try_device!(
@@ -2501,7 +2524,7 @@ impl<'a> Attention<'a> {
                     let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
                         &k_rope_mqa,
                         config.qk_rope_dim,
-                        past_tokens,
+                        query_position,
                         config.rope_theta as f32,
                     ));
                     let (k_heads, v_heads) = if use_absorbed_mla {
@@ -2574,13 +2597,42 @@ impl<'a> Attention<'a> {
             profile::TokenProfileStage::SparseDsaIndexer,
             backend,
             || {
-                let selected_past_tokens = if let Some(indexer) = self.indexer.as_ref() {
+                let selected_past_tokens = if !include_current_kv {
+                    let shared_selection = shared_selection.ok_or_else(|| {
+                        Error::model(format!(
+                            "MTP KVShare selection missing for sparse attention layer {}",
+                            self.layer_index
+                        ))
+                    })?;
+                    past_only_selected_indices(shared_selection, past_tokens)?
+                } else if let Some(indexer) = self.indexer.as_ref() {
                     if full_context {
                         index_key = Some(crate::try_device!(profile::run_layer_stage(
                             self.layer_index,
                             "dsa_indexer.current_key_device",
                             || indexer.key_device(config, hidden_states, past_tokens, backend),
                         )));
+                        if self.layer_index == config.num_layers
+                            && config.index_share_for_mtp_iteration
+                        {
+                            let last_verified_token = past_tokens
+                                .checked_add(tokens)
+                                .and_then(|count| count.checked_sub(1))
+                                .ok_or_else(|| {
+                                    Error::model("MTP full-context IndexShare token range overflow")
+                                })?;
+                            next_shared_selection = Some(
+                                (0..=last_verified_token)
+                                    .map(|token| {
+                                        u32::try_from(token).map_err(|_| {
+                                            Error::model(
+                                                "MTP full-context IndexShare token exceeds u32",
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>>>()?,
+                            );
+                        }
                         Vec::new()
                     } else {
                         let cached_index_keys = index_keys_for_layer(self.layer_index)?
@@ -2734,6 +2786,7 @@ impl<'a> Attention<'a> {
                                     &selected_kv.v,
                                     current_k,
                                     current_v,
+                                    include_current_kv,
                                 ),
                             ))
                         }
@@ -2791,6 +2844,7 @@ impl<'a> Attention<'a> {
                                             &selected_v_for_attention,
                                             current_k,
                                             current_v,
+                                            include_current_kv,
                                         )
                                     },
                                 ));
@@ -3097,7 +3151,8 @@ fn validate_device_past_kv_layout(
 }
 
 fn should_use_dense_absorbed_mla(layout: DevicePastKvLayout, tokens: usize) -> bool {
-    layout == DevicePastKvLayout::MlaLatent && tokens == 1
+    layout == DevicePastKvLayout::MlaLatent
+        && (1..=crate::MAX_DEVICE_SEQUENCE_TOKENS).contains(&tokens)
 }
 
 fn mla_latent_cache(kv_latent: &Tensor) -> Result<Tensor> {
@@ -3289,14 +3344,18 @@ mod tests {
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn dense_absorbed_mla_is_limited_to_single_token_latent_decode() {
+    fn dense_absorbed_mla_accepts_the_full_mtp_verifier_width() {
         assert!(should_use_dense_absorbed_mla(
             DevicePastKvLayout::MlaLatent,
             1
         ));
+        assert!(should_use_dense_absorbed_mla(
+            DevicePastKvLayout::MlaLatent,
+            crate::MAX_DEVICE_SEQUENCE_TOKENS
+        ));
         assert!(!should_use_dense_absorbed_mla(
             DevicePastKvLayout::MlaLatent,
-            2
+            crate::MAX_DEVICE_SEQUENCE_TOKENS + 1
         ));
         assert!(!should_use_dense_absorbed_mla(
             DevicePastKvLayout::ExpandedHeads,
@@ -3513,6 +3572,8 @@ mod tests {
             index_head_dim: 128,
             index_n_heads: 32,
             index_topk_freq: 4,
+            index_skip_topk_offset: 3,
+            index_share_for_mtp_iteration: true,
             indexer_rope_interleave: true,
             indexer_types: Vec::new(),
             num_nextn_predict_layers: 0,

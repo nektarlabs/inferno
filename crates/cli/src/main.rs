@@ -86,10 +86,6 @@ enum Command {
         /// Write runtime memory telemetry to a file instead of interleaving it with streamed text.
         #[arg(long)]
         telemetry_file: Option<PathBuf>,
-
-        /// Enable the experimental GLM multi-token prediction verifier.
-        #[arg(long, default_value_t = false)]
-        speculative_mtp: bool,
     },
 }
 
@@ -115,7 +111,6 @@ fn main() -> Result<()> {
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file,
-            speculative_mtp,
         } => commands::generate::run(
             model.as_path(),
             config.as_deref(),
@@ -134,7 +129,6 @@ fn main() -> Result<()> {
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file.as_deref(),
-            speculative_mtp,
         )?,
     }
 
@@ -375,25 +369,6 @@ mod tests {
         } = cli.command;
         assert_eq!(expert_cache_gb, Some(9.5));
         assert_eq!(hot_kv_cache_gb, Some(2.0));
-    }
-
-    #[test]
-    fn generate_accepts_speculative_mtp_flag() {
-        let cli = Cli::try_parse_from([
-            "inferno",
-            "generate",
-            "--model",
-            "/tmp/model",
-            "--prompt",
-            "Hello GLM",
-            "--speculative-mtp",
-        ])
-        .unwrap();
-
-        let Command::Generate {
-            speculative_mtp, ..
-        } = cli.command;
-        assert!(speculative_mtp);
     }
 
     #[test]

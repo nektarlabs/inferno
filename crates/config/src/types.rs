@@ -39,6 +39,8 @@ pub struct Config {
     pub index_head_dim: usize,
     pub index_n_heads: usize,
     pub index_topk_freq: usize,
+    pub index_skip_topk_offset: usize,
+    pub index_share_for_mtp_iteration: bool,
     pub indexer_rope_interleave: bool,
     pub indexer_types: Vec<IndexerLayerKind>,
     pub num_nextn_predict_layers: usize,
@@ -88,6 +90,8 @@ struct RawConfig {
     index_head_dim: Option<usize>,
     index_n_heads: Option<usize>,
     index_topk_freq: Option<usize>,
+    index_skip_topk_offset: Option<usize>,
+    index_share_for_mtp_iteration: Option<bool>,
     indexer_rope_interleave: Option<bool>,
     indexer_types: Option<Vec<IndexerLayerKind>>,
     num_nextn_predict_layers: Option<usize>,
@@ -169,6 +173,8 @@ impl<'de> Deserialize<'de> for Config {
             index_head_dim: raw.index_head_dim.unwrap_or_else(default_index_head_dim),
             index_n_heads: raw.index_n_heads.unwrap_or_else(default_index_n_heads),
             index_topk_freq: raw.index_topk_freq.unwrap_or_else(default_index_topk_freq),
+            index_skip_topk_offset: raw.index_skip_topk_offset.unwrap_or(0),
+            index_share_for_mtp_iteration: raw.index_share_for_mtp_iteration.unwrap_or(false),
             indexer_rope_interleave: raw
                 .indexer_rope_interleave
                 .unwrap_or_else(default_indexer_rope_interleave),
@@ -362,6 +368,8 @@ mod tests {
         assert_eq!(config.index_head_dim, 128);
         assert_eq!(config.index_n_heads, 32);
         assert_eq!(config.index_topk_freq, 4);
+        assert_eq!(config.index_skip_topk_offset, 3);
+        assert!(config.index_share_for_mtp_iteration);
         assert!(config.indexer_rope_interleave);
         assert_eq!(config.indexer_types.len(), 78);
         assert_eq!(config.indexer_types[3], IndexerLayerKind::Full);

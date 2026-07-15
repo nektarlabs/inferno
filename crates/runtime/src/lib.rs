@@ -55,11 +55,10 @@ const F32_BYTES: u64 = 4;
 const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
-const MTP_DRAFTS_PER_STEP: usize = 1;
+const MTP_DRAFTS_PER_STEP: usize = 7;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GenerationOptions {
-    pub speculative_mtp: bool,
     pub hot_kv_cache_budget_bytes: Option<usize>,
     pub dynamic_cache_budget: Option<CacheBudgetSpec>,
     pub profile_token_costs: bool,
@@ -118,7 +117,26 @@ impl KvCacheMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamingGenerationReport {
     pub kv_cache: KvCacheMetrics,
+    pub mtp: MtpMetrics,
     pub cache_budget: Option<CacheBudgetRuntimeReport>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MtpMetrics {
+    pub enabled: bool,
+    pub verification_passes: u64,
+    pub target_tokens: u64,
+    pub draft_tokens: u64,
+    pub accepted_draft_tokens: u64,
+}
+
+impl MtpMetrics {
+    pub fn acceptance_rate(self) -> f64 {
+        if self.draft_tokens == 0 {
+            return 0.0;
+        }
+        self.accepted_draft_tokens as f64 / self.draft_tokens as f64
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -880,6 +898,7 @@ pub fn benchmark_dsa_selected_attention<B: Backend>(
                 &selected_v,
                 &current_k,
                 &current_v,
+                true,
             )?,
         )?;
     }
@@ -1211,7 +1230,8 @@ where
     let generate_started_at = Instant::now();
     let use_streaming_prefill = backend.capabilities().custom_kernels;
     let use_device_kv = use_streaming_prefill;
-    let mtp_available = options.speculative_mtp && use_device_kv && model.has_mtp_head();
+    let mtp_available =
+        config.index_share_for_mtp_iteration && use_device_kv && model.has_mtp_head();
     let prefill_strategy = if use_streaming_prefill {
         PrefillStrategy::Streaming
     } else {
@@ -1225,6 +1245,10 @@ where
         prefill_strategy,
     )?;
     let use_mtp = should_enable_mtp(mtp_available, effective_max_new_tokens);
+    let mut mtp_metrics = MtpMetrics {
+        enabled: use_mtp,
+        ..MtpMetrics::default()
+    };
     if options.profile_token_costs && use_mtp {
         return Err(Error::runtime(
             "per-token cost profiling cannot be combined with speculative MTP because one verification step can emit multiple tokens",
@@ -1350,6 +1374,9 @@ where
                         &mut mtp_device_cache,
                         page_size,
                         options.hot_kv_cache_budget_bytes,
+                        None,
+                        None,
+                        true,
                         true,
                     )?;
                 }
@@ -1410,6 +1437,7 @@ where
             &device_kv_cache,
             &host_kv_cache,
             cache_budget_controller.as_ref(),
+            mtp_metrics,
         ));
     }
 
@@ -1486,6 +1514,13 @@ where
                 &[input_ids.len(), input_ids.len()],
             )?;
             let draft_count = input_ids.len() - 1;
+            mtp_metrics.verification_passes = mtp_metrics.verification_passes.saturating_add(1);
+            mtp_metrics.target_tokens = mtp_metrics
+                .target_tokens
+                .saturating_add(u64::try_from(input_ids.len()).unwrap_or(u64::MAX));
+            mtp_metrics.draft_tokens = mtp_metrics
+                .draft_tokens
+                .saturating_add(u64::try_from(draft_count).unwrap_or(u64::MAX));
             let mut accepted_drafts = 0_usize;
             let mut accepted_eos = false;
             for draft_index in 0..draft_count {
@@ -1510,6 +1545,9 @@ where
                     break;
                 }
             }
+            mtp_metrics.accepted_draft_tokens = mtp_metrics
+                .accepted_draft_tokens
+                .saturating_add(u64::try_from(accepted_drafts).unwrap_or(u64::MAX));
             let accepted_input_rows = 1 + accepted_drafts;
             let mut emitted = input_ids[1..accepted_input_rows].to_vec();
             if !accepted_eos {
@@ -1622,6 +1660,7 @@ where
         &device_kv_cache,
         &host_kv_cache,
         cache_budget_controller.as_ref(),
+        mtp_metrics,
     ))
 }
 
@@ -1777,6 +1816,8 @@ struct PendingMtpDrafts {
 
 struct MtpDeviceDraftState {
     token_id: u32,
+    recycle_hidden_states: backend::DeviceValue,
+    shared_selection: Option<Vec<u32>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1789,6 +1830,9 @@ fn run_mtp_device_draft<B: Backend>(
     mtp_cache: &mut Option<DevicePagedRuntimeCache>,
     page_size: usize,
     hot_kv_cache_budget_bytes: Option<usize>,
+    shared_selection: Option<&[u32]>,
+    query_position: Option<usize>,
+    include_current_kv: bool,
     commit_cache: bool,
 ) -> Result<Option<MtpDeviceDraftState>> {
     if !model.has_mtp_head() || next_token_ids.is_empty() {
@@ -1818,6 +1862,9 @@ fn run_mtp_device_draft<B: Backend>(
                         .borrow_mut()
                         .dsa_index_keys_for_layer_device(layer_index, backend)
                 },
+                shared_selection,
+                query_position,
+                include_current_kv,
             )?
         }
         None => model.draft_next_token_with_mtp_device(
@@ -1828,6 +1875,9 @@ fn run_mtp_device_draft<B: Backend>(
             None,
             |_layer_index, _token_indices| Ok(None),
             |_layer_index| Ok(None),
+            shared_selection,
+            query_position,
+            include_current_kv,
         )?,
     };
     let Some(draft) = draft else {
@@ -1859,6 +1909,8 @@ fn run_mtp_device_draft<B: Backend>(
     }
     Ok(Some(MtpDeviceDraftState {
         token_id: draft.token_id,
+        recycle_hidden_states: draft.recycle_hidden_states,
+        shared_selection: draft.shared_selection,
     }))
 }
 
@@ -1887,14 +1939,58 @@ fn build_pending_mtp_drafts<B: Backend>(
         mtp_cache,
         page_size,
         hot_kv_cache_budget_bytes,
+        None,
+        None,
+        true,
         true,
     )?
     else {
         return Ok(None);
     };
-    Ok(Some(PendingMtpDrafts {
-        token_ids: vec![first.token_id],
-    }))
+    let mut token_ids = vec![first.token_id];
+    if draft_count > 1 {
+        let shared_selection = first.shared_selection.ok_or_else(|| {
+            Error::runtime("MTP IndexShare step 0 did not produce reusable token indices")
+        })?;
+        let fixed_cache_tokens = mtp_cache
+            .as_ref()
+            .ok_or_else(|| Error::runtime("MTP KVShare cache was not initialized"))?
+            .cached_tokens()?;
+        let mut draft_hidden = require_device_value(
+            "MTP next-step hidden state selection",
+            backend.select_last_token_device(&first.recycle_hidden_states)?,
+        )?;
+        let mut draft_token_id = first.token_id;
+
+        for draft_index in 1..draft_count {
+            let query_position = fixed_cache_tokens
+                .checked_add(draft_index - 1)
+                .ok_or_else(|| Error::runtime("MTP KVShare query position overflow"))?;
+            let next = run_mtp_device_draft(
+                model,
+                config,
+                backend,
+                &draft_hidden,
+                &[draft_token_id],
+                mtp_cache,
+                page_size,
+                hot_kv_cache_budget_bytes,
+                Some(&shared_selection),
+                Some(query_position),
+                false,
+                false,
+            )?
+            .ok_or_else(|| Error::runtime("MTP KVShare draft step produced no output"))?;
+            token_ids.push(next.token_id);
+            draft_token_id = next.token_id;
+            draft_hidden = require_device_value(
+                "MTP next-step hidden state selection",
+                backend.select_last_token_device(&next.recycle_hidden_states)?,
+            )?;
+        }
+    }
+
+    Ok(Some(PendingMtpDrafts { token_ids }))
 }
 
 fn should_enable_mtp(mtp_available: bool, effective_max_new_tokens: usize) -> bool {
@@ -2310,10 +2406,12 @@ fn streaming_generation_report(
     device: &Option<DevicePagedRuntimeCache>,
     host: &Option<PagedRuntimeCache>,
     budget: Option<&CacheBudgetController>,
+    mtp: MtpMetrics,
 ) -> StreamingGenerationReport {
     if let Some(device) = device.as_ref() {
         return StreamingGenerationReport {
             kv_cache: device.cache_metrics(),
+            mtp,
             cache_budget: budget.map(CacheBudgetController::report),
         };
     }
@@ -2324,6 +2422,7 @@ fn streaming_generation_report(
             cold_bytes: memory.cold_bytes.unwrap_or(0),
             ..KvCacheMetrics::default()
         },
+        mtp,
         cache_budget: budget.map(CacheBudgetController::report),
     }
 }
@@ -4630,12 +4729,11 @@ mod tests {
         assert!(report.raw_f32_bytes > report.stored_bytes);
     }
 
-    /// The batched device-resident decode path (one shared command buffer,
-    /// sync only at host sinks) must generate exactly the same tokens as the
-    /// eager per-op path on the same native Metal backend. Skipped where no
-    /// Metal device is available.
+    /// Production Metal generation must never silently fall back to host KV.
+    /// The explicit debug switch proves that runtime enforcement remains in
+    /// place if the resident device path becomes unavailable.
     #[test]
-    fn device_batched_decode_matches_eager_decode_on_metal() {
+    fn metal_generation_rejects_disabled_resident_device_decode() {
         let Ok(native_backend) = MetalBackend::new() else {
             return;
         };
@@ -4643,15 +4741,16 @@ mod tests {
         let gguf = GgufFile::open(&path).unwrap();
         let config = tiny_config();
 
-        let batched_model = Model::open_from_gguf(
+        let model = Model::open_from_gguf(
             &gguf,
             &config,
             &native_backend,
             DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
         )
         .unwrap();
-        let batched_token_ids = run_generate_token_ids_with_stop_tokens(
-            &batched_model,
+        model.disable_device_decode();
+        let error = run_generate_token_ids_with_stop_tokens(
+            &model,
             &config,
             &native_backend,
             &[1, 2],
@@ -4659,29 +4758,93 @@ mod tests {
             1,
             &[],
         )
-        .unwrap();
+        .expect_err("disabled resident decode must not fall back to host KV");
 
-        let eager_model = Model::open_from_gguf(
-            &gguf,
-            &config,
-            &native_backend,
-            DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
-        )
-        .unwrap();
-        eager_model.disable_device_decode();
-        let eager_token_ids = run_generate_token_ids_with_stop_tokens(
-            &eager_model,
-            &config,
-            &native_backend,
-            &[1, 2],
-            Some(3),
+        assert!(error
+            .to_string()
+            .contains("fallback to host KV is disabled"));
+    }
+
+    #[test]
+    fn eight_row_device_verifier_preserves_the_first_causal_row_on_metal() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_gguf_model_fixture(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = tiny_config();
+        let model = Model::open_from_gguf(&gguf, &config, &backend, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS)
+            .unwrap();
+
+        let single_seed = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("single-row seed device path");
+        let mut single_cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
             1,
-            &[],
+            &single_seed.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        let single = run_cached_device_token_sequence_without_append(
+            &model,
+            &config,
+            &backend,
+            &[2],
+            &mut single_cache,
+            1,
+            "test.single",
+            "test.single.model",
         )
         .unwrap();
 
-        assert_eq!(batched_token_ids, eager_token_ids);
-        assert_eq!(batched_token_ids.len(), 3);
+        let sequence_seed = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("sequence seed device path");
+        let mut sequence_cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
+            1,
+            &sequence_seed.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        let sequence = run_cached_device_token_sequence_without_append(
+            &model,
+            &config,
+            &backend,
+            &[2, 3, 4, 5, 6, 7, 1, 2],
+            &mut sequence_cache,
+            1,
+            "test.sequence",
+            "test.sequence.model",
+        )
+        .unwrap();
+
+        let single_hidden = backend
+            .device_download_f32_tensor(&single.hidden_states)
+            .unwrap();
+        let sequence_hidden = backend
+            .device_download_f32_tensor(&sequence.hidden_states)
+            .unwrap();
+        assert_eq!(single_hidden.dims(), &[1, 1, config.hidden_size]);
+        assert_eq!(sequence_hidden.dims(), &[1, 8, config.hidden_size]);
+        for (hidden_index, (&single_value, &sequence_value)) in single_hidden
+            .values()
+            .iter()
+            .zip(&sequence_hidden.values()[..config.hidden_size])
+            .enumerate()
+        {
+            let tolerance = 1e-4_f32 * single_value.abs().max(sequence_value.abs()).max(1.0);
+            assert!(
+                (single_value - sequence_value).abs() <= tolerance,
+                "first verifier row differs at hidden {hidden_index}: single={single_value}, sequence={sequence_value}"
+            );
+        }
+        assert_eq!(single.token_ids[0], sequence.token_ids[0]);
     }
 
     #[test]
@@ -4843,11 +5006,27 @@ mod tests {
     }
 
     #[test]
-    fn mtp_uses_the_artifacts_single_draft_head() {
+    fn mtp_reuses_the_single_head_for_seven_draft_steps() {
         assert_eq!(mtp_draft_count(0), 0);
         assert_eq!(mtp_draft_count(1), 0);
         assert_eq!(mtp_draft_count(2), 1);
-        assert_eq!(mtp_draft_count(8), 1);
+        assert_eq!(mtp_draft_count(3), 2);
+        assert_eq!(mtp_draft_count(8), 7);
+        assert_eq!(mtp_draft_count(32), 7);
+    }
+
+    #[test]
+    fn mtp_acceptance_rate_uses_only_verified_drafts() {
+        let metrics = MtpMetrics {
+            enabled: true,
+            verification_passes: 2,
+            target_tokens: 6,
+            draft_tokens: 4,
+            accepted_draft_tokens: 3,
+        };
+
+        assert_eq!(metrics.acceptance_rate(), 0.75);
+        assert_eq!(MtpMetrics::default().acceptance_rate(), 0.0);
     }
 
     #[test]
@@ -5255,6 +5434,8 @@ mod tests {
             index_head_dim: 128,
             index_n_heads: 32,
             index_topk_freq: 4,
+            index_skip_topk_offset: 3,
+            index_share_for_mtp_iteration: true,
             indexer_rope_interleave: true,
             indexer_types: Vec::new(),
             moe_intermediate_size: 256,

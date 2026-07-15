@@ -1535,6 +1535,30 @@ impl Metal {
         )
     }
 
+    pub(crate) fn prefetch_routed_experts(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<()> {
+        self.q2_matvec.prefetch_routed_experts(
+            &self.device,
+            layer_index,
+            model_path,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+            in_features,
+            intermediate_features,
+            out_features,
+        )
+    }
+
     /// Adds a GPU-side dependency immediately before a routed-expert consumer.
     /// The CPU does not wait here: Metal starts subsequent work as soon as the
     /// expert queue signals that every output row is complete.
@@ -2206,11 +2230,11 @@ impl Metal {
         })
     }
 
-    /// Encodes the complete absorbed MLA decode core into the current Metal
+    /// Encodes absorbed MLA for a short causal sequence into the current Metal
     /// batch: K_b query absorption, paged latent attention, then V_b output
-    /// projection. No expanded historical K/V tensor is materialized.
+    /// projection. No expanded historical or current K/V is materialized.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn batched_q8_0_absorbed_mla_decode(
+    pub(crate) fn batched_q8_0_absorbed_mla(
         &self,
         k_b_weights: &[u8],
         v_b_weights: &[u8],
@@ -2224,6 +2248,7 @@ impl Metal {
         current_rope_len: usize,
         past_kv: &DevicePagedKvView,
         batch_count: usize,
+        token_count: usize,
         head_count: usize,
         q_no_rope_dim: usize,
         rope_dim: usize,
@@ -2237,7 +2262,10 @@ impl Metal {
                 past_kv.batch
             )));
         }
-        let absorbed_q_len = batch_count
+        let row_count = batch_count
+            .checked_mul(token_count)
+            .ok_or_else(|| Error::backend("absorbed MLA row count overflow"))?;
+        let absorbed_q_len = row_count
             .checked_mul(head_count)
             .and_then(|rows| rows.checked_mul(latent_dim))
             .ok_or_else(|| Error::backend("absorbed MLA query length overflow"))?;
@@ -2249,7 +2277,7 @@ impl Metal {
                 k_b_weights,
                 q_no_rope,
                 q_no_rope_len,
-                batch_count,
+                row_count,
                 head_count,
                 q_no_rope_dim,
                 latent_dim,
@@ -2267,6 +2295,7 @@ impl Metal {
                     current_rope,
                     current_rope_len,
                     past_kv,
+                    token_count,
                     head_count,
                     latent_dim,
                     rope_dim,
@@ -2278,12 +2307,12 @@ impl Metal {
                 v_b_weights,
                 &context_latent,
                 context_latent_len,
-                batch_count,
+                row_count,
                 head_count,
                 latent_dim,
                 value_dim,
             )?;
-            let output_len = batch_count
+            let output_len = row_count
                 .checked_mul(head_count)
                 .and_then(|rows| rows.checked_mul(value_dim))
                 .ok_or_else(|| Error::backend("absorbed MLA output length overflow"))?;
@@ -2310,6 +2339,7 @@ impl Metal {
         selected_tokens: usize,
         head_dim: usize,
         value_dim: usize,
+        include_current_kv: bool,
     ) -> Result<(Buffer, usize)> {
         self.batch.encode(&self.queue, |command_buffer| {
             self.decode_attention.encode_selected(
@@ -2331,6 +2361,7 @@ impl Metal {
                 selected_tokens,
                 head_dim,
                 value_dim,
+                include_current_kv,
             )
         })
     }

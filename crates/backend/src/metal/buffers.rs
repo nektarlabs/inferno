@@ -252,7 +252,7 @@ fn byte_len<T>(len: usize) -> Result<usize> {
         .ok_or_else(|| Error::backend("Metal buffer byte length overflow"))
 }
 
-fn f16_bits_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
     let exponent = (bits >> 10) & 0x1f;
     let mantissa = (bits & 0x03ff) as u32;

@@ -78,6 +78,8 @@ pub struct ModelTokenSequenceOutput {
 
 #[derive(Debug)]
 pub struct ModelDeviceTokenOutput {
+    /// Backbone hidden states after the final RMSNorm. GLM-5.2 trains its MTP
+    /// head against this representation.
     pub hidden_states: backend::DeviceValue,
     pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
     pub token_id: u32,
@@ -86,6 +88,8 @@ pub struct ModelDeviceTokenOutput {
 
 #[derive(Debug)]
 pub struct ModelDeviceTokenSequenceOutput {
+    /// Backbone hidden states after the final RMSNorm. These rows can be fed
+    /// directly into MTP after speculative verification.
     pub hidden_states: backend::DeviceValue,
     pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
     pub token_ids: Vec<u32>,
@@ -301,6 +305,9 @@ impl<'a> Model<'a> {
         mtp_past_kv: Option<&backend::DevicePagedKvView>,
         mut selected_kv_for_tokens: S,
         mut index_keys_for_layer: I,
+        shared_selection: Option<&[u32]>,
+        query_position: Option<usize>,
+        include_current_kv: bool,
     ) -> Result<Option<MtpDeviceDraftOutput>>
     where
         B: Backend,
@@ -320,6 +327,9 @@ impl<'a> Model<'a> {
             mtp_past_kv,
             &mut selected_kv_for_tokens,
             &mut index_keys_for_layer,
+            shared_selection,
+            query_position,
+            include_current_kv,
         )
     }
 
@@ -395,13 +405,17 @@ impl<'a> Model<'a> {
             &embedding.hidden_states,
             backend,
         ));
+        let normalized_hidden_states = self
+            .output_head
+            .normalize_device(&stack.hidden_states, backend)?
+            .ok_or_else(|| Error::backend("device seed final norm has no native path"))?;
         let token = self
             .output_head
-            .decode_token_device(&stack.hidden_states, backend)?
+            .decode_token_from_normalized_device(&normalized_hidden_states, backend)?
             .ok_or_else(|| Error::backend("device seed output head has no native path"))?;
 
         Ok(Some(ModelDeviceTokenOutput {
-            hidden_states: stack.hidden_states,
+            hidden_states: normalized_hidden_states,
             layer_kv_cache: stack.layer_kv_cache,
             token_id: token.token_id,
             token_score: token.token_score,
@@ -649,9 +663,11 @@ impl<'a> Model<'a> {
         S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
         I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
-        if decode_token_ids.is_empty() || decode_token_ids.len() > 3 {
+        if decode_token_ids.is_empty() || decode_token_ids.len() > crate::MAX_DEVICE_SEQUENCE_TOKENS
+        {
             return Err(Error::model(format!(
-                "GLM-5.2 device sequence decode expects one to three token ids, got {}",
+                "GLM-5.2 device sequence decode expects one to {} token ids, got {}",
+                crate::MAX_DEVICE_SEQUENCE_TOKENS,
                 decode_token_ids.len()
             )));
         }
@@ -690,7 +706,7 @@ impl<'a> Model<'a> {
         Ok(output)
     }
 
-    /// Runs one normal decode row or a two-row speculative verification while
+    /// Runs one normal decode row or an MTP speculative verification while
     /// hidden states, attention, MoE, logits and reductions remain on Metal.
     fn decode_token_sequence_paged_device<B, F, S, I>(
         &self,
@@ -717,28 +733,35 @@ impl<'a> Model<'a> {
             index_keys_for_layer,
         ));
 
+        let normalized_hidden_states = crate::try_device!(self
+            .output_head
+            .normalize_device(&stack.hidden_states, backend));
         let (token_ids, token_scores) = match self
             .output_head
-            .decode_tokens_device(&stack.hidden_states, backend)?
+            .decode_tokens_from_normalized_device(&normalized_hidden_states, backend)?
         {
             Some(tokens) => tokens,
             None if decode_token_ids.len() == 1 => {
                 // The head has no device path (e.g. a non-Q2_K output
-                // projection): download the final hidden states and finish on
-                // the eager head. The layer stack still ran fully batched.
-                let hidden_states = backend.device_download_f32_tensor(&stack.hidden_states)?;
+                // projection): download the already-normalized final hidden
+                // states and finish on the eager head. The layer stack still
+                // ran fully batched.
+                let hidden_states =
+                    backend.device_download_f32_tensor(&normalized_hidden_states)?;
                 let selected = require_native(
                     "select_last_token",
                     backend.select_last_token_f32_tensor(&hidden_states)?,
                 )?;
-                let token = self.output_head.decode_token_f32(&selected, backend)?;
+                let token = self
+                    .output_head
+                    .decode_token_from_normalized_f32(&selected, backend)?;
                 (vec![token.token_id], vec![token.token_score])
             }
             None => return Ok(None),
         };
 
         Ok(Some(ModelDeviceTokenSequenceOutput {
-            hidden_states: stack.hidden_states,
+            hidden_states: normalized_hidden_states,
             layer_kv_cache: stack.layer_kv_cache,
             token_ids,
             token_scores,
@@ -1593,6 +1616,8 @@ mod tests {
             index_head_dim: 128,
             index_n_heads: 32,
             index_topk_freq: 4,
+            index_skip_topk_offset: 3,
+            index_share_for_mtp_iteration: true,
             indexer_rope_interleave: true,
             indexer_types: Vec::new(),
             num_nextn_predict_layers: 0,
@@ -1630,6 +1655,8 @@ mod tests {
             index_head_dim: 128,
             index_n_heads: 32,
             index_topk_freq: 4,
+            index_skip_topk_offset: 3,
+            index_share_for_mtp_iteration: true,
             indexer_rope_interleave: true,
             indexer_types: Vec::new(),
             num_nextn_predict_layers: 0,

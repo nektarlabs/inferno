@@ -456,13 +456,13 @@ kernel void fused_paged_decode_attention_f16_kv_kernel(
     }
 }
 
-// Flash-style decode attention over normalized MLA latent cache rows.
+// Flash-style causal attention over normalized MLA latent cache rows.
 //
 // q_latent is K_b * q_no_rope, so the no-RoPE score can be computed directly
 // against the cached 512-wide latent. The kernel aggregates one latent vector
 // per query head; V_b is applied once after this kernel instead of once for
 // every cached token.
-kernel void fused_paged_absorbed_mla_decode_f32_kernel(
+kernel void fused_paged_absorbed_mla_sequence_f32_kernel(
     const device float* q_latent [[buffer(0)]],
     const device float* q_rope [[buffer(1)]],
     const device float* paged_latent [[buffer(2)]],
@@ -472,18 +472,20 @@ kernel void fused_paged_absorbed_mla_decode_f32_kernel(
     device float* output_latent [[buffer(6)]],
     constant uint& batch_count [[buffer(7)]],
     constant uint& head_count [[buffer(8)]],
-    constant uint& past_tokens [[buffer(9)]],
-    constant uint& page_size [[buffer(10)]],
-    constant uint& latent_dim [[buffer(11)]],
-    constant uint& rope_dim [[buffer(12)]],
-    constant uint& scale_dim [[buffer(13)]],
+    constant uint& query_tokens [[buffer(9)]],
+    constant uint& past_tokens [[buffer(10)]],
+    constant uint& page_size [[buffer(11)]],
+    constant uint& latent_dim [[buffer(12)]],
+    constant uint& rope_dim [[buffer(13)]],
+    constant uint& scale_dim [[buffer(14)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row_count = batch_count * head_count;
-    uint key_tokens = past_tokens + 1;
+    uint row_count = batch_count * query_tokens * head_count;
+    uint query = (row / head_count) % query_tokens;
+    uint key_tokens = past_tokens + query + 1;
     if (row >= row_count || key_tokens > FUSED_DECODE_MAX_KEYS) {
         return;
     }
@@ -493,7 +495,7 @@ kernel void fused_paged_absorbed_mla_decode_f32_kernel(
     threadgroup float row_max_shared;
     threadgroup float denom_shared;
 
-    uint batch = row / head_count;
+    uint batch = row / (query_tokens * head_count);
     uint q_latent_base = row * latent_dim;
     uint q_rope_base = row * rope_dim;
     float scale = 1.0f / sqrt(float(scale_dim));
@@ -514,8 +516,10 @@ kernel void fused_paged_absorbed_mla_decode_f32_kernel(
                 local_dot += q_rope[q_rope_base + dim] * paged_rope[rope_base + dim];
             }
         } else {
-            uint latent_base = batch * latent_dim;
-            uint rope_base = batch * rope_dim;
+            uint current_token = key - past_tokens;
+            uint current_base = batch * query_tokens + current_token;
+            uint latent_base = current_base * latent_dim;
+            uint rope_base = current_base * rope_dim;
             for (uint dim = tid; dim < latent_dim; dim += FUSED_DECODE_THREADS) {
                 local_dot += q_latent[q_latent_base + dim]
                     * current_latent[latent_base + dim];
@@ -588,8 +592,12 @@ kernel void fused_paged_absorbed_mla_decode_f32_kernel(
             uint token_base = ((page_index * batch_count + batch) * page_size + page_offset);
             sum += probability * paged_latent[token_base * latent_dim + dim];
         }
-        float current_probability = exp(scores[past_tokens] - row_max_shared) / denom_shared;
-        sum += current_probability * current_latent[batch * latent_dim + dim];
+        for (uint current_token = 0; current_token <= query; current_token++) {
+            uint key = past_tokens + current_token;
+            float probability = exp(scores[key] - row_max_shared) / denom_shared;
+            uint current_base = batch * query_tokens + current_token;
+            sum += probability * current_latent[current_base * latent_dim + dim];
+        }
         output_latent[row * latent_dim + dim] = sum;
     }
 }
@@ -606,13 +614,14 @@ kernel void fused_selected_decode_attention_f32_kernel(
     constant uint& selected_tokens [[buffer(8)]],
     constant uint& head_dim [[buffer(9)]],
     constant uint& value_dim [[buffer(10)]],
+    constant uint& include_current_kv [[buffer(11)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint row_count = batch_count * head_count;
-    uint key_tokens = selected_tokens + 1;
+    uint key_tokens = selected_tokens + include_current_kv;
     if (row >= row_count || key_tokens > FUSED_DECODE_MAX_KEYS) {
         return;
     }
@@ -635,7 +644,7 @@ kernel void fused_selected_decode_attention_f32_kernel(
             for (uint dim = tid; dim < head_dim; dim += FUSED_DECODE_THREADS) {
                 local_dot += q[q_base + dim] * selected_k[k_base + dim];
             }
-        } else {
+        } else if (include_current_kv != 0) {
             for (uint dim = tid; dim < head_dim; dim += FUSED_DECODE_THREADS) {
                 local_dot += q[q_base + dim] * current_k[current_k_base + dim];
             }
@@ -703,8 +712,10 @@ kernel void fused_selected_decode_attention_f32_kernel(
             uint v_index = ((batch * head_count + head) * selected_tokens + key) * value_dim + value_index;
             sum += probability * selected_v[v_index];
         }
-        float current_probability = exp(scores[selected_tokens] - row_max_shared) / denom_shared;
-        sum += current_probability * current_v[current_v_base + value_index];
+        if (include_current_kv != 0) {
+            float current_probability = exp(scores[selected_tokens] - row_max_shared) / denom_shared;
+            sum += current_probability * current_v[current_v_base + value_index];
+        }
         output[(row * value_dim) + value_index] = sum;
     }
 }
@@ -850,13 +861,14 @@ kernel void fused_selected_decode_attention_f16_kv_kernel(
     constant uint& selected_tokens [[buffer(8)]],
     constant uint& head_dim [[buffer(9)]],
     constant uint& value_dim [[buffer(10)]],
+    constant uint& include_current_kv [[buffer(11)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint row_count = batch_count * head_count;
-    uint key_tokens = selected_tokens + 1;
+    uint key_tokens = selected_tokens + include_current_kv;
     if (row >= row_count || key_tokens > FUSED_DECODE_MAX_KEYS) {
         return;
     }
@@ -879,7 +891,7 @@ kernel void fused_selected_decode_attention_f16_kv_kernel(
             for (uint dim = tid; dim < head_dim; dim += FUSED_DECODE_THREADS) {
                 local_dot += q[q_base + dim] * float(selected_k[k_base + dim]);
             }
-        } else {
+        } else if (include_current_kv != 0) {
             for (uint dim = tid; dim < head_dim; dim += FUSED_DECODE_THREADS) {
                 local_dot += q[q_base + dim] * current_k[current_k_base + dim];
             }
@@ -947,8 +959,10 @@ kernel void fused_selected_decode_attention_f16_kv_kernel(
             uint v_index = ((batch * head_count + head) * selected_tokens + key) * value_dim + value_index;
             sum += probability * float(selected_v[v_index]);
         }
-        float current_probability = exp(scores[selected_tokens] - row_max_shared) / denom_shared;
-        sum += current_probability * current_v[current_v_base + value_index];
+        if (include_current_kv != 0) {
+            float current_probability = exp(scores[selected_tokens] - row_max_shared) / denom_shared;
+            sum += current_probability * current_v[current_v_base + value_index];
+        }
         output[(row * value_dim) + value_index] = sum;
     }
 }

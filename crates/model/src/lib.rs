@@ -16,6 +16,10 @@ macro_rules! try_device {
 }
 pub(crate) use try_device;
 
+/// One target token plus the seven speculative tokens used by GLM-5.2's
+/// trained MTP verification path.
+pub(crate) const MAX_DEVICE_SEQUENCE_TOKENS: usize = 8;
+
 mod artifact_source;
 mod attention;
 mod attention_math;

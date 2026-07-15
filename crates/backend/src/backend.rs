@@ -905,6 +905,22 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    /// Loads predicted next-layer Q2 experts into the resident cache without
+    /// executing them. Exact routing remains authoritative on the next layer.
+    fn prefetch_routed_experts_device(
+        &self,
+        _layer_index: usize,
+        _model_path: &Path,
+        _gate_payloads: &[Q2ExpertSource<'_>],
+        _up_payloads: &[Q2ExpertSource<'_>],
+        _down_payloads: &[Q2ExpertSource<'_>],
+        _in_features: usize,
+        _intermediate_features: usize,
+        _out_features: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Inserts a device-side dependency before consuming routed-expert rows.
     /// The default backend has no asynchronous routed-expert path.
     fn wait_for_routed_experts_device(&self, _routed: &DeviceRoutedExperts) -> Result<()> {
@@ -1036,13 +1052,13 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
-    /// GLM MLA decode without materializing historical per-head K/V.
+    /// GLM MLA attention without materializing historical per-head K/V.
     ///
-    /// Inputs are one no-RoPE and RoPE query per head, one normalized current
-    /// latent, and the normalized latent/RoPE paged cache. The result is
-    /// `[B,H,1,V]`, ready for the attention output projection.
+    /// Inputs are a short causal query sequence, its normalized latent/RoPE
+    /// rows, and the normalized latent/RoPE paged cache. The result is
+    /// `[B,T,H,V]`; callers convert it to attention layout `[B,H,T,V]`.
     #[allow(clippy::too_many_arguments)]
-    fn q8_0_absorbed_mla_decode_device(
+    fn q8_0_absorbed_mla_device(
         &self,
         _k_b_weights: &[u8],
         _v_b_weights: &[u8],
@@ -1068,6 +1084,7 @@ pub trait Backend: Sync {
         _selected_v: &DeviceValue,
         _current_k: &DeviceValue,
         _current_v: &DeviceValue,
+        _include_current_kv: bool,
     ) -> Result<Option<DeviceValue>> {
         Ok(None)
     }
@@ -3980,6 +3997,51 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn prefetch_routed_experts_device(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            native_metal.prefetch_routed_experts(
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+                in_features,
+                intermediate_features,
+                out_features,
+            )?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+                in_features,
+                intermediate_features,
+                out_features,
+            );
+            Ok(false)
+        }
+    }
+
     fn wait_for_routed_experts_device(&self, routed: &DeviceRoutedExperts) -> Result<()> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -4576,7 +4638,7 @@ impl Backend for MetalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn q8_0_absorbed_mla_decode_device(
+    fn q8_0_absorbed_mla_device(
         &self,
         k_b_weights: &[u8],
         v_b_weights: &[u8],
@@ -4615,6 +4677,7 @@ impl Backend for MetalBackend {
             }
 
             let batch = q_no_dims[0];
+            let tokens = q_no_dims[1];
             let head_count = q_no_dims[2];
             let q_no_rope_dim = q_no_dims[3];
             let rope_dim = q_rope_dims[3];
@@ -4622,17 +4685,17 @@ impl Backend for MetalBackend {
             validate_exact_shape(
                 "device_absorbed_mla_q_rope_shape",
                 q_rope_dims,
-                &[batch, 1, head_count, rope_dim],
+                &[batch, tokens, head_count, rope_dim],
             )?;
             validate_exact_shape(
                 "device_absorbed_mla_current_latent_shape",
                 current_latent_dims,
-                &[batch, 1, latent_dim],
+                &[batch, tokens, latent_dim],
             )?;
             validate_exact_shape(
                 "device_absorbed_mla_current_rope_shape",
                 current_rope_dims,
-                &[batch, 1, 1, rope_dim],
+                &[batch, tokens, 1, rope_dim],
             )?;
             validate_exact_shape(
                 "device_absorbed_mla_cache_shape",
@@ -4650,7 +4713,7 @@ impl Backend for MetalBackend {
                 )));
             }
 
-            let (buffer, _) = native_metal.batched_q8_0_absorbed_mla_decode(
+            let (buffer, _) = native_metal.batched_q8_0_absorbed_mla(
                 k_b_weights,
                 v_b_weights,
                 &q_no_rope.buffer,
@@ -4663,6 +4726,7 @@ impl Backend for MetalBackend {
                 current_rope.element_count()?,
                 past_kv,
                 batch,
+                tokens,
                 head_count,
                 q_no_rope_dim,
                 rope_dim,
@@ -4671,7 +4735,7 @@ impl Backend for MetalBackend {
                 qk_head_dim,
             )?;
             return Ok(Some(DeviceValue::new(
-                vec![batch, head_count, 1, value_dim],
+                vec![batch, tokens, head_count, value_dim],
                 buffer,
             )));
         }
@@ -4700,6 +4764,7 @@ impl Backend for MetalBackend {
         selected_v: &DeviceValue,
         current_k: &DeviceValue,
         current_v: &DeviceValue,
+        include_current_kv: bool,
     ) -> Result<Option<DeviceValue>> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -4786,6 +4851,7 @@ impl Backend for MetalBackend {
                 selected_tokens,
                 head_dim,
                 value_dim,
+                include_current_kv,
             )?;
             return Ok(Some(DeviceValue::new(
                 vec![batch, heads, 1, value_dim],
@@ -4795,7 +4861,14 @@ impl Backend for MetalBackend {
 
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
-            let _ = (q, selected_k, selected_v, current_k, current_v);
+            let _ = (
+                q,
+                selected_k,
+                selected_v,
+                current_k,
+                current_v,
+                include_current_kv,
+            );
             Ok(None)
         }
     }

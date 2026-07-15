@@ -26,6 +26,8 @@ pub const GLM52_LIKE_CONFIG_JSON: &str = r#"{
   "index_head_dim": 128,
   "index_n_heads": 32,
   "index_topk_freq": 4,
+  "index_skip_topk_offset": 3,
+  "index_share_for_mtp_iteration": true,
   "indexer_rope_interleave": true,
   "num_nextn_predict_layers": 1,
   "rms_norm_eps": 0.00001,

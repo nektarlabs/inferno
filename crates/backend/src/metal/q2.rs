@@ -67,7 +67,9 @@ const Q2_K_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
     "q2_k_packed_heads_transposed_matvec_f32_kernel";
 const Q8_0_MATVEC_KERNEL: &str = "q8_0_matvec_f32_kernel";
 const Q8_0_MATVEC_TILED_KERNEL: &str = "q8_0_matvec_tiled_f32_kernel";
+const Q8_0_BATCHED_MATVEC_TILED_KERNEL: &str = "q8_0_batched_matvec_tiled_f32_kernel";
 const Q8_0_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_matvec_add_tiled_f32_kernel";
+const Q8_0_BATCHED_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_batched_matvec_add_tiled_f32_kernel";
 const Q8_0_TRANSPOSED_MATVEC_KERNEL: &str = "q8_0_transposed_matvec_f32_kernel";
 const Q8_0_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
     "q8_0_packed_heads_transposed_matvec_f32_kernel";
@@ -75,13 +77,22 @@ const Q8_0_PACKED_HEADS_MATVEC_KERNEL: &str = "q8_0_packed_heads_matvec_f32_kern
 const ARGMAX_F32_KERNEL: &str = "argmax_f32_kernel";
 const ARGMAX_ROWS_F32_KERNEL: &str = "argmax_rows_f32_kernel";
 const Q2_K_SIMD_LANES: usize = 32;
+const READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP: usize = 8;
+const READY_EXPERT_ASSIGNMENTS_PER_KERNEL_GROUP: usize = 8;
+const READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP: usize = 1;
+const Q8_0_BATCH_MAX_ROWS: usize = 8;
+const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
-// Sixteen Q2 expert triplets per routed layer use about 14.9 GB for the main
-// 75-layer model. On the 64 GB target this measured faster than 10 slots;
-// 21 slots increased macOS memory pressure enough to reduce throughput.
-const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 16;
+// Twelve Q2 expert triplets per routed layer use about 11.3 GB including the
+// MTP head. On the 64 GB target this measured faster for repeated MTP
+// verification than 8, 10, 16, or 18 slots because it avoids memory pressure
+// without discarding too much adjacent-token expert locality.
+const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 12;
 const ROUTED_EXPERT_READ_WORKERS: usize = 8;
+// Submit small ready-first groups so SSD reads remain overlapped with Metal
+// execution without creating one command buffer per expert.
+const ROUTED_EXPERT_WAVE_MIN_GROUPS: usize = 4;
 static EXPERT_CACHE_LOCK_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct MetalQ2Matvec {
@@ -99,7 +110,9 @@ pub(crate) struct MetalQ2Matvec {
     packed_heads_transposed_pipeline: ComputePipelineState,
     q8_0_pipeline: ComputePipelineState,
     q8_0_tiled_pipeline: ComputePipelineState,
+    q8_0_batched_tiled_pipeline: ComputePipelineState,
     q8_0_tiled_add_pipeline: ComputePipelineState,
+    q8_0_batched_tiled_add_pipeline: ComputePipelineState,
     q8_0_transposed_pipeline: ComputePipelineState,
     q8_0_packed_heads_transposed_pipeline: ComputePipelineState,
     q8_0_packed_heads_pipeline: ComputePipelineState,
@@ -107,6 +120,7 @@ pub(crate) struct MetalQ2Matvec {
     argmax_rows_pipeline: ComputePipelineState,
     scratch: Mutex<Q2ScratchBuffers>,
     ready_expert_cache: Mutex<Q2PerLayerExpertCache>,
+    transient_expert_pool: Mutex<Q2TransientExpertPool>,
     expert_cache_counters: Q2ExpertCacheCounters,
     expert_queue: CommandQueue,
     expert_completion_event: SharedEvent,
@@ -208,7 +222,7 @@ struct ExpertCacheKey {
     down_bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Q2ExpertCacheLayout {
     gate_stride: usize,
     up_stride: usize,
@@ -227,6 +241,13 @@ struct Q2ExpertLayerBuffers {
     gate: LockedMetalSlab,
     up: LockedMetalSlab,
     down: LockedMetalSlab,
+}
+
+#[derive(Debug, Default)]
+struct Q2TransientExpertPool {
+    layout: Option<Q2ExpertCacheLayout>,
+    capacity: usize,
+    storage: Option<Q2ExpertLayerBuffers>,
 }
 
 #[derive(Debug)]
@@ -418,10 +439,20 @@ impl MetalQ2Matvec {
             )?,
             q8_0_pipeline: compute_pipeline(device, library, Q8_0_MATVEC_KERNEL)?,
             q8_0_tiled_pipeline: compute_pipeline(device, library, Q8_0_MATVEC_TILED_KERNEL)?,
+            q8_0_batched_tiled_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_BATCHED_MATVEC_TILED_KERNEL,
+            )?,
             q8_0_tiled_add_pipeline: compute_pipeline(
                 device,
                 library,
                 Q8_0_MATVEC_ADD_TILED_KERNEL,
+            )?,
+            q8_0_batched_tiled_add_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_BATCHED_MATVEC_ADD_TILED_KERNEL,
             )?,
             q8_0_transposed_pipeline: compute_pipeline(
                 device,
@@ -442,6 +473,7 @@ impl MetalQ2Matvec {
             argmax_rows_pipeline: compute_pipeline(device, library, ARGMAX_ROWS_F32_KERNEL)?,
             scratch: Mutex::new(Q2ScratchBuffers::default()),
             ready_expert_cache: Mutex::new(Q2PerLayerExpertCache::default()),
+            transient_expert_pool: Mutex::new(Q2TransientExpertPool::default()),
             expert_cache_counters: Q2ExpertCacheCounters::default(),
             expert_queue: device.new_command_queue(),
             expert_completion_event: device.new_shared_event(),
@@ -1418,9 +1450,12 @@ impl MetalQ2Matvec {
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("quantized matvec output length overflow"))?;
 
+        let use_q8_batch =
+            kind == QuantMatvecKind::Q80 && (2..=Q8_0_BATCH_MAX_ROWS).contains(&row_count);
         let pipeline = match kind {
             QuantMatvecKind::Q2K => &self.pipeline,
             QuantMatvecKind::Q2KTransposed => &self.transposed_pipeline,
+            QuantMatvecKind::Q80 if use_q8_batch => &self.q8_0_batched_tiled_pipeline,
             QuantMatvecKind::Q80 => &self.q8_0_tiled_pipeline,
             QuantMatvecKind::Q80Transposed => &self.q8_0_transposed_pipeline,
         };
@@ -1470,7 +1505,11 @@ impl MetalQ2Matvec {
                     buffers[6],
                     &simdgroups_per_output_buffer,
                 ],
-                output_len,
+                if use_q8_batch {
+                    row_count.div_ceil(Q8_0_BATCH_ROW_TILE) * out_features
+                } else {
+                    output_len
+                },
                 simdgroups_per_output * Q2_K_SIMD_LANES,
             )?;
         } else {
@@ -1801,9 +1840,14 @@ impl MetalQ2Matvec {
             .arena
             .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
 
+        let use_q8_batch = (2..=Q8_0_BATCH_MAX_ROWS).contains(&row_count);
         encode_1d_threadgroups(
             command_buffer,
-            &self.q8_0_tiled_add_pipeline,
+            if use_q8_batch {
+                &self.q8_0_batched_tiled_add_pipeline
+            } else {
+                &self.q8_0_tiled_add_pipeline
+            },
             &[
                 &weight_buffer.buffer,
                 input,
@@ -1815,7 +1859,11 @@ impl MetalQ2Matvec {
                 &blocks_per_row_buffer,
                 &simdgroups_per_output_buffer,
             ],
-            output_len,
+            if use_q8_batch {
+                row_count.div_ceil(Q8_0_BATCH_ROW_TILE) * out_features
+            } else {
+                output_len
+            },
             simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
         Ok(output_buffer)
@@ -2270,9 +2318,24 @@ impl MetalQ2Matvec {
             .lock()
             .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?;
         let slots_per_layer = layer_cache.slots.len();
+        let can_reuse_transient_pool = self
+            .pending_expert_submissions
+            .lock()
+            .map_err(|_| Error::backend("pending routed expert submission lock poisoned"))?
+            .is_empty();
+        let mut transient_pool = if can_reuse_transient_pool {
+            Some(
+                self.transient_expert_pool
+                    .lock()
+                    .map_err(|_| Error::backend("Q2 transient expert pool lock poisoned"))?,
+            )
+        } else {
+            None
+        };
         let groups = prepare_ready_expert_groups(
             device,
             &mut layer_cache,
+            transient_pool.as_mut().map(|pool| &mut **pool),
             gate_payloads,
             up_payloads,
             down_payloads,
@@ -2376,6 +2439,188 @@ impl MetalQ2Matvec {
             read_bytes,
             ready_waves,
         })
+    }
+
+    /// Loads a predicted next layer's exact Q2 expert ranges into that
+    /// layer's resident slots. The next layer still performs its real router
+    /// lookup; a correct prediction then becomes a normal cache hit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefetch_routed_experts(
+        &self,
+        device: &Device,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<()> {
+        if gate_payloads.is_empty() {
+            return Err(Error::backend(
+                "routed expert prefetch requires at least one predicted expert",
+            ));
+        }
+        validate_exact_len(
+            "prefetch routed up payload count",
+            up_payloads.len(),
+            gate_payloads.len(),
+        )?;
+        validate_exact_len(
+            "prefetch routed down payload count",
+            down_payloads.len(),
+            gate_payloads.len(),
+        )?;
+
+        let gate_stride = uniform_payload_stride(gate_payloads, "prefetch routed gate")?;
+        let up_stride = uniform_payload_stride(up_payloads, "prefetch routed up")?;
+        let down_stride = uniform_payload_stride(down_payloads, "prefetch routed down")?;
+        validate_exact_len(
+            "prefetch routed gate stride",
+            gate_stride,
+            q2_expert_stride(in_features, intermediate_features)?,
+        )?;
+        validate_exact_len(
+            "prefetch routed up stride",
+            up_stride,
+            q2_expert_stride(in_features, intermediate_features)?,
+        )?;
+        validate_exact_len(
+            "prefetch routed down stride",
+            down_stride,
+            q2_expert_stride(intermediate_features, out_features)?,
+        )?;
+
+        let (layer_cache, model_file, model_path) = {
+            let mut cache = self
+                .ready_expert_cache
+                .lock()
+                .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+            cache.ensure_model_file(model_path)?;
+            cache.ensure_layout(gate_stride, up_stride, down_stride);
+            let layer_cache = cache.layer(layer_index);
+            let model_file = cache
+                .model_file
+                .as_ref()
+                .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?
+                .file
+                .try_clone()
+                .map_err(|source| Error::Io {
+                    path: model_path.to_path_buf(),
+                    source,
+                })?;
+            (layer_cache, model_file, model_path.to_path_buf())
+        };
+
+        // Keep the layer locked until all writes finish. Exact routing for the
+        // same layer can then observe either a complete expert or no expert,
+        // never a partially loaded slot.
+        let mut layer_cache = layer_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?;
+        let unique_count = gate_payloads
+            .iter()
+            .zip(up_payloads)
+            .zip(down_payloads)
+            .map(|((gate, up), down)| expert_cache_key(gate.bytes, up.bytes, down.bytes))
+            .collect::<HashSet<_>>()
+            .len();
+        if unique_count > layer_cache.slots.len() {
+            return Err(Error::backend(format!(
+                "routed expert prefetch selected {unique_count} unique experts but layer {layer_index} has only {} resident slots",
+                layer_cache.slots.len()
+            )));
+        }
+
+        let groups = prepare_ready_expert_groups(
+            device,
+            &mut layer_cache,
+            None,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+            gate_stride,
+            up_stride,
+            down_stride,
+        )?;
+        let cache_hits = groups.iter().filter(|group| group.cache_hit).count();
+        let miss_indices = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| (!group.cache_hit).then_some(index))
+            .collect::<Vec<_>>();
+        let cached_miss_keys = groups
+            .iter()
+            .filter_map(|group| group.cached_miss_key)
+            .collect::<Vec<_>>();
+        let read_bytes = miss_indices.iter().try_fold(0_u64, |total, &index| {
+            groups[index]
+                .read_tasks
+                .iter()
+                .try_fold(total, |total, task| {
+                    total
+                        .checked_add(u64::try_from(task.byte_len).map_err(|_| {
+                            Error::backend("prefetched expert read size does not fit u64")
+                        })?)
+                        .ok_or_else(|| Error::backend("prefetched expert read bytes overflow"))
+                })
+        })?;
+
+        let started = Instant::now();
+        let load_result = thread::scope(|scope| -> Result<()> {
+            let worker_count = miss_indices.len().min(ROUTED_EXPERT_READ_WORKERS);
+            if worker_count == 0 {
+                return Ok(());
+            }
+            let jobs_per_worker = miss_indices.len().div_ceil(worker_count);
+            let mut workers = Vec::with_capacity(worker_count);
+            for jobs in miss_indices.chunks(jobs_per_worker) {
+                let model_file = &model_file;
+                let model_path = &model_path;
+                let groups = &groups;
+                workers.push(scope.spawn(move || -> Result<()> {
+                    for &group_index in jobs {
+                        pread_ready_expert_gate_up(&model_file, &model_path, &groups[group_index])?;
+                        pread_ready_expert_down(&model_file, &model_path, &groups[group_index])?;
+                    }
+                    Ok(())
+                }));
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| Error::backend("Q2 expert prefetch worker thread panicked"))??;
+            }
+            Ok(())
+        });
+        let load_nanoseconds = elapsed_nanoseconds(started.elapsed());
+        if let Err(error) = load_result {
+            layer_cache.invalidate(&cached_miss_keys);
+            return Err(error);
+        }
+
+        // Predictions do not count as cache requests. Their I/O does count,
+        // otherwise telemetry would hide the cost of incorrect speculation.
+        self.expert_cache_counters
+            .ssd_read_bytes
+            .fetch_add(read_bytes, Ordering::Relaxed);
+        if !miss_indices.is_empty() {
+            self.expert_cache_counters
+                .ssd_load_nanoseconds
+                .fetch_add(load_nanoseconds, Ordering::Relaxed);
+        }
+        debug!(
+            target: "inferno::expert_cache",
+            layer_index,
+            predicted_experts = groups.len(),
+            cache_hits,
+            cache_misses = miss_indices.len(),
+            read_bytes,
+            load_ms = load_nanoseconds as f64 / 1_000_000.0,
+            "prefetched predicted next-layer Q2 experts"
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2489,11 +2734,11 @@ impl MetalQ2Matvec {
             let mut first_error = None;
             let mut completed_gate_up = 0_usize;
             let mut completed_down = 0_usize;
+            let mut pending_gate_up = Vec::with_capacity(ROUTED_EXPERT_WAVE_MIN_GROUPS);
             let mut pending_down = cached.clone();
             while let Ok(first) = receiver.recv() {
                 let mut completed = vec![first];
                 completed.extend(receiver.try_iter());
-                let mut pending_gate_up = Vec::new();
                 for (group_index, phase, result) in completed {
                     match phase {
                         ReadyExpertPhase::GateUp => {
@@ -2514,12 +2759,17 @@ impl MetalQ2Matvec {
                         }
                     }
                 }
-                if !pending_gate_up.is_empty() {
+
+                let all_gate_up_ready = completed_gate_up == misses.len();
+                if pending_gate_up.len() >= ROUTED_EXPERT_WAVE_MIN_GROUPS
+                    || (all_gate_up_ready && !pending_gate_up.is_empty())
+                {
                     first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+                    let ready = std::mem::take(&mut pending_gate_up);
                     waves.push(self.submit_ready_expert_wave(
                         device,
                         groups,
-                        &pending_gate_up,
+                        &ready,
                         input,
                         input_len,
                         token_indices,
@@ -2533,11 +2783,16 @@ impl MetalQ2Matvec {
                         ReadyExpertPhase::GateUp,
                     )?);
                 }
-                if completed_gate_up == misses.len() && !pending_down.is_empty() {
+                if all_gate_up_ready
+                    && (pending_down.len() >= ROUTED_EXPERT_WAVE_MIN_GROUPS
+                        || completed_down == misses.len())
+                    && !pending_down.is_empty()
+                {
+                    let ready = std::mem::take(&mut pending_down);
                     waves.push(self.submit_ready_expert_wave(
                         device,
                         groups,
-                        &pending_down,
+                        &ready,
                         input,
                         input_len,
                         token_indices,
@@ -2550,10 +2805,28 @@ impl MetalQ2Matvec {
                         &output,
                         ReadyExpertPhase::Down,
                     )?);
-                    pending_down.clear();
                 }
             }
 
+            if !pending_gate_up.is_empty() {
+                first_ready_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+                waves.push(self.submit_ready_expert_wave(
+                    device,
+                    groups,
+                    &pending_gate_up,
+                    input,
+                    input_len,
+                    token_indices,
+                    token_count,
+                    assignment_count,
+                    in_features,
+                    intermediate_features,
+                    out_features,
+                    &gated,
+                    &output,
+                    ReadyExpertPhase::GateUp,
+                )?);
+            }
             if !pending_down.is_empty() {
                 waves.push(self.submit_ready_expert_wave(
                     device,
@@ -2720,7 +2993,7 @@ impl MetalQ2Matvec {
             .q2_matmul_gpu_nanoseconds
             .fetch_add(gpu_nanoseconds, Ordering::Relaxed);
         trace!(
-            target: "inferno::metal",
+            target: "inferno::expert_cache",
             submission_count = submissions.len(),
             gpu_ms = gpu_nanoseconds as f64 / 1_000_000.0,
             "validated asynchronous routed expert submissions"
@@ -2773,6 +3046,7 @@ impl MetalQ2Matvec {
         }
 
         let mut assignment_indices = Vec::<u32>::new();
+        let mut group_offsets = vec![0_u32];
         let mut gate_addresses = Vec::<u64>::new();
         let mut up_addresses = Vec::<u64>::new();
         let mut down_addresses = Vec::<u64>::new();
@@ -2785,16 +3059,34 @@ impl MetalQ2Matvec {
                     "ready routed group index {group_index} is out of bounds"
                 ))
             })?;
-            for &assignment_index in &group.assignment_indices {
-                assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
-                    Error::backend("ready routed assignment index exceeds Metal u32 limit")
-                })?);
-                gate_addresses.push(group.buffers.gate.gpu_address());
-                up_addresses.push(group.buffers.up.gpu_address());
-                down_addresses.push(group.buffers.down.gpu_address());
+            validate_ready_expert_group_width(group.assignment_indices.len())?;
+            // A mixed wave uses indirect addresses for both transient
+            // buffers and cache-slab slots. Slab buffers share one base
+            // address, so the selected slot offset must be included.
+            let gate_address =
+                ready_expert_gpu_address(&group.buffers.gate, group.buffers.gate_offset, "gate")?;
+            let up_address =
+                ready_expert_gpu_address(&group.buffers.up, group.buffers.up_offset, "up")?;
+            let down_address =
+                ready_expert_gpu_address(&group.buffers.down, group.buffers.down_offset, "down")?;
+            for assignment_group in group
+                .assignment_indices
+                .chunks(READY_EXPERT_ASSIGNMENTS_PER_KERNEL_GROUP)
+            {
+                gate_addresses.push(gate_address);
+                up_addresses.push(up_address);
+                down_addresses.push(down_address);
                 gate_resources.push(&group.buffers.gate);
                 up_resources.push(&group.buffers.up);
                 down_resources.push(&group.buffers.down);
+                for &assignment_index in assignment_group {
+                    assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
+                        Error::backend("ready routed assignment index exceeds Metal u32 limit")
+                    })?);
+                }
+                group_offsets.push(u32::try_from(assignment_indices.len()).map_err(|_| {
+                    Error::backend("ready routed assignment count exceeds Metal u32 limit")
+                })?);
             }
         }
         if assignment_indices.is_empty() {
@@ -2811,10 +3103,12 @@ impl MetalQ2Matvec {
             ));
         }
 
+        let kernel_group_count = gate_addresses.len();
         let gate_addresses = u64_buffer(device, &gate_addresses)?;
         let up_addresses = u64_buffer(device, &up_addresses)?;
         let down_addresses = u64_buffer(device, &down_addresses)?;
         let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
+        let group_offsets_buffer = u32_buffer(device, &group_offsets)?;
         let command_buffer = self.expert_queue.new_command_buffer().to_owned();
         match phase {
             ReadyExpertPhase::GateUp => self.encode_ready_gate_up_swiglu(
@@ -2828,6 +3122,8 @@ impl MetalQ2Matvec {
                 input_len,
                 token_indices,
                 &assignment_indices_buffer,
+                &group_offsets_buffer,
+                kernel_group_count,
                 assignment_indices.len(),
                 token_count,
                 assignment_count,
@@ -2842,6 +3138,8 @@ impl MetalQ2Matvec {
                 &down_resources,
                 gated,
                 &assignment_indices_buffer,
+                &group_offsets_buffer,
+                kernel_group_count,
                 assignment_indices.len(),
                 assignment_count,
                 intermediate_features,
@@ -2883,6 +3181,7 @@ impl MetalQ2Matvec {
             )
             .ok_or_else(|| Error::backend("ready routed slot wave group is out of bounds"))?;
         let mut assignment_indices = Vec::<u32>::new();
+        let mut group_offsets = vec![0_u32];
         let mut slot_indices = Vec::<u32>::new();
         for &group_index in ready_groups {
             let group = groups.get(group_index).ok_or_else(|| {
@@ -2902,11 +3201,20 @@ impl MetalQ2Matvec {
                 Error::backend("ready routed slot wave contains a transient expert")
             })?)
             .map_err(|_| Error::backend("ready routed expert slot exceeds Metal u32 limit"))?;
-            for &assignment_index in &group.assignment_indices {
-                assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
-                    Error::backend("ready routed assignment index exceeds Metal u32 limit")
-                })?);
+            validate_ready_expert_group_width(group.assignment_indices.len())?;
+            for assignment_group in group
+                .assignment_indices
+                .chunks(READY_EXPERT_ASSIGNMENTS_PER_KERNEL_GROUP)
+            {
                 slot_indices.push(slot);
+                for &assignment_index in assignment_group {
+                    assignment_indices.push(u32::try_from(assignment_index).map_err(|_| {
+                        Error::backend("ready routed assignment index exceeds Metal u32 limit")
+                    })?);
+                }
+                group_offsets.push(u32::try_from(assignment_indices.len()).map_err(|_| {
+                    Error::backend("ready routed assignment count exceeds Metal u32 limit")
+                })?);
             }
         }
         if assignment_indices.is_empty() {
@@ -2940,6 +3248,7 @@ impl MetalQ2Matvec {
         }
 
         let assignment_indices_buffer = u32_buffer(device, &assignment_indices)?;
+        let group_offsets_buffer = u32_buffer(device, &group_offsets)?;
         let slot_indices_buffer = u32_buffer(device, &slot_indices)?;
         let command_buffer = self.expert_queue.new_command_buffer().to_owned();
         match phase {
@@ -2952,7 +3261,9 @@ impl MetalQ2Matvec {
                 input_len,
                 token_indices,
                 &assignment_indices_buffer,
+                &group_offsets_buffer,
                 &slot_indices_buffer,
+                slot_indices.len(),
                 assignment_indices.len(),
                 token_count,
                 assignment_count,
@@ -2968,7 +3279,9 @@ impl MetalQ2Matvec {
                 &first.buffers.down,
                 gated,
                 &assignment_indices_buffer,
+                &group_offsets_buffer,
                 &slot_indices_buffer,
+                slot_indices.len(),
                 assignment_indices.len(),
                 assignment_count,
                 slot_count,
@@ -2999,7 +3312,9 @@ impl MetalQ2Matvec {
         input_len: usize,
         token_indices: &Buffer,
         assignment_indices: &Buffer,
-        ready_count: usize,
+        group_offsets: &Buffer,
+        ready_group_count: usize,
+        ready_assignment_count: usize,
         token_count: usize,
         assignment_count: usize,
         in_features: usize,
@@ -3014,8 +3329,13 @@ impl MetalQ2Matvec {
         )?;
         require_u32_buffer_capacity(
             assignment_indices,
-            ready_count,
+            ready_assignment_count,
             "ready routed gate/up assignment indices",
+        )?;
+        require_u32_buffer_capacity(
+            group_offsets,
+            ready_group_count + 1,
+            "ready routed gate/up group offsets",
         )?;
         require_f32_capacity(
             output,
@@ -3026,8 +3346,8 @@ impl MetalQ2Matvec {
         )?;
         let physical_threads = q2_k_cooperative_threads(
             &self.ready_gate_up_swiglu_pipeline,
-            ready_count
-                .checked_mul(out_features)
+            ready_group_count
+                .checked_mul(out_features.div_ceil(READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP))
                 .ok_or_else(|| Error::backend("ready routed gate/up thread count overflow"))?,
             "ready Q2_K routed gate/up",
         )?;
@@ -3036,7 +3356,9 @@ impl MetalQ2Matvec {
         let assignment_count = self
             .arena
             .u32(matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let ready_group_count = self
+            .arena
+            .u32(matvec_u32(ready_group_count, "ready_group_count")?)?;
         let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
         let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row = self
@@ -3056,10 +3378,11 @@ impl MetalQ2Matvec {
                 input,
                 token_indices,
                 assignment_indices,
+                group_offsets,
                 output,
                 &token_count,
                 &assignment_count,
-                &ready_count,
+                &ready_group_count,
                 &in_features,
                 &out_features,
                 &blocks_per_row,
@@ -3078,7 +3401,9 @@ impl MetalQ2Matvec {
         weight_resources: &[&Buffer],
         input: &Buffer,
         assignment_indices: &Buffer,
-        ready_count: usize,
+        group_offsets: &Buffer,
+        ready_group_count: usize,
+        ready_assignment_count: usize,
         assignment_count: usize,
         in_features: usize,
         out_features: usize,
@@ -3086,8 +3411,13 @@ impl MetalQ2Matvec {
     ) -> Result<()> {
         require_u32_buffer_capacity(
             assignment_indices,
-            ready_count,
+            ready_assignment_count,
             "ready routed down assignment indices",
+        )?;
+        require_u32_buffer_capacity(
+            group_offsets,
+            ready_group_count + 1,
+            "ready routed down group offsets",
         )?;
         require_f32_capacity(
             input,
@@ -3105,8 +3435,8 @@ impl MetalQ2Matvec {
         )?;
         let physical_threads = q2_k_cooperative_threads(
             &self.ready_matvec_pipeline,
-            ready_count
-                .checked_mul(out_features)
+            ready_group_count
+                .checked_mul(out_features.div_ceil(READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP))
                 .ok_or_else(|| Error::backend("ready routed down thread count overflow"))?,
             "ready Q2_K routed down",
         )?;
@@ -3114,7 +3444,9 @@ impl MetalQ2Matvec {
         let assignment_count = self
             .arena
             .u32(matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let ready_group_count = self
+            .arena
+            .u32(matvec_u32(ready_group_count, "ready_group_count")?)?;
         let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
         let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row = self
@@ -3127,9 +3459,10 @@ impl MetalQ2Matvec {
                 weight_addresses,
                 input,
                 assignment_indices,
+                group_offsets,
                 output,
                 &assignment_count,
-                &ready_count,
+                &ready_group_count,
                 &in_features,
                 &out_features,
                 &blocks_per_row,
@@ -3150,8 +3483,10 @@ impl MetalQ2Matvec {
         input_len: usize,
         token_indices: &Buffer,
         assignment_indices: &Buffer,
+        group_offsets: &Buffer,
         slot_indices: &Buffer,
-        ready_count: usize,
+        ready_group_count: usize,
+        ready_assignment_count: usize,
         token_count: usize,
         assignment_count: usize,
         slot_count: usize,
@@ -3173,12 +3508,17 @@ impl MetalQ2Matvec {
         )?;
         require_u32_buffer_capacity(
             assignment_indices,
-            ready_count,
+            ready_assignment_count,
             "ready routed slot assignment indices",
         )?;
         require_u32_buffer_capacity(
+            group_offsets,
+            ready_group_count + 1,
+            "ready routed slot group offsets",
+        )?;
+        require_u32_buffer_capacity(
             slot_indices,
-            ready_count,
+            ready_group_count,
             "ready routed expert slot indices",
         )?;
         require_f32_capacity(
@@ -3190,8 +3530,8 @@ impl MetalQ2Matvec {
         )?;
         let physical_threads = q2_k_cooperative_threads(
             &self.ready_slot_gate_up_swiglu_pipeline,
-            ready_count
-                .checked_mul(out_features)
+            ready_group_count
+                .checked_mul(out_features.div_ceil(READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP))
                 .ok_or_else(|| Error::backend("ready routed slot gate/up threads overflow"))?,
             "ready Q2_K slot gate/up",
         )?;
@@ -3200,7 +3540,9 @@ impl MetalQ2Matvec {
         let assignment_count = self
             .arena
             .u32(matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let ready_group_count = self
+            .arena
+            .u32(matvec_u32(ready_group_count, "ready_group_count")?)?;
         let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
         let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row = self
@@ -3219,11 +3561,12 @@ impl MetalQ2Matvec {
                 input,
                 token_indices,
                 assignment_indices,
+                group_offsets,
                 slot_indices,
                 output,
                 &token_count,
                 &assignment_count,
-                &ready_count,
+                &ready_group_count,
                 &in_features,
                 &out_features,
                 &blocks_per_row,
@@ -3242,8 +3585,10 @@ impl MetalQ2Matvec {
         weights: &Buffer,
         input: &Buffer,
         assignment_indices: &Buffer,
+        group_offsets: &Buffer,
         slot_indices: &Buffer,
-        ready_count: usize,
+        ready_group_count: usize,
+        ready_assignment_count: usize,
         assignment_count: usize,
         slot_count: usize,
         in_features: usize,
@@ -3260,12 +3605,17 @@ impl MetalQ2Matvec {
         )?;
         require_u32_buffer_capacity(
             assignment_indices,
-            ready_count,
+            ready_assignment_count,
             "ready routed slot down assignment indices",
         )?;
         require_u32_buffer_capacity(
+            group_offsets,
+            ready_group_count + 1,
+            "ready routed slot down group offsets",
+        )?;
+        require_u32_buffer_capacity(
             slot_indices,
-            ready_count,
+            ready_group_count,
             "ready routed slot down expert indices",
         )?;
         require_f32_capacity(
@@ -3284,8 +3634,8 @@ impl MetalQ2Matvec {
         )?;
         let physical_threads = q2_k_cooperative_threads(
             &self.ready_slot_matvec_pipeline,
-            ready_count
-                .checked_mul(out_features)
+            ready_group_count
+                .checked_mul(out_features.div_ceil(READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP))
                 .ok_or_else(|| Error::backend("ready routed slot down threads overflow"))?,
             "ready Q2_K slot down",
         )?;
@@ -3293,7 +3643,9 @@ impl MetalQ2Matvec {
         let assignment_count = self
             .arena
             .u32(matvec_u32(assignment_count, "assignment_count")?)?;
-        let ready_count = self.arena.u32(matvec_u32(ready_count, "ready_count")?)?;
+        let ready_group_count = self
+            .arena
+            .u32(matvec_u32(ready_group_count, "ready_group_count")?)?;
         let in_features = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
         let out_features = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row = self
@@ -3310,10 +3662,11 @@ impl MetalQ2Matvec {
                 weights,
                 input,
                 assignment_indices,
+                group_offsets,
                 slot_indices,
                 output,
                 &assignment_count,
-                &ready_count,
+                &ready_group_count,
                 &in_features,
                 &out_features,
                 &blocks_per_row,
@@ -3451,6 +3804,66 @@ impl Q2ExpertLayerBuffers {
     }
 }
 
+impl Q2TransientExpertPool {
+    fn ensure(
+        &mut self,
+        device: &Device,
+        capacity: usize,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<()> {
+        if capacity == 0 {
+            return Err(Error::backend(
+                "Q2 transient expert pool capacity must be positive",
+            ));
+        }
+        let layout = Q2ExpertCacheLayout {
+            gate_stride,
+            up_stride,
+            down_stride,
+        };
+        if self.layout == Some(layout) && self.capacity >= capacity {
+            return Ok(());
+        }
+
+        self.storage = Some(Q2ExpertLayerBuffers::new(
+            device,
+            capacity,
+            gate_stride,
+            up_stride,
+            down_stride,
+        )?);
+        self.layout = Some(layout);
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    fn ready_buffers(
+        &mut self,
+        slot: usize,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<ReadyExpertBuffers> {
+        if slot >= self.capacity {
+            return Err(Error::backend(format!(
+                "Q2 transient expert slot {slot} exceeds pool capacity {}",
+                self.capacity
+            )));
+        }
+        let storage = self
+            .storage
+            .as_mut()
+            .ok_or_else(|| Error::backend("Q2 transient expert pool is not allocated"))?;
+        let mut buffers = storage.ready_buffers(slot, gate_stride, up_stride, down_stride)?;
+        // Transient and persistent experts can share one wave, so dispatch by
+        // explicit GPU addresses instead of treating this as a layer-cache slot.
+        buffers.slot_index = None;
+        Ok(buffers)
+    }
+}
+
 impl LockedMetalSlab {
     fn new(device: &Device, byte_len: usize) -> Result<Self> {
         Ok(Self {
@@ -3555,6 +3968,34 @@ fn q2_expert_stride(in_features: usize, out_features: usize) -> Result<usize> {
         .checked_mul(in_features / Q2_K_BLOCK_VALUES)
         .and_then(|blocks| blocks.checked_mul(Q2_K_BLOCK_BYTES))
         .ok_or_else(|| Error::backend("Q2 staged expert stride overflow"))
+}
+
+fn ready_expert_gpu_address(buffer: &Buffer, byte_offset: usize, component: &str) -> Result<u64> {
+    let base = buffer.gpu_address();
+    if base == 0 {
+        return Err(Error::backend(format!(
+            "ready routed {component} expert buffer has no GPU address"
+        )));
+    }
+    let byte_offset = u64::try_from(byte_offset).map_err(|_| {
+        Error::backend(format!(
+            "ready routed {component} expert offset exceeds Metal u64 limit"
+        ))
+    })?;
+    base.checked_add(byte_offset).ok_or_else(|| {
+        Error::backend(format!(
+            "ready routed {component} expert GPU address overflow"
+        ))
+    })
+}
+
+fn validate_ready_expert_group_width(assignment_count: usize) -> Result<()> {
+    if assignment_count == 0 || assignment_count > READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP {
+        return Err(Error::backend(format!(
+            "ready routed expert group must contain 1..={READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP} assignments, got {assignment_count}"
+        )));
+    }
+    Ok(())
 }
 
 fn expert_cache_key(gate: &[u8], up: &[u8], down: &[u8]) -> ExpertCacheKey {
@@ -3771,6 +4212,7 @@ fn take_unselected(
 fn prepare_ready_expert_groups<'a>(
     device: &Device,
     cache: &mut Q2ExpertLayerCache,
+    mut transient_pool: Option<&mut Q2TransientExpertPool>,
     gate_payloads: &[Q2ExpertSource<'a>],
     up_payloads: &[Q2ExpertSource<'a>],
     down_payloads: &[Q2ExpertSource<'a>],
@@ -3808,7 +4250,10 @@ fn prepare_ready_expert_groups<'a>(
         });
     }
 
+    prioritize_ready_expert_seeds(&mut seeds);
     let selected_keys = seeds.iter().map(|seed| seed.key).collect::<HashSet<_>>();
+    let transient_capacity = seeds.len().saturating_sub(cache.slots.len());
+    let mut transient_slot = 0_usize;
     let mut groups = Vec::with_capacity(seeds.len());
     for seed in seeds {
         let resolution = cache.resolve_slot(seed.key, &selected_keys)?;
@@ -3827,10 +4272,28 @@ fn prepare_ready_expert_groups<'a>(
                 false,
                 None,
             ),
-            LayerSlotResolution::Transient => {
-                let slot = Q2ExpertSlotBuffers::new(device, gate_stride, up_stride, down_stride)?;
-                (slot.ready_buffers(), false, None, true, Some(slot))
-            }
+            LayerSlotResolution::Transient => match transient_pool.as_deref_mut() {
+                Some(pool) => {
+                    if transient_slot == 0 {
+                        pool.ensure(
+                            device,
+                            transient_capacity,
+                            gate_stride,
+                            up_stride,
+                            down_stride,
+                        )?;
+                    }
+                    let buffers =
+                        pool.ready_buffers(transient_slot, gate_stride, up_stride, down_stride)?;
+                    transient_slot += 1;
+                    (buffers, false, None, true, None)
+                }
+                None => {
+                    let slot =
+                        Q2ExpertSlotBuffers::new(device, gate_stride, up_stride, down_stride)?;
+                    (slot.ready_buffers(), false, None, true, Some(slot))
+                }
+            },
         };
         let read_tasks = if cache_hit {
             Vec::new()
@@ -3867,6 +4330,22 @@ fn prepare_ready_expert_groups<'a>(
         });
     }
     Ok(groups)
+}
+
+fn prioritize_ready_expert_seeds(seeds: &mut [ReadyExpertSeed<'_>]) {
+    // MTP verification is token-major. Keep experts used by the newest row in
+    // persistent slots because that row is closest to the next decode step.
+    // Assignment count breaks ties in favor of weights reused by more rows.
+    seeds.sort_by(|left, right| {
+        let left_recency = left.assignment_indices.last().copied().unwrap_or(0);
+        let right_recency = right.assignment_indices.last().copied().unwrap_or(0);
+        right_recency.cmp(&left_recency).then_with(|| {
+            right
+                .assignment_indices
+                .len()
+                .cmp(&left.assignment_indices.len())
+        })
+    });
 }
 
 fn pread_ready_expert_gate_up(file: &File, path: &Path, group: &ReadyExpertGroup) -> Result<()> {
@@ -3937,9 +4416,8 @@ fn pread_expert_buffer(file: &File, path: &Path, task: &ExpertReadTask) -> Resul
             "Q2 expert pread destination pointer is null",
         ));
     }
-    // SAFETY: this shared Metal buffer is exclusively owned by the cache slot,
-    // the previous command buffer was flushed before reuse, and capacity was
-    // validated above.
+    // The cache slot is not used by Metal until this read completes, and the
+    // destination range was validated above.
     let mut destination = unsafe {
         std::slice::from_raw_parts_mut(pointer.add(task.destination_offset), task.byte_len)
     };
@@ -4243,8 +4721,9 @@ mod tests {
         super::validation::{
             Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES,
         },
-        ExpertCacheKey, LayerSlotResolution, Q2ExpertLayerCache, Q2PerLayerExpertCache,
-        QuantMatvecKind,
+        prioritize_ready_expert_seeds, ExpertCacheKey, LayerSlotResolution, Q2ExpertLayerCache,
+        Q2PerLayerExpertCache, Q2TransientExpertPool, QuantMatvecKind, ReadyExpertSeed,
+        ROUTED_EXPERT_WAVE_MIN_GROUPS,
     };
 
     fn expert_key(seed: usize) -> ExpertCacheKey {
@@ -4330,6 +4809,66 @@ mod tests {
             LayerSlotResolution::Transient
         ));
         assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn transient_expert_pool_reuses_its_backing_slab() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let mut pool = Q2TransientExpertPool::default();
+        pool.ensure(metal.device(), 4, 64, 64, 32).unwrap();
+        let first = pool.ready_buffers(1, 64, 64, 32).unwrap();
+        pool.ensure(metal.device(), 2, 64, 64, 32).unwrap();
+        let second = pool.ready_buffers(1, 64, 64, 32).unwrap();
+
+        assert_eq!(first.gate.gpu_address(), second.gate.gpu_address());
+        assert_eq!(first.up.gpu_address(), second.up.gpu_address());
+        assert_eq!(first.down.gpu_address(), second.down.gpu_address());
+        assert_eq!(first.gate_offset, second.gate_offset);
+        assert_eq!(first.up_offset, second.up_offset);
+        assert_eq!(first.down_offset, second.down_offset);
+        assert_eq!(first.slot_index, None);
+        assert_eq!(second.slot_index, None);
+    }
+
+    #[test]
+    fn mtp_cache_admission_prioritizes_the_latest_token_row() {
+        let weights = [0_u8; 3];
+        let source = |index: usize| Q2ExpertSource {
+            bytes: &weights[index..index + 1],
+            absolute_offset: index as u64,
+        };
+        let mut seeds = vec![
+            ReadyExpertSeed {
+                key: expert_key(0),
+                assignment_indices: vec![0, 8],
+                gate: source(0),
+                up: source(0),
+                down: source(0),
+            },
+            ReadyExpertSeed {
+                key: expert_key(1),
+                assignment_indices: vec![1, 15],
+                gate: source(1),
+                up: source(1),
+                down: source(1),
+            },
+            ReadyExpertSeed {
+                key: expert_key(2),
+                assignment_indices: vec![2, 9],
+                gate: source(2),
+                up: source(2),
+                down: source(2),
+            },
+        ];
+
+        prioritize_ready_expert_seeds(&mut seeds);
+
+        assert_eq!(
+            seeds.iter().map(|seed| seed.key).collect::<Vec<_>>(),
+            vec![expert_key(1), expert_key(2), expert_key(0)]
+        );
     }
 
     #[test]
@@ -4526,6 +5065,98 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_batched_matvec_reuses_weights_across_eight_rows() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = 8;
+        let in_features = 64;
+        let out_features = 3;
+        let weights = [
+            q8_0_block(0x3c00, 1),
+            q8_0_block(0x4000, -2),
+            q8_0_block(0x3800, 3),
+            q8_0_block(0x3c00, -1),
+            q8_0_block(0x4000, 2),
+            q8_0_block(0x3800, -3),
+        ]
+        .concat();
+        let input = (0..row_count * in_features)
+            .map(|index| {
+                let row = index / in_features;
+                let column = index % in_features;
+                (row as f32 - 2.0) * 0.03125 + (column as f32 - 17.0) * 0.00390625
+            })
+            .collect::<Vec<_>>();
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+
+        let output = metal
+            .batched_quant_matvec(
+                QuantMatvecKind::Q80,
+                &weights,
+                &input_buffer,
+                input.len(),
+                row_count,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, row_count * out_features)
+            .unwrap();
+        let expected = cpu_q8_0_matvec(&weights, &input, row_count, in_features, out_features);
+
+        assert_close(&actual, &expected, 1e-4);
+    }
+
+    #[test]
+    fn q8_0_batched_matvec_add_matches_cpu_reference() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = 7;
+        let in_features = 64;
+        let out_features = 2;
+        let weights = [
+            q8_0_block(0x3c00, 2),
+            q8_0_block(0x3800, -3),
+            q8_0_block(0x4000, -1),
+            q8_0_block(0x3c00, 4),
+        ]
+        .concat();
+        let input = (0..row_count * in_features)
+            .map(|index| (index as f32 % 37.0) * 0.0078125 - 0.125)
+            .collect::<Vec<_>>();
+        let residual = (0..row_count * out_features)
+            .map(|index| index as f32 * 0.015625 - 0.25)
+            .collect::<Vec<_>>();
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let residual_buffer = metal.batch_upload_f32(&residual).unwrap();
+
+        let output = metal
+            .batched_q8_0_matvec_add(
+                &weights,
+                &input_buffer,
+                input.len(),
+                &residual_buffer,
+                residual.len(),
+                row_count,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, row_count * out_features)
+            .unwrap();
+        let mut expected = cpu_q8_0_matvec(&weights, &input, row_count, in_features, out_features);
+        for (value, residual) in expected.iter_mut().zip(&residual) {
+            *value += residual;
+        }
+
+        assert_close(&actual, &expected, 1e-4);
+    }
+
+    #[test]
     fn gate_up_swiglu_matches_cpu_reference() {
         let Some(metal) = native_metal_or_skip() else {
             return;
@@ -4699,26 +5330,21 @@ mod tests {
         let mut up_weights = Vec::new();
         let mut down_weights = Vec::new();
         for expert in 0..expert_count {
-            for _row in 0..intermediate_features {
-                gate_weights.extend(q2_k_block(
+            for row in 0..intermediate_features {
+                let seed = (expert * intermediate_features + row) as u8;
+                gate_weights.extend(q2_k_patterned_block(
                     if expert == 0 { 0x3c00 } else { 0x4000 },
-                    0x0000,
-                    0x01,
-                    if expert == 0 { 0xe4 } else { 0x1b },
+                    seed,
                 ));
-                up_weights.extend(q2_k_block(
+                up_weights.extend(q2_k_patterned_block(
                     if expert == 0 { 0x4000 } else { 0x3c00 },
-                    0x0000,
-                    0x01,
-                    if expert == 0 { 0x1b } else { 0xe4 },
+                    seed.wrapping_mul(3).wrapping_add(1),
                 ));
             }
             for row in 0..hidden_features {
-                down_weights.extend(q2_k_block(
+                down_weights.extend(q2_k_patterned_block(
                     0x3c00,
-                    0x0000,
-                    0x01,
-                    if (expert + row) % 2 == 0 { 0xe4 } else { 0x1b },
+                    (expert * hidden_features + row) as u8,
                 ));
             }
         }
@@ -4818,7 +5444,7 @@ mod tests {
         assert_eq!(first.cache_hits, 0);
         assert_eq!(first.cache_misses, selected_ids.len());
         assert_eq!(first.selected_experts, selected_ids.len());
-        assert!(first.ready_waves >= 1);
+        assert_eq!(first.ready_waves, 2);
         let ready = metal
             .ready_routed_experts(
                 1,
@@ -4836,6 +5462,7 @@ mod tests {
             .unwrap();
         assert_eq!(ready.cache_hits, selected_ids.len());
         assert_eq!(ready.cache_misses, 0);
+        assert_eq!(ready.ready_waves, 2);
         let other_layer = metal
             .ready_routed_experts(
                 2,
@@ -4853,6 +5480,36 @@ mod tests {
             .unwrap();
         assert_eq!(other_layer.cache_hits, 0);
         assert_eq!(other_layer.cache_misses, selected_ids.len());
+        assert_eq!(other_layer.ready_waves, 2);
+        metal
+            .prefetch_routed_experts(
+                3,
+                model_file.path(),
+                &gate_sources,
+                &up_sources,
+                &down_sources,
+                hidden_features,
+                intermediate_features,
+                hidden_features,
+            )
+            .unwrap();
+        let prefetched_layer = metal
+            .ready_routed_experts(
+                3,
+                model_file.path(),
+                &gate_sources,
+                &up_sources,
+                &down_sources,
+                &input_buffer,
+                input.len(),
+                &routing,
+                hidden_features,
+                intermediate_features,
+                hidden_features,
+            )
+            .unwrap();
+        assert_eq!(prefetched_layer.cache_hits, selected_ids.len());
+        assert_eq!(prefetched_layer.cache_misses, 0);
         metal
             .batched_wait_for_ready_routed_experts(ready.completion_value)
             .unwrap();
@@ -4912,6 +5569,206 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_close_relative(&actual, &expected, 2e-6);
+    }
+
+    #[test]
+    fn ready_router_experts_preserve_eight_token_rows_beyond_cache_capacity() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let token_count = 8;
+        let top_k = 8;
+        let expert_count = 24;
+        let hidden_features = Q2_K_BLOCK_VALUES;
+        let intermediate_features = Q2_K_BLOCK_VALUES;
+        let expert_stride = hidden_features * Q2_K_BLOCK_BYTES;
+
+        let mut gate_weights = Vec::new();
+        let mut up_weights = Vec::new();
+        let mut down_weights = Vec::new();
+        for expert in 0..expert_count {
+            for row in 0..hidden_features {
+                let selector = (expert + row) % 4;
+                gate_weights.extend(q2_k_block(
+                    0x3c00 + (expert % 2) as u16 * 0x0400,
+                    0,
+                    1 + (expert % 7) as u8,
+                    [0x00, 0x1b, 0xe4, 0xff][selector],
+                ));
+                up_weights.extend(q2_k_block(
+                    0x3c00,
+                    0,
+                    1 + (row % 7) as u8,
+                    [0xff, 0xe4, 0x1b, 0x00][selector],
+                ));
+                down_weights.extend(q2_k_block(
+                    0x3c00,
+                    0,
+                    1 + ((expert + row) % 7) as u8,
+                    [0x1b, 0xe4, 0xff, 0x00][selector],
+                ));
+            }
+        }
+
+        let input = (0..token_count * hidden_features)
+            .map(|index| {
+                let token = index / hidden_features;
+                let hidden = index % hidden_features;
+                (token as f32 + 1.0) * 0.0001 + (hidden as f32 % 17.0) * 0.00001
+            })
+            .collect::<Vec<_>>();
+        let mut router_logits = vec![-20.0_f32; token_count * expert_count];
+        for token in 0..token_count {
+            let expert_base = (token * top_k) % expert_count;
+            for rank in 0..top_k {
+                let expert = (expert_base + rank) % expert_count;
+                router_logits[token * expert_count + expert] = 10.0 - rank as f32;
+            }
+        }
+        let correction_bias = vec![0.0_f32; expert_count];
+        let zeros = vec![0.0_f32; token_count * hidden_features];
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let logits_buffer = metal.batch_upload_f32(&router_logits).unwrap();
+        let zero_buffer = metal.batch_upload_f32(&zeros).unwrap();
+        let routing = metal
+            .batched_moe_router_topk_resident(
+                &logits_buffer,
+                router_logits.len(),
+                &correction_bias,
+                token_count,
+                expert_count,
+                top_k,
+                true,
+                1.0,
+            )
+            .unwrap();
+        let selected_ids = metal.batched_moe_router_expert_ids(&routing).unwrap();
+        assert_eq!(selected_ids.len(), token_count * top_k);
+        assert!(selected_ids.iter().copied().collect::<HashSet<_>>().len() > 16);
+
+        let up_base = gate_weights.len() as u64;
+        let down_base = up_base + up_weights.len() as u64;
+        let model_file = TemporaryModelFile::new(
+            "eight-token-ready-experts",
+            [&gate_weights[..], &up_weights[..], &down_weights[..]].concat(),
+        );
+        let gate_sources = selected_ids
+            .iter()
+            .map(|&expert| {
+                let start = expert as usize * expert_stride;
+                Q2ExpertSource {
+                    bytes: &gate_weights[start..start + expert_stride],
+                    absolute_offset: start as u64,
+                }
+            })
+            .collect::<Vec<_>>();
+        let up_sources = selected_ids
+            .iter()
+            .map(|&expert| {
+                let start = expert as usize * expert_stride;
+                Q2ExpertSource {
+                    bytes: &up_weights[start..start + expert_stride],
+                    absolute_offset: up_base + start as u64,
+                }
+            })
+            .collect::<Vec<_>>();
+        let down_sources = selected_ids
+            .iter()
+            .map(|&expert| {
+                let start = expert as usize * expert_stride;
+                Q2ExpertSource {
+                    bytes: &down_weights[start..start + expert_stride],
+                    absolute_offset: down_base + start as u64,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let ready = metal
+            .ready_routed_experts(
+                79,
+                model_file.path(),
+                &gate_sources,
+                &up_sources,
+                &down_sources,
+                &input_buffer,
+                input.len(),
+                &routing,
+                hidden_features,
+                intermediate_features,
+                hidden_features,
+            )
+            .unwrap();
+        assert!(ready.transient_experts > 0);
+        assert!(ready.ready_waves >= 2);
+        assert!(
+            ready.ready_waves
+                <= 2 * ready
+                    .selected_experts
+                    .div_ceil(ROUTED_EXPERT_WAVE_MIN_GROUPS)
+        );
+        metal
+            .batched_wait_for_ready_routed_experts(ready.completion_value)
+            .unwrap();
+        let combined = metal
+            .batched_moe_topk_combine_residual(
+                &zero_buffer,
+                zeros.len(),
+                &zero_buffer,
+                zeros.len(),
+                &ready.output,
+                selected_ids.len() * hidden_features,
+                &routing,
+                hidden_features,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&combined, zeros.len()).unwrap();
+
+        let mut expected = vec![0.0_f32; zeros.len()];
+        for token in 0..token_count {
+            let selected = &selected_ids[token * top_k..(token + 1) * top_k];
+            let score_sum = selected
+                .iter()
+                .map(|&expert| {
+                    let logit = router_logits[token * expert_count + expert as usize];
+                    1.0 / (1.0 + (-logit).exp())
+                })
+                .sum::<f32>();
+            let token_input = &input[token * hidden_features..(token + 1) * hidden_features];
+            for &expert in selected {
+                let expert = expert as usize;
+                let start = expert * expert_stride;
+                let end = start + expert_stride;
+                let gate = cpu_q2_k_matvec(
+                    &gate_weights[start..end],
+                    token_input,
+                    1,
+                    hidden_features,
+                    intermediate_features,
+                );
+                let up = cpu_q2_k_matvec(
+                    &up_weights[start..end],
+                    token_input,
+                    1,
+                    hidden_features,
+                    intermediate_features,
+                );
+                let gated = cpu_swiglu(&gate, &up);
+                let down = cpu_q2_k_matvec(
+                    &down_weights[start..end],
+                    &gated,
+                    1,
+                    intermediate_features,
+                    hidden_features,
+                );
+                let logit = router_logits[token * expert_count + expert];
+                let weight = (1.0 / (1.0 + (-logit).exp())) / score_sum;
+                for hidden in 0..hidden_features {
+                    expected[token * hidden_features + hidden] += down[hidden] * weight;
+                }
+            }
+        }
+
+        assert_close_relative(&actual, &expected, 2e-5);
     }
 
     #[test]
@@ -5044,11 +5901,12 @@ mod tests {
     }
 
     #[test]
-    fn absorbed_mla_matches_expanded_q8_reference() {
+    fn absorbed_mla_sequence_matches_causal_q8_reference() {
         let Some(metal) = native_metal_or_skip() else {
             return;
         };
         let batch = 1;
+        let query_tokens = 3;
         let heads = 2;
         let q_no_dim = 32;
         let rope_dim = 8;
@@ -5057,16 +5915,16 @@ mod tests {
         let past_tokens = 2;
         let page_size = 4;
 
-        let q_no = (0..heads * q_no_dim)
+        let q_no = (0..query_tokens * heads * q_no_dim)
             .map(|index| (index as f32 - 17.0) * 0.01)
             .collect::<Vec<_>>();
-        let q_rope = (0..heads * rope_dim)
+        let q_rope = (0..query_tokens * heads * rope_dim)
             .map(|index| (index as f32 + 1.0) * -0.015)
             .collect::<Vec<_>>();
-        let current_latent = (0..latent_dim)
+        let current_latent = (0..query_tokens * latent_dim)
             .map(|index| (index as f32 - 9.0) * 0.02)
             .collect::<Vec<_>>();
-        let current_rope = (0..rope_dim)
+        let current_rope = (0..query_tokens * rope_dim)
             .map(|index| (index as f32 + 2.0) * 0.025)
             .collect::<Vec<_>>();
         let mut paged_latent = vec![0.0_f32; page_size * latent_dim];
@@ -5116,7 +5974,7 @@ mod tests {
         };
 
         let (output, output_len) = metal
-            .batched_q8_0_absorbed_mla_decode(
+            .batched_q8_0_absorbed_mla(
                 &k_b,
                 &v_b,
                 &q_no_buffer,
@@ -5129,6 +5987,7 @@ mod tests {
                 current_rope.len(),
                 &past_kv,
                 batch,
+                query_tokens,
                 heads,
                 q_no_dim,
                 rope_dim,
@@ -5139,69 +5998,82 @@ mod tests {
             .unwrap();
         let actual = metal.batch_read_f32(&output, output_len).unwrap();
 
-        let mut expected = Vec::with_capacity(heads * value_dim);
+        let mut expected = Vec::with_capacity(query_tokens * heads * value_dim);
         let k_head_bytes = latent_dim * Q8_0_BLOCK_BYTES;
         let v_head_bytes = value_dim * Q8_0_BLOCK_BYTES;
-        for head in 0..heads {
-            let q_start = head * q_no_dim;
-            let q_latent = cpu_q8_0_matvec(
-                &k_b[head * k_head_bytes..(head + 1) * k_head_bytes],
-                &q_no[q_start..q_start + q_no_dim],
-                1,
-                q_no_dim,
-                latent_dim,
-            );
-            let mut scores = Vec::with_capacity(past_tokens + 1);
-            for token in 0..past_tokens {
-                let latent_start = token * latent_dim;
-                let rope_start = token * rope_dim;
-                let latent_score = q_latent
-                    .iter()
-                    .zip(&paged_latent[latent_start..latent_start + latent_dim])
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-                let rope_score = q_rope[head * rope_dim..(head + 1) * rope_dim]
-                    .iter()
-                    .zip(&paged_rope[rope_start..rope_start + rope_dim])
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-                scores.push((latent_score + rope_score) / ((q_no_dim + rope_dim) as f32).sqrt());
-            }
-            let current_score = q_latent
-                .iter()
-                .zip(&current_latent)
-                .map(|(left, right)| left * right)
-                .sum::<f32>()
-                + q_rope[head * rope_dim..(head + 1) * rope_dim]
-                    .iter()
-                    .zip(&current_rope)
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-            scores.push(current_score / ((q_no_dim + rope_dim) as f32).sqrt());
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let denominator = scores
-                .iter()
-                .map(|score| (score - max_score).exp())
-                .sum::<f32>();
-            let probabilities = scores
-                .iter()
-                .map(|score| (score - max_score).exp() / denominator)
-                .collect::<Vec<_>>();
-            let mut context_latent = vec![0.0_f32; latent_dim];
-            for dim in 0..latent_dim {
+        for query in 0..query_tokens {
+            for head in 0..heads {
+                let query_head = query * heads + head;
+                let q_no_start = query_head * q_no_dim;
+                let q_rope_start = query_head * rope_dim;
+                let q_latent = cpu_q8_0_matvec(
+                    &k_b[head * k_head_bytes..(head + 1) * k_head_bytes],
+                    &q_no[q_no_start..q_no_start + q_no_dim],
+                    1,
+                    q_no_dim,
+                    latent_dim,
+                );
+                let mut scores = Vec::with_capacity(past_tokens + query + 1);
                 for token in 0..past_tokens {
-                    context_latent[dim] +=
-                        probabilities[token] * paged_latent[token * latent_dim + dim];
+                    let latent_start = token * latent_dim;
+                    let rope_start = token * rope_dim;
+                    let latent_score = q_latent
+                        .iter()
+                        .zip(&paged_latent[latent_start..latent_start + latent_dim])
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    let rope_score = q_rope[q_rope_start..q_rope_start + rope_dim]
+                        .iter()
+                        .zip(&paged_rope[rope_start..rope_start + rope_dim])
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    scores
+                        .push((latent_score + rope_score) / ((q_no_dim + rope_dim) as f32).sqrt());
                 }
-                context_latent[dim] += probabilities[past_tokens] * current_latent[dim];
+                for current_token in 0..=query {
+                    let latent_start = current_token * latent_dim;
+                    let rope_start = current_token * rope_dim;
+                    let latent_score = q_latent
+                        .iter()
+                        .zip(&current_latent[latent_start..latent_start + latent_dim])
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    let rope_score = q_rope[q_rope_start..q_rope_start + rope_dim]
+                        .iter()
+                        .zip(&current_rope[rope_start..rope_start + rope_dim])
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>();
+                    scores
+                        .push((latent_score + rope_score) / ((q_no_dim + rope_dim) as f32).sqrt());
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let denominator = scores
+                    .iter()
+                    .map(|score| (score - max_score).exp())
+                    .sum::<f32>();
+                let probabilities = scores
+                    .iter()
+                    .map(|score| (score - max_score).exp() / denominator)
+                    .collect::<Vec<_>>();
+                let mut context_latent = vec![0.0_f32; latent_dim];
+                for dim in 0..latent_dim {
+                    for token in 0..past_tokens {
+                        context_latent[dim] +=
+                            probabilities[token] * paged_latent[token * latent_dim + dim];
+                    }
+                    for current_token in 0..=query {
+                        context_latent[dim] += probabilities[past_tokens + current_token]
+                            * current_latent[current_token * latent_dim + dim];
+                    }
+                }
+                expected.extend(cpu_q8_0_matvec(
+                    &v_b[head * v_head_bytes..(head + 1) * v_head_bytes],
+                    &context_latent,
+                    1,
+                    latent_dim,
+                    value_dim,
+                ));
             }
-            expected.extend(cpu_q8_0_matvec(
-                &v_b[head * v_head_bytes..(head + 1) * v_head_bytes],
-                &context_latent,
-                1,
-                latent_dim,
-                value_dim,
-            ));
         }
 
         assert_close(&actual, &expected, 2e-4);
@@ -5244,6 +6116,19 @@ mod tests {
         block.extend(std::iter::repeat_n(quant, 64));
         block.extend(d.to_le_bytes());
         block.extend(dmin.to_le_bytes());
+        block
+    }
+
+    fn q2_k_patterned_block(d: u16, seed: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(Q2_K_BLOCK_BYTES);
+        for index in 0..16_u8 {
+            block.push(seed.wrapping_add(index) & 0x0f);
+        }
+        for index in 0..64_u8 {
+            block.push(seed.wrapping_mul(29).wrapping_add(index.wrapping_mul(17)));
+        }
+        block.extend(d.to_le_bytes());
+        block.extend(0_u16.to_le_bytes());
         block
     }
 
@@ -5481,12 +6366,7 @@ mod tests {
     }
 
     fn f16_fixture_to_f32(bits: u16) -> f32 {
-        match bits {
-            0x0000 => 0.0,
-            0x3c00 => 1.0,
-            0x4000 => 2.0,
-            other => panic!("unsupported test f16 bits {other:#06x}"),
-        }
+        crate::metal::buffers::f16_bits_to_f32(bits)
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
