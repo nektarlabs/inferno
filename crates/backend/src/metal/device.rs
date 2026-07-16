@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::{DevicePagedKvView, DeviceRouterTopK, ExpertCacheMetrics, Q2ExpertSource};
 use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, Error, PagedKvView, Result};
+use inferno_io::ExpertPackHeader;
 
 use super::activation::MetalActivation;
 use super::arena::MetalArena;
@@ -102,6 +103,10 @@ impl Metal {
     pub fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
         self.q2_matvec
             .resize_expert_cache_slots_per_layer(slots_per_layer)
+    }
+
+    pub fn configure_expert_pack(&self, path: &Path, header: ExpertPackHeader) -> Result<()> {
+        self.q2_matvec.configure_expert_pack(path, header)
     }
 
     pub(crate) fn device(&self) -> &Device {
@@ -1529,30 +1534,6 @@ impl Metal {
             &routing.token_indices,
             routing.token_count,
             routing.top_k,
-            in_features,
-            intermediate_features,
-            out_features,
-        )
-    }
-
-    pub(crate) fn prefetch_routed_experts(
-        &self,
-        layer_index: usize,
-        model_path: &Path,
-        gate_payloads: &[Q2ExpertSource<'_>],
-        up_payloads: &[Q2ExpertSource<'_>],
-        down_payloads: &[Q2ExpertSource<'_>],
-        in_features: usize,
-        intermediate_features: usize,
-        out_features: usize,
-    ) -> Result<()> {
-        self.q2_matvec.prefetch_routed_experts(
-            &self.device,
-            layer_index,
-            model_path,
-            gate_payloads,
-            up_payloads,
-            down_payloads,
             in_features,
             intermediate_features,
             out_features,

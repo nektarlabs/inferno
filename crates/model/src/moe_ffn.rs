@@ -319,20 +319,23 @@ impl<'a> MoeFfn<'a> {
         let mut up_payloads = Vec::with_capacity(expert_ids.len());
         let mut down_payloads = Vec::with_capacity(expert_ids.len());
         for &expert_id in expert_ids {
-            let expert_id = usize::try_from(expert_id)
+            let expert_index = usize::try_from(expert_id)
                 .map_err(|_| Error::moe("device router expert id does not fit usize"))?;
-            let gate = self.routed_gate.q2_expert_payload(expert_id)?;
-            let up = self.routed_up.q2_expert_payload(expert_id)?;
-            let down = self.routed_down.q2_expert_payload(expert_id)?;
+            let gate = self.routed_gate.q2_expert_payload(expert_index)?;
+            let up = self.routed_up.q2_expert_payload(expert_index)?;
+            let down = self.routed_down.q2_expert_payload(expert_index)?;
             gate_payloads.push(Q2ExpertSource {
+                expert_id,
                 bytes: gate.bytes,
                 absolute_offset: gate.absolute_offset,
             });
             up_payloads.push(Q2ExpertSource {
+                expert_id,
                 bytes: up.bytes,
                 absolute_offset: up.absolute_offset,
             });
             down_payloads.push(Q2ExpertSource {
+                expert_id,
                 bytes: down.bytes,
                 absolute_offset: down.absolute_offset,
             });
@@ -342,55 +345,6 @@ impl<'a> MoeFfn<'a> {
             up: up_payloads,
             down: down_payloads,
         })
-    }
-
-    /// Predicts the latest token's top-k experts for this layer from a proxy
-    /// hidden state and loads those expert ranges into the resident cache.
-    /// Exact routing still runs when the layer is reached.
-    pub(crate) fn prefetch_from_proxy_device<B: Backend>(
-        &self,
-        config: &Config,
-        proxy_hidden_states: &backend::DeviceValue,
-        backend: &B,
-    ) -> Result<bool> {
-        let routing = match self
-            .router
-            .route_device(config, proxy_hidden_states, backend)?
-        {
-            Some(routing) => routing,
-            None => return Ok(false),
-        };
-        let selected_expert_ids = match backend.moe_router_expert_ids_device(&routing.topk)? {
-            Some(ids) => ids,
-            None => return Ok(false),
-        };
-        if selected_expert_ids.len() < config.experts_per_token {
-            return Err(Error::moe(format!(
-                "next-layer expert prediction returned {} IDs, expected at least {}",
-                selected_expert_ids.len(),
-                config.experts_per_token
-            )));
-        }
-        let latest_row_start = selected_expert_ids.len() - config.experts_per_token;
-        let latest_expert_ids = &selected_expert_ids[latest_row_start..];
-        let sources = self.selected_routed_expert_sources(latest_expert_ids)?;
-        let prefetched = backend.prefetch_routed_experts_device(
-            self.layer_index,
-            self.routed_gate.gguf.path(),
-            &sources.gate,
-            &sources.up,
-            &sources.down,
-            self.routed_gate_up.in_features,
-            self.routed_gate_up.out_features,
-            self.routed_down.out_features,
-        )?;
-        tracing::debug!(
-            layer_index = self.layer_index,
-            expert_ids = ?latest_expert_ids,
-            prefetched,
-            "predicted next-layer routed experts"
-        );
-        Ok(prefetched)
     }
 
     fn run_with_async_selected_routed_expert_prefetch<T>(
@@ -814,7 +768,6 @@ impl<'a> MoeFfn<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
-        next_ffn: Option<&MoeFfn<'_>>,
     ) -> Result<Option<backend::DeviceValue>> {
         let dims = hidden_states.dims();
         if dims.len() != 3 {
@@ -910,14 +863,6 @@ impl<'a> MoeFfn<'a> {
                 backend.device_submit()?;
                 Ok(shared_down)
             })();
-            let prefetch_result = match (&shared_result, next_ffn) {
-                (Ok(_), Some(next_ffn)) => profile::run_layer_stage(
-                    next_ffn.layer_index,
-                    "sparse_moe.next_expert_prefetch",
-                    || next_ffn.prefetch_from_proxy_device(config, hidden_states, backend),
-                ),
-                _ => Ok(false),
-            };
             let routed_result = routed
                 .join()
                 .map_err(|_| Error::moe("ready routed expert thread panicked"))?;
@@ -936,10 +881,6 @@ impl<'a> MoeFfn<'a> {
                     return Err(error);
                 }
             };
-            if let Err(error) = prefetch_result {
-                backend.device_flush()?;
-                return Err(error);
-            }
             Ok::<_, Error>((routed, shared_down))
         })?;
         tracing::debug!(

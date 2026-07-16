@@ -26,6 +26,7 @@ mod attention_math;
 mod dense_block;
 mod dense_ffn;
 mod embedding;
+mod expert_pack;
 mod index;
 mod indexer;
 mod kv_types;
@@ -55,6 +56,7 @@ pub(crate) use dense_ffn::{DenseFfn, DenseFfnOutput};
 pub use dense_ffn::{DenseFfnForwardReport, DenseFfnLoadReport};
 pub use embedding::EmbeddingLookupReport;
 pub(crate) use embedding::{EmbeddingLookupOutput, EmbeddingTable};
+pub use expert_pack::{create_expert_pack, expected_expert_pack_header, ExpertPackReport};
 pub use index::{
     AttentionIndex, DenseFfnIndex, FfnIndex, Index, IndexSummary, IndexerIndex, LayerIndex,
     MemoryAdviceReport, MtpIndex, PackedExpertsIndex, RootIndex, SharedExpertIndex, TensorRef,

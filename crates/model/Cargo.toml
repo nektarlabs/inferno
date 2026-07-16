@@ -10,5 +10,6 @@ backend = { path = "../backend" }
 config = { path = "../config" }
 common = { path = "../common" }
 gguf = { path = "../gguf" }
+inferno-io = { package = "io", path = "../io" }
 moe = { path = "../moe" }
 tracing.workspace = true

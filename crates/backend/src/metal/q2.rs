@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
-    io::{self, ErrorKind},
-    os::unix::fs::FileExt,
+    io::{self, ErrorKind, Read},
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,6 +17,7 @@ use ::metal::{
     MTLCommandBufferStatus, SharedEvent,
 };
 use common::{Error, Result};
+use inferno_io::{ExpertComponent, ExpertPackHeader, EXPERT_PACK_HEADER_BYTES};
 use objc::{msg_send, sel, sel_impl};
 use tracing::{debug, trace, warn};
 
@@ -89,7 +90,9 @@ const ARGMAX_THREADS_PER_VECTOR: usize = 256;
 // verification than 8, 10, 16, or 18 slots because it avoids memory pressure
 // without discarding too much adjacent-token expert locality.
 const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 12;
-const ROUTED_EXPERT_READ_WORKERS: usize = 8;
+// Chunking bounds thread creation while exposing enough independent large
+// reads to keep the sidecar's no-cache SSD path busy.
+const ROUTED_EXPERT_READ_WORKERS: usize = 32;
 // Submit small ready-first groups so SSD reads remain overlapped with Metal
 // execution without creating one command buffer per expert.
 const ROUTED_EXPERT_WAVE_MIN_GROUPS: usize = 4;
@@ -269,6 +272,13 @@ struct ExpertModelFile {
 }
 
 #[derive(Debug)]
+struct ExpertPackFile {
+    path: PathBuf,
+    file: File,
+    header: ExpertPackHeader,
+}
+
+#[derive(Debug)]
 struct ExpertReadTask {
     buffer: Buffer,
     destination_offset: usize,
@@ -307,6 +317,7 @@ enum ReadyExpertPhase {
 #[derive(Debug)]
 struct ReadyExpertSeed<'a> {
     key: ExpertCacheKey,
+    expert_id: u32,
     assignment_indices: Vec<usize>,
     gate: Q2ExpertSource<'a>,
     up: Q2ExpertSource<'a>,
@@ -329,6 +340,7 @@ struct Q2PerLayerExpertCache {
     layout: Option<Q2ExpertCacheLayout>,
     layers: HashMap<usize, Arc<Mutex<Q2ExpertLayerCache>>>,
     model_file: Option<ExpertModelFile>,
+    expert_pack: Option<ExpertPackFile>,
     slots_per_layer: usize,
 }
 
@@ -338,6 +350,7 @@ impl Default for Q2PerLayerExpertCache {
             layout: None,
             layers: HashMap::new(),
             model_file: None,
+            expert_pack: None,
             slots_per_layer: ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER,
         }
     }
@@ -602,6 +615,70 @@ impl MetalQ2Matvec {
             .lock()
             .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
         cache.resize(slots_per_layer)
+    }
+
+    pub(crate) fn configure_expert_pack(
+        &self,
+        path: &Path,
+        expected_header: ExpertPackHeader,
+    ) -> Result<()> {
+        let mut cache = self
+            .ready_expert_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+        if !cache.layers.is_empty() {
+            return Err(Error::backend(
+                "Q2 expert pack must be configured before generation starts",
+            ));
+        }
+        if let Some(configured) = &cache.expert_pack {
+            if configured.path == path && configured.header == expected_header {
+                return Ok(());
+            }
+            return Err(Error::backend(
+                "a different Q2 expert pack is already configured",
+            ));
+        }
+
+        let mut file = File::open(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // The explicit expert cache owns useful reuse. Avoid filling the much
+        // smaller macOS page cache with one-time reads from the 241 GB pack.
+        let no_cache = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        if no_cache == -1 {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source: io::Error::last_os_error(),
+            });
+        }
+        let mut encoded = [0_u8; EXPERT_PACK_HEADER_BYTES];
+        file.read_exact(&mut encoded).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let header = ExpertPackHeader::decode(&encoded)?;
+        if header != expected_header {
+            return Err(Error::backend(format!(
+                "Q2 expert pack {} does not match the selected GGUF layout",
+                path.display()
+            )));
+        }
+        let file_bytes = file
+            .metadata()
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        header.validate_file_bytes(file_bytes)?;
+        cache.expert_pack = Some(ExpertPackFile {
+            path: path.to_path_buf(),
+            file,
+            header,
+        });
+        Ok(())
     }
 
     pub(crate) fn run(
@@ -2293,7 +2370,7 @@ impl MetalQ2Matvec {
         )?;
 
         let lookup_started = Instant::now();
-        let (layer_cache, model_file, model_path) = {
+        let (layer_cache, read_file, read_path, expert_pack_header) = {
             let mut cache = self
                 .ready_expert_cache
                 .lock()
@@ -2301,17 +2378,31 @@ impl MetalQ2Matvec {
             cache.ensure_model_file(model_path)?;
             cache.ensure_layout(gate_stride, up_stride, down_stride);
             let layer_cache = cache.layer(layer_index);
-            let model_file = cache
-                .model_file
-                .as_ref()
-                .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?
-                .file
-                .try_clone()
-                .map_err(|source| Error::Io {
-                    path: model_path.to_path_buf(),
-                    source,
-                })?;
-            (layer_cache, model_file, model_path.to_path_buf())
+            let (read_file, read_path, expert_pack_header) = match &cache.expert_pack {
+                Some(pack) => (
+                    pack.file.try_clone().map_err(|source| Error::Io {
+                        path: pack.path.clone(),
+                        source,
+                    })?,
+                    pack.path.clone(),
+                    Some(pack.header),
+                ),
+                None => {
+                    let model_file = cache
+                        .model_file
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?;
+                    (
+                        model_file.file.try_clone().map_err(|source| Error::Io {
+                            path: model_path.to_path_buf(),
+                            source,
+                        })?,
+                        model_path.to_path_buf(),
+                        None,
+                    )
+                }
+            };
+            (layer_cache, read_file, read_path, expert_pack_header)
         };
 
         let mut layer_cache = layer_cache
@@ -2342,6 +2433,8 @@ impl MetalQ2Matvec {
             gate_stride,
             up_stride,
             down_stride,
+            layer_index,
+            expert_pack_header,
         )?;
         let lookup_nanoseconds = elapsed_nanoseconds(lookup_started.elapsed());
         let cache_hits = groups.iter().filter(|group| group.cache_hit).count();
@@ -2364,8 +2457,8 @@ impl MetalQ2Matvec {
         let started = Instant::now();
         let execution = self.execute_ready_expert_groups(
             device,
-            &model_file,
-            &model_path,
+            &read_file,
+            &read_path,
             &groups,
             input,
             input_len,
@@ -2441,188 +2534,6 @@ impl MetalQ2Matvec {
         })
     }
 
-    /// Loads a predicted next layer's exact Q2 expert ranges into that
-    /// layer's resident slots. The next layer still performs its real router
-    /// lookup; a correct prediction then becomes a normal cache hit.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prefetch_routed_experts(
-        &self,
-        device: &Device,
-        layer_index: usize,
-        model_path: &Path,
-        gate_payloads: &[Q2ExpertSource<'_>],
-        up_payloads: &[Q2ExpertSource<'_>],
-        down_payloads: &[Q2ExpertSource<'_>],
-        in_features: usize,
-        intermediate_features: usize,
-        out_features: usize,
-    ) -> Result<()> {
-        if gate_payloads.is_empty() {
-            return Err(Error::backend(
-                "routed expert prefetch requires at least one predicted expert",
-            ));
-        }
-        validate_exact_len(
-            "prefetch routed up payload count",
-            up_payloads.len(),
-            gate_payloads.len(),
-        )?;
-        validate_exact_len(
-            "prefetch routed down payload count",
-            down_payloads.len(),
-            gate_payloads.len(),
-        )?;
-
-        let gate_stride = uniform_payload_stride(gate_payloads, "prefetch routed gate")?;
-        let up_stride = uniform_payload_stride(up_payloads, "prefetch routed up")?;
-        let down_stride = uniform_payload_stride(down_payloads, "prefetch routed down")?;
-        validate_exact_len(
-            "prefetch routed gate stride",
-            gate_stride,
-            q2_expert_stride(in_features, intermediate_features)?,
-        )?;
-        validate_exact_len(
-            "prefetch routed up stride",
-            up_stride,
-            q2_expert_stride(in_features, intermediate_features)?,
-        )?;
-        validate_exact_len(
-            "prefetch routed down stride",
-            down_stride,
-            q2_expert_stride(intermediate_features, out_features)?,
-        )?;
-
-        let (layer_cache, model_file, model_path) = {
-            let mut cache = self
-                .ready_expert_cache
-                .lock()
-                .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
-            cache.ensure_model_file(model_path)?;
-            cache.ensure_layout(gate_stride, up_stride, down_stride);
-            let layer_cache = cache.layer(layer_index);
-            let model_file = cache
-                .model_file
-                .as_ref()
-                .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?
-                .file
-                .try_clone()
-                .map_err(|source| Error::Io {
-                    path: model_path.to_path_buf(),
-                    source,
-                })?;
-            (layer_cache, model_file, model_path.to_path_buf())
-        };
-
-        // Keep the layer locked until all writes finish. Exact routing for the
-        // same layer can then observe either a complete expert or no expert,
-        // never a partially loaded slot.
-        let mut layer_cache = layer_cache
-            .lock()
-            .map_err(|_| Error::backend("Q2 layer expert cache lock poisoned"))?;
-        let unique_count = gate_payloads
-            .iter()
-            .zip(up_payloads)
-            .zip(down_payloads)
-            .map(|((gate, up), down)| expert_cache_key(gate.bytes, up.bytes, down.bytes))
-            .collect::<HashSet<_>>()
-            .len();
-        if unique_count > layer_cache.slots.len() {
-            return Err(Error::backend(format!(
-                "routed expert prefetch selected {unique_count} unique experts but layer {layer_index} has only {} resident slots",
-                layer_cache.slots.len()
-            )));
-        }
-
-        let groups = prepare_ready_expert_groups(
-            device,
-            &mut layer_cache,
-            None,
-            gate_payloads,
-            up_payloads,
-            down_payloads,
-            gate_stride,
-            up_stride,
-            down_stride,
-        )?;
-        let cache_hits = groups.iter().filter(|group| group.cache_hit).count();
-        let miss_indices = groups
-            .iter()
-            .enumerate()
-            .filter_map(|(index, group)| (!group.cache_hit).then_some(index))
-            .collect::<Vec<_>>();
-        let cached_miss_keys = groups
-            .iter()
-            .filter_map(|group| group.cached_miss_key)
-            .collect::<Vec<_>>();
-        let read_bytes = miss_indices.iter().try_fold(0_u64, |total, &index| {
-            groups[index]
-                .read_tasks
-                .iter()
-                .try_fold(total, |total, task| {
-                    total
-                        .checked_add(u64::try_from(task.byte_len).map_err(|_| {
-                            Error::backend("prefetched expert read size does not fit u64")
-                        })?)
-                        .ok_or_else(|| Error::backend("prefetched expert read bytes overflow"))
-                })
-        })?;
-
-        let started = Instant::now();
-        let load_result = thread::scope(|scope| -> Result<()> {
-            let worker_count = miss_indices.len().min(ROUTED_EXPERT_READ_WORKERS);
-            if worker_count == 0 {
-                return Ok(());
-            }
-            let jobs_per_worker = miss_indices.len().div_ceil(worker_count);
-            let mut workers = Vec::with_capacity(worker_count);
-            for jobs in miss_indices.chunks(jobs_per_worker) {
-                let model_file = &model_file;
-                let model_path = &model_path;
-                let groups = &groups;
-                workers.push(scope.spawn(move || -> Result<()> {
-                    for &group_index in jobs {
-                        pread_ready_expert_gate_up(&model_file, &model_path, &groups[group_index])?;
-                        pread_ready_expert_down(&model_file, &model_path, &groups[group_index])?;
-                    }
-                    Ok(())
-                }));
-            }
-            for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| Error::backend("Q2 expert prefetch worker thread panicked"))??;
-            }
-            Ok(())
-        });
-        let load_nanoseconds = elapsed_nanoseconds(started.elapsed());
-        if let Err(error) = load_result {
-            layer_cache.invalidate(&cached_miss_keys);
-            return Err(error);
-        }
-
-        // Predictions do not count as cache requests. Their I/O does count,
-        // otherwise telemetry would hide the cost of incorrect speculation.
-        self.expert_cache_counters
-            .ssd_read_bytes
-            .fetch_add(read_bytes, Ordering::Relaxed);
-        if !miss_indices.is_empty() {
-            self.expert_cache_counters
-                .ssd_load_nanoseconds
-                .fetch_add(load_nanoseconds, Ordering::Relaxed);
-        }
-        debug!(
-            target: "inferno::expert_cache",
-            layer_index,
-            predicted_experts = groups.len(),
-            cache_hits,
-            cache_misses = miss_indices.len(),
-            read_bytes,
-            load_ms = load_nanoseconds as f64 / 1_000_000.0,
-            "prefetched predicted next-layer Q2 experts"
-        );
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn execute_ready_expert_groups(
         &self,
@@ -2673,6 +2584,7 @@ impl MetalQ2Matvec {
                     let sender = sender.clone();
                     let ssd_finished_nanoseconds = &ssd_finished_nanoseconds;
                     workers.push(scope.spawn(move || {
+                        let mut gate_up_ready = Vec::with_capacity(worker_jobs.len());
                         for &group_index in worker_jobs {
                             let gate_up_result = pread_ready_expert_gate_up(
                                 model_file,
@@ -2686,10 +2598,12 @@ impl MetalQ2Matvec {
                             {
                                 return;
                             }
-                            if !gate_up_succeeded {
-                                continue;
+                            if gate_up_succeeded {
+                                gate_up_ready.push(group_index);
                             }
+                        }
 
+                        for group_index in gate_up_ready {
                             let down_result = pread_ready_expert_down(
                                 model_file,
                                 model_path,
@@ -4033,6 +3947,22 @@ impl Q2PerLayerExpertCache {
             path: path.to_path_buf(),
             source,
         })?;
+        if let Some(pack) = &self.expert_pack {
+            let source_bytes = file
+                .metadata()
+                .map_err(|source| Error::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+                .len();
+            if source_bytes != pack.header.source_bytes {
+                return Err(Error::backend(format!(
+                    "Q2 expert pack expects a {}-byte GGUF, but {} has {source_bytes} bytes",
+                    pack.header.source_bytes,
+                    path.display()
+                )));
+            }
+        }
         self.model_file = Some(ExpertModelFile {
             path: path.to_path_buf(),
             file,
@@ -4219,17 +4149,46 @@ fn prepare_ready_expert_groups<'a>(
     gate_stride: usize,
     up_stride: usize,
     down_stride: usize,
+    layer_index: usize,
+    expert_pack_header: Option<ExpertPackHeader>,
 ) -> Result<Vec<ReadyExpertGroup>> {
+    if let Some(header) = expert_pack_header {
+        validate_exact_len(
+            "Q2 expert-pack gate stride",
+            usize::try_from(header.gate_bytes)
+                .map_err(|_| Error::backend("Q2 expert-pack gate stride exceeds usize"))?,
+            gate_stride,
+        )?;
+        validate_exact_len(
+            "Q2 expert-pack up stride",
+            usize::try_from(header.up_bytes)
+                .map_err(|_| Error::backend("Q2 expert-pack up stride exceeds usize"))?,
+            up_stride,
+        )?;
+        validate_exact_len(
+            "Q2 expert-pack down stride",
+            usize::try_from(header.down_bytes)
+                .map_err(|_| Error::backend("Q2 expert-pack down stride exceeds usize"))?,
+            down_stride,
+        )?;
+    }
     let mut seed_indices = HashMap::<ExpertCacheKey, usize>::new();
     let mut seeds = Vec::<ReadyExpertSeed<'a>>::new();
     for assignment_index in 0..gate_payloads.len() {
         let gate = gate_payloads[assignment_index];
         let up = up_payloads[assignment_index];
         let down = down_payloads[assignment_index];
+        if gate.expert_id != up.expert_id || gate.expert_id != down.expert_id {
+            return Err(Error::backend(format!(
+                "Q2 routed expert assignment {assignment_index} mixes expert IDs {}, {}, and {}",
+                gate.expert_id, up.expert_id, down.expert_id
+            )));
+        }
         let key = expert_cache_key(gate.bytes, up.bytes, down.bytes);
         if let Some(&seed_index) = seed_indices.get(&key) {
             let seed = &mut seeds[seed_index];
-            if seed.gate.absolute_offset != gate.absolute_offset
+            if seed.expert_id != gate.expert_id
+                || seed.gate.absolute_offset != gate.absolute_offset
                 || seed.up.absolute_offset != up.absolute_offset
                 || seed.down.absolute_offset != down.absolute_offset
             {
@@ -4243,6 +4202,7 @@ fn prepare_ready_expert_groups<'a>(
         seed_indices.insert(key, seeds.len());
         seeds.push(ReadyExpertSeed {
             key,
+            expert_id: gate.expert_id,
             assignment_indices: vec![assignment_index],
             gate,
             up,
@@ -4295,6 +4255,8 @@ fn prepare_ready_expert_groups<'a>(
                 }
             },
         };
+        let (gate_absolute_offset, up_absolute_offset, down_absolute_offset) =
+            expert_read_offsets(expert_pack_header, layer_index, &seed)?;
         let read_tasks = if cache_hit {
             Vec::new()
         } else {
@@ -4302,19 +4264,19 @@ fn prepare_ready_expert_groups<'a>(
                 ExpertReadTask {
                     buffer: buffers.gate.clone(),
                     destination_offset: buffers.gate_offset,
-                    absolute_offset: seed.gate.absolute_offset,
+                    absolute_offset: gate_absolute_offset,
                     byte_len: seed.gate.bytes.len(),
                 },
                 ExpertReadTask {
                     buffer: buffers.up.clone(),
                     destination_offset: buffers.up_offset,
-                    absolute_offset: seed.up.absolute_offset,
+                    absolute_offset: up_absolute_offset,
                     byte_len: seed.up.bytes.len(),
                 },
                 ExpertReadTask {
                     buffer: buffers.down.clone(),
                     destination_offset: buffers.down_offset,
-                    absolute_offset: seed.down.absolute_offset,
+                    absolute_offset: down_absolute_offset,
                     byte_len: seed.down.bytes.len(),
                 },
             ]
@@ -4330,6 +4292,27 @@ fn prepare_ready_expert_groups<'a>(
         });
     }
     Ok(groups)
+}
+
+fn expert_read_offsets(
+    header: Option<ExpertPackHeader>,
+    layer_index: usize,
+    seed: &ReadyExpertSeed<'_>,
+) -> Result<(u64, u64, u64)> {
+    let Some(header) = header else {
+        return Ok((
+            seed.gate.absolute_offset,
+            seed.up.absolute_offset,
+            seed.down.absolute_offset,
+        ));
+    };
+    let layer_index = u32::try_from(layer_index)
+        .map_err(|_| Error::backend("Q2 expert-pack layer index exceeds u32"))?;
+    Ok((
+        header.component_offset(layer_index, seed.expert_id, ExpertComponent::Gate)?,
+        header.component_offset(layer_index, seed.expert_id, ExpertComponent::Up)?,
+        header.component_offset(layer_index, seed.expert_id, ExpertComponent::Down)?,
+    ))
 }
 
 fn prioritize_ready_expert_seeds(seeds: &mut [ReadyExpertSeed<'_>]) {
@@ -4716,6 +4699,7 @@ mod tests {
     };
 
     use crate::{metal::Metal, DevicePagedKvView, DeviceValue, Q2ExpertSource};
+    use inferno_io::ExpertPackHeader;
 
     use super::{
         super::validation::{
@@ -4836,12 +4820,14 @@ mod tests {
     fn mtp_cache_admission_prioritizes_the_latest_token_row() {
         let weights = [0_u8; 3];
         let source = |index: usize| Q2ExpertSource {
+            expert_id: index as u32,
             bytes: &weights[index..index + 1],
             absolute_offset: index as u64,
         };
         let mut seeds = vec![
             ReadyExpertSeed {
                 key: expert_key(0),
+                expert_id: 0,
                 assignment_indices: vec![0, 8],
                 gate: source(0),
                 up: source(0),
@@ -4849,6 +4835,7 @@ mod tests {
             },
             ReadyExpertSeed {
                 key: expert_key(1),
+                expert_id: 1,
                 assignment_indices: vec![1, 15],
                 gate: source(1),
                 up: source(1),
@@ -4856,6 +4843,7 @@ mod tests {
             },
             ReadyExpertSeed {
                 key: expert_key(2),
+                expert_id: 2,
                 assignment_indices: vec![2, 9],
                 gate: source(2),
                 up: source(2),
@@ -5402,10 +5390,36 @@ mod tests {
             "staged-router-experts",
             [&gate_weights[..], &up_weights[..], &down_weights[..]].concat(),
         );
+        let pack_header = ExpertPackHeader::new(
+            (gate_weights.len() + up_weights.len() + down_weights.len()) as u64,
+            1,
+            1,
+            2,
+            expert_count as u32,
+            gate_stride as u64,
+            gate_stride as u64,
+            down_stride as u64,
+        )
+        .unwrap();
+        let mut pack_bytes = pack_header.encode().unwrap().to_vec();
+        for _layer in 0..pack_header.layer_count {
+            for expert in 0..expert_count {
+                let gate_start = expert * gate_stride;
+                let down_start = expert * down_stride;
+                pack_bytes.extend_from_slice(&gate_weights[gate_start..gate_start + gate_stride]);
+                pack_bytes.extend_from_slice(&up_weights[gate_start..gate_start + gate_stride]);
+                pack_bytes.extend_from_slice(&down_weights[down_start..down_start + down_stride]);
+            }
+        }
+        let expert_pack = TemporaryModelFile::new("staged-router-expert-pack", pack_bytes);
+        metal
+            .configure_expert_pack(expert_pack.path(), pack_header)
+            .unwrap();
         let gate_sources = selected_ids
             .iter()
             .zip(&gate_payloads)
             .map(|(&expert, &bytes)| Q2ExpertSource {
+                expert_id: expert,
                 bytes,
                 absolute_offset: expert as u64 * gate_stride as u64,
             })
@@ -5414,6 +5428,7 @@ mod tests {
             .iter()
             .zip(&up_payloads)
             .map(|(&expert, &bytes)| Q2ExpertSource {
+                expert_id: expert,
                 bytes,
                 absolute_offset: up_base + expert as u64 * gate_stride as u64,
             })
@@ -5422,6 +5437,7 @@ mod tests {
             .iter()
             .zip(&down_payloads)
             .map(|(&expert, &bytes)| Q2ExpertSource {
+                expert_id: expert,
                 bytes,
                 absolute_offset: down_base + expert as u64 * down_stride as u64,
             })
@@ -5481,35 +5497,6 @@ mod tests {
         assert_eq!(other_layer.cache_hits, 0);
         assert_eq!(other_layer.cache_misses, selected_ids.len());
         assert_eq!(other_layer.ready_waves, 2);
-        metal
-            .prefetch_routed_experts(
-                3,
-                model_file.path(),
-                &gate_sources,
-                &up_sources,
-                &down_sources,
-                hidden_features,
-                intermediate_features,
-                hidden_features,
-            )
-            .unwrap();
-        let prefetched_layer = metal
-            .ready_routed_experts(
-                3,
-                model_file.path(),
-                &gate_sources,
-                &up_sources,
-                &down_sources,
-                &input_buffer,
-                input.len(),
-                &routing,
-                hidden_features,
-                intermediate_features,
-                hidden_features,
-            )
-            .unwrap();
-        assert_eq!(prefetched_layer.cache_hits, selected_ids.len());
-        assert_eq!(prefetched_layer.cache_misses, 0);
         metal
             .batched_wait_for_ready_routed_experts(ready.completion_value)
             .unwrap();
@@ -5657,6 +5644,7 @@ mod tests {
             .map(|&expert| {
                 let start = expert as usize * expert_stride;
                 Q2ExpertSource {
+                    expert_id: expert,
                     bytes: &gate_weights[start..start + expert_stride],
                     absolute_offset: start as u64,
                 }
@@ -5667,6 +5655,7 @@ mod tests {
             .map(|&expert| {
                 let start = expert as usize * expert_stride;
                 Q2ExpertSource {
+                    expert_id: expert,
                     bytes: &up_weights[start..start + expert_stride],
                     absolute_offset: up_base + start as u64,
                 }
@@ -5677,6 +5666,7 @@ mod tests {
             .map(|&expert| {
                 let start = expert as usize * expert_stride;
                 Q2ExpertSource {
+                    expert_id: expert,
                     bytes: &down_weights[start..start + expert_stride],
                     absolute_offset: down_base + start as u64,
                 }

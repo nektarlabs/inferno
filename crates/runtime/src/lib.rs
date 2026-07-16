@@ -55,7 +55,7 @@ const F32_BYTES: u64 = 4;
 const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
-const MTP_DRAFTS_PER_STEP: usize = 7;
+const MTP_DRAFTS_PER_STEP: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GenerationOptions {
@@ -5006,13 +5006,13 @@ mod tests {
     }
 
     #[test]
-    fn mtp_reuses_the_single_head_for_seven_draft_steps() {
+    fn mtp_caps_speculative_rows_for_streamed_moe() {
         assert_eq!(mtp_draft_count(0), 0);
         assert_eq!(mtp_draft_count(1), 0);
         assert_eq!(mtp_draft_count(2), 1);
         assert_eq!(mtp_draft_count(3), 2);
-        assert_eq!(mtp_draft_count(8), 7);
-        assert_eq!(mtp_draft_count(32), 7);
+        assert_eq!(mtp_draft_count(8), 2);
+        assert_eq!(mtp_draft_count(32), 2);
     }
 
     #[test]

@@ -262,7 +262,6 @@ impl<'a> MtpHead<'a> {
                         config,
                         &projected,
                         backend,
-                        None,
                         past_kv,
                         selected_kv_for_tokens,
                         index_keys_for_layer,
@@ -277,7 +276,7 @@ impl<'a> MtpHead<'a> {
                 (
                     crate::try_device!(self
                         .block
-                        .forward_seed_device(config, &projected, backend, None,)),
+                        .forward_seed_device(config, &projected, backend,)),
                     None,
                 )
             }

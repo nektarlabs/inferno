@@ -2,6 +2,12 @@
 
 //! File IO helpers for large GLM weight shards.
 
+mod expert_pack;
+
+pub use expert_pack::{
+    ExpertComponent, ExpertPackHeader, EXPERT_PACK_FILE_NAME, EXPERT_PACK_HEADER_BYTES,
+};
+
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::{

@@ -309,7 +309,6 @@ impl<'a> SparseBlock<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
-        next_sparse_block: Option<&SparseBlock<'_>>,
         past_kv: &backend::DevicePagedKvView,
         selected_kv_for_tokens: &mut S,
         index_keys_for_layer: &mut I,
@@ -355,12 +354,8 @@ impl<'a> SparseBlock<'a> {
         };
         let output_hidden_states =
             match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
-                self.ffn.forward_device(
-                    config,
-                    &attention_output.tensors.hidden_states,
-                    backend,
-                    next_sparse_block.map(|block| &block.ffn),
-                )
+                self.ffn
+                    .forward_device(config, &attention_output.tensors.hidden_states, backend)
             })? {
                 Some(output) => output,
                 None => {
@@ -387,7 +382,6 @@ impl<'a> SparseBlock<'a> {
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
-        next_sparse_block: Option<&SparseBlock<'_>>,
     ) -> Result<Option<crate::kv_types::BlockDeviceTensors>> {
         let attention_output = match profile::run_layer_stage(
             self.load_report.layer_index,
@@ -413,12 +407,8 @@ impl<'a> SparseBlock<'a> {
         };
         let output_hidden_states =
             match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
-                self.ffn.forward_device(
-                    config,
-                    &attention_output.hidden_states,
-                    backend,
-                    next_sparse_block.map(|block| &block.ffn),
-                )
+                self.ffn
+                    .forward_device(config, &attention_output.hidden_states, backend)
             })? {
                 Some(output) => output,
                 None => {

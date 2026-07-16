@@ -8,6 +8,7 @@ use common::{
     PagedKvView, Result,
 };
 use common::{Device, Tensor};
+use inferno_io::ExpertPackHeader;
 use std::path::Path;
 
 use crate::device_value::DeviceValue;
@@ -164,6 +165,7 @@ impl DeviceRoutedExperts {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Q2ExpertSource<'a> {
+    pub expert_id: u32,
     pub bytes: &'a [u8],
     pub absolute_offset: u64,
 }
@@ -360,6 +362,11 @@ pub trait Backend: Sync {
     }
     fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
         self.configure_expert_cache_slots_per_layer(slots_per_layer)
+    }
+    fn configure_expert_pack(&self, _path: &Path, _header: ExpertPackHeader) -> Result<()> {
+        Err(Error::backend(
+            "Q2 expert packs require the native Metal backend",
+        ))
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor>;
@@ -905,22 +912,6 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
-    /// Loads predicted next-layer Q2 experts into the resident cache without
-    /// executing them. Exact routing remains authoritative on the next layer.
-    fn prefetch_routed_experts_device(
-        &self,
-        _layer_index: usize,
-        _model_path: &Path,
-        _gate_payloads: &[Q2ExpertSource<'_>],
-        _up_payloads: &[Q2ExpertSource<'_>],
-        _down_payloads: &[Q2ExpertSource<'_>],
-        _in_features: usize,
-        _intermediate_features: usize,
-        _out_features: usize,
-    ) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Inserts a device-side dependency before consuming routed-expert rows.
     /// The default backend has no asynchronous routed-expert path.
     fn wait_for_routed_experts_device(&self, _routed: &DeviceRoutedExperts) -> Result<()> {
@@ -1373,6 +1364,20 @@ impl Backend for MetalBackend {
 
         let _ = slots_per_layer;
         Ok(())
+    }
+
+    fn configure_expert_pack(&self, path: &Path, header: ExpertPackHeader) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.configure_expert_pack(path, header);
+            }
+        }
+
+        let _ = (path, header);
+        Err(Error::backend(
+            "Q2 expert packs require the native Metal backend",
+        ))
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
@@ -3994,51 +3999,6 @@ impl Backend for MetalBackend {
                 out_features,
             );
             Ok(None)
-        }
-    }
-
-    fn prefetch_routed_experts_device(
-        &self,
-        layer_index: usize,
-        model_path: &Path,
-        gate_payloads: &[Q2ExpertSource<'_>],
-        up_payloads: &[Q2ExpertSource<'_>],
-        down_payloads: &[Q2ExpertSource<'_>],
-        in_features: usize,
-        intermediate_features: usize,
-        out_features: usize,
-    ) -> Result<bool> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        {
-            let Some(native_metal) = self.native_metal() else {
-                return Ok(false);
-            };
-            native_metal.prefetch_routed_experts(
-                layer_index,
-                model_path,
-                gate_payloads,
-                up_payloads,
-                down_payloads,
-                in_features,
-                intermediate_features,
-                out_features,
-            )?;
-            return Ok(true);
-        }
-
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        {
-            let _ = (
-                layer_index,
-                model_path,
-                gate_payloads,
-                up_payloads,
-                down_payloads,
-                in_features,
-                intermediate_features,
-                out_features,
-            );
-            Ok(false)
         }
     }
 

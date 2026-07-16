@@ -11,9 +11,10 @@ use backend::{Backend, ExpertCacheMetrics, MetalBackend};
 use common::{Error, Result as InfernoResult};
 use config::{load_config, load_generation_config, Config};
 use gguf::GgufFile;
+use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
-    antirez_q2_artifact, enable_layer_profile, validate_routing_policy, FfnIndex, Index,
-    IndexSummary, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    antirez_q2_artifact, enable_layer_profile, expected_expert_pack_header,
+    validate_routing_policy, FfnIndex, Index, IndexSummary, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_telemetry, enable_memory_telemetry_file, enable_q2_runtime_profile,
@@ -74,6 +75,11 @@ pub fn run(
             expert_cache_budget_bytes,
         )?;
         backend.configure_expert_cache_slots_per_layer(slots_per_layer)?;
+    }
+    let expert_pack_path = model_path.join(EXPERT_PACK_FILE_NAME);
+    if expert_pack_path.is_file() {
+        let header = expected_expert_pack_header(&gguf, &config, &readiness.index)?;
+        backend.configure_expert_pack(&expert_pack_path, header)?;
     }
     let model = Model::open_from_index(
         &gguf,

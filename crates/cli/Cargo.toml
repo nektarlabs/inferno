@@ -12,6 +12,7 @@ backend = { path = "../backend" }
 config = { path = "../config" }
 common = { path = "../common" }
 gguf = { path = "../gguf" }
+inferno-io = { package = "io", path = "../io" }
 model = { path = "../model" }
 runtime = { path = "../runtime" }
 tokenizer = { path = "../tokenizer" }

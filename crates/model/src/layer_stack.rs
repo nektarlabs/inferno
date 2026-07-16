@@ -662,7 +662,7 @@ impl<'a> LayerStack<'a> {
         let mut layer_kv_cache = Vec::with_capacity(self.layers.len());
         let mut last_dsa_selection: Option<Vec<u32>> = None;
 
-        for (layer_position, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             match layer {
                 RuntimeLayer::Dense(block) => {
                     let layer_index = block.load_report().layer_index;
@@ -700,13 +700,6 @@ impl<'a> LayerStack<'a> {
                 }
                 RuntimeLayer::Sparse(block) => {
                     let layer_index = block.load_report().layer_index;
-                    let next_sparse_block = self.layers.get(layer_position + 1).and_then(|layer| {
-                        if let RuntimeLayer::Sparse(block) = layer {
-                            Some(block)
-                        } else {
-                            None
-                        }
-                    });
                     let Some(past_kv) = past_kv_for_layer(layer_index)? else {
                         return Ok(None);
                     };
@@ -718,7 +711,6 @@ impl<'a> LayerStack<'a> {
                                 config,
                                 &current,
                                 backend,
-                                next_sparse_block,
                                 &past_kv,
                                 &mut selected_kv_for_tokens,
                                 &mut index_keys_for_layer,
@@ -777,7 +769,7 @@ impl<'a> LayerStack<'a> {
         let mut current = crate::try_device!(backend.device_upload_f32_tensor(hidden_states));
         let mut layer_kv_cache = Vec::with_capacity(self.layers.len());
 
-        for (layer_position, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             match layer {
                 RuntimeLayer::Dense(block) => {
                     let layer_index = block.load_report().layer_index;
@@ -804,17 +796,10 @@ impl<'a> LayerStack<'a> {
                 }
                 RuntimeLayer::Sparse(block) => {
                     let layer_index = block.load_report().layer_index;
-                    let next_sparse_block = self.layers.get(layer_position + 1).and_then(|layer| {
-                        if let RuntimeLayer::Sparse(block) = layer {
-                            Some(block)
-                        } else {
-                            None
-                        }
-                    });
                     let output = match profile::run_layer_stage(
                         layer_index,
                         "sparse_moe.seed_device",
-                        || block.forward_seed_device(config, &current, backend, next_sparse_block),
+                        || block.forward_seed_device(config, &current, backend),
                     )? {
                         Some(output) => output,
                         None => {

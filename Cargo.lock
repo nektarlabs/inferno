@@ -86,6 +86,7 @@ name = "backend"
 version = "0.1.0"
 dependencies = [
  "common",
+ "io",
  "libc",
  "metal",
  "objc",
@@ -520,6 +521,7 @@ dependencies = [
  "common",
  "config",
  "gguf",
+ "io",
  "model",
  "runtime",
  "serde_json",
@@ -664,6 +666,7 @@ dependencies = [
  "common",
  "config",
  "gguf",
+ "io",
  "moe",
  "tracing",
 ]

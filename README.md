@@ -54,7 +54,7 @@ experiment is testing.
 
 ## Multi-Token Prediction
 
-Inferno uses the GLM-5.2 MTP head to propose up to seven tokens before asking
+Inferno uses the GLM-5.2 MTP head to propose up to two tokens before asking
 the main model to verify them. MTP is enabled automatically when the loaded
 artifact and configuration expose the required tensors and metadata; no CLI
 flag is required.
@@ -64,13 +64,13 @@ One MTP generation step follows this sequence:
 ```txt
 committed hidden state
   -> MTP draft step 0
-  -> up to six additional shared-head draft steps
+  -> up to one additional shared-head draft step
   -> one causal target-model verification
   -> accept matching prefix
   -> commit accepted KV rows only
 ```
 
-For `D <= 7` draft tokens, the main shapes are:
+For `D <= 2` draft tokens, the main shapes are:
 
 ```txt
 draft token ids:       [D]
@@ -90,6 +90,11 @@ causal sequence. Drafts are accepted from left to right until the first
 mismatch. Rejected drafts are discarded, and only the verified prefix is
 appended to the request KV cache. This preserves greedy target-model semantics
 while amortizing one full backbone pass across multiple accepted tokens.
+
+The two-draft limit is specific to SSD-streamed MoE execution. Wider verifier
+batches activate many more unique experts, and measured SSD traffic grows
+faster than the number of accepted tokens. Two drafts retained the accepted
+prefix while reducing verifier rows and expert reads on the target machine.
 
 ## Memory Strategy
 
@@ -149,11 +154,31 @@ reconstruct F32 rows before upload and remain a separate optimization target.
 
 ### Routed expert cache
 
-The 256 routed experts per sparse layer remain in the GGUF artifact on SSD.
-Inferno executes the artifact's exact top-8 routing and caches selected Q2 gate,
-up, and down matrices in shared Metal slabs. The default is 12 expert slots per
-routed layer, approximately 11.3 GB including the main sparse layers and MTP
-head.
+The source weights remain in the GGUF artifact. For inference, Inferno uses a
+lossless derived file named
+`GLM-5.2-UD-Q2_K_RoutedQ2K-Inferno-ExpertPack-v1.q2pack` that stores one fixed
+record per layer and expert:
+
+```txt
+4 KiB header -> [layer][expert][gate][up][down]
+```
+
+The pack preserves the exact Q2 bytes and top-8 routing; it changes only their
+physical order on SSD. Keeping each expert's three matrices adjacent reduces
+seeks compared with the component-major GGUF layout. The runtime validates the
+pack version, source layout fingerprint, dimensions, component strides, and
+exact file size before using it.
+
+In a controlled comparison with identical prompt, routing, output, and MTP
+acceptance, the ExpertPack increased end-to-end decode throughput from 0.247 to
+0.612 tokens/s, approximately 2.5x. Time to first token fell from 84.5 to 51.1
+seconds, and physical reads fell from 201.9 to 182.5 GB. These results isolate
+the storage layout before later cache and scheduling improvements; the format
+does not alter model values or output quality.
+
+Inferno caches selected Q2 gate, up, and down matrices in shared Metal slabs.
+The default is 12 expert slots per routed layer, approximately 11.3 GB including
+the main sparse layers and MTP head.
 
 Each layer uses a segmented LRU:
 
@@ -162,14 +187,14 @@ probation: newly loaded or weakly reused experts
 protected: experts promoted after reuse
 ```
 
-Cache hits execute directly from the resident Metal slot. On a miss, parallel
-`pread` workers load the gate and up matrices first. Metal starts their fused
-SwiGLU projection while the same workers continue loading the down matrices.
-All ready gate/up waves are queued before the down waves, which overlaps SSD
-reads with useful GPU work without changing the result. The cache never evicts
-an expert selected by the current token; if every slot is temporarily
-protected, overflow experts use a bounded staging slab that is reused after
-the current layer completes.
+Cache hits execute directly from the resident Metal slot. On a miss, up to 32
+parallel `pread` workers load gate and up matrices before loading down matrices.
+Metal starts fused SwiGLU work as small ready waves arrive. The expert-pack file
+uses `F_NOCACHE`: Inferno's bounded cache owns useful reuse, while one-time
+misses bypass the macOS page cache and avoid displacing always-hot model data.
+The cache never evicts an expert selected by the current token; if every slot
+is temporarily protected, overflow experts use a bounded staging slab that is
+reused after the current layer completes.
 
 ### Budget control
 
@@ -220,8 +245,13 @@ https://huggingface.co/antirez/glm-5.2-gguf/blob/main/GLM-5.2-UD-Q2_K_RoutedQ2K.
 The runtime is built around this Q2 GGUF layout. Full-precision GLM-5.2 shards
 are not part of the inference path.
 
-Credit to Antirez for publishing the GLM-5.2 GGUF conversion used as the target
-artifact for this implementation.
+Inferno's ExpertPack is derived losslessly from this artifact: every routed
+expert payload remains byte-for-byte identical to the Q2 data published by
+Antirez. Inferno changes only the on-disk ordering required for efficient expert
+streaming.
+
+Credit and thanks to Antirez for producing and publishing the GLM-5.2 Q2 GGUF
+artifact that makes Inferno's local Apple Silicon work possible.
 
 ## How to Run
 
@@ -243,7 +273,19 @@ Expected files:
 models/glm-5.2/config.json
 models/glm-5.2/tokenizer.json
 models/glm-5.2/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
+models/glm-5.2/GLM-5.2-UD-Q2_K_RoutedQ2K-Inferno-ExpertPack-v1.q2pack
 ```
+
+Create the lossless expert pack once after downloading the GGUF artifact:
+
+```bash
+cargo run --release -p inferno --example pack_experts -- \
+  --model models/glm-5.2
+```
+
+The generated file is approximately 241 GB. Creation is resumable at complete
+expert-record boundaries and publishes the final path atomically. Subsequent
+generation validates and selects it automatically.
 
 Run generation:
 
