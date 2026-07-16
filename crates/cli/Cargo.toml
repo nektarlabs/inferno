@@ -15,6 +15,7 @@ gguf = { path = "../gguf" }
 inferno-io = { package = "io", path = "../io" }
 model = { path = "../model" }
 runtime = { path = "../runtime" }
+rustix.workspace = true
 tokenizer = { path = "../tokenizer" }
 tracing.workspace = true
 tracing-subscriber.workspace = true

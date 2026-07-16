@@ -295,6 +295,29 @@ target/release/inferno generate \
   --prompt "Tell me the capital of Italy."
 ```
 
+Start an interactive local chat session:
+
+```bash
+target/release/inferno
+```
+
+With no arguments, Inferno starts chat mode using `models/glm-5.2`. Use the
+explicit `chat` subcommand only when overriding defaults, for example
+`target/release/inferno chat --model /path/to/model`.
+
+The model, Metal backend, and routed-expert cache remain alive across turns.
+The input prompt is `inferno>`. During generation, terminal input is disabled
+and any attempted keystrokes are discarded. GLM reasoning streams in gray;
+when the model emits `</think>`, the final answer begins on a new white line
+without a label. Final answers are retained in conversation history; previous
+reasoning is displayed to the user but excluded from later prompts, as required
+by the GLM chat template. Use `/clear` to reset the conversation and `/exit` to
+close the session.
+
+Each turn currently re-prefills the accumulated conversation into a fresh
+request KV cache. This preserves multi-turn correctness while persistent
+cross-turn KV reuse remains a future latency optimization.
+
 MTP, IndexShare, and KVShare are selected automatically from the model
 metadata. Generation falls back to ordinary single-token verification only
 when MTP is unavailable or too few output tokens remain to benefit from it.

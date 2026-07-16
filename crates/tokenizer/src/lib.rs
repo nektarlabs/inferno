@@ -61,6 +61,12 @@ pub struct ChatPrompt {
     pub rendered: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     tokenizer: HfTokenizer,
@@ -168,11 +174,32 @@ fn encode_decode_round_trip(
 }
 
 pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
-    ChatPrompt {
-        rendered: format!(
-            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>{prompt}<|assistant|><think>"
-        ),
+    render_chat_prompt(&[], prompt)
+}
+
+pub fn render_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatPrompt {
+    let history_bytes = history.iter().fold(0_usize, |total, turn| {
+        total
+            .saturating_add(turn.user.len())
+            .saturating_add(turn.assistant.len())
+    });
+    let mut rendered = String::with_capacity(
+        "[gMASK]<sop><|system|>Reasoning Effort: Max".len()
+            + history_bytes
+            + prompt.len()
+            + (history.len() + 1) * 48,
+    );
+    rendered.push_str("[gMASK]<sop><|system|>Reasoning Effort: Max");
+    for turn in history {
+        rendered.push_str("<|user|>");
+        rendered.push_str(&turn.user);
+        rendered.push_str("<|assistant|><think></think>");
+        rendered.push_str(turn.assistant.trim());
     }
+    rendered.push_str("<|user|>");
+    rendered.push_str(prompt);
+    rendered.push_str("<|assistant|><think>");
+    ChatPrompt { rendered }
 }
 
 #[cfg(test)]
@@ -248,6 +275,21 @@ mod tests {
         assert_eq!(
             rendered.rendered,
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello GLM<|assistant|><think>"
+        );
+    }
+
+    #[test]
+    fn renders_chat_history_without_replaying_previous_reasoning() {
+        let history = vec![ChatTurn {
+            user: "What is the capital of Italy?".to_string(),
+            assistant: "  Rome.  ".to_string(),
+        }];
+
+        let rendered = render_chat_prompt(&history, "And of France?");
+
+        assert_eq!(
+            rendered.rendered,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of Italy?<|assistant|><think></think>Rome.<|user|>And of France?<|assistant|><think>"
         );
     }
 

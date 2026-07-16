@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(about = "Lightweight GLM-5.2 inference engine for Apple Silicon")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,12 +87,54 @@ enum Command {
         #[arg(long)]
         telemetry_file: Option<PathBuf>,
     },
+
+    /// Start a persistent local GLM-5.2 chat session.
+    Chat {
+        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        #[arg(long)]
+        model: PathBuf,
+
+        /// Optional config.json path. Defaults to <model>/config.json.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Optional tokenizer.json path. Defaults to <model>/tokenizer.json.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+
+        /// Page size for the paged KV cache.
+        #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
+        page_size: usize,
+
+        /// Optional maximum number of tokens generated for each answer.
+        #[arg(long)]
+        max_new_tokens: Option<usize>,
+
+        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        #[arg(long)]
+        expert_cache_gb: Option<f64>,
+
+        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        #[arg(long)]
+        hot_kv_cache_gb: Option<f64>,
+
+        /// Emit runtime memory telemetry to stderr during generation.
+        #[arg(long, default_value_t = false)]
+        enable_telemetry: bool,
+
+        /// Write runtime memory telemetry to a file instead of the terminal.
+        #[arg(long)]
+        telemetry_file: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    tracing_init::init(cli.telemetry_to_stderr(), cli.token_costs_to_stderr());
-    match cli.command {
+    let command = Cli::parse().command.unwrap_or_else(Command::default_chat);
+    tracing_init::init(
+        command.telemetry_to_stderr(),
+        command.token_costs_to_stderr(),
+    );
+    match command {
         Command::Generate {
             model,
             config,
@@ -130,15 +172,55 @@ fn main() -> Result<()> {
             enable_telemetry,
             telemetry_file.as_deref(),
         )?,
+        Command::Chat {
+            model,
+            config,
+            tokenizer,
+            page_size,
+            max_new_tokens,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+        } => commands::chat::run(
+            model.as_path(),
+            config.as_deref(),
+            tokenizer.as_deref(),
+            page_size,
+            max_new_tokens,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file.as_deref(),
+        )?,
     }
 
     Ok(())
 }
 
-impl Cli {
+impl Command {
+    fn default_chat() -> Self {
+        Self::Chat {
+            model: PathBuf::from("models/glm-5.2"),
+            config: None,
+            tokenizer: None,
+            page_size: runtime::DEFAULT_KV_PAGE_SIZE,
+            max_new_tokens: None,
+            expert_cache_gb: None,
+            hot_kv_cache_gb: None,
+            enable_telemetry: false,
+            telemetry_file: None,
+        }
+    }
+
     fn telemetry_to_stderr(&self) -> bool {
-        match &self.command {
+        match self {
             Command::Generate {
+                enable_telemetry,
+                telemetry_file,
+                ..
+            } => *enable_telemetry && telemetry_file.is_none(),
+            Command::Chat {
                 enable_telemetry,
                 telemetry_file,
                 ..
@@ -147,11 +229,12 @@ impl Cli {
     }
 
     fn token_costs_to_stderr(&self) -> bool {
-        match &self.command {
+        match self {
             Command::Generate {
                 profile_token_costs,
                 ..
             } => *profile_token_costs,
+            Command::Chat { .. } => false,
         }
     }
 }
@@ -177,7 +260,10 @@ mod tests {
         let Command::Generate {
             skip_special_tokens,
             ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert!(!skip_special_tokens);
     }
 
@@ -196,7 +282,10 @@ mod tests {
         let Command::Generate {
             skip_special_tokens,
             ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert!(skip_special_tokens);
     }
 
@@ -212,7 +301,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { page_size, .. } = cli.command;
+        let Command::Generate { page_size, .. } = cli.command.expect("expected command") else {
+            panic!("expected generate command");
+        };
         assert_eq!(page_size, runtime::DEFAULT_KV_PAGE_SIZE);
     }
 
@@ -228,7 +319,10 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { max_new_tokens, .. } = cli.command;
+        let Command::Generate { max_new_tokens, .. } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(max_new_tokens, None);
     }
 
@@ -246,7 +340,10 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { max_new_tokens, .. } = cli.command;
+        let Command::Generate { max_new_tokens, .. } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(max_new_tokens, Some(16));
     }
 
@@ -264,7 +361,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { page_size, .. } = cli.command;
+        let Command::Generate { page_size, .. } = cli.command.expect("expected command") else {
+            panic!("expected generate command");
+        };
         assert_eq!(page_size, 64);
     }
 
@@ -284,7 +383,10 @@ mod tests {
 
         let Command::Generate {
             profile_runtime, ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(profile_runtime.unwrap(), PathBuf::from("/tmp/runtime.tsv"));
     }
 
@@ -302,7 +404,10 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { profile_layers, .. } = cli.command;
+        let Command::Generate { profile_layers, .. } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(profile_layers.unwrap(), PathBuf::from("/tmp/layers.tsv"));
     }
 
@@ -322,7 +427,10 @@ mod tests {
         let Command::Generate {
             measure_tokens_per_second,
             ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert!(measure_tokens_per_second);
     }
 
@@ -342,7 +450,10 @@ mod tests {
         let Command::Generate {
             profile_token_costs,
             ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert!(profile_token_costs);
     }
 
@@ -366,7 +477,10 @@ mod tests {
             expert_cache_gb,
             hot_kv_cache_gb,
             ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(expert_cache_gb, Some(9.5));
         assert_eq!(hot_kv_cache_gb, Some(2.0));
     }
@@ -387,7 +501,10 @@ mod tests {
 
         let Command::Generate {
             throughput_file, ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(
             throughput_file.unwrap(),
             PathBuf::from("/tmp/inferno-throughput.tsv")
@@ -409,7 +526,10 @@ mod tests {
 
         let Command::Generate {
             enable_telemetry, ..
-        } = cli.command;
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert!(enable_telemetry);
     }
 
@@ -427,7 +547,10 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Generate { telemetry_file, .. } = cli.command;
+        let Command::Generate { telemetry_file, .. } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
         assert_eq!(
             telemetry_file.unwrap(),
             PathBuf::from("/tmp/inferno-memory.log")
@@ -449,5 +572,75 @@ mod tests {
         .expect_err("production CLI is Q2-only and should reject quantization selection");
 
         assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn no_subcommand_selects_default_local_chat() {
+        let cli = Cli::try_parse_from(["inferno"]).unwrap();
+        let command = cli.command.unwrap_or_else(Command::default_chat);
+
+        let Command::Chat {
+            model,
+            page_size,
+            max_new_tokens,
+            ..
+        } = command
+        else {
+            panic!("expected default chat command");
+        };
+        assert_eq!(model, PathBuf::from("models/glm-5.2"));
+        assert_eq!(page_size, runtime::DEFAULT_KV_PAGE_SIZE);
+        assert_eq!(max_new_tokens, None);
+    }
+
+    #[test]
+    fn chat_accepts_model_and_has_no_default_answer_limit() {
+        let cli = Cli::try_parse_from(["inferno", "chat", "--model", "/tmp/model"]).unwrap();
+
+        let Command::Chat {
+            model,
+            page_size,
+            max_new_tokens,
+            ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected chat command");
+        };
+        assert_eq!(model, PathBuf::from("/tmp/model"));
+        assert_eq!(page_size, runtime::DEFAULT_KV_PAGE_SIZE);
+        assert_eq!(max_new_tokens, None);
+    }
+
+    #[test]
+    fn chat_accepts_cache_and_telemetry_controls() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "chat",
+            "--model",
+            "/tmp/model",
+            "--max-new-tokens",
+            "64",
+            "--expert-cache-gb",
+            "10.5",
+            "--hot-kv-cache-gb",
+            "1.0",
+            "--enable-telemetry",
+        ])
+        .unwrap();
+
+        let Command::Chat {
+            max_new_tokens,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected chat command");
+        };
+        assert_eq!(max_new_tokens, Some(64));
+        assert_eq!(expert_cache_gb, Some(10.5));
+        assert_eq!(hot_kv_cache_gb, Some(1.0));
+        assert!(enable_telemetry);
     }
 }

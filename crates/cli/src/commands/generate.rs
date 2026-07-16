@@ -22,6 +22,7 @@ use runtime::{
 };
 use tokenizer::{render_user_prompt, Tokenizer};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     model_path: &Path,
     config_path: Option<&Path>,
@@ -303,7 +304,7 @@ fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
 }
 
-fn cache_gb_to_bytes(name: &str, value: Option<f64>) -> InfernoResult<Option<usize>> {
+pub(super) fn cache_gb_to_bytes(name: &str, value: Option<f64>) -> InfernoResult<Option<usize>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -321,7 +322,7 @@ fn cache_gb_to_bytes(name: &str, value: Option<f64>) -> InfernoResult<Option<usi
     Ok(Some(bytes.floor() as usize))
 }
 
-fn expert_cache_slots_per_layer(
+pub(super) fn expert_cache_slots_per_layer(
     index: &Index,
     expert_count: usize,
     include_mtp: bool,
@@ -512,7 +513,7 @@ fn percentile_seconds(mut values: Vec<Duration>, percentile: usize) -> f64 {
     values[index.min(last_index)].as_secs_f64()
 }
 
-struct DecodedTextStream<'a> {
+pub(super) struct DecodedTextStream<'a> {
     tokenizer: &'a Tokenizer,
     skip_special_tokens: bool,
     token_ids: Vec<u32>,
@@ -520,7 +521,7 @@ struct DecodedTextStream<'a> {
 }
 
 impl<'a> DecodedTextStream<'a> {
-    fn new(tokenizer: &'a Tokenizer, skip_special_tokens: bool) -> Self {
+    pub(super) fn new(tokenizer: &'a Tokenizer, skip_special_tokens: bool) -> Self {
         Self {
             tokenizer,
             skip_special_tokens,
@@ -529,7 +530,7 @@ impl<'a> DecodedTextStream<'a> {
         }
     }
 
-    fn push(&mut self, token_id: u32) -> InfernoResult<Option<String>> {
+    pub(super) fn push(&mut self, token_id: u32) -> InfernoResult<Option<String>> {
         self.token_ids.push(token_id);
         let decoded = self
             .tokenizer
@@ -553,18 +554,18 @@ impl<'a> DecodedTextStream<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactSelection {
-    gguf_path: PathBuf,
-    artifact_file_name: String,
+pub(super) struct ArtifactSelection {
+    pub(super) gguf_path: PathBuf,
+    pub(super) artifact_file_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Readiness {
-    artifact_file_name: String,
-    index: Index,
+pub(super) struct Readiness {
+    pub(super) artifact_file_name: String,
+    pub(super) index: Index,
 }
 
-fn resolve_q2_artifact(model_path: &Path) -> Result<ArtifactSelection> {
+pub(super) fn resolve_q2_artifact(model_path: &Path) -> Result<ArtifactSelection> {
     let artifact = antirez_q2_artifact();
     let gguf_path = model_path.join(artifact.file_name);
     if !gguf_path.exists() {
@@ -584,7 +585,7 @@ fn resolve_q2_artifact(model_path: &Path) -> Result<ArtifactSelection> {
     })
 }
 
-fn load_q2_readiness(
+pub(super) fn load_q2_readiness(
     gguf: &GgufFile,
     artifact: &ArtifactSelection,
     config: &Config,
@@ -596,7 +597,8 @@ fn load_q2_readiness(
     })
 }
 
-fn validate_generation_request(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_generation_request(
     config: &Config,
     eos_token_ids: &[u32],
     prompt_token_ids: &[u32],
@@ -698,7 +700,10 @@ fn validate_generation_request(
     Ok(())
 }
 
-fn discover_config_path(model_path: &Path, explicit_config_path: Option<&Path>) -> Result<PathBuf> {
+pub(super) fn discover_config_path(
+    model_path: &Path,
+    explicit_config_path: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(path) = explicit_config_path {
         return Ok(path.to_path_buf());
     }
@@ -713,7 +718,7 @@ fn discover_config_path(model_path: &Path, explicit_config_path: Option<&Path>) 
     .into())
 }
 
-fn discover_tokenizer_path(
+pub(super) fn discover_tokenizer_path(
     model_path: &Path,
     explicit_tokenizer_path: Option<&Path>,
 ) -> Result<PathBuf> {
