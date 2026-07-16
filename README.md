@@ -177,8 +177,12 @@ the storage layout before later cache and scheduling improvements; the format
 does not alter model values or output quality.
 
 Inferno caches selected Q2 gate, up, and down matrices in shared Metal slabs.
-The default is 12 expert slots per routed layer, approximately 11.3 GB including
-the main sparse layers and MTP head.
+The default is 16 expert slots per routed layer, approximately 15.1 GB including
+the main sparse layers and MTP head. A shared adaptive reserve can add at most
+512 pageable slots across the whole model, approximately 6.3 GB, only to layers
+that demonstrate useful expert locality. The base tier is locked; adaptive
+slots remain reclaimable by macOS. This avoids paying for extra capacity in
+layers that do not reuse it.
 
 Each layer uses a segmented LRU:
 
@@ -186,6 +190,14 @@ Each layer uses a segmented LRU:
 probation: newly loaded or weakly reused experts
 protected: experts promoted after reuse
 ```
+
+Each layer also records a small frequency counter for every requested expert.
+When the cache is full, Inferno evicts the least-used unselected resident; LRU
+order breaks frequency ties. Newly selected experts still enter the probation
+segment, so the cache can follow a changing conversation instead of requiring
+repeated SSD loads before admission. Reused experts move into the protected
+segment, while one-time experts rotate through probation. Frequencies are
+halved every 4,096 lookups so old popularity does not remain permanent.
 
 Cache hits execute directly from the resident Metal slot. On a miss, up to 32
 parallel `pread` workers load gate and up matrices before loading down matrices.
@@ -201,11 +213,14 @@ reused after the current layer completes.
 The CLI currently uses fixed, independent budgets:
 
 ```txt
-expert cache: 12 slots per routed layer
+expert cache: 16 slots per routed layer
+adaptive expert reserve: up to 512 pageable model-wide slots
 hot KV cache: 512 MiB
 ```
 
 They can be overridden with `--expert-cache-gb` and `--hot-kv-cache-gb`.
+An explicit expert-cache budget disables adaptive growth and remains an exact
+uniform capacity.
 Because Apple Silicon uses unified memory, both allocations consume the same
 physical RAM. Their sum must leave enough space for dense weights,
 intermediates, macOS, and filesystem cache; excessive values can trigger swap

@@ -5,7 +5,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -85,11 +85,21 @@ const Q8_0_BATCH_MAX_ROWS: usize = 8;
 const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
-// Twelve Q2 expert triplets per routed layer use about 11.3 GB including the
-// MTP head. On the 64 GB target this measured faster for repeated MTP
-// verification than 8, 10, 16, or 18 slots because it avoids memory pressure
-// without discarding too much adjacent-token expert locality.
-const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 12;
+// Sixteen Q2 expert triplets per routed layer use about 15.1 GB including the
+// MTP head. On the 64 GB target this improved warm decode by 5.9% over twelve
+// slots while leaving 4.7 GB free. Twenty slots left less than 1 GB free, which
+// is not enough margin for longer-context KV growth.
+const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 16;
+// Spare RAM is more useful when assigned to layers with demonstrated expert
+// locality than when every layer is enlarged uniformly. The pageable shared
+// allowance is about 6.3 GB for this artifact. It remains reclaimable by macOS,
+// unlike the locked sixteen-slot L1 slabs.
+const ROUTED_EXPERT_ADAPTIVE_EXTRA_SLOTS: usize = 512;
+const ROUTED_EXPERT_ADAPTIVE_MAX_EXTRA_SLOTS_PER_LAYER: usize = 8;
+const ROUTED_EXPERT_ADAPTIVE_MIN_LOOKUPS: usize = 64;
+const ROUTED_EXPERT_ADAPTIVE_MIN_HIT_PERCENT: usize = 35;
+const ROUTED_EXPERT_ADAPTIVE_REUSE_SIGNALS_PER_SLOT: usize = 2;
+const ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS: usize = 4_096;
 // Chunking bounds thread creation while exposing enough independent large
 // reads to keep the sidecar's no-cache SSD path busy.
 const ROUTED_EXPERT_READ_WORKERS: usize = 32;
@@ -328,11 +338,20 @@ struct ReadyExpertSeed<'a> {
 struct Q2ExpertLayerCache {
     slots: Vec<bool>,
     storage: Option<Q2ExpertLayerBuffers>,
+    overflow_storage: Vec<Option<Q2ExpertSlotBuffers>>,
     entries: HashMap<ExpertCacheKey, usize>,
     probation: VecDeque<ExpertCacheKey>,
     protected: VecDeque<ExpertCacheKey>,
     protected_capacity: usize,
     free_slots: Vec<usize>,
+    base_capacity: usize,
+    frequencies: HashMap<ExpertCacheKey, u16>,
+    frequency_lookups: usize,
+    growth_candidates: HashSet<ExpertCacheKey>,
+    reuse_signals_since_growth: usize,
+    observed_lookups: usize,
+    observed_hits: usize,
+    adaptive_budget: Option<Arc<AdaptiveExpertCacheBudget>>,
 }
 
 #[derive(Debug)]
@@ -342,6 +361,13 @@ struct Q2PerLayerExpertCache {
     model_file: Option<ExpertModelFile>,
     expert_pack: Option<ExpertPackFile>,
     slots_per_layer: usize,
+    adaptive_budget: Arc<AdaptiveExpertCacheBudget>,
+}
+
+#[derive(Debug)]
+struct AdaptiveExpertCacheBudget {
+    enabled: AtomicBool,
+    remaining_slots: AtomicUsize,
 }
 
 impl Default for Q2PerLayerExpertCache {
@@ -352,6 +378,9 @@ impl Default for Q2PerLayerExpertCache {
             model_file: None,
             expert_pack: None,
             slots_per_layer: ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER,
+            adaptive_budget: Arc::new(AdaptiveExpertCacheBudget::new(
+                ROUTED_EXPERT_ADAPTIVE_EXTRA_SLOTS,
+            )),
         }
     }
 }
@@ -600,6 +629,7 @@ impl MetalQ2Matvec {
                 "Q2 expert cache capacity must be configured before generation starts",
             ));
         }
+        cache.disable_adaptive_growth();
         cache.slots_per_layer = slots_per_layer;
         Ok(())
     }
@@ -614,6 +644,7 @@ impl MetalQ2Matvec {
             .ready_expert_cache
             .lock()
             .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+        cache.disable_adaptive_growth();
         cache.resize(slots_per_layer)
     }
 
@@ -2586,11 +2617,9 @@ impl MetalQ2Matvec {
                     workers.push(scope.spawn(move || {
                         let mut gate_up_ready = Vec::with_capacity(worker_jobs.len());
                         for &group_index in worker_jobs {
-                            let gate_up_result = pread_ready_expert_gate_up(
-                                model_file,
-                                model_path,
-                                &groups[group_index],
-                            );
+                            let group = &groups[group_index];
+                            let gate_up_result =
+                                pread_ready_expert_gate_up(model_file, model_path, group);
                             let gate_up_succeeded = gate_up_result.is_ok();
                             if sender
                                 .send((group_index, ReadyExpertPhase::GateUp, gate_up_result))
@@ -2604,11 +2633,9 @@ impl MetalQ2Matvec {
                         }
 
                         for group_index in gate_up_ready {
-                            let down_result = pread_ready_expert_down(
-                                model_file,
-                                model_path,
-                                &groups[group_index],
-                            );
+                            let group = &groups[group_index];
+                            let down_result =
+                                pread_ready_expert_down(model_file, model_path, group);
                             ssd_finished_nanoseconds.fetch_max(
                                 elapsed_nanoseconds(ssd_started.elapsed()),
                                 Ordering::Relaxed,
@@ -3638,6 +3665,13 @@ impl LockedMetalBuffer {
         }
         Ok(Self { buffer, locked })
     }
+
+    fn new_pageable(device: &Device, byte_len: usize) -> Result<Self> {
+        Ok(Self {
+            buffer: empty_u8_buffer(device, byte_len)?,
+            locked: false,
+        })
+    }
 }
 
 impl Q2ExpertSlotBuffers {
@@ -3651,6 +3685,19 @@ impl Q2ExpertSlotBuffers {
             gate: LockedMetalBuffer::new(device, gate_stride, "gate")?,
             up: LockedMetalBuffer::new(device, up_stride, "up")?,
             down: LockedMetalBuffer::new(device, down_stride, "down")?,
+        })
+    }
+
+    fn new_pageable(
+        device: &Device,
+        gate_stride: usize,
+        up_stride: usize,
+        down_stride: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate: LockedMetalBuffer::new_pageable(device, gate_stride)?,
+            up: LockedMetalBuffer::new_pageable(device, up_stride)?,
+            down: LockedMetalBuffer::new_pageable(device, down_stride)?,
         })
     }
 
@@ -3923,8 +3970,38 @@ fn expert_cache_key(gate: &[u8], up: &[u8], down: &[u8]) -> ExpertCacheKey {
     }
 }
 
+impl AdaptiveExpertCacheBudget {
+    fn new(slots: usize) -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            remaining_slots: AtomicUsize::new(slots),
+        }
+    }
+
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        self.remaining_slots.store(0, Ordering::Relaxed);
+    }
+
+    fn try_reserve_slot(&self) -> bool {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.remaining_slots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
 impl Q2PerLayerExpertCache {
+    fn disable_adaptive_growth(&self) {
+        self.adaptive_budget.disable();
+    }
+
     fn resize(&mut self, slots_per_layer: usize) -> Result<()> {
+        self.disable_adaptive_growth();
         for layer in self.layers.values() {
             layer
                 .lock()
@@ -3989,24 +4066,46 @@ impl Q2PerLayerExpertCache {
 
     fn layer(&mut self, layer_index: usize) -> Arc<Mutex<Q2ExpertLayerCache>> {
         let slots_per_layer = self.slots_per_layer;
-        Arc::clone(
-            self.layers
-                .entry(layer_index)
-                .or_insert_with(|| Arc::new(Mutex::new(Q2ExpertLayerCache::new(slots_per_layer)))),
-        )
+        let adaptive_budget = Arc::clone(&self.adaptive_budget);
+        Arc::clone(self.layers.entry(layer_index).or_insert_with(|| {
+            Arc::new(Mutex::new(Q2ExpertLayerCache::new_adaptive(
+                slots_per_layer,
+                adaptive_budget,
+            )))
+        }))
     }
 }
 
 impl Q2ExpertLayerCache {
     fn new(capacity: usize) -> Self {
+        Self::with_adaptive_budget(capacity, None)
+    }
+
+    fn new_adaptive(capacity: usize, budget: Arc<AdaptiveExpertCacheBudget>) -> Self {
+        Self::with_adaptive_budget(capacity, Some(budget))
+    }
+
+    fn with_adaptive_budget(
+        capacity: usize,
+        adaptive_budget: Option<Arc<AdaptiveExpertCacheBudget>>,
+    ) -> Self {
         Self {
             slots: vec![false; capacity],
             storage: None,
+            overflow_storage: Vec::new(),
             entries: HashMap::new(),
             probation: VecDeque::new(),
             protected: VecDeque::new(),
             protected_capacity: capacity.div_ceil(2),
             free_slots: (0..capacity).rev().collect(),
+            base_capacity: capacity,
+            frequencies: HashMap::new(),
+            frequency_lookups: 0,
+            growth_candidates: HashSet::new(),
+            reuse_signals_since_growth: 0,
+            observed_lookups: 0,
+            observed_hits: 0,
+            adaptive_budget,
         }
     }
 
@@ -4031,25 +4130,102 @@ impl Q2ExpertLayerCache {
         key: ExpertCacheKey,
         selected_keys: &HashSet<ExpertCacheKey>,
     ) -> Result<LayerSlotResolution> {
+        let incoming_frequency = self.observe_frequency(key);
+        self.observed_lookups = self.observed_lookups.saturating_add(1);
         if let Some(&slot) = self.entries.get(&key) {
+            self.observed_hits = self.observed_hits.saturating_add(1);
             self.touch(key);
             return Ok(LayerSlotResolution::Hit(slot));
         }
 
-        let slot = match self.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                let Some(evicted) = self.take_evictable(selected_keys) else {
-                    return Ok(LayerSlotResolution::Transient);
-                };
-                self.entries.remove(&evicted).ok_or_else(|| {
-                    Error::backend("Q2 layer expert LRU and entry map are inconsistent")
-                })?
-            }
+        if let Some(slot) = self.free_slots.pop() {
+            self.entries.insert(key, slot);
+            self.insert_new(key);
+            return Ok(LayerSlotResolution::Miss(slot));
+        }
+
+        let Some(victim) = self.peek_evictable(selected_keys) else {
+            self.observe_capacity_pressure(key, incoming_frequency);
+            let Some(slot) = self.free_slots.pop() else {
+                return Ok(LayerSlotResolution::Transient);
+            };
+            self.entries.insert(key, slot);
+            self.insert_new(key);
+            return Ok(LayerSlotResolution::Miss(slot));
         };
+        let victim_frequency = self.frequency(victim);
+        self.observe_capacity_pressure(victim, victim_frequency);
+        if let Some(slot) = self.free_slots.pop() {
+            self.entries.insert(key, slot);
+            self.insert_new(key);
+            return Ok(LayerSlotResolution::Miss(slot));
+        }
+
+        remove_key(&mut self.probation, victim);
+        remove_key(&mut self.protected, victim);
+        let slot = self
+            .entries
+            .remove(&victim)
+            .ok_or_else(|| Error::backend("Q2 layer expert LRU and entry map are inconsistent"))?;
         self.entries.insert(key, slot);
         self.insert_new(key);
         Ok(LayerSlotResolution::Miss(slot))
+    }
+
+    fn observe_frequency(&mut self, key: ExpertCacheKey) -> u16 {
+        self.frequency_lookups = self.frequency_lookups.saturating_add(1);
+        if self.frequency_lookups >= ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS {
+            self.frequency_lookups = 0;
+            self.frequencies.retain(|_, frequency| {
+                *frequency /= 2;
+                *frequency > 0
+            });
+            self.growth_candidates
+                .retain(|candidate| self.frequencies.contains_key(candidate));
+        }
+        let frequency = self.frequencies.entry(key).or_default();
+        *frequency = frequency.saturating_add(1);
+        *frequency
+    }
+
+    fn frequency(&self, key: ExpertCacheKey) -> u16 {
+        self.frequencies.get(&key).copied().unwrap_or_default()
+    }
+
+    fn observe_capacity_pressure(&mut self, key: ExpertCacheKey, frequency: u16) {
+        if frequency < 2 || !self.growth_candidates.insert(key) {
+            return;
+        }
+        self.reuse_signals_since_growth = self.reuse_signals_since_growth.saturating_add(1);
+        self.grow_for_observed_reuse();
+    }
+
+    fn grow_for_observed_reuse(&mut self) {
+        let extra_slots = self.slots.len().saturating_sub(self.base_capacity);
+        if extra_slots >= ROUTED_EXPERT_ADAPTIVE_MAX_EXTRA_SLOTS_PER_LAYER
+            || self.observed_lookups < ROUTED_EXPERT_ADAPTIVE_MIN_LOOKUPS
+            || self.reuse_signals_since_growth < ROUTED_EXPERT_ADAPTIVE_REUSE_SIGNALS_PER_SLOT
+            || self.observed_hits.saturating_mul(100)
+                < self
+                    .observed_lookups
+                    .saturating_mul(ROUTED_EXPERT_ADAPTIVE_MIN_HIT_PERCENT)
+        {
+            return;
+        }
+        let Some(budget) = self.adaptive_budget.as_ref() else {
+            return;
+        };
+        if !budget.try_reserve_slot() {
+            return;
+        }
+
+        let slot = self.slots.len();
+        self.slots.push(false);
+        self.overflow_storage.push(None);
+        self.free_slots.push(slot);
+        self.protected_capacity = self.slots.len().div_ceil(2);
+        self.growth_candidates.clear();
+        self.reuse_signals_since_growth = 0;
     }
 
     fn buffers(
@@ -4060,24 +4236,42 @@ impl Q2ExpertLayerCache {
         up_stride: usize,
         down_stride: usize,
     ) -> Result<ReadyExpertBuffers> {
-        let capacity = self.slots.len();
         let cache_slot = self.slots.get_mut(slot).ok_or_else(|| {
             Error::backend(format!("Q2 layer expert slot {slot} is out of bounds"))
         })?;
-        if self.storage.is_none() {
-            self.storage = Some(Q2ExpertLayerBuffers::new(
-                device,
-                capacity,
-                gate_stride,
-                up_stride,
-                down_stride,
-            )?);
-        }
-        let buffers = self
-            .storage
-            .as_mut()
-            .ok_or_else(|| Error::backend("Q2 layer expert slab allocation failed"))?
-            .ready_buffers(slot, gate_stride, up_stride, down_stride)?;
+        let buffers = if slot < self.base_capacity {
+            if self.storage.is_none() {
+                self.storage = Some(Q2ExpertLayerBuffers::new(
+                    device,
+                    self.base_capacity,
+                    gate_stride,
+                    up_stride,
+                    down_stride,
+                )?);
+            }
+            self.storage
+                .as_mut()
+                .ok_or_else(|| Error::backend("Q2 layer expert slab allocation failed"))?
+                .ready_buffers(slot, gate_stride, up_stride, down_stride)?
+        } else {
+            let overflow_index = slot - self.base_capacity;
+            let overflow = self
+                .overflow_storage
+                .get_mut(overflow_index)
+                .ok_or_else(|| Error::backend("Q2 adaptive expert slot storage is missing"))?;
+            if overflow.is_none() {
+                *overflow = Some(Q2ExpertSlotBuffers::new_pageable(
+                    device,
+                    gate_stride,
+                    up_stride,
+                    down_stride,
+                )?);
+            }
+            overflow
+                .as_mut()
+                .ok_or_else(|| Error::backend("Q2 adaptive expert slot allocation failed"))?
+                .ready_buffers()
+        };
         *cache_slot = true;
         Ok(buffers)
     }
@@ -4099,12 +4293,20 @@ impl Q2ExpertLayerCache {
         self.probation.push_back(key);
     }
 
-    fn take_evictable(
-        &mut self,
-        selected_keys: &HashSet<ExpertCacheKey>,
-    ) -> Option<ExpertCacheKey> {
-        take_unselected(&mut self.probation, selected_keys)
-            .or_else(|| take_unselected(&mut self.protected, selected_keys))
+    fn peek_evictable(&self, selected_keys: &HashSet<ExpertCacheKey>) -> Option<ExpertCacheKey> {
+        let mut victim = None;
+        for candidate in self
+            .probation
+            .iter()
+            .chain(self.protected.iter())
+            .copied()
+            .filter(|candidate| !selected_keys.contains(candidate))
+        {
+            if victim.is_none_or(|current| self.frequency(candidate) < self.frequency(current)) {
+                victim = Some(candidate);
+            }
+        }
+        victim
     }
 
     fn invalidate(&mut self, keys: &[ExpertCacheKey]) {
@@ -4127,16 +4329,6 @@ fn remove_key(queue: &mut VecDeque<ExpertCacheKey>, key: ExpertCacheKey) -> bool
     };
     queue.remove(index);
     true
-}
-
-fn take_unselected(
-    queue: &mut VecDeque<ExpertCacheKey>,
-    selected_keys: &HashSet<ExpertCacheKey>,
-) -> Option<ExpertCacheKey> {
-    let index = queue
-        .iter()
-        .position(|candidate| !selected_keys.contains(candidate))?;
-    queue.remove(index)
 }
 
 fn prepare_ready_expert_groups<'a>(
@@ -4212,7 +4404,10 @@ fn prepare_ready_expert_groups<'a>(
 
     prioritize_ready_expert_seeds(&mut seeds);
     let selected_keys = seeds.iter().map(|seed| seed.key).collect::<HashSet<_>>();
-    let transient_capacity = seeds.len().saturating_sub(cache.slots.len());
+    // Frequency admission may reject any selected expert even when the layer
+    // cache has more slots than this routing group. Size staging for the full
+    // group rather than only for slot-capacity overflow.
+    let transient_capacity = seeds.len();
     let mut transient_slot = 0_usize;
     let mut groups = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -4695,7 +4890,10 @@ mod tests {
         collections::HashSet,
         fs,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     };
 
     use crate::{metal::Metal, DevicePagedKvView, DeviceValue, Q2ExpertSource};
@@ -4705,9 +4903,10 @@ mod tests {
         super::validation::{
             Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES,
         },
-        prioritize_ready_expert_seeds, ExpertCacheKey, LayerSlotResolution, Q2ExpertLayerCache,
-        Q2PerLayerExpertCache, Q2TransientExpertPool, QuantMatvecKind, ReadyExpertSeed,
-        ROUTED_EXPERT_WAVE_MIN_GROUPS,
+        prioritize_ready_expert_seeds, AdaptiveExpertCacheBudget, ExpertCacheKey,
+        LayerSlotResolution, Q2ExpertLayerCache, Q2ExpertSlotBuffers, Q2PerLayerExpertCache,
+        Q2TransientExpertPool, QuantMatvecKind, ReadyExpertSeed,
+        ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS, ROUTED_EXPERT_WAVE_MIN_GROUPS,
     };
 
     fn expert_key(seed: usize) -> ExpertCacheKey {
@@ -4719,6 +4918,24 @@ mod tests {
             down_address: seed * 10 + 3,
             down_bytes: 4,
         }
+    }
+
+    fn exercise_adaptive_growth(cache: &mut Q2ExpertLayerCache) {
+        let first = expert_key(1);
+        let second = expert_key(2);
+        let third = expert_key(3);
+        cache.resolve_slot(first, &HashSet::new()).unwrap();
+        cache.resolve_slot(second, &HashSet::new()).unwrap();
+        for _ in 0..32 {
+            cache.resolve_slot(first, &HashSet::new()).unwrap();
+            cache.resolve_slot(second, &HashSet::new()).unwrap();
+        }
+        cache.resolve_slot(third, &HashSet::new()).unwrap();
+        cache.resolve_slot(first, &HashSet::new()).unwrap();
+        cache.resolve_slot(third, &HashSet::new()).unwrap();
+        let fourth = expert_key(4);
+        cache.resolve_slot(fourth, &HashSet::new()).unwrap();
+        cache.resolve_slot(fourth, &HashSet::new()).unwrap();
     }
 
     #[test]
@@ -4817,6 +5034,21 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_expert_buffers_remain_pageable() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let buffers = Q2ExpertSlotBuffers::new_pageable(metal.device(), 64, 64, 32).unwrap();
+
+        assert!(!buffers.gate.locked);
+        assert!(!buffers.up.locked);
+        assert!(!buffers.down.locked);
+        assert_eq!(buffers.gate.buffer.length(), 64);
+        assert_eq!(buffers.up.buffer.length(), 64);
+        assert_eq!(buffers.down.buffer.length(), 32);
+    }
+
+    #[test]
     fn mtp_cache_admission_prioritizes_the_latest_token_row() {
         let weights = [0_u8; 3];
         let source = |index: usize| Q2ExpertSource {
@@ -4860,7 +5092,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_lru_protects_reused_experts_from_one_time_scans() {
+    fn frequency_victim_selection_protects_reused_experts_from_one_time_scans() {
         let mut cache = Q2ExpertLayerCache::new(3);
         let reused = expert_key(1);
         let scan_a = expert_key(2);
@@ -4876,6 +5108,46 @@ mod tests {
         assert!(cache.entries.contains_key(&reused));
         assert!(cache.protected.contains(&reused));
         assert!(!cache.entries.contains_key(&scan_a));
+        assert!(cache.entries.contains_key(&scan_c));
+    }
+
+    #[test]
+    fn frequency_telemetry_decays_old_history() {
+        let mut cache = Q2ExpertLayerCache::new(2);
+        let old = expert_key(1);
+        let current = expert_key(2);
+        cache.frequencies.insert(old, 8);
+        cache.frequency_lookups = ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS - 1;
+
+        assert_eq!(cache.observe_frequency(current), 1);
+        assert_eq!(cache.frequency(old), 4);
+    }
+
+    #[test]
+    fn repeated_post_eviction_reuse_grows_only_the_affected_layer() {
+        let budget = Arc::new(AdaptiveExpertCacheBudget::new(2));
+        let mut useful_layer = Q2ExpertLayerCache::new_adaptive(2, Arc::clone(&budget));
+        let untouched_layer = Q2ExpertLayerCache::new_adaptive(2, budget);
+
+        exercise_adaptive_growth(&mut useful_layer);
+
+        assert_eq!(useful_layer.slots.len(), 3);
+        assert_eq!(useful_layer.overflow_storage.len(), 1);
+        assert_eq!(untouched_layer.slots.len(), 2);
+    }
+
+    #[test]
+    fn adaptive_growth_respects_the_shared_slot_budget() {
+        let budget = Arc::new(AdaptiveExpertCacheBudget::new(1));
+        let mut first_layer = Q2ExpertLayerCache::new_adaptive(2, Arc::clone(&budget));
+        let mut second_layer = Q2ExpertLayerCache::new_adaptive(2, budget);
+
+        exercise_adaptive_growth(&mut first_layer);
+        exercise_adaptive_growth(&mut second_layer);
+
+        let total_extra_slots =
+            first_layer.slots.len().saturating_sub(2) + second_layer.slots.len().saturating_sub(2);
+        assert_eq!(total_extra_slots, 1);
     }
 
     #[test]
