@@ -45,6 +45,11 @@ pub struct ExpertCacheMetrics {
     pub hits: u64,
     pub misses: u64,
     pub ssd_read_bytes: u64,
+    pub prefetch_lookups: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_misses: u64,
+    pub prefetch_ssd_read_bytes: u64,
+    pub prefetch_nanoseconds: u64,
     pub transient_experts: u64,
     pub ready_waves: u64,
     pub resident_experts: u64,
@@ -64,6 +69,13 @@ impl ExpertCacheMetrics {
             return 0.0;
         }
         self.hits as f64 / self.lookups as f64
+    }
+
+    pub fn prefetch_hit_rate(self) -> f64 {
+        if self.prefetch_lookups == 0 {
+            return 0.0;
+        }
+        self.prefetch_hits as f64 / self.prefetch_lookups as f64
     }
 }
 
@@ -910,6 +922,20 @@ pub trait Backend: Sync {
         _out_features: usize,
     ) -> Result<Option<DeviceRoutedExperts>> {
         Ok(None)
+    }
+
+    /// Loads predicted Q2 experts into the resident cache before exact routing.
+    /// Implementations must keep predictive reads separate from demand misses
+    /// in their observability counters.
+    fn prefetch_routed_experts_device(
+        &self,
+        _layer_index: usize,
+        _model_path: &Path,
+        _gate_payloads: &[Q2ExpertSource<'_>],
+        _up_payloads: &[Q2ExpertSource<'_>],
+        _down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Inserts a device-side dependency before consuming routed-expert rows.
@@ -3999,6 +4025,41 @@ impl Backend for MetalBackend {
                 out_features,
             );
             Ok(None)
+        }
+    }
+
+    fn prefetch_routed_experts_device(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(());
+            };
+            return native_metal.prefetch_routed_experts(
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+            );
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                layer_index,
+                model_path,
+                gate_payloads,
+                up_payloads,
+                down_payloads,
+            );
+            Ok(())
         }
     }
 

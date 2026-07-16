@@ -1,3 +1,5 @@
+use std::thread;
+
 use backend::{Backend, BackendCapabilities};
 use common::Tensor;
 use common::{validate_exact_shape, Error, F32Tensor, PagedKvView, Result, Shape};
@@ -321,50 +323,90 @@ impl<'a> SparseBlock<'a> {
         S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
         I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
-        let attention_output = match profile::run_layer_stage(
+        let predicted_expert_ids = profile::run_layer_stage(
             self.load_report.layer_index,
-            "sparse_moe.attention",
+            "sparse_moe.router_prediction",
             || {
-                profile::run_token_device_stage(
-                    profile::TokenProfileStage::SparseAttention,
-                    backend,
+                self.ffn
+                    .predict_expert_ids_device(config, hidden_states, backend)
+            },
+        )?;
+        let (attention_output, output_hidden_states) = thread::scope(|scope| -> Result<_> {
+            let prefetch = predicted_expert_ids.as_deref().map(|expert_ids| {
+                scope.spawn(move || {
+                    self.ffn
+                        .prefetch_predicted_experts_device(config, expert_ids, backend)
+                })
+            });
+            let work = (|| -> Result<_> {
+                let attention_output = match profile::run_layer_stage(
+                    self.load_report.layer_index,
+                    "sparse_moe.attention",
                     || {
-                        self.attention.forward_sparse_decode_device(
-                            config,
-                            hidden_states,
+                        profile::run_token_device_stage(
+                            profile::TokenProfileStage::SparseAttention,
                             backend,
-                            past_kv,
-                            selected_kv_for_tokens,
-                            index_keys_for_layer,
-                            shared_selection,
-                            query_position,
-                            include_current_kv,
+                            || {
+                                self.attention.forward_sparse_decode_device(
+                                    config,
+                                    hidden_states,
+                                    backend,
+                                    past_kv,
+                                    selected_kv_for_tokens,
+                                    index_keys_for_layer,
+                                    shared_selection,
+                                    query_position,
+                                    include_current_kv,
+                                )
+                            },
                         )
                     },
-                )
-            },
-        )? {
-            Some(output) => output,
-            None => {
-                return Err(Error::backend(format!(
-                    "sparse layer {} attention has no complete native device path",
-                    self.load_report.layer_index
-                )));
-            }
-        };
-        let output_hidden_states =
-            match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
-                self.ffn
-                    .forward_device(config, &attention_output.tensors.hidden_states, backend)
-            })? {
-                Some(output) => output,
-                None => {
-                    return Err(Error::backend(format!(
-                        "sparse layer {} MoE FFN has no complete native device path",
-                        self.load_report.layer_index
-                    )));
-                }
+                )? {
+                    Some(output) => output,
+                    None => {
+                        return Err(Error::backend(format!(
+                            "sparse layer {} attention has no complete native device path",
+                            self.load_report.layer_index
+                        )));
+                    }
+                };
+                let output_hidden_states = match profile::run_layer_stage(
+                    self.load_report.layer_index,
+                    "sparse_moe.ffn",
+                    || {
+                        self.ffn.forward_device(
+                            config,
+                            &attention_output.tensors.hidden_states,
+                            backend,
+                            predicted_expert_ids.as_deref(),
+                        )
+                    },
+                )? {
+                    Some(output) => output,
+                    None => {
+                        return Err(Error::backend(format!(
+                            "sparse layer {} MoE FFN has no complete native device path",
+                            self.load_report.layer_index
+                        )));
+                    }
+                };
+                Ok((attention_output, output_hidden_states))
+            })();
+            let prefetch = match prefetch {
+                Some(prefetch) => prefetch
+                    .join()
+                    .map_err(|_| Error::moe("predictive expert prefetch thread panicked"))?,
+                None => Ok(()),
             };
+            if let Err(error) = prefetch {
+                tracing::debug!(
+                    layer_index = self.load_report.layer_index,
+                    error = %error,
+                    "predictive expert prefetch failed; exact demand loading remains authoritative"
+                );
+            }
+            work
+        })?;
 
         Ok(Some((
             crate::kv_types::BlockDeviceTensors {
@@ -408,7 +450,7 @@ impl<'a> SparseBlock<'a> {
         let output_hidden_states =
             match profile::run_layer_stage(self.load_report.layer_index, "sparse_moe.ffn", || {
                 self.ffn
-                    .forward_device(config, &attention_output.hidden_states, backend)
+                    .forward_device(config, &attention_output.hidden_states, backend, None)
             })? {
                 Some(output) => output,
                 None => {

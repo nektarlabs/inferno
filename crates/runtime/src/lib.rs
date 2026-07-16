@@ -56,6 +56,11 @@ const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
 const MTP_DRAFTS_PER_STEP: usize = 2;
+// Batched MTP verification increases the number of distinct routed experts per
+// pass. With SSD-streamed Q2 weights it measured slower than ordinary decode
+// after predictive prefetch, so keep the implementation available but do not
+// select it automatically until the expert scheduler can amortize that traffic.
+const ENABLE_STREAMED_EXPERT_MTP: bool = false;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GenerationOptions {
@@ -117,6 +122,7 @@ impl KvCacheMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamingGenerationReport {
     pub kv_cache: KvCacheMetrics,
+    pub decode_expert_cache: ExpertCacheMetrics,
     pub mtp: MtpMetrics,
     pub cache_budget: Option<CacheBudgetRuntimeReport>,
 }
@@ -1424,6 +1430,7 @@ where
     if let Some(snapshot) = prefill_cost_snapshot {
         log_token_cost(snapshot.finish(0, true, prefill_token_id, backend, &device_kv_cache)?);
     }
+    let prefill_expert_cache = backend.expert_cache_metrics()?;
     on_token(prefill_token_id)?;
     if contains_stop_token(prefill_token_id, stop_token_ids) {
         log_memory_snapshot(
@@ -1437,6 +1444,7 @@ where
             &device_kv_cache,
             &host_kv_cache,
             cache_budget_controller.as_ref(),
+            ExpertCacheMetrics::default(),
             mtp_metrics,
         ));
     }
@@ -1656,10 +1664,13 @@ where
         runtime_kv_memory(&device_kv_cache, &host_kv_cache),
     );
     record_q2_runtime_stage(0, None, "generate.total", generate_started_at.elapsed());
+    let decode_expert_cache =
+        expert_cache_metrics_delta(backend.expert_cache_metrics()?, prefill_expert_cache);
     Ok(streaming_generation_report(
         &device_kv_cache,
         &host_kv_cache,
         cache_budget_controller.as_ref(),
+        decode_expert_cache,
         mtp_metrics,
     ))
 }
@@ -1996,7 +2007,7 @@ fn build_pending_mtp_drafts<B: Backend>(
 fn should_enable_mtp(mtp_available: bool, effective_max_new_tokens: usize) -> bool {
     // The prefill pass already emits the first generated token. MTP only helps
     // when decode has room to verify a draft and emit at least one more token.
-    mtp_available && effective_max_new_tokens > 2
+    ENABLE_STREAMED_EXPERT_MTP && mtp_available && effective_max_new_tokens > 2
 }
 
 fn mtp_draft_count(remaining_tokens: usize) -> usize {
@@ -2406,11 +2417,13 @@ fn streaming_generation_report(
     device: &Option<DevicePagedRuntimeCache>,
     host: &Option<PagedRuntimeCache>,
     budget: Option<&CacheBudgetController>,
+    decode_expert_cache: ExpertCacheMetrics,
     mtp: MtpMetrics,
 ) -> StreamingGenerationReport {
     if let Some(device) = device.as_ref() {
         return StreamingGenerationReport {
             kv_cache: device.cache_metrics(),
+            decode_expert_cache,
             mtp,
             cache_budget: budget.map(CacheBudgetController::report),
         };
@@ -2422,8 +2435,51 @@ fn streaming_generation_report(
             cold_bytes: memory.cold_bytes.unwrap_or(0),
             ..KvCacheMetrics::default()
         },
+        decode_expert_cache,
         mtp,
         cache_budget: budget.map(CacheBudgetController::report),
+    }
+}
+
+fn expert_cache_metrics_delta(
+    after: ExpertCacheMetrics,
+    before: ExpertCacheMetrics,
+) -> ExpertCacheMetrics {
+    ExpertCacheMetrics {
+        lookups: after.lookups.saturating_sub(before.lookups),
+        hits: after.hits.saturating_sub(before.hits),
+        misses: after.misses.saturating_sub(before.misses),
+        ssd_read_bytes: after.ssd_read_bytes.saturating_sub(before.ssd_read_bytes),
+        prefetch_lookups: after
+            .prefetch_lookups
+            .saturating_sub(before.prefetch_lookups),
+        prefetch_hits: after.prefetch_hits.saturating_sub(before.prefetch_hits),
+        prefetch_misses: after.prefetch_misses.saturating_sub(before.prefetch_misses),
+        prefetch_ssd_read_bytes: after
+            .prefetch_ssd_read_bytes
+            .saturating_sub(before.prefetch_ssd_read_bytes),
+        prefetch_nanoseconds: after
+            .prefetch_nanoseconds
+            .saturating_sub(before.prefetch_nanoseconds),
+        resident_experts: after.resident_experts,
+        allocated_slots: after.allocated_slots,
+        capacity_slots: after.capacity_slots,
+        bytes_per_expert: after.bytes_per_expert,
+        allocated_bytes: after.allocated_bytes,
+        capacity_bytes: after.capacity_bytes,
+        transient_experts: after
+            .transient_experts
+            .saturating_sub(before.transient_experts),
+        ready_waves: after.ready_waves.saturating_sub(before.ready_waves),
+        lookup_nanoseconds: after
+            .lookup_nanoseconds
+            .saturating_sub(before.lookup_nanoseconds),
+        ssd_load_nanoseconds: after
+            .ssd_load_nanoseconds
+            .saturating_sub(before.ssd_load_nanoseconds),
+        q2_matmul_gpu_nanoseconds: after
+            .q2_matmul_gpu_nanoseconds
+            .saturating_sub(before.q2_matmul_gpu_nanoseconds),
     }
 }
 
@@ -4998,11 +5054,11 @@ mod tests {
     }
 
     #[test]
-    fn mtp_requires_two_decode_slots_after_prefill() {
+    fn streamed_expert_policy_does_not_enable_mtp_automatically() {
         assert!(!should_enable_mtp(false, 3));
         assert!(!should_enable_mtp(true, 1));
         assert!(!should_enable_mtp(true, 2));
-        assert!(should_enable_mtp(true, 3));
+        assert!(!should_enable_mtp(true, 3));
     }
 
     #[test]
@@ -5027,6 +5083,42 @@ mod tests {
 
         assert_eq!(metrics.acceptance_rate(), 0.75);
         assert_eq!(MtpMetrics::default().acceptance_rate(), 0.0);
+    }
+
+    #[test]
+    fn expert_cache_delta_separates_decode_from_prefill() {
+        let before = ExpertCacheMetrics {
+            lookups: 100,
+            hits: 40,
+            misses: 60,
+            ssd_read_bytes: 600,
+            prefetch_lookups: 50,
+            prefetch_hits: 20,
+            prefetch_misses: 30,
+            prefetch_ssd_read_bytes: 300,
+            ..ExpertCacheMetrics::default()
+        };
+        let after = ExpertCacheMetrics {
+            lookups: 160,
+            hits: 82,
+            misses: 78,
+            ssd_read_bytes: 780,
+            prefetch_lookups: 80,
+            prefetch_hits: 38,
+            prefetch_misses: 42,
+            prefetch_ssd_read_bytes: 420,
+            ..ExpertCacheMetrics::default()
+        };
+
+        let decode = expert_cache_metrics_delta(after, before);
+
+        assert_eq!(decode.lookups, 60);
+        assert_eq!(decode.hits, 42);
+        assert_eq!(decode.misses, 18);
+        assert_eq!(decode.hit_rate(), 0.7);
+        assert_eq!(decode.ssd_read_bytes, 180);
+        assert_eq!(decode.prefetch_lookups, 30);
+        assert_eq!(decode.prefetch_ssd_read_bytes, 120);
     }
 
     #[test]

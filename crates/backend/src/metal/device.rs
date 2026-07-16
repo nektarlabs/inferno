@@ -1540,6 +1540,24 @@ impl Metal {
         )
     }
 
+    pub(crate) fn prefetch_routed_experts(
+        &self,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<()> {
+        self.q2_matvec.prefetch_ready_routed_experts(
+            &self.device,
+            layer_index,
+            model_path,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+        )
+    }
+
     /// Adds a GPU-side dependency immediately before a routed-expert consumer.
     /// The CPU does not wait here: Metal starts subsequent work as soon as the
     /// expert queue signals that every output row is complete.

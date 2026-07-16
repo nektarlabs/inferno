@@ -42,9 +42,10 @@ The artifact declares eight routed experts per token, and Inferno executes all
 eight. Startup fails if `config.json` or the GGUF metadata declares a different
 routing count, preventing an accidental quality-changing approximation.
 
-Multi-token prediction is part of the default generation path when the model
-metadata exposes the GLM-5.2 MTP head and enables shared index selection. It is
-not an optional approximation and does not reduce the top-8 MoE contract.
+Inferno implements the model's multi-token prediction path, but does not select
+it automatically for SSD-streamed Q2 inference. Verification batches activate
+more distinct experts and measured slower than ordinary decode after predictive
+prefetch. The implementation remains available for future scheduler work.
 
 This is not a general model zoo. Inferno keeps the inference path small,
 explicit, and optimized for Q2 GLM-5.2-style execution so it can become fast
@@ -54,10 +55,9 @@ experiment is testing.
 
 ## Multi-Token Prediction
 
-Inferno uses the GLM-5.2 MTP head to propose up to two tokens before asking
-the main model to verify them. MTP is enabled automatically when the loaded
-artifact and configuration expose the required tensors and metadata; no CLI
-flag is required.
+Inferno can use the GLM-5.2 MTP head to propose up to two tokens before asking
+the main model to verify them. Automatic activation is currently disabled for
+the streamed-Q2 runtime because ordinary decode is faster on the 64 GB target.
 
 One MTP generation step follows this sequence:
 
@@ -199,6 +199,13 @@ repeated SSD loads before admission. Reused experts move into the protected
 segment, while one-time experts rotate through probation. Frequencies are
 halved every 4,096 lookups so old popularity does not remain permanent.
 
+Before sparse attention, the router evaluates the incoming hidden state as an
+early prediction. SSD workers load the four highest-ranked predicted experts
+while Metal executes attention. A layer may prefetch rank five only after at
+least 32 observed selections and 95% prediction recall. Exact post-attention
+routing remains authoritative: wrong predictions never change model output and
+remain visible as separate prefetch traffic in throughput metrics.
+
 Cache hits execute directly from the resident Metal slot. On a miss, up to 32
 parallel `pread` workers load gate and up matrices before loading down matrices.
 Metal starts fused SwiGLU work as small ready waves arrive. The expert-pack file
@@ -233,9 +240,13 @@ two caches automatically.
 
 ## Performance
 
-| Best decode tokens/s |
-| ---: |
-| 1.5 |
+| Model | Runtime policy | Decode throughput |
+| --- | --- | ---: |
+| GLM-5.2 Q2 | Exact top-8 routing with streamed experts | **1.218 tokens/s** |
+
+Measured on a 64 GB Apple Silicon MacBook Pro using a release build. The value
+covers decode only; prompt prefill is excluded. Results vary with context
+length, cache state, and SSD activity.
 
 ## Model
 
@@ -333,9 +344,9 @@ Each turn currently re-prefills the accumulated conversation into a fresh
 request KV cache. This preserves multi-turn correctness while persistent
 cross-turn KV reuse remains a future latency optimization.
 
-MTP, IndexShare, and KVShare are selected automatically from the model
-metadata. Generation falls back to ordinary single-token verification only
-when MTP is unavailable or too few output tokens remain to benefit from it.
+IndexShare and KVShare follow the model metadata. MTP support remains present,
+but ordinary single-token decode is the current automatic policy for streamed
+Q2 experts.
 
 Run with telemetry and throughput measurement:
 
@@ -360,8 +371,8 @@ Compare throughput after each optimization:
 tail -n 5 /tmp/inferno-throughput.tsv
 ```
 
-The throughput report also includes the number of MTP verification passes,
-drafted tokens, accepted drafts, and the resulting acceptance rate.
+The throughput report separates cold-prefill and decode expert hit rates,
+predictive reads, SSD traffic, and MTP activity.
 
 Profile one prefill result and each decode token by subsystem:
 

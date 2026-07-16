@@ -148,6 +148,11 @@ struct Q2ExpertCacheCounters {
     hits: AtomicU64,
     misses: AtomicU64,
     ssd_read_bytes: AtomicU64,
+    prefetch_lookups: AtomicU64,
+    prefetch_hits: AtomicU64,
+    prefetch_misses: AtomicU64,
+    prefetch_ssd_read_bytes: AtomicU64,
+    prefetch_nanoseconds: AtomicU64,
     transient_experts: AtomicU64,
     ready_waves: AtomicU64,
     lookup_nanoseconds: AtomicU64,
@@ -575,6 +580,26 @@ impl MetalQ2Matvec {
             ssd_read_bytes: self
                 .expert_cache_counters
                 .ssd_read_bytes
+                .load(Ordering::Relaxed),
+            prefetch_lookups: self
+                .expert_cache_counters
+                .prefetch_lookups
+                .load(Ordering::Relaxed),
+            prefetch_hits: self
+                .expert_cache_counters
+                .prefetch_hits
+                .load(Ordering::Relaxed),
+            prefetch_misses: self
+                .expert_cache_counters
+                .prefetch_misses
+                .load(Ordering::Relaxed),
+            prefetch_ssd_read_bytes: self
+                .expert_cache_counters
+                .prefetch_ssd_read_bytes
+                .load(Ordering::Relaxed),
+            prefetch_nanoseconds: self
+                .expert_cache_counters
+                .prefetch_nanoseconds
                 .load(Ordering::Relaxed),
             transient_experts: self
                 .expert_cache_counters
@@ -2466,6 +2491,7 @@ impl MetalQ2Matvec {
             down_stride,
             layer_index,
             expert_pack_header,
+            false,
         )?;
         let lookup_nanoseconds = elapsed_nanoseconds(lookup_started.elapsed());
         let cache_hits = groups.iter().filter(|group| group.cache_hit).count();
@@ -2563,6 +2589,146 @@ impl MetalQ2Matvec {
             read_bytes,
             ready_waves,
         })
+    }
+
+    pub(crate) fn prefetch_ready_routed_experts(
+        &self,
+        device: &Device,
+        layer_index: usize,
+        model_path: &Path,
+        gate_payloads: &[Q2ExpertSource<'_>],
+        up_payloads: &[Q2ExpertSource<'_>],
+        down_payloads: &[Q2ExpertSource<'_>],
+    ) -> Result<()> {
+        if gate_payloads.is_empty() {
+            return Ok(());
+        }
+        validate_exact_len(
+            "predictive expert up assignment count",
+            up_payloads.len(),
+            gate_payloads.len(),
+        )?;
+        validate_exact_len(
+            "predictive expert down assignment count",
+            down_payloads.len(),
+            gate_payloads.len(),
+        )?;
+        let gate_stride = uniform_payload_stride(gate_payloads, "predictive expert gate")?;
+        let up_stride = uniform_payload_stride(up_payloads, "predictive expert up")?;
+        let down_stride = uniform_payload_stride(down_payloads, "predictive expert down")?;
+        let predicted_experts = gate_payloads
+            .iter()
+            .map(|source| source.expert_id)
+            .collect::<HashSet<_>>()
+            .len();
+
+        let started = Instant::now();
+        let (layer_cache, read_file, read_path, expert_pack_header) = {
+            let mut cache = self
+                .ready_expert_cache
+                .lock()
+                .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
+            cache.ensure_model_file(model_path)?;
+            cache.ensure_layout(gate_stride, up_stride, down_stride);
+            let layer_cache = cache.layer(layer_index);
+            let (read_file, read_path, expert_pack_header) = match &cache.expert_pack {
+                Some(pack) => (
+                    pack.file.try_clone().map_err(|source| Error::Io {
+                        path: pack.path.clone(),
+                        source,
+                    })?,
+                    pack.path.clone(),
+                    Some(pack.header),
+                ),
+                None => {
+                    let model_file = cache
+                        .model_file
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("Q2 expert model file is not initialized"))?;
+                    (
+                        model_file.file.try_clone().map_err(|source| Error::Io {
+                            path: model_path.to_path_buf(),
+                            source,
+                        })?,
+                        model_path.to_path_buf(),
+                        None,
+                    )
+                }
+            };
+            (layer_cache, read_file, read_path, expert_pack_header)
+        };
+
+        // Hold the layer lock until every predicted slot is complete. Exact
+        // routing can run concurrently, but it cannot observe a partially read
+        // Metal buffer.
+        let mut layer_cache = layer_cache
+            .lock()
+            .map_err(|_| Error::backend("Q2 predictive expert cache lock poisoned"))?;
+        let groups = prepare_ready_expert_groups(
+            device,
+            &mut layer_cache,
+            None,
+            gate_payloads,
+            up_payloads,
+            down_payloads,
+            gate_stride,
+            up_stride,
+            down_stride,
+            layer_index,
+            expert_pack_header,
+            true,
+        )?;
+        let prefetch_hits = groups.iter().filter(|group| group.cache_hit).count();
+        let prefetch_misses = groups.len().saturating_sub(prefetch_hits);
+        let read_bytes = groups.iter().try_fold(0_u64, |total, group| {
+            group.read_tasks.iter().try_fold(total, |total, task| {
+                total
+                    .checked_add(u64::try_from(task.byte_len).map_err(|_| {
+                        Error::backend("predictive expert read size does not fit u64")
+                    })?)
+                    .ok_or_else(|| Error::backend("predictive expert read bytes overflow"))
+            })
+        })?;
+        let cached_miss_keys = groups
+            .iter()
+            .filter_map(|group| group.cached_miss_key)
+            .collect::<Vec<_>>();
+        if let Err(error) = pread_ready_expert_groups(&read_file, &read_path, &groups) {
+            layer_cache.invalidate(&cached_miss_keys);
+            return Err(error);
+        }
+        let elapsed_nanoseconds = elapsed_nanoseconds(started.elapsed());
+
+        self.expert_cache_counters
+            .prefetch_lookups
+            .fetch_add(predicted_experts as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .prefetch_hits
+            .fetch_add(prefetch_hits as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .prefetch_misses
+            .fetch_add(prefetch_misses as u64, Ordering::Relaxed);
+        self.expert_cache_counters
+            .prefetch_ssd_read_bytes
+            .fetch_add(read_bytes, Ordering::Relaxed);
+        self.expert_cache_counters
+            .prefetch_nanoseconds
+            .fetch_add(elapsed_nanoseconds, Ordering::Relaxed);
+        self.expert_cache_counters
+            .ssd_read_bytes
+            .fetch_add(read_bytes, Ordering::Relaxed);
+        debug!(
+            target: "inferno::expert_predictor",
+            layer_index,
+            predicted_experts,
+            prefetch_hits,
+            prefetch_misses,
+            skipped_experts = predicted_experts.saturating_sub(groups.len()),
+            read_bytes,
+            elapsed_ms = elapsed_nanoseconds as f64 / 1_000_000.0,
+            "prefetched predicted experts into the Metal cache"
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4172,6 +4338,32 @@ impl Q2ExpertLayerCache {
         Ok(LayerSlotResolution::Miss(slot))
     }
 
+    fn resolve_prefetch_slot(
+        &mut self,
+        key: ExpertCacheKey,
+        selected_keys: &HashSet<ExpertCacheKey>,
+    ) -> Result<LayerSlotResolution> {
+        if let Some(&slot) = self.entries.get(&key) {
+            return Ok(LayerSlotResolution::Hit(slot));
+        }
+        if let Some(slot) = self.free_slots.pop() {
+            self.entries.insert(key, slot);
+            self.insert_new(key);
+            return Ok(LayerSlotResolution::Miss(slot));
+        }
+        let Some(victim) = self.peek_evictable(selected_keys) else {
+            return Ok(LayerSlotResolution::Transient);
+        };
+        remove_key(&mut self.probation, victim);
+        remove_key(&mut self.protected, victim);
+        let slot = self.entries.remove(&victim).ok_or_else(|| {
+            Error::backend("Q2 predictive cache LRU and entry map are inconsistent")
+        })?;
+        self.entries.insert(key, slot);
+        self.insert_new(key);
+        Ok(LayerSlotResolution::Miss(slot))
+    }
+
     fn observe_frequency(&mut self, key: ExpertCacheKey) -> u16 {
         self.frequency_lookups = self.frequency_lookups.saturating_add(1);
         if self.frequency_lookups >= ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS {
@@ -4343,6 +4535,7 @@ fn prepare_ready_expert_groups<'a>(
     down_stride: usize,
     layer_index: usize,
     expert_pack_header: Option<ExpertPackHeader>,
+    predictive_prefetch: bool,
 ) -> Result<Vec<ReadyExpertGroup>> {
     if let Some(header) = expert_pack_header {
         validate_exact_len(
@@ -4411,7 +4604,14 @@ fn prepare_ready_expert_groups<'a>(
     let mut transient_slot = 0_usize;
     let mut groups = Vec::with_capacity(seeds.len());
     for seed in seeds {
-        let resolution = cache.resolve_slot(seed.key, &selected_keys)?;
+        let resolution = if predictive_prefetch {
+            cache.resolve_prefetch_slot(seed.key, &selected_keys)?
+        } else {
+            cache.resolve_slot(seed.key, &selected_keys)?
+        };
+        if predictive_prefetch && matches!(resolution, LayerSlotResolution::Transient) {
+            continue;
+        }
         let (buffers, cache_hit, cached_miss_key, transient, transient_owner) = match resolution {
             LayerSlotResolution::Hit(slot) => (
                 cache.buffers(device, slot, gate_stride, up_stride, down_stride)?,
@@ -4544,6 +4744,36 @@ fn pread_ready_expert_down(file: &File, path: &Path, group: &ReadyExpertGroup) -
         .get(2)
         .ok_or_else(|| Error::backend("ready routed expert has no down read task"))?;
     pread_expert_buffer(file, path, task)
+}
+
+fn pread_ready_expert_groups(file: &File, path: &Path, groups: &[ReadyExpertGroup]) -> Result<()> {
+    let misses = groups
+        .iter()
+        .filter(|group| !group.cache_hit)
+        .collect::<Vec<_>>();
+    if misses.is_empty() {
+        return Ok(());
+    }
+    let worker_count = misses.len().min(ROUTED_EXPERT_READ_WORKERS);
+    let jobs_per_worker = misses.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for jobs in misses.chunks(jobs_per_worker) {
+            workers.push(scope.spawn(move || -> Result<()> {
+                for group in jobs {
+                    pread_ready_expert_gate_up(file, path, group)?;
+                    pread_ready_expert_down(file, path, group)?;
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| Error::backend("predictive expert read worker thread panicked"))??;
+        }
+        Ok(())
+    })
 }
 
 fn wait_ready_expert_waves(waves: &[SubmittedReadyWave]) -> Result<u64> {
@@ -5121,6 +5351,24 @@ mod tests {
 
         assert_eq!(cache.observe_frequency(current), 1);
         assert_eq!(cache.frequency(old), 4);
+    }
+
+    #[test]
+    fn predictive_admission_does_not_inflate_demand_frequency() {
+        let mut cache = Q2ExpertLayerCache::new(2);
+        let predicted = expert_key(1);
+        let selected = [predicted].into_iter().collect();
+
+        assert!(matches!(
+            cache.resolve_prefetch_slot(predicted, &selected).unwrap(),
+            LayerSlotResolution::Miss(_)
+        ));
+        assert_eq!(cache.frequency(predicted), 0);
+        assert!(matches!(
+            cache.resolve_slot(predicted, &selected).unwrap(),
+            LayerSlotResolution::Hit(_)
+        ));
+        assert_eq!(cache.frequency(predicted), 1);
     }
 
     #[test]

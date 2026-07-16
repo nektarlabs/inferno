@@ -141,6 +141,7 @@ pub fn run(
         .finish(encoded.token_ids.len(), config.experts_per_token)
         .with_runtime_metrics(
             backend.expert_cache_metrics()?,
+            generation_report.decode_expert_cache,
             generation_report.kv_cache,
             generation_report.mtp,
         );
@@ -174,7 +175,7 @@ fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
-        "inferno throughput: prompt_tokens={} generated_tokens={} routed_experts_per_token={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_ssd_read_gb={:.3} expert_cache_allocated_gb={:.3} expert_cache_capacity_gb={:.3} kv_lookups={} kv_hits={} kv_misses={} kv_hit_rate={:.4} kv_miss_rate={:.4} kv_selected_rows={} kv_ssd_read_gb={:.3} hot_kv_gb={:.3} cold_kv_gb={:.3} mtp_enabled={} mtp_verification_passes={} mtp_target_tokens={} mtp_draft_tokens={} mtp_accepted_draft_tokens={} mtp_acceptance_rate={:.4}",
+        "inferno throughput: prompt_tokens={} generated_tokens={} routed_experts_per_token={} total_seconds={:.3} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens={} decode_seconds={:.3} decode_tokens_per_second={:.3} decode_token_mean_seconds={:.3} decode_token_p50_seconds={:.3} decode_token_p95_seconds={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_prefetch_lookups={} expert_prefetch_hits={} expert_prefetch_misses={} expert_prefetch_hit_rate={:.4} expert_prefetch_ssd_read_gb={:.3} expert_ssd_read_gb={:.3} expert_cache_allocated_gb={:.3} expert_cache_capacity_gb={:.3} decode_expert_lookups={} decode_expert_hits={} decode_expert_misses={} decode_expert_hit_rate={:.4} decode_expert_ssd_read_gb={:.3} kv_lookups={} kv_hits={} kv_misses={} kv_hit_rate={:.4} kv_miss_rate={:.4} kv_selected_rows={} kv_ssd_read_gb={:.3} hot_kv_gb={:.3} cold_kv_gb={:.3} mtp_enabled={} mtp_verification_passes={} mtp_target_tokens={} mtp_draft_tokens={} mtp_accepted_draft_tokens={} mtp_acceptance_rate={:.4}",
         report.prompt_tokens,
         report.generated_tokens,
         report.routed_experts_per_token,
@@ -191,9 +192,19 @@ fn write_tokens_per_second_report(report: &ThroughputReport) -> InfernoResult<()
         report.expert_cache.hits,
         report.expert_cache.misses,
         report.expert_cache.hit_rate(),
+        report.expert_cache.prefetch_lookups,
+        report.expert_cache.prefetch_hits,
+        report.expert_cache.prefetch_misses,
+        report.expert_cache.prefetch_hit_rate(),
+        bytes_to_gb(report.expert_cache.prefetch_ssd_read_bytes),
         bytes_to_gb(report.expert_cache.ssd_read_bytes),
         bytes_to_gb(report.expert_cache.allocated_bytes),
         bytes_to_gb(report.expert_cache.capacity_bytes),
+        report.decode_expert_cache.lookups,
+        report.decode_expert_cache.hits,
+        report.decode_expert_cache.misses,
+        report.decode_expert_cache.hit_rate(),
+        bytes_to_gb(report.decode_expert_cache.ssd_read_bytes),
         report.kv_cache.lookups(),
         report.kv_cache.hits(),
         report.kv_cache.misses(),
@@ -256,7 +267,7 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
     }
     writeln!(
         file,
-        "{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
+        "{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
         report.prompt_tokens,
         report.generated_tokens,
         report.routed_experts_per_token,
@@ -273,9 +284,19 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
         report.expert_cache.hits,
         report.expert_cache.misses,
         report.expert_cache.hit_rate(),
+        report.expert_cache.prefetch_lookups,
+        report.expert_cache.prefetch_hits,
+        report.expert_cache.prefetch_misses,
+        report.expert_cache.prefetch_hit_rate(),
+        bytes_to_gb(report.expert_cache.prefetch_ssd_read_bytes),
         bytes_to_gb(report.expert_cache.ssd_read_bytes),
         bytes_to_gb(report.expert_cache.allocated_bytes),
         bytes_to_gb(report.expert_cache.capacity_bytes),
+        report.decode_expert_cache.lookups,
+        report.decode_expert_cache.hits,
+        report.decode_expert_cache.misses,
+        report.decode_expert_cache.hit_rate(),
+        bytes_to_gb(report.decode_expert_cache.ssd_read_bytes),
         report.kv_cache.lookups(),
         report.kv_cache.hits(),
         report.kv_cache.misses(),
@@ -298,7 +319,7 @@ fn append_tokens_per_second_report(path: &Path, report: &ThroughputReport) -> In
     })
 }
 
-const THROUGHPUT_REPORT_HEADER: &str = "prompt_tokens\tgenerated_tokens\trouted_experts_per_token\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_ssd_read_gb\texpert_cache_allocated_gb\texpert_cache_capacity_gb\tkv_lookups\tkv_hits\tkv_misses\tkv_hit_rate\tkv_miss_rate\tkv_selected_rows\tkv_ssd_read_gb\thot_kv_gb\tcold_kv_gb\tmtp_enabled\tmtp_verification_passes\tmtp_target_tokens\tmtp_draft_tokens\tmtp_accepted_draft_tokens\tmtp_acceptance_rate";
+const THROUGHPUT_REPORT_HEADER: &str = "prompt_tokens\tgenerated_tokens\trouted_experts_per_token\ttotal_seconds\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens\tdecode_seconds\tdecode_tokens_per_second\tdecode_token_mean_seconds\tdecode_token_p50_seconds\tdecode_token_p95_seconds\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_prefetch_lookups\texpert_prefetch_hits\texpert_prefetch_misses\texpert_prefetch_hit_rate\texpert_prefetch_ssd_read_gb\texpert_ssd_read_gb\texpert_cache_allocated_gb\texpert_cache_capacity_gb\tdecode_expert_lookups\tdecode_expert_hits\tdecode_expert_misses\tdecode_expert_hit_rate\tdecode_expert_ssd_read_gb\tkv_lookups\tkv_hits\tkv_misses\tkv_hit_rate\tkv_miss_rate\tkv_selected_rows\tkv_ssd_read_gb\thot_kv_gb\tcold_kv_gb\tmtp_enabled\tmtp_verification_passes\tmtp_target_tokens\tmtp_draft_tokens\tmtp_accepted_draft_tokens\tmtp_acceptance_rate";
 
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
@@ -425,6 +446,7 @@ struct ThroughputReport {
     decode_token_p50_seconds: f64,
     decode_token_p95_seconds: f64,
     expert_cache: ExpertCacheMetrics,
+    decode_expert_cache: ExpertCacheMetrics,
     kv_cache: KvCacheMetrics,
     mtp: MtpMetrics,
 }
@@ -478,6 +500,7 @@ impl ThroughputReport {
             decode_token_p50_seconds,
             decode_token_p95_seconds,
             expert_cache: ExpertCacheMetrics::default(),
+            decode_expert_cache: ExpertCacheMetrics::default(),
             kv_cache: KvCacheMetrics::default(),
             mtp: MtpMetrics::default(),
         }
@@ -486,10 +509,12 @@ impl ThroughputReport {
     fn with_runtime_metrics(
         mut self,
         expert_cache: ExpertCacheMetrics,
+        decode_expert_cache: ExpertCacheMetrics,
         kv_cache: KvCacheMetrics,
         mtp: MtpMetrics,
     ) -> Self {
         self.expert_cache = expert_cache;
+        self.decode_expert_cache = decode_expert_cache;
         self.kv_cache = kv_cache;
         self.mtp = mtp;
         self

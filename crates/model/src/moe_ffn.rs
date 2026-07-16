@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     sync::{Mutex, OnceLock},
     thread,
@@ -20,6 +20,10 @@ use crate::{
 };
 
 const ROUTED_EXPERT_PREFETCH_CACHE_BYTES: u64 = 9 * 1024 * 1024 * 1024;
+const PREDICTIVE_PREFETCH_BASE_RANKS: usize = 4;
+const PREDICTIVE_PREFETCH_MAX_RANKS: usize = 5;
+const PREDICTIVE_PREFETCH_MIN_SELECTIONS: usize = 32;
+const PREDICTIVE_PREFETCH_PROMOTION_PERCENT: usize = 95;
 static ROUTED_EXPERT_PREFETCH_CACHE: OnceLock<Mutex<ExpertPayloadPrefetchCache>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -33,7 +37,14 @@ pub struct MoeFfn<'a> {
     routed_up: PackedExpertLinear<'a>,
     routed_gate_up: PackedExpertGateUp<'a>,
     routed_down: PackedExpertLinear<'a>,
+    predictive_prefetch: Mutex<PredictivePrefetchPolicy>,
     load_report: MoeFfnLoadReport,
+}
+
+#[derive(Debug, Default)]
+struct PredictivePrefetchPolicy {
+    selected_experts: usize,
+    overlapping_experts: usize,
 }
 
 #[derive(Debug)]
@@ -265,6 +276,7 @@ impl<'a> MoeFfn<'a> {
             routed_up,
             routed_gate_up,
             routed_down,
+            predictive_prefetch: Mutex::new(PredictivePrefetchPolicy::default()),
             load_report,
         })
     }
@@ -763,11 +775,47 @@ impl<'a> MoeFfn<'a> {
     /// verification. Router and expert math stay on Metal. After top-k, one
     /// deliberate synchronization reads the selected IDs so their exact Q2
     /// ranges can be streamed from SSD before the expert kernels run.
+    pub(crate) fn predict_expert_ids_device<B: Backend>(
+        &self,
+        config: &Config,
+        hidden_states: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<Vec<u32>>> {
+        let Some(routing) = self.router.route_device(config, hidden_states, backend)? else {
+            return Ok(None);
+        };
+        backend.moe_router_expert_ids_device(&routing.topk)
+    }
+
+    pub(crate) fn prefetch_predicted_experts_device<B: Backend>(
+        &self,
+        config: &Config,
+        expert_ids: &[u32],
+        backend: &B,
+    ) -> Result<()> {
+        let prefetch_ranks = self
+            .predictive_prefetch
+            .lock()
+            .map_err(|_| Error::moe("predictive expert policy lock poisoned"))?
+            .prefetch_ranks();
+        let prefetch_ids =
+            predictive_prefetch_ids(expert_ids, config.experts_per_token, prefetch_ranks)?;
+        let sources = self.selected_routed_expert_sources(&prefetch_ids)?;
+        backend.prefetch_routed_experts_device(
+            self.layer_index,
+            self.routed_gate.gguf.path(),
+            &sources.gate,
+            &sources.up,
+            &sources.down,
+        )
+    }
+
     pub(crate) fn forward_device<B: Backend>(
         &self,
         config: &Config,
         hidden_states: &backend::DeviceValue,
         backend: &B,
+        predicted_expert_ids: Option<&[u32]>,
     ) -> Result<Option<backend::DeviceValue>> {
         let dims = hidden_states.dims();
         if dims.len() != 3 {
@@ -809,6 +857,24 @@ impl<'a> MoeFfn<'a> {
         let flat_tokens = routing
             .normed_hidden_states
             .reshape(vec![flat_token_count, config.hidden_size])?;
+        if let Some(predicted_expert_ids) = predicted_expert_ids {
+            let (predicted_unique, selected_unique, overlap) =
+                unique_expert_overlap(predicted_expert_ids, &selected_expert_ids);
+            self.predictive_prefetch
+                .lock()
+                .map_err(|_| Error::moe("predictive expert policy lock poisoned"))?
+                .observe(selected_unique, overlap);
+            tracing::debug!(
+                target: "inferno::expert_predictor",
+                layer_index = self.layer_index,
+                predicted_assignments = predicted_expert_ids.len(),
+                selected_assignments = selected_expert_ids.len(),
+                predicted_unique,
+                selected_unique,
+                overlap,
+                "compared pre-attention router prediction with exact expert selection"
+            );
+        }
         let sources = self.selected_routed_expert_sources(&selected_expert_ids)?;
         let (routed, shared_down) = thread::scope(|scope| {
             let routed = scope.spawn(|| {
@@ -1076,6 +1142,57 @@ impl<'a> MoeFfn<'a> {
             )?,
         )
     }
+}
+
+fn unique_expert_overlap(predicted: &[u32], selected: &[u32]) -> (usize, usize, usize) {
+    let predicted = predicted.iter().copied().collect::<HashSet<_>>();
+    let selected = selected.iter().copied().collect::<HashSet<_>>();
+    let overlap = predicted.intersection(&selected).count();
+    (predicted.len(), selected.len(), overlap)
+}
+
+impl PredictivePrefetchPolicy {
+    fn observe(&mut self, selected_experts: usize, overlapping_experts: usize) {
+        self.selected_experts = self.selected_experts.saturating_add(selected_experts);
+        self.overlapping_experts = self
+            .overlapping_experts
+            .saturating_add(overlapping_experts.min(selected_experts));
+    }
+
+    fn prefetch_ranks(&self) -> usize {
+        if self.selected_experts >= PREDICTIVE_PREFETCH_MIN_SELECTIONS
+            && self.overlapping_experts.saturating_mul(100)
+                >= self
+                    .selected_experts
+                    .saturating_mul(PREDICTIVE_PREFETCH_PROMOTION_PERCENT)
+        {
+            PREDICTIVE_PREFETCH_MAX_RANKS
+        } else {
+            PREDICTIVE_PREFETCH_BASE_RANKS
+        }
+    }
+}
+
+fn predictive_prefetch_ids(
+    expert_ids: &[u32],
+    experts_per_token: usize,
+    prefetch_ranks: usize,
+) -> Result<Vec<u32>> {
+    if experts_per_token == 0 || prefetch_ranks == 0 || prefetch_ranks > experts_per_token {
+        return Err(Error::moe(format!(
+            "predictive expert prefetch requires 0 < ranks <= experts_per_token, got ranks={prefetch_ranks} experts_per_token={experts_per_token}"
+        )));
+    }
+    if !expert_ids.len().is_multiple_of(experts_per_token) {
+        return Err(Error::moe(format!(
+            "predictive expert assignment count {} is not divisible by experts_per_token {experts_per_token}",
+            expert_ids.len()
+        )));
+    }
+    Ok(expert_ids
+        .chunks_exact(experts_per_token)
+        .flat_map(|row| row[..prefetch_ranks].iter().copied())
+        .collect())
 }
 
 fn routed_expert_prefetch_cache() -> &'static Mutex<ExpertPayloadPrefetchCache> {
@@ -2309,6 +2426,37 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn expert_prediction_overlap_counts_unique_experts() {
+        let predicted = [1, 2, 2, 3, 4];
+        let selected = [2, 2, 4, 5];
+
+        assert_eq!(unique_expert_overlap(&predicted, &selected), (4, 3, 2));
+    }
+
+    #[test]
+    fn predictive_prefetch_keeps_the_highest_ranks_per_token() {
+        let ids = (0_u32..16).collect::<Vec<_>>();
+
+        assert_eq!(
+            predictive_prefetch_ids(&ids, 8, 4).unwrap(),
+            vec![0, 1, 2, 3, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn predictive_prefetch_promotes_only_after_reliable_history() {
+        let mut policy = PredictivePrefetchPolicy::default();
+        policy.observe(24, 24);
+        assert_eq!(policy.prefetch_ranks(), 4);
+
+        policy.observe(8, 7);
+        assert_eq!(policy.prefetch_ranks(), 5);
+
+        policy.observe(8, 0);
+        assert_eq!(policy.prefetch_ranks(), 4);
+    }
 
     #[test]
     fn token_major_routed_outputs_reorders_expert_grouped_batches() {
