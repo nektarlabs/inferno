@@ -8,7 +8,7 @@ constant uint Q2_K_SCALE_BYTES = 16;
 constant uint Q2_K_QUANT_BYTES = 64;
 constant uint Q2_K_SIMD_LANES = 32;
 constant uint Q2_K_READY_MAX_ASSIGNMENTS = 8;
-constant uint Q2_K_READY_OUTPUT_ROWS = 1;
+constant uint Q2_K_READY_OUTPUT_ROWS = 4;
 constant uint ARGMAX_THREADS = 256;
 constant uint Q8_0_BLOCK_VALUES = 32;
 constant uint Q8_0_BLOCK_BYTES = 34;
@@ -825,23 +825,45 @@ kernel void q2_k_ready_gate_up_swiglu_f32_kernel(
         reinterpret_cast<device const uchar*>(gate_addresses[group]);
     const device uchar* up_weights =
         reinterpret_cast<device const uchar*>(up_addresses[group]);
-    q2_k_ready_group_gate_up_swiglu(
-        gate_weights,
-        up_weights,
-        input,
-        token_indices,
-        assignment_indices,
-        output,
-        group_offsets[group],
-        group_offsets[group + 1],
-        token_count,
-        assignment_count,
-        in_features,
-        out_features,
-        blocks_per_row,
-        first_output_feature,
-        simd_lane
-    );
+    uint assignment_start = group_offsets[group];
+    uint assignment_end = group_offsets[group + 1];
+    if (assignment_end - assignment_start == 1) {
+        q2_k_ready_tiled_gate_up_swiglu(
+            gate_weights,
+            up_weights,
+            input,
+            token_indices,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            token_count,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    } else {
+        q2_k_ready_group_gate_up_swiglu(
+            gate_weights,
+            up_weights,
+            input,
+            token_indices,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            token_count,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    }
 }
 
 kernel void q2_k_ready_matvec_f32_kernel(
@@ -871,20 +893,39 @@ kernel void q2_k_ready_matvec_f32_kernel(
     }
     const device uchar* weights =
         reinterpret_cast<device const uchar*>(weight_addresses[group]);
-    q2_k_ready_group_matvec(
-        weights,
-        input,
-        assignment_indices,
-        output,
-        group_offsets[group],
-        group_offsets[group + 1],
-        assignment_count,
-        in_features,
-        out_features,
-        blocks_per_row,
-        first_output_feature,
-        simd_lane
-    );
+    uint assignment_start = group_offsets[group];
+    uint assignment_end = group_offsets[group + 1];
+    if (assignment_end - assignment_start == 1) {
+        q2_k_ready_tiled_matvec(
+            weights,
+            input,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    } else {
+        q2_k_ready_group_matvec(
+            weights,
+            input,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    }
 }
 
 kernel void q2_k_ready_slot_gate_up_swiglu_f32_kernel(
@@ -920,23 +961,45 @@ kernel void q2_k_ready_slot_gate_up_swiglu_f32_kernel(
         return;
     }
     uint expert_base = slot * expert_stride_bytes;
-    q2_k_ready_group_gate_up_swiglu(
-        gate_weights + expert_base,
-        up_weights + expert_base,
-        input,
-        token_indices,
-        assignment_indices,
-        output,
-        group_offsets[group],
-        group_offsets[group + 1],
-        token_count,
-        assignment_count,
-        in_features,
-        out_features,
-        blocks_per_row,
-        first_output_feature,
-        simd_lane
-    );
+    uint assignment_start = group_offsets[group];
+    uint assignment_end = group_offsets[group + 1];
+    if (assignment_end - assignment_start == 1) {
+        q2_k_ready_tiled_gate_up_swiglu(
+            gate_weights + expert_base,
+            up_weights + expert_base,
+            input,
+            token_indices,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            token_count,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    } else {
+        q2_k_ready_group_gate_up_swiglu(
+            gate_weights + expert_base,
+            up_weights + expert_base,
+            input,
+            token_indices,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            token_count,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    }
 }
 
 kernel void q2_k_ready_slot_matvec_f32_kernel(
@@ -968,20 +1031,39 @@ kernel void q2_k_ready_slot_matvec_f32_kernel(
     if (slot >= slot_count) {
         return;
     }
-    q2_k_ready_group_matvec(
-        weights + (slot * expert_stride_bytes),
-        input,
-        assignment_indices,
-        output,
-        group_offsets[group],
-        group_offsets[group + 1],
-        assignment_count,
-        in_features,
-        out_features,
-        blocks_per_row,
-        first_output_feature,
-        simd_lane
-    );
+    uint assignment_start = group_offsets[group];
+    uint assignment_end = group_offsets[group + 1];
+    if (assignment_end - assignment_start == 1) {
+        q2_k_ready_tiled_matvec(
+            weights + (slot * expert_stride_bytes),
+            input,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    } else {
+        q2_k_ready_group_matvec(
+            weights + (slot * expert_stride_bytes),
+            input,
+            assignment_indices,
+            output,
+            assignment_start,
+            assignment_end,
+            assignment_count,
+            in_features,
+            out_features,
+            blocks_per_row,
+            first_output_feature,
+            simd_lane
+        );
+    }
 }
 
 kernel void q2_k_transposed_matvec_f32_kernel(

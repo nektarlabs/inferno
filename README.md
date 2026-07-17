@@ -242,7 +242,7 @@ two caches automatically.
 
 | Model | Runtime policy | Decode throughput |
 | --- | --- | ---: |
-| GLM-5.2 Q2 | Exact top-8 routing with streamed experts | **1.218 tokens/s** |
+| GLM-5.2 Q2 | Exact top-8 routing with streamed experts | **1.347 tokens/s** |
 
 Measured on a 64 GB Apple Silicon MacBook Pro using a release build. The value
 covers decode only; prompt prefill is excluded. Results vary with context
