@@ -19,6 +19,7 @@ const MOE_WEIGHTED_INDEX_ADD_COMBINE_KERNEL: &str = "moe_weighted_index_add_comb
 const MOE_WEIGHTED_TOKEN_MAJOR_COMBINE_KERNEL: &str = "moe_weighted_token_major_combine_f32_kernel";
 const MOE_TOPK_COMBINE_RESIDUAL_KERNEL: &str = "moe_topk_combine_residual_f32_kernel";
 const MOE_ROUTER_TOPK_KERNEL: &str = "moe_router_topk_f32_kernel";
+const ROUTER_TOPK_SIMD_LANES: usize = 32;
 
 pub(crate) struct MetalMoe {
     arena: MetalArena,
@@ -482,6 +483,17 @@ impl MetalMoe {
             ));
         }
         require_f32_capacity(router_logits, router_logits_len, "MoE router logits")?;
+        if expert_count > ROUTER_TOPK_SIMD_LANES * 8 {
+            return Err(Error::backend(format!(
+                "MoE router top-k supports at most {} experts, got {expert_count}",
+                ROUTER_TOPK_SIMD_LANES * 8
+            )));
+        }
+        if self.router_topk_pipeline.thread_execution_width() as usize != ROUTER_TOPK_SIMD_LANES {
+            return Err(Error::backend(format!(
+                "MoE router top-k requires {ROUTER_TOPK_SIMD_LANES}-lane Metal SIMD groups"
+            )));
+        }
 
         let output_len = token_count
             .checked_mul(top_k)
@@ -520,7 +532,9 @@ impl MetalMoe {
                 &norm_topk_prob_buffer,
                 &routed_scaling_factor_buffer,
             ],
-            token_count,
+            token_count
+                .checked_mul(ROUTER_TOPK_SIMD_LANES)
+                .ok_or_else(|| Error::backend("MoE router top-k thread count overflow"))?,
         )?;
 
         Ok(MetalRouterTopKBuffers {
@@ -756,6 +770,36 @@ mod tests {
                 "router weight {index} differs: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn router_topk_preserves_stable_ties_for_256_experts() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let expert_count = 256;
+        let top_k = 8;
+        let logits = vec![0.0_f32; expert_count];
+        let correction_bias = vec![0.0_f32; expert_count];
+        let logits_buffer = metal.batch_upload_f32(&logits).unwrap();
+
+        let (expert_ids, expert_weights) = metal
+            .batched_moe_router_topk(
+                &logits_buffer,
+                logits.len(),
+                &correction_bias,
+                1,
+                expert_count,
+                top_k,
+                true,
+                2.5,
+            )
+            .unwrap();
+
+        assert_eq!(expert_ids, (0_u32..top_k as u32).collect::<Vec<_>>());
+        assert!(expert_weights
+            .iter()
+            .all(|weight| (*weight - 0.3125).abs() <= 1e-6));
     }
 
     #[test]

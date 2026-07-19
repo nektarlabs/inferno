@@ -122,21 +122,27 @@ kernel void linear_f32_gemv_kernel(
     device float* output [[buffer(2)]],
     constant uint& in_features_vec4 [[buffer(3)]],
     constant uint& out_features [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
-    if (gid >= out_features) {
+    constexpr uint simd_lanes = 32;
+    uint output_feature = gid / simd_lanes;
+    if (output_feature >= out_features) {
         return;
     }
 
     const device packed_float4* input4 = reinterpret_cast<const device packed_float4*>(input);
     const device packed_float4* weight4 = reinterpret_cast<const device packed_float4*>(
-        weight + (gid * in_features_vec4 * 4)
+        weight + (output_feature * in_features_vec4 * 4)
     );
 
     float sum = 0.0f;
-    for (uint index = 0; index < in_features_vec4; index++) {
+    for (uint index = simd_lane; index < in_features_vec4; index += simd_lanes) {
         sum += dot(float4(input4[index]), float4(weight4[index]));
     }
+    sum = simd_sum(sum);
 
-    output[gid] = sum;
+    if (simd_lane == 0) {
+        output[output_feature] = sum;
+    }
 }

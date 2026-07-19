@@ -16,6 +16,7 @@ const LINEAR_KERNEL: &str = "linear_f32_kernel";
 const LINEAR_GEMV_KERNEL: &str = "linear_f32_gemv_kernel";
 const TILE_M: usize = 16;
 const TILE_N: usize = 16;
+const LINEAR_GEMV_SIMD_LANES: usize = 32;
 
 pub(crate) struct MetalMatmul {
     matmul_pipeline: ComputePipelineState,
@@ -158,11 +159,14 @@ impl MetalMatmul {
             "running native Metal F32 linear"
         );
 
-        if rows == 1 && in_features % 4 == 0 {
+        let thread_count = if rows == 1 && in_features % 4 == 0 {
             let in_features_vec4 = u32::try_from(in_features / 4)
                 .map_err(|_| Error::backend("linear in_features/4 exceed Metal u32 limit"))?;
             let in_features_vec4_buffer = self.arena.u32(in_features_vec4)?;
             let out_features_buffer = self.arena.u32(out_features_u32)?;
+            let thread_count = out_features
+                .checked_mul(LINEAR_GEMV_SIMD_LANES)
+                .ok_or_else(|| Error::backend("linear GEMV thread count overflow"))?;
 
             dispatch_1d(
                 queue,
@@ -174,8 +178,9 @@ impl MetalMatmul {
                     &in_features_vec4_buffer,
                     &out_features_buffer,
                 ],
-                out_features,
+                thread_count,
             )?;
+            thread_count
         } else {
             let rows_buffer = self.arena.u32(rows_u32)?;
             let in_features_buffer = self.arena.u32(in_features_u32)?;
@@ -197,7 +202,8 @@ impl MetalMatmul {
                 TILE_N,
                 TILE_M,
             )?;
-        }
+            output_len
+        };
 
         let values = read_f32_buffer(&output_buffer, output_len)?;
 
@@ -208,7 +214,7 @@ impl MetalMatmul {
             out_features,
             input_len: input.len(),
             weight_len: weight.len(),
-            thread_count: output_len,
+            thread_count,
         })
     }
 
@@ -264,6 +270,9 @@ impl MetalMatmul {
             })?;
             let in_features_vec4_buffer = self.arena.u32(in_features_vec4)?;
             let out_features_buffer = self.arena.u32(out_features_u32)?;
+            let thread_count = out_features
+                .checked_mul(LINEAR_GEMV_SIMD_LANES)
+                .ok_or_else(|| Error::backend("batched F32 linear GEMV thread count overflow"))?;
             encode_1d(
                 command_buffer,
                 &self.linear_gemv_pipeline,
@@ -274,7 +283,7 @@ impl MetalMatmul {
                     &in_features_vec4_buffer,
                     &out_features_buffer,
                 ],
-                out_features,
+                thread_count,
             )?;
         } else {
             let rows_u32 = u32::try_from(rows)
@@ -381,7 +390,10 @@ mod tests {
         assert_eq!(report.rows, rows);
         assert_eq!(report.in_features, in_features);
         assert_eq!(report.out_features, out_features);
-        assert_eq!(report.thread_count, rows * out_features);
+        assert_eq!(
+            report.thread_count,
+            out_features * super::LINEAR_GEMV_SIMD_LANES
+        );
         assert_close(&report.values, &expected, 1e-5);
     }
 

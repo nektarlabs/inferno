@@ -2106,19 +2106,16 @@ impl<'a> Attention<'a> {
             profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
                 let kv_a_mqa =
                     crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-                let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
-                    &kv_a_mqa,
-                    self.kv_lora_rank,
-                    config.qk_rope_dim,
-                ));
-                let kv_a_norm =
-                    crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-                let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                    &k_rope_mqa,
-                    config.qk_rope_dim,
-                    past_tokens,
-                    config.rope_theta as f32,
-                ));
+                let (kv_a_norm, k_rope_after_rope) = crate::try_device!(backend
+                    .mla_kv_postprocess_device(
+                        &kv_a_mqa,
+                        self.kv_a_norm.weight(),
+                        self.kv_a_norm.eps(),
+                        self.kv_lora_rank,
+                        config.qk_rope_dim,
+                        past_tokens,
+                        config.rope_theta as f32,
+                    ));
                 let (k_heads, v_heads) = if use_absorbed_mla {
                     (None, None)
                 } else {
@@ -2328,22 +2325,18 @@ impl<'a> Attention<'a> {
                     || {
                         let kv_a_mqa =
                             crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-                        let (kv_latent, k_rope_mqa) =
-                            crate::try_device!(backend.split_kv_mqa_device(
+                        let (kv_a_norm, k_rope_after_rope) = crate::try_device!(backend
+                            .mla_kv_postprocess_device(
                                 &kv_a_mqa,
+                                self.kv_a_norm.weight(),
+                                self.kv_a_norm.eps(),
                                 self.kv_lora_rank,
                                 config.qk_rope_dim,
+                                0,
+                                config.rope_theta as f32,
                             ));
-                        let kv_a_norm =
-                            crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
                         let v_heads =
                             crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
-                        let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                            &k_rope_mqa,
-                            config.qk_rope_dim,
-                            0,
-                            config.rope_theta as f32,
-                        ));
                         Ok(Some((kv_a_norm, k_rope_after_rope, v_heads)))
                     },
                 ),
@@ -2500,9 +2493,13 @@ impl<'a> Attention<'a> {
                         query_position,
                         config.rope_theta as f32,
                     ));
-                    let q_recombined = crate::try_device!(
-                        backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
-                    );
+                    let q_recombined = if use_absorbed_mla {
+                        None
+                    } else {
+                        Some(crate::try_device!(
+                            backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                        ))
+                    };
                     Ok(Some((q_no_rope, q_rope_after_rope, q_recombined, q_a_norm)))
                 }),
             ));
@@ -2514,19 +2511,16 @@ impl<'a> Attention<'a> {
                 || profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
                     let kv_a_mqa =
                         crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
-                    let (kv_latent, k_rope_mqa) = crate::try_device!(backend.split_kv_mqa_device(
-                        &kv_a_mqa,
-                        self.kv_lora_rank,
-                        config.qk_rope_dim,
-                    ));
-                    let kv_a_norm =
-                        crate::try_device!(self.kv_a_norm.forward_device(&kv_latent, backend));
-                    let k_rope_after_rope = crate::try_device!(backend.rope_slice_device(
-                        &k_rope_mqa,
-                        config.qk_rope_dim,
-                        query_position,
-                        config.rope_theta as f32,
-                    ));
+                    let (kv_a_norm, k_rope_after_rope) = crate::try_device!(backend
+                        .mla_kv_postprocess_device(
+                            &kv_a_mqa,
+                            self.kv_a_norm.weight(),
+                            self.kv_a_norm.eps(),
+                            self.kv_lora_rank,
+                            config.qk_rope_dim,
+                            query_position,
+                            config.rope_theta as f32,
+                        ));
                     let (k_heads, v_heads) = if use_absorbed_mla {
                         (None, None)
                     } else {
@@ -2551,8 +2545,11 @@ impl<'a> Attention<'a> {
                     if use_absorbed_mla {
                         return Ok(Some((None, None, None)));
                     }
+                    let q_recombined = q_recombined.as_ref().ok_or_else(|| {
+                        Error::model("expanded sparse attention is missing query heads")
+                    })?;
                     let q_for_attention = Some(crate::try_device!(
-                        backend.heads_to_attention_layout_device(&q_recombined)
+                        backend.heads_to_attention_layout_device(q_recombined)
                     ));
                     let current_k_for_attention = Some(crate::try_device!(backend
                         .heads_to_attention_layout_device(k_heads.as_ref().ok_or_else(|| {

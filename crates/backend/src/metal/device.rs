@@ -1320,6 +1320,38 @@ impl Metal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_mla_kv_postprocess(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        norm_weight: &[f32],
+        batch_count: usize,
+        token_count: usize,
+        latent_dim: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<(Buffer, Buffer)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.rms_norm.encode_mla_kv_postprocess(
+                command_buffer,
+                &self.device,
+                input,
+                input_len,
+                norm_weight,
+                batch_count,
+                token_count,
+                latent_dim,
+                rope_dim,
+                position_offset,
+                theta,
+                eps,
+            )
+        })
+    }
+
     pub(crate) fn batched_linear_f32(
         &self,
         input: &Buffer,

@@ -85,16 +85,13 @@ const Q8_0_BATCH_MAX_ROWS: usize = 8;
 const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
-// Sixteen Q2 expert triplets per routed layer use about 15.1 GB including the
-// MTP head. On the 64 GB target this improved warm decode by 5.9% over twelve
-// slots while leaving 4.7 GB free. Twenty slots left less than 1 GB free, which
-// is not enough margin for longer-context KV growth.
-const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 16;
-// Spare RAM is more useful when assigned to layers with demonstrated expert
-// locality than when every layer is enlarged uniformly. The pageable shared
-// allowance is about 6.3 GB for this artifact. It remains reclaimable by macOS,
-// unlike the locked sixteen-slot L1 slabs.
-const ROUTED_EXPERT_ADAPTIVE_EXTRA_SLOTS: usize = 512;
+// Thirty Q2 expert triplets per routed layer allocate about 27.9 GB on the
+// 64 GB target. This is the measured decode optimum: thirty-two slots caused
+// severe memory pressure, while a smaller adaptive cache produced more SSD
+// misses. Long-context runtime rebalancing may still shrink this base cache.
+const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 30;
+const ROUTED_EXPERT_PROTECTED_PERCENT: usize = 25;
+const ROUTED_EXPERT_ADAPTIVE_EXTRA_SLOTS: usize = 0;
 const ROUTED_EXPERT_ADAPTIVE_MAX_EXTRA_SLOTS_PER_LAYER: usize = 8;
 const ROUTED_EXPERT_ADAPTIVE_MIN_LOOKUPS: usize = 64;
 const ROUTED_EXPERT_ADAPTIVE_MIN_HIT_PERCENT: usize = 35;
@@ -4262,7 +4259,7 @@ impl Q2ExpertLayerCache {
             entries: HashMap::new(),
             probation: VecDeque::new(),
             protected: VecDeque::new(),
-            protected_capacity: capacity.div_ceil(2),
+            protected_capacity: expert_protected_capacity(capacity),
             free_slots: (0..capacity).rev().collect(),
             base_capacity: capacity,
             frequencies: HashMap::new(),
@@ -4415,7 +4412,7 @@ impl Q2ExpertLayerCache {
         self.slots.push(false);
         self.overflow_storage.push(None);
         self.free_slots.push(slot);
-        self.protected_capacity = self.slots.len().div_ceil(2);
+        self.protected_capacity = expert_protected_capacity(self.slots.len());
         self.growth_candidates.clear();
         self.reuse_signals_since_growth = 0;
     }
@@ -4486,19 +4483,12 @@ impl Q2ExpertLayerCache {
     }
 
     fn peek_evictable(&self, selected_keys: &HashSet<ExpertCacheKey>) -> Option<ExpertCacheKey> {
-        let mut victim = None;
-        for candidate in self
-            .probation
+        self.probation
             .iter()
             .chain(self.protected.iter())
             .copied()
             .filter(|candidate| !selected_keys.contains(candidate))
-        {
-            if victim.is_none_or(|current| self.frequency(candidate) < self.frequency(current)) {
-                victim = Some(candidate);
-            }
-        }
-        victim
+            .next()
     }
 
     fn invalidate(&mut self, keys: &[ExpertCacheKey]) {
@@ -4513,6 +4503,13 @@ impl Q2ExpertLayerCache {
             }
         }
     }
+}
+
+fn expert_protected_capacity(capacity: usize) -> usize {
+    capacity
+        .saturating_mul(ROUTED_EXPERT_PROTECTED_PERCENT)
+        .div_ceil(100)
+        .min(capacity)
 }
 
 fn remove_key(queue: &mut VecDeque<ExpertCacheKey>, key: ExpertCacheKey) -> bool {
@@ -5133,9 +5130,9 @@ mod tests {
         super::validation::{
             Q2_K_BLOCK_BYTES, Q2_K_BLOCK_VALUES, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES,
         },
-        prioritize_ready_expert_seeds, AdaptiveExpertCacheBudget, ExpertCacheKey,
-        LayerSlotResolution, Q2ExpertLayerCache, Q2ExpertSlotBuffers, Q2PerLayerExpertCache,
-        Q2TransientExpertPool, QuantMatvecKind, ReadyExpertSeed,
+        expert_protected_capacity, prioritize_ready_expert_seeds, AdaptiveExpertCacheBudget,
+        ExpertCacheKey, LayerSlotResolution, Q2ExpertLayerCache, Q2ExpertSlotBuffers,
+        Q2PerLayerExpertCache, Q2TransientExpertPool, QuantMatvecKind, ReadyExpertSeed,
         ROUTED_EXPERT_FREQUENCY_DECAY_LOOKUPS, ROUTED_EXPERT_WAVE_MIN_GROUPS,
     };
 
@@ -5204,6 +5201,13 @@ mod tests {
         let layer = cache.layer(7);
 
         assert_eq!(layer.lock().unwrap().slots.len(), 3);
+    }
+
+    #[test]
+    fn expert_slru_reserves_one_quarter_for_protected_entries() {
+        assert_eq!(expert_protected_capacity(30), 8);
+        assert_eq!(expert_protected_capacity(4), 1);
+        assert_eq!(expert_protected_capacity(1), 1);
     }
 
     #[test]
@@ -5322,7 +5326,7 @@ mod tests {
     }
 
     #[test]
-    fn frequency_victim_selection_protects_reused_experts_from_one_time_scans() {
+    fn segmented_lru_protects_reused_experts_from_one_time_scans() {
         let mut cache = Q2ExpertLayerCache::new(3);
         let reused = expert_key(1);
         let scan_a = expert_key(2);
@@ -6085,7 +6089,7 @@ mod tests {
         };
         let token_count = 8;
         let top_k = 8;
-        let expert_count = 24;
+        let expert_count = super::ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER + top_k;
         let hidden_features = Q2_K_BLOCK_VALUES;
         let intermediate_features = Q2_K_BLOCK_VALUES;
         let expert_stride = hidden_features * Q2_K_BLOCK_BYTES;
@@ -6151,7 +6155,10 @@ mod tests {
             .unwrap();
         let selected_ids = metal.batched_moe_router_expert_ids(&routing).unwrap();
         assert_eq!(selected_ids.len(), token_count * top_k);
-        assert!(selected_ids.iter().copied().collect::<HashSet<_>>().len() > 16);
+        assert!(
+            selected_ids.iter().copied().collect::<HashSet<_>>().len()
+                > super::ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER
+        );
 
         let up_base = gate_weights.len() as u64;
         let down_base = up_base + up_weights.len() as u64;

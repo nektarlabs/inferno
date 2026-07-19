@@ -100,66 +100,86 @@ kernel void moe_router_topk_f32_kernel(
     constant uint& top_k [[buffer(7)]],
     constant uint& norm_topk_prob [[buffer(8)]],
     constant float& routed_scaling_factor [[buffer(9)]],
-    uint token [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
+    constexpr uint simd_lanes = 32;
+    constexpr uint max_top_k = 8;
+    uint token = gid / simd_lanes;
     if (token >= token_count) {
         return;
     }
 
-    constexpr uint max_top_k = 8;
-    float top_corrected[max_top_k];
-    float top_scores[max_top_k];
-    uint top_ids[max_top_k];
-
-    for (uint rank = 0; rank < max_top_k; rank++) {
-        top_corrected[rank] = -3.402823466e+38F;
-        top_scores[rank] = 0.0f;
-        top_ids[rank] = 0;
-    }
-
-    for (uint expert = 0; expert < expert_count; expert++) {
+    float local_corrected[max_top_k];
+    float local_scores[max_top_k];
+    uint local_ids[max_top_k];
+    bool local_selected[max_top_k];
+    uint local_count = 0;
+    for (uint expert = simd_lane; expert < expert_count; expert += simd_lanes) {
         float logit = router_logits[(token * expert_count) + expert];
         float score = 1.0f / (1.0f + exp(-logit));
-        float corrected = score + correction_bias[expert];
-
-        uint insert_at = top_k;
-        for (uint rank = 0; rank < top_k; rank++) {
-            bool better = corrected > top_corrected[rank]
-                || (corrected == top_corrected[rank] && expert < top_ids[rank]);
-            if (better) {
-                insert_at = rank;
-                break;
-            }
-        }
-
-        if (insert_at < top_k) {
-            for (uint rank = top_k - 1; rank > insert_at; rank--) {
-                top_corrected[rank] = top_corrected[rank - 1];
-                top_scores[rank] = top_scores[rank - 1];
-                top_ids[rank] = top_ids[rank - 1];
-            }
-            top_corrected[insert_at] = corrected;
-            top_scores[insert_at] = score;
-            top_ids[insert_at] = expert;
-        }
+        local_corrected[local_count] = score + correction_bias[expert];
+        local_scores[local_count] = score;
+        local_ids[local_count] = expert;
+        local_selected[local_count] = false;
+        local_count++;
     }
 
-    float weight_sum = 0.0f;
-    if (norm_topk_prob != 0) {
-        for (uint rank = 0; rank < top_k; rank++) {
-            weight_sum += top_scores[rank];
-        }
-    }
-
+    float selected_scores[max_top_k];
+    uint selected_ids[max_top_k];
     for (uint rank = 0; rank < top_k; rank++) {
-        float weight = top_scores[rank];
-        if (norm_topk_prob != 0 && weight_sum > 0.0f && isfinite(weight_sum)) {
-            weight /= weight_sum;
+        float lane_corrected = -3.402823466e+38F;
+        float lane_score = 0.0f;
+        uint lane_id = 0xffffffffu;
+        uint lane_local_index = max_top_k;
+        for (uint local = 0; local < local_count; local++) {
+            if (local_selected[local]) {
+                continue;
+            }
+            float corrected = local_corrected[local];
+            uint expert = local_ids[local];
+            bool better = corrected > lane_corrected
+                || (corrected == lane_corrected && expert < lane_id);
+            if (better) {
+                lane_corrected = corrected;
+                lane_score = local_scores[local];
+                lane_id = expert;
+                lane_local_index = local;
+            }
         }
-        uint assignment = (token * top_k) + rank;
-        expert_ids[assignment] = top_ids[rank];
-        expert_weights[assignment] = weight * routed_scaling_factor;
-        token_indices[assignment] = token;
+
+        float best_corrected = simd_max(lane_corrected);
+        uint candidate_id = lane_corrected == best_corrected ? lane_id : 0xffffffffu;
+        uint best_id = simd_min(candidate_id);
+        uint winning_lane = best_id % simd_lanes;
+        float best_score = simd_broadcast(lane_score, winning_lane);
+        if (lane_local_index < local_count && lane_id == best_id) {
+            local_selected[lane_local_index] = true;
+        }
+        if (simd_lane == 0) {
+            selected_scores[rank] = best_score;
+            selected_ids[rank] = best_id;
+        }
+    }
+
+    if (simd_lane == 0) {
+        float weight_sum = 0.0f;
+        if (norm_topk_prob != 0) {
+            for (uint rank = 0; rank < top_k; rank++) {
+                weight_sum += selected_scores[rank];
+            }
+        }
+
+        for (uint rank = 0; rank < top_k; rank++) {
+            float weight = selected_scores[rank];
+            if (norm_topk_prob != 0 && weight_sum > 0.0f && isfinite(weight_sum)) {
+                weight /= weight_sum;
+            }
+            uint assignment = (token * top_k) + rank;
+            expert_ids[assignment] = selected_ids[rank];
+            expert_weights[assignment] = weight * routed_scaling_factor;
+            token_indices[assignment] = token;
+        }
     }
 }
 

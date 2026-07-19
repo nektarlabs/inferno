@@ -1001,6 +1001,20 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn mla_kv_postprocess_device(
+        &self,
+        _kv_mqa: &DeviceValue,
+        _norm_weight: &F32Tensor,
+        _norm_eps: f32,
+        _kv_lora_rank: usize,
+        _rope_dim: usize,
+        _position_offset: usize,
+        _theta: f32,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
     fn combine_rope_tail_device(
         &self,
         _no_rope: &DeviceValue,
@@ -4266,6 +4280,68 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (kv_mqa, kv_lora_rank, rope_dim);
+            Ok(None)
+        }
+    }
+
+    fn mla_kv_postprocess_device(
+        &self,
+        kv_mqa: &DeviceValue,
+        norm_weight: &F32Tensor,
+        norm_eps: f32,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+        position_offset: usize,
+        theta: f32,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let dims = require_device_rank("device_mla_kv_postprocess", kv_mqa, 3)?;
+            let total_dim = kv_lora_rank
+                .checked_add(rope_dim)
+                .ok_or_else(|| Error::backend("device MLA KV total dim overflow"))?;
+            validate_exact_shape(
+                "device_mla_kv_postprocess_input",
+                dims,
+                &[dims[0], dims[1], total_dim],
+            )?;
+            validate_exact_shape(
+                "device_mla_kv_postprocess_norm_weight",
+                norm_weight.dims(),
+                &[kv_lora_rank],
+            )?;
+            let (latent, rope) = native_metal.batched_mla_kv_postprocess(
+                &kv_mqa.buffer,
+                kv_mqa.element_count()?,
+                norm_weight.values(),
+                dims[0],
+                dims[1],
+                kv_lora_rank,
+                rope_dim,
+                position_offset,
+                theta,
+                norm_eps,
+            )?;
+            return Ok(Some((
+                DeviceValue::new(vec![dims[0], dims[1], kv_lora_rank], latent),
+                DeviceValue::new(vec![dims[0], dims[1], 1, rope_dim], rope),
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                kv_mqa,
+                norm_weight,
+                norm_eps,
+                kv_lora_rank,
+                rope_dim,
+                position_offset,
+                theta,
+            );
             Ok(None)
         }
     }
