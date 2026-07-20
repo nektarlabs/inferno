@@ -16,9 +16,10 @@ macro_rules! try_device {
 }
 pub(crate) use try_device;
 
-/// One target token plus the seven speculative tokens used by GLM-5.2's
-/// trained MTP verification path.
-pub(crate) const MAX_DEVICE_SEQUENCE_TOKENS: usize = 8;
+/// Maximum number of causal token rows handled by the current native Metal
+/// sequence path. The runtime uses this limit for MTP verification and chunked
+/// prompt prefill.
+pub const MAX_DEVICE_SEQUENCE_TOKENS: usize = 8;
 
 mod artifact_source;
 mod attention;
@@ -72,10 +73,10 @@ pub use layer_stack::{
 pub(crate) use linear::QuantizedLinear;
 pub use linear::{LinearForwardReport, LinearGreedyReport};
 pub use model::{
-    Model, ModelDeviceTokenOutput, ModelDeviceTokenSequenceOutput, ModelGreedyOutput,
-    ModelGreedyReport, ModelHiddenOutput, ModelHiddenReport, ModelLoadReport, ModelLogitsOutput,
-    ModelLogitsReport, ModelTokenOutput, ModelTokenSequenceOutput, ModelTokenWithHiddenOutput,
-    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    Model, ModelDevicePrefillChunkOutput, ModelDevicePrefillToken, ModelDeviceTokenOutput,
+    ModelDeviceTokenSequenceOutput, ModelGreedyOutput, ModelGreedyReport, ModelHiddenOutput,
+    ModelHiddenReport, ModelLoadReport, ModelLogitsOutput, ModelLogitsReport, ModelTokenOutput,
+    ModelTokenSequenceOutput, ModelTokenWithHiddenOutput, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 pub(crate) use moe_ffn::{MoeFfn, MoeFfnOutput};
 pub use moe_ffn::{MoeFfnForwardReport, MoeFfnLoadReport};

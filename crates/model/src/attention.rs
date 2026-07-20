@@ -2314,7 +2314,48 @@ impl<'a> Attention<'a> {
                 || self.input_norm.forward_device(hidden_states, backend),
             ),
         ));
-        let (kv_latent_norm, k_rope_after_rope, v_heads) =
+        let q_for_attention = if tokens > 1 {
+            Some(crate::try_device!(profile::run_sparse_token_device_stage(
+                sparse_layer,
+                profile::TokenProfileStage::SparseQProjection,
+                backend,
+                || profile::run_layer_stage(
+                    self.layer_index,
+                    "attention.q_projection.seed_device",
+                    || {
+                        let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+                        let q_a_norm =
+                            crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
+                        let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
+                        let q_heads = q_b.reshape(vec![
+                            batch,
+                            tokens,
+                            config.attention_heads,
+                            config.qk_head_dim,
+                        ])?;
+                        let (q_no_rope, q_rope) = crate::try_device!(backend
+                            .split_rope_tail_device(
+                                &q_heads,
+                                config.qk_no_rope_dim,
+                                config.qk_rope_dim,
+                            ));
+                        let q_rope_after_rope = crate::try_device!(backend.rope_slice_device(
+                            &q_rope,
+                            config.qk_rope_dim,
+                            0,
+                            config.rope_theta as f32,
+                        ));
+                        let q_recombined = crate::try_device!(
+                            backend.combine_rope_tail_device(&q_no_rope, &q_rope_after_rope)
+                        );
+                        backend.heads_to_attention_layout_device(&q_recombined)
+                    },
+                ),
+            )))
+        } else {
+            None
+        };
+        let (kv_latent_norm, k_rope_after_rope, v_heads, current_k, current_v) =
             crate::try_device!(profile::run_sparse_token_device_stage(
                 sparse_layer,
                 profile::TokenProfileStage::SparseKvProjection,
@@ -2337,7 +2378,31 @@ impl<'a> Attention<'a> {
                             ));
                         let v_heads =
                             crate::try_device!(self.v_b.forward_heads_device(&kv_a_norm, backend));
-                        Ok(Some((kv_a_norm, k_rope_after_rope, v_heads)))
+                        let (current_k, current_v) = if tokens > 1 {
+                            let k_no_rope = crate::try_device!(self
+                                .k_b
+                                .forward_heads_device(&kv_a_norm, backend));
+                            let k_heads =
+                                crate::try_device!(backend
+                                    .combine_rope_tail_device(&k_no_rope, &k_rope_after_rope,));
+                            (
+                                Some(crate::try_device!(
+                                    backend.heads_to_attention_layout_device(&k_heads)
+                                )),
+                                Some(crate::try_device!(
+                                    backend.heads_to_attention_layout_device(&v_heads)
+                                )),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        Ok(Some((
+                            kv_a_norm,
+                            k_rope_after_rope,
+                            v_heads,
+                            current_k,
+                            current_v,
+                        )))
                     },
                 ),
             ));
@@ -2347,11 +2412,29 @@ impl<'a> Attention<'a> {
             profile::TokenProfileStage::SparseCacheLayout,
             backend,
             || {
-                let context_heads = crate::try_device!(profile::run_layer_stage(
-                    self.layer_index,
-                    "attention.single_token_context.seed_device",
-                    || backend.heads_to_attention_layout_device(&v_heads),
-                ));
+                let context_heads = if tokens == 1 {
+                    crate::try_device!(profile::run_layer_stage(
+                        self.layer_index,
+                        "attention.single_token_context.seed_device",
+                        || backend.heads_to_attention_layout_device(&v_heads),
+                    ))
+                } else {
+                    crate::try_device!(profile::run_layer_stage(
+                        self.layer_index,
+                        "attention.causal_sequence.seed_device",
+                        || backend.causal_sequence_attention_device(
+                            q_for_attention.as_ref().ok_or_else(|| {
+                                Error::model("seed causal attention is missing query heads")
+                            })?,
+                            current_k.as_ref().ok_or_else(|| {
+                                Error::model("seed causal attention is missing current K")
+                            })?,
+                            current_v.as_ref().ok_or_else(|| {
+                                Error::model("seed causal attention is missing current V")
+                            })?,
+                        ),
+                    ))
+                };
                 let cache_v = crate::try_device!(
                     backend.heads_to_attention_layout_device(&k_rope_after_rope)
                 );

@@ -268,6 +268,7 @@ impl<'a> MtpHead<'a> {
                         shared_selection,
                         query_position,
                         include_current_kv,
+                        true,
                     ));
                 (output, next_shared_selection)
             }

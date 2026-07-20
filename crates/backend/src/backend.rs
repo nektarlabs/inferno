@@ -1133,6 +1133,17 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    /// Causal attention for the first prompt chunk, where no past KV exists.
+    /// Query row `t` can attend to current K/V rows `0..=t`.
+    fn causal_sequence_attention_device(
+        &self,
+        _q: &DeviceValue,
+        _current_k: &DeviceValue,
+        _current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Linearizes resident paged KV into contiguous `[B,H,T,D]` device tensors.
     /// Dense MLA uses this to expand latent cache on GPU without CPU
     /// reconstruction.
@@ -5049,6 +5060,74 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (q, past_k, past_v, current_k, current_v);
+            Ok(None)
+        }
+    }
+
+    fn causal_sequence_attention_device(
+        &self,
+        q: &DeviceValue,
+        current_k: &DeviceValue,
+        current_v: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let q_dims = require_device_rank("device_causal_sequence_q", q, 4)?;
+            let current_k_dims =
+                require_device_rank("device_causal_sequence_current_k", current_k, 4)?;
+            let current_v_dims =
+                require_device_rank("device_causal_sequence_current_v", current_v, 4)?;
+            if [q, current_k, current_v]
+                .iter()
+                .any(|value| value.dtype() != DType::F32)
+            {
+                return Err(Error::backend(
+                    "causal sequence attention currently requires f32 tensors",
+                ));
+            }
+            let (batch, heads, query_tokens, head_dim) =
+                (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+            let value_dim = current_v_dims[3];
+            validate_exact_shape(
+                "device_causal_sequence_current_k_shape",
+                current_k_dims,
+                &[batch, heads, query_tokens, head_dim],
+            )?;
+            validate_exact_shape(
+                "device_causal_sequence_current_v_shape",
+                current_v_dims,
+                &[batch, heads, query_tokens, value_dim],
+            )?;
+            let (buffer, _) = native_metal.batched_selected_sequence_attention(
+                &q.buffer,
+                q.element_count()?,
+                &current_k.buffer,
+                0,
+                &current_v.buffer,
+                0,
+                &current_k.buffer,
+                current_k.element_count()?,
+                &current_v.buffer,
+                current_v.element_count()?,
+                batch,
+                heads,
+                0,
+                query_tokens,
+                head_dim,
+                value_dim,
+            )?;
+            return Ok(Some(DeviceValue::new(
+                vec![batch, heads, query_tokens, value_dim],
+                buffer,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (q, current_k, current_v);
             Ok(None)
         }
     }

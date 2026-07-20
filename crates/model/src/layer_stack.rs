@@ -649,6 +649,7 @@ impl<'a> LayerStack<'a> {
         mut past_kv_for_layer: F,
         mut selected_kv_for_tokens: S,
         mut index_keys_for_layer: I,
+        predictive_expert_prefetch: bool,
     ) -> Result<Option<LayerStackDecodeDeviceTensors>>
     where
         B: Backend,
@@ -717,6 +718,7 @@ impl<'a> LayerStack<'a> {
                                 last_dsa_selection.as_deref(),
                                 None,
                                 true,
+                                predictive_expert_prefetch,
                             )
                         },
                     )? {

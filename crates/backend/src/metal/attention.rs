@@ -1491,9 +1491,9 @@ impl MetalDecodeAttention {
         head_dim: usize,
         value_dim: usize,
     ) -> Result<(Buffer, usize)> {
-        if selected_tokens == 0 || query_tokens == 0 {
+        if query_tokens == 0 {
             return Err(Error::backend(
-                "selected sequence attention requires past and query tokens",
+                "selected sequence attention requires query tokens",
             ));
         }
         let visible_keys = selected_tokens
@@ -2654,6 +2654,80 @@ mod tests {
                 batch_count,
                 head_count,
                 past_tokens,
+                query_tokens,
+                head_dim,
+                value_dim,
+            )
+            .unwrap();
+        let actual = metal.batch_read_f32(&output, output_len).unwrap();
+
+        assert_close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn selected_sequence_attention_supports_a_current_only_prefill_chunk() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let head_count = 2;
+        let query_tokens = 8;
+        let head_dim = 4;
+        let value_dim = 3;
+        let q = (0..batch_count * head_count * query_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 10.0)
+            .collect::<Vec<_>>();
+        let current_k = (0..batch_count * head_count * query_tokens * head_dim)
+            .map(|index| (index as f32 + 1.0) / 20.0)
+            .collect::<Vec<_>>();
+        let current_v = (0..batch_count * head_count * query_tokens * value_dim)
+            .map(|index| (index as f32 + 1.0) / 30.0)
+            .collect::<Vec<_>>();
+        let scores = cpu_attention_scores(
+            &q,
+            &current_k,
+            batch_count,
+            head_count,
+            query_tokens,
+            query_tokens,
+            head_dim,
+        );
+        let probs = cpu_attention_causal_softmax(
+            &scores,
+            batch_count,
+            head_count,
+            query_tokens,
+            query_tokens,
+            0,
+        );
+        let expected = cpu_attention_values(
+            &probs,
+            &current_v,
+            batch_count,
+            head_count,
+            query_tokens,
+            query_tokens,
+            value_dim,
+        );
+
+        let q = metal.batch_upload_f32(&q).unwrap();
+        let current_k = metal.batch_upload_f32(&current_k).unwrap();
+        let current_v = metal.batch_upload_f32(&current_v).unwrap();
+        let (output, output_len) = metal
+            .batched_selected_sequence_attention(
+                &q,
+                batch_count * head_count * query_tokens * head_dim,
+                &current_k,
+                0,
+                &current_v,
+                0,
+                &current_k,
+                batch_count * head_count * query_tokens * head_dim,
+                &current_v,
+                batch_count * head_count * query_tokens * value_dim,
+                batch_count,
+                head_count,
+                0,
                 query_tokens,
                 head_dim,
                 value_dim,

@@ -317,20 +317,25 @@ impl<'a> SparseBlock<'a> {
         shared_selection: Option<&[u32]>,
         query_position: Option<usize>,
         include_current_kv: bool,
+        predictive_expert_prefetch: bool,
     ) -> Result<Option<(crate::kv_types::BlockDeviceTensors, Option<Vec<u32>>)>>
     where
         B: Backend,
         S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
         I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
-        let predicted_expert_ids = profile::run_layer_stage(
-            self.load_report.layer_index,
-            "sparse_moe.router_prediction",
-            || {
-                self.ffn
-                    .predict_expert_ids_device(config, hidden_states, backend)
-            },
-        )?;
+        let predicted_expert_ids = if predictive_expert_prefetch {
+            profile::run_layer_stage(
+                self.load_report.layer_index,
+                "sparse_moe.router_prediction",
+                || {
+                    self.ffn
+                        .predict_expert_ids_device(config, hidden_states, backend)
+                },
+            )?
+        } else {
+            None
+        };
         let (attention_output, output_hidden_states) = thread::scope(|scope| -> Result<_> {
             let prefetch = predicted_expert_ids.as_deref().map(|expert_ids| {
                 scope.spawn(move || {

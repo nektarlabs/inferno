@@ -97,6 +97,18 @@ pub struct ModelDeviceTokenSequenceOutput {
 }
 
 #[derive(Debug)]
+pub struct ModelDevicePrefillChunkOutput {
+    pub layer_kv_cache: Vec<LayerDeviceKvCacheTensors>,
+    pub next_token: Option<ModelDevicePrefillToken>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelDevicePrefillToken {
+    pub token_id: u32,
+    pub token_score: f32,
+}
+
+#[derive(Debug)]
 struct ModelHiddenTensors {
     hidden_states: Tensor,
     layer_kv_cache: Vec<LayerKvCacheTensors>,
@@ -389,22 +401,8 @@ impl<'a> Model<'a> {
         input_ids: &[u32],
         backend: &B,
     ) -> Result<Option<ModelDeviceTokenOutput>> {
-        if input_ids.len() != 1 {
-            return Err(Error::model(format!(
-                "device seed prefill requires exactly one token id, got {}",
-                input_ids.len()
-            )));
-        }
-        if !backend.capabilities().custom_kernels {
-            return Ok(None);
-        }
-
-        let embedding = self.embedding_table.lookup_f32(input_ids)?;
-        let stack = crate::try_device!(self.layer_stack.forward_seed_device(
-            config,
-            &embedding.hidden_states,
-            backend,
-        ));
+        let stack =
+            crate::try_device!(self.prefill_seed_backbone_device(config, input_ids, backend,));
         let normalized_hidden_states = self
             .output_head
             .normalize_device(&stack.hidden_states, backend)?
@@ -420,6 +418,46 @@ impl<'a> Model<'a> {
             token_id: token.token_id,
             token_score: token.token_score,
         }))
+    }
+
+    /// Initializes one-token device KV without running the final norm or
+    /// vocabulary projection. Use this when more prompt chunks follow and the
+    /// seed prediction would be discarded.
+    pub fn prefill_seed_kv_device<B: Backend>(
+        &self,
+        config: &Config,
+        input_ids: &[u32],
+        backend: &B,
+    ) -> Result<Option<Vec<LayerDeviceKvCacheTensors>>> {
+        let stack =
+            crate::try_device!(self.prefill_seed_backbone_device(config, input_ids, backend,));
+        Ok(Some(stack.layer_kv_cache))
+    }
+
+    fn prefill_seed_backbone_device<B: Backend>(
+        &self,
+        config: &Config,
+        input_ids: &[u32],
+        backend: &B,
+    ) -> Result<Option<crate::layer_stack::LayerStackDecodeDeviceTensors>> {
+        if input_ids.is_empty() || input_ids.len() > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+            return Err(Error::model(format!(
+                "device seed prefill requires one to {} token ids, got {}",
+                crate::MAX_DEVICE_SEQUENCE_TOKENS,
+                input_ids.len()
+            )));
+        }
+        if !backend.capabilities().custom_kernels {
+            return Ok(None);
+        }
+
+        let embedding = self.embedding_table.lookup_f32(input_ids)?;
+        let stack = crate::try_device!(self.layer_stack.forward_seed_device(
+            config,
+            &embedding.hidden_states,
+            backend,
+        ));
+        Ok(Some(stack))
     }
 
     pub fn decode_step_with_past_kv_provider<B, F>(
@@ -706,6 +744,71 @@ impl<'a> Model<'a> {
         Ok(output)
     }
 
+    /// Runs one causal prompt chunk on Metal. Intermediate chunks return only
+    /// their per-layer KV rows; the final chunk additionally projects the last
+    /// hidden row into one next-token prediction. Predictive expert routing is
+    /// disabled here because prefill already exposes multiple exact router rows
+    /// and has too little attention work to hide an additional router sync.
+    pub fn prefill_chunk_with_device_paged_kv_provider<B, F, S, I>(
+        &self,
+        config: &Config,
+        input_token_ids: &[u32],
+        emit_next_token: bool,
+        backend: &B,
+        mut past_kv_for_layer: F,
+        mut selected_kv_for_tokens: S,
+        mut index_keys_for_layer: I,
+    ) -> Result<Option<ModelDevicePrefillChunkOutput>>
+    where
+        B: Backend,
+        F: FnMut(usize) -> Result<Option<backend::DevicePagedKvView>>,
+        S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
+        I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
+    {
+        if input_token_ids.is_empty() || input_token_ids.len() > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+            return Err(Error::model(format!(
+                "GLM-5.2 device prefill chunk expects one to {} token ids, got {}",
+                crate::MAX_DEVICE_SEQUENCE_TOKENS,
+                input_token_ids.len()
+            )));
+        }
+        if !backend.capabilities().custom_kernels || !backend.device_values_supported() {
+            return Ok(None);
+        }
+
+        let embedding = self.embedding_table.lookup_f32(input_token_ids)?;
+        let stack = crate::try_device!(self.layer_stack.forward_decode_device(
+            config,
+            &embedding.hidden_states,
+            backend,
+            &mut past_kv_for_layer,
+            &mut selected_kv_for_tokens,
+            &mut index_keys_for_layer,
+            false,
+        ));
+
+        let next_token = if emit_next_token {
+            let last_hidden =
+                crate::try_device!(backend.select_last_token_device(&stack.hidden_states));
+            let normalized =
+                crate::try_device!(self.output_head.normalize_device(&last_hidden, backend));
+            let token = crate::try_device!(self
+                .output_head
+                .decode_token_from_normalized_device(&normalized, backend));
+            Some(ModelDevicePrefillToken {
+                token_id: token.token_id,
+                token_score: token.token_score,
+            })
+        } else {
+            None
+        };
+
+        Ok(Some(ModelDevicePrefillChunkOutput {
+            layer_kv_cache: stack.layer_kv_cache,
+            next_token,
+        }))
+    }
+
     /// Runs one normal decode row or an MTP speculative verification while
     /// hidden states, attention, MoE, logits and reductions remain on Metal.
     fn decode_token_sequence_paged_device<B, F, S, I>(
@@ -731,6 +834,7 @@ impl<'a> Model<'a> {
             past_kv_for_layer,
             selected_kv_for_tokens,
             index_keys_for_layer,
+            true,
         ));
 
         let normalized_hidden_states = crate::try_device!(self

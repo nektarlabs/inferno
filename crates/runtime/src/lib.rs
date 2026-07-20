@@ -40,7 +40,7 @@ use config::Config;
 use model::ModelGreedyOutput;
 use model::{
     set_layer_profile_context, LayerDeviceKvCacheTensors, LayerKvCacheTensors, Model,
-    ModelDeviceTokenSequenceOutput,
+    ModelDevicePrefillChunkOutput, ModelDeviceTokenSequenceOutput,
 };
 use telemetry::{
     capture_memory_snapshot, log_memory_snapshot, RuntimeKvMemoryBytes, RuntimeMemorySnapshot,
@@ -1292,22 +1292,41 @@ where
     let prefill_started_at = Instant::now();
     set_layer_profile_context(0, "prefill.seed")?;
     let seed_input_ids = if use_streaming_prefill {
-        &prompt_token_ids[..1]
+        let seed_tokens = if use_mtp {
+            1
+        } else {
+            prompt_token_ids
+                .len()
+                .min(model::MAX_DEVICE_SEQUENCE_TOKENS)
+        };
+        &prompt_token_ids[..seed_tokens]
     } else {
         prompt_token_ids
     };
+    let seed_needs_prediction = seed_input_ids.len() == prompt_token_ids.len() || use_mtp;
     let mut last_main_hidden_device = None;
     let mut device_seed_layer_kv_cache = None;
     let (mut prefill_token_id, prefill_layer_kv_cache) = if use_device_kv {
-        let output = model
-            .prefill_seed_device(config, seed_input_ids, backend)?
-            .ok_or_else(|| Error::backend("native Metal seed prefill requires device path"))?;
-        last_main_hidden_device = Some(output.hidden_states);
-        device_seed_layer_kv_cache = Some(output.layer_kv_cache);
-        (output.token_id, Vec::new())
+        if seed_needs_prediction {
+            let output = model
+                .prefill_seed_device(config, seed_input_ids, backend)?
+                .ok_or_else(|| Error::backend("native Metal seed prefill requires device path"))?;
+            last_main_hidden_device = Some(output.hidden_states);
+            device_seed_layer_kv_cache = Some(output.layer_kv_cache);
+            (Some(output.token_id), Vec::new())
+        } else {
+            device_seed_layer_kv_cache = Some(
+                model
+                    .prefill_seed_kv_device(config, seed_input_ids, backend)?
+                    .ok_or_else(|| {
+                        Error::backend("native Metal seed KV prefill requires device path")
+                    })?,
+            );
+            (None, Vec::new())
+        }
     } else {
         let output = model.prefill_next_token(config, seed_input_ids, backend)?;
-        (output.token_id, output.layer_kv_cache)
+        (Some(output.token_id), output.layer_kv_cache)
     };
     record_q2_runtime_stage(0, None, "prefill.model", prefill_started_at.elapsed());
     log_memory_snapshot(
@@ -1351,25 +1370,98 @@ where
     let mut mtp_device_cache = None;
 
     if use_streaming_prefill && prompt_token_ids.len() > 1 {
-        for (prefill_index, prompt_token_id) in prompt_token_ids.iter().copied().enumerate().skip(1)
-        {
-            if let Some(cache) = device_kv_cache.as_mut() {
+        if !use_mtp {
+            let cache = device_kv_cache
+                .as_mut()
+                .ok_or_else(|| Error::runtime("device KV cache is not initialized"))?;
+            let mut chunk_start = seed_input_ids.len();
+            while chunk_start < prompt_token_ids.len() {
+                let chunk_end = next_prefill_chunk_end(chunk_start, prompt_token_ids.len());
+                let chunk = &prompt_token_ids[chunk_start..chunk_end];
+                let prefill_index = chunk_end - 1;
+                let emit_next_token = chunk_end == prompt_token_ids.len();
                 if let Some(controller) = cache_budget_controller.as_mut() {
                     controller.maybe_rebalance(
-                        cache.cached_tokens()?.saturating_add(1),
+                        cache.cached_tokens()?.saturating_add(chunk.len()),
                         backend,
                         cache,
                     )?;
                 }
                 cache.set_profile_step_index(prefill_index);
+                log_memory_snapshot(
+                    "prefill.chunk.before_model",
+                    Some(prefill_index),
+                    backend,
+                    cache.runtime_kv_memory(),
+                );
+
+                let output = run_cached_device_prefill_chunk_without_append(
+                    model,
+                    config,
+                    backend,
+                    chunk,
+                    emit_next_token,
+                    cache,
+                    prefill_index,
+                    "prefill.chunk",
+                    "prefill.chunk.model",
+                )?;
+                match (emit_next_token, output.next_token) {
+                    (true, Some(token)) => prefill_token_id = Some(token.token_id),
+                    (false, None) => {}
+                    (true, None) => {
+                        return Err(Error::runtime(
+                            "final prefill chunk produced no next-token prediction",
+                        ));
+                    }
+                    (false, Some(_)) => {
+                        return Err(Error::runtime(
+                            "intermediate prefill chunk unexpectedly produced a token",
+                        ));
+                    }
+                }
+
+                let cache_started_at = Instant::now();
+                cache.append_decode_prefix(
+                    &output.layer_kv_cache,
+                    chunk.len(),
+                    chunk.len(),
+                    backend,
+                )?;
+                record_q2_runtime_stage(
+                    prefill_index,
+                    None,
+                    "prefill.chunk.cache_append",
+                    cache_started_at.elapsed(),
+                );
+                log_memory_snapshot(
+                    "prefill.chunk.after_cache_append",
+                    Some(prefill_index),
+                    backend,
+                    cache.runtime_kv_memory(),
+                );
+                chunk_start = chunk_end;
             }
-            log_memory_snapshot(
-                "prefill.decode.before_model",
-                Some(prefill_index),
-                backend,
-                runtime_kv_memory(&device_kv_cache, &host_kv_cache),
-            );
-            if use_mtp {
+        } else {
+            for (prefill_index, prompt_token_id) in
+                prompt_token_ids.iter().copied().enumerate().skip(1)
+            {
+                if let Some(cache) = device_kv_cache.as_mut() {
+                    if let Some(controller) = cache_budget_controller.as_mut() {
+                        controller.maybe_rebalance(
+                            cache.cached_tokens()?.saturating_add(1),
+                            backend,
+                            cache,
+                        )?;
+                    }
+                    cache.set_profile_step_index(prefill_index);
+                }
+                log_memory_snapshot(
+                    "prefill.decode.before_model",
+                    Some(prefill_index),
+                    backend,
+                    runtime_kv_memory(&device_kv_cache, &host_kv_cache),
+                );
                 if let Some(hidden) = last_main_hidden_device.as_ref() {
                     let _ = run_mtp_device_draft(
                         model,
@@ -1399,33 +1491,20 @@ where
                     "prefill.decode.after_model",
                     "prefill.decode.cache_append",
                 )?;
-                prefill_token_id = output.token_id;
+                prefill_token_id = Some(output.token_id);
                 last_main_hidden_device = output.device_hidden_states;
-            } else {
-                prefill_token_id = run_cached_token_step(
-                    model,
-                    config,
+                log_memory_snapshot(
+                    "prefill.decode.after_cache_append",
+                    Some(prefill_index),
                     backend,
-                    &[prompt_token_id],
-                    &mut device_kv_cache,
-                    &mut host_kv_cache,
-                    prefill_index,
-                    "prefill.decode",
-                    "prefill.decode.model",
-                    "prefill.decode.after_model",
-                    "prefill.decode.cache_append",
-                )?
-                .token_id;
+                    runtime_kv_memory(&device_kv_cache, &host_kv_cache),
+                );
             }
-            log_memory_snapshot(
-                "prefill.decode.after_cache_append",
-                Some(prefill_index),
-                backend,
-                runtime_kv_memory(&device_kv_cache, &host_kv_cache),
-            );
         }
     }
 
+    let prefill_token_id = prefill_token_id
+        .ok_or_else(|| Error::runtime("prefill completed without a next-token prediction"))?;
     let mut generated_token_count = 1_usize;
     if let Some(snapshot) = prefill_cost_snapshot {
         log_token_cost(snapshot.finish(0, true, prefill_token_id, backend, &device_kv_cache)?);
@@ -1819,6 +1898,58 @@ fn run_cached_device_token_sequence_without_append<B: Backend>(
         })?;
     record_q2_runtime_stage(step_index, None, model_stage, decode_started_at.elapsed());
     Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cached_device_prefill_chunk_without_append<B: Backend>(
+    model: &Model<'_>,
+    config: &Config,
+    backend: &B,
+    input_token_ids: &[u32],
+    emit_next_token: bool,
+    device_kv_cache: &mut DevicePagedRuntimeCache,
+    step_index: usize,
+    profile_context: &'static str,
+    model_stage: &'static str,
+) -> Result<ModelDevicePrefillChunkOutput> {
+    let started_at = Instant::now();
+    set_layer_profile_context(step_index, profile_context)?;
+    let cache_cell = RefCell::new(device_kv_cache);
+    let output = model
+        .prefill_chunk_with_device_paged_kv_provider(
+            config,
+            input_token_ids,
+            emit_next_token,
+            backend,
+            |layer_index| {
+                cache_cell
+                    .borrow_mut()
+                    .device_paged_kv_for_layer(layer_index, backend)
+            },
+            |layer_index, token_indices| {
+                cache_cell.borrow_mut().selected_device_kv_for_layer(
+                    layer_index,
+                    token_indices,
+                    backend,
+                )
+            },
+            |layer_index| {
+                cache_cell
+                    .borrow_mut()
+                    .dsa_index_keys_for_layer_device(layer_index, backend)
+            },
+        )?
+        .ok_or_else(|| {
+            Error::backend("native Metal prefill chunk requires the device sequence path")
+        })?;
+    record_q2_runtime_stage(step_index, None, model_stage, started_at.elapsed());
+    Ok(output)
+}
+
+fn next_prefill_chunk_end(chunk_start: usize, prompt_token_count: usize) -> usize {
+    chunk_start
+        .saturating_add(model::MAX_DEVICE_SEQUENCE_TOKENS)
+        .min(prompt_token_count)
 }
 
 struct PendingMtpDrafts {
@@ -2765,6 +2896,11 @@ impl DevicePagedRuntimeCache {
         hot_kv_cache_budget_bytes: Option<usize>,
     ) -> Result<Self> {
         let spec = device_cache_spec(max_context, page_size, layer_kv_cache)?;
+        let seed_tokens = layer_kv_cache
+            .first()
+            .and_then(|entry| entry.cache_k.dims().get(2))
+            .copied()
+            .ok_or_else(|| Error::cache("device seed cache token count is missing"))?;
         let policy = ColdKvRuntimePolicy::new(
             page_size,
             hot_kv_cache_budget_bytes.unwrap_or(HOT_ALL_LAYERS_BUDGET_BYTES),
@@ -2807,8 +2943,8 @@ impl DevicePagedRuntimeCache {
             policy,
             metrics: KvCacheMetrics::default(),
         };
-        cache.initialize_hot_layers(backend, 1)?;
-        cache.append_decode(layer_kv_cache, backend)?;
+        cache.initialize_hot_layers(backend, seed_tokens)?;
+        cache.append_decode_prefix(layer_kv_cache, seed_tokens, seed_tokens, backend)?;
         Ok(cache)
     }
 
@@ -4012,7 +4148,11 @@ fn device_cache_spec(
         &[v_dims[0], v_dims[1], v_dims[2]],
         &[k_dims[0], k_dims[1], k_dims[2]],
     )?;
-    validate_exact_shape("device_seed_cache_token_count", &[k_dims[2]], &[1])?;
+    if k_dims[2] == 0 {
+        return Err(Error::cache(
+            "device seed cache requires at least one token",
+        ));
+    }
 
     let spec = LayeredPagedKvCacheSpec {
         batch: k_dims[0],
@@ -4026,12 +4166,22 @@ fn device_cache_spec(
         validate_exact_shape(
             format!("device_seed_layer_{}_k_shape", entry.layer_index),
             entry.cache_k.dims(),
-            &[spec.batch, spec.attention_heads, 1, spec.key_head_dim],
+            &[
+                spec.batch,
+                spec.attention_heads,
+                k_dims[2],
+                spec.key_head_dim,
+            ],
         )?;
         validate_exact_shape(
             format!("device_seed_layer_{}_v_shape", entry.layer_index),
             entry.cache_v.dims(),
-            &[spec.batch, spec.attention_heads, 1, spec.value_head_dim],
+            &[
+                spec.batch,
+                spec.attention_heads,
+                k_dims[2],
+                spec.value_head_dim,
+            ],
         )?;
     }
     Ok(spec)
@@ -4521,6 +4671,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_prefill_chunks_cover_the_prompt_without_exceeding_device_limit() {
+        let prompt_token_count = 19;
+        let mut ranges = Vec::new();
+        let mut start = model::MAX_DEVICE_SEQUENCE_TOKENS.min(prompt_token_count);
+        while start < prompt_token_count {
+            let end = next_prefill_chunk_end(start, prompt_token_count);
+            ranges.push(start..end);
+            start = end;
+        }
+
+        assert_eq!(ranges, vec![8..16, 16..19]);
+        assert!(ranges
+            .iter()
+            .all(|range| range.len() <= model::MAX_DEVICE_SEQUENCE_TOKENS));
+    }
+
+    #[test]
+    fn native_prefill_chunk_end_never_exceeds_prompt_tail() {
+        assert_eq!(next_prefill_chunk_end(1, 2), 2);
+        assert_eq!(next_prefill_chunk_end(1, 9), 9);
+        assert_eq!(next_prefill_chunk_end(9, 10), 10);
+    }
+
+    #[test]
     fn kv_cache_rates_include_full_and_selected_lookups() {
         let metrics = KvCacheMetrics {
             full_layer_lookups: 4,
@@ -4918,6 +5092,62 @@ mod tests {
             );
         }
         assert_eq!(single.token_ids[0], sequence.token_ids[0]);
+    }
+
+    #[test]
+    fn eight_row_device_seed_is_causal_and_initializes_all_kv_rows() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_gguf_model_fixture(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = tiny_config();
+        let model = Model::open_from_gguf(&gguf, &config, &backend, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS)
+            .unwrap();
+
+        let single = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("single-row seed device path");
+        let sequence = model
+            .prefill_seed_device(&config, &[1, 2, 3, 4, 5, 6, 7, 1], &backend)
+            .unwrap()
+            .expect("eight-row seed device path");
+        let single_hidden = backend
+            .device_download_f32_tensor(&single.hidden_states)
+            .unwrap();
+        let sequence_hidden = backend
+            .device_download_f32_tensor(&sequence.hidden_states)
+            .unwrap();
+
+        assert_eq!(single_hidden.dims(), &[1, 1, config.hidden_size]);
+        assert_eq!(sequence_hidden.dims(), &[1, 8, config.hidden_size]);
+        for (hidden_index, (&single_value, &sequence_value)) in single_hidden
+            .values()
+            .iter()
+            .zip(&sequence_hidden.values()[..config.hidden_size])
+            .enumerate()
+        {
+            let tolerance = 1e-4_f32 * single_value.abs().max(sequence_value.abs()).max(1.0);
+            assert!(
+                (single_value - sequence_value).abs() <= tolerance,
+                "first seed row differs at hidden {hidden_index}: single={single_value}, sequence={sequence_value}"
+            );
+        }
+        assert!(sequence
+            .layer_kv_cache
+            .iter()
+            .all(|layer| layer.cache_k.dims()[2] == 8 && layer.cache_v.dims()[2] == 8));
+
+        let cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
+            1,
+            &sequence.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cache.cached_tokens().unwrap(), 8);
     }
 
     #[test]
