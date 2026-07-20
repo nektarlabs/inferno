@@ -78,10 +78,8 @@ const Q8_0_PACKED_HEADS_MATVEC_KERNEL: &str = "q8_0_packed_heads_matvec_f32_kern
 const ARGMAX_F32_KERNEL: &str = "argmax_f32_kernel";
 const ARGMAX_ROWS_F32_KERNEL: &str = "argmax_rows_f32_kernel";
 const Q2_K_SIMD_LANES: usize = 32;
-const READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP: usize = 8;
 const READY_EXPERT_ASSIGNMENTS_PER_KERNEL_GROUP: usize = 8;
 const READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP: usize = 4;
-const Q8_0_BATCH_MAX_ROWS: usize = 8;
 const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
@@ -1575,8 +1573,7 @@ impl MetalQ2Matvec {
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("quantized matvec output length overflow"))?;
 
-        let use_q8_batch =
-            kind == QuantMatvecKind::Q80 && (2..=Q8_0_BATCH_MAX_ROWS).contains(&row_count);
+        let use_q8_batch = kind == QuantMatvecKind::Q80 && row_count >= 2;
         let pipeline = match kind {
             QuantMatvecKind::Q2K => &self.pipeline,
             QuantMatvecKind::Q2KTransposed => &self.transposed_pipeline,
@@ -1965,7 +1962,7 @@ impl MetalQ2Matvec {
             .arena
             .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
 
-        let use_q8_batch = (2..=Q8_0_BATCH_MAX_ROWS).contains(&row_count);
+        let use_q8_batch = row_count >= 2;
         encode_1d_threadgroups(
             command_buffer,
             if use_q8_batch {
@@ -4088,10 +4085,10 @@ fn ready_expert_gpu_address(buffer: &Buffer, byte_offset: usize, component: &str
 }
 
 fn validate_ready_expert_group_width(assignment_count: usize) -> Result<()> {
-    if assignment_count == 0 || assignment_count > READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP {
-        return Err(Error::backend(format!(
-            "ready routed expert group must contain 1..={READY_EXPERT_MAX_ASSIGNMENTS_PER_GROUP} assignments, got {assignment_count}"
-        )));
+    if assignment_count == 0 {
+        return Err(Error::backend(
+            "ready routed expert group must contain at least one assignment",
+        ));
     }
     Ok(())
 }
@@ -5537,11 +5534,11 @@ mod tests {
     }
 
     #[test]
-    fn q8_0_batched_matvec_reuses_weights_across_eight_rows() {
+    fn q8_0_batched_matvec_reuses_weights_across_prefill_rows() {
         let Some(metal) = native_metal_or_skip() else {
             return;
         };
-        let row_count = 8;
+        let row_count = 17;
         let in_features = 64;
         let out_features = 3;
         let weights = [
@@ -5586,7 +5583,7 @@ mod tests {
         let Some(metal) = native_metal_or_skip() else {
             return;
         };
-        let row_count = 7;
+        let row_count = 19;
         let in_features = 64;
         let out_features = 2;
         let weights = [

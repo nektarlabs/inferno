@@ -1191,9 +1191,9 @@ kernel void q8_0_matvec_tiled_f32_kernel(
     }
 }
 
-// MTP verifies up to eight rows at once. Dense Q8_0 projections share the
-// same weight matrix across those rows, so decode each weight value once and
-// accumulate every verifier row before moving to the next block.
+// Dense Q8_0 projections share the same weight matrix across MTP and prefill
+// rows. Decode each weight value once per row tile before moving to the next
+// block; row_count may contain any number of four-row tiles.
 kernel void q8_0_batched_matvec_tiled_f32_kernel(
     const device uchar* weights [[buffer(0)]],
     const device float* input [[buffer(1)]],

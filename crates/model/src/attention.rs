@@ -2051,7 +2051,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2294,7 +2294,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -2513,7 +2513,7 @@ impl<'a> Attention<'a> {
         }
         let batch = dims[0];
         let tokens = dims[1];
-        if tokens == 0 || tokens > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if tokens == 0 || tokens > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Ok(None);
         }
         validate_exact_shape(
@@ -3232,7 +3232,7 @@ fn validate_device_past_kv_layout(
 
 fn should_use_dense_absorbed_mla(layout: DevicePastKvLayout, tokens: usize) -> bool {
     layout == DevicePastKvLayout::MlaLatent
-        && (1..=crate::MAX_DEVICE_SEQUENCE_TOKENS).contains(&tokens)
+        && (1..=crate::MAX_DEVICE_PREFILL_TOKENS).contains(&tokens)
 }
 
 fn mla_latent_cache(kv_latent: &Tensor) -> Result<Tensor> {
@@ -3424,18 +3424,18 @@ mod tests {
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn dense_absorbed_mla_accepts_the_full_mtp_verifier_width() {
+    fn dense_absorbed_mla_accepts_the_full_prefill_width() {
         assert!(should_use_dense_absorbed_mla(
             DevicePastKvLayout::MlaLatent,
             1
         ));
         assert!(should_use_dense_absorbed_mla(
             DevicePastKvLayout::MlaLatent,
-            crate::MAX_DEVICE_SEQUENCE_TOKENS
+            crate::MAX_DEVICE_PREFILL_TOKENS
         ));
         assert!(!should_use_dense_absorbed_mla(
             DevicePastKvLayout::MlaLatent,
-            crate::MAX_DEVICE_SEQUENCE_TOKENS + 1
+            crate::MAX_DEVICE_PREFILL_TOKENS + 1
         ));
         assert!(!should_use_dense_absorbed_mla(
             DevicePastKvLayout::ExpandedHeads,

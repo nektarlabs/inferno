@@ -16,10 +16,14 @@ macro_rules! try_device {
 }
 pub(crate) use try_device;
 
-/// Maximum number of causal token rows handled by the current native Metal
-/// sequence path. The runtime uses this limit for MTP verification and chunked
-/// prompt prefill.
+/// Maximum number of causal token rows handled by one decode or MTP
+/// verification pass.
 pub const MAX_DEVICE_SEQUENCE_TOKENS: usize = 8;
+
+/// Maximum number of prompt rows handled by one native Metal prefill pass.
+/// Larger prompt batches amortize routed-expert SSD loads across more tokens;
+/// each expert is still dispatched in eight-assignment Metal kernel groups.
+pub const MAX_DEVICE_PREFILL_TOKENS: usize = 512;
 
 mod artifact_source;
 mod attention;

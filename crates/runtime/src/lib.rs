@@ -1297,7 +1297,8 @@ where
         } else {
             prompt_token_ids
                 .len()
-                .min(model::MAX_DEVICE_SEQUENCE_TOKENS)
+                .min(model::MAX_DEVICE_PREFILL_TOKENS)
+                .min(config.dsa_index_topk.max(1))
         };
         &prompt_token_ids[..seed_tokens]
     } else {
@@ -1376,7 +1377,11 @@ where
                 .ok_or_else(|| Error::runtime("device KV cache is not initialized"))?;
             let mut chunk_start = seed_input_ids.len();
             while chunk_start < prompt_token_ids.len() {
-                let chunk_end = next_prefill_chunk_end(chunk_start, prompt_token_ids.len());
+                let chunk_end = next_prefill_chunk_end(
+                    chunk_start,
+                    prompt_token_ids.len(),
+                    config.dsa_index_topk,
+                );
                 let chunk = &prompt_token_ids[chunk_start..chunk_end];
                 let prefill_index = chunk_end - 1;
                 let emit_next_token = chunk_end == prompt_token_ids.len();
@@ -1946,9 +1951,21 @@ fn run_cached_device_prefill_chunk_without_append<B: Backend>(
     Ok(output)
 }
 
-fn next_prefill_chunk_end(chunk_start: usize, prompt_token_count: usize) -> usize {
+fn next_prefill_chunk_end(
+    chunk_start: usize,
+    prompt_token_count: usize,
+    dense_context_token_limit: usize,
+) -> usize {
+    let chunk_capacity = if chunk_start < dense_context_token_limit {
+        model::MAX_DEVICE_PREFILL_TOKENS.min(dense_context_token_limit - chunk_start)
+    } else {
+        // Each query beyond the dense DSA window needs an independent top-k
+        // selection. The current selected-attention ABI accepts one selection,
+        // so process those queries individually until a per-query ABI exists.
+        1
+    };
     chunk_start
-        .saturating_add(model::MAX_DEVICE_SEQUENCE_TOKENS)
+        .saturating_add(chunk_capacity)
         .min(prompt_token_count)
 }
 
@@ -3118,11 +3135,13 @@ impl DevicePagedRuntimeCache {
                 download_started_at.elapsed(),
             );
             let append_started_at = Instant::now();
-            self.cold.store_mut().write_layer_block(
+            write_cold_layer_token_blocks(
+                self.cold.store_mut(),
                 layer.layer_index,
                 append_position,
                 &host_k,
                 &host_v,
+                self.policy.block_tokens,
             )?;
             if let Some(index_key_device) = append.index_key.as_ref() {
                 let index_key = backend.device_download_f32_tensor(index_key_device)?;
@@ -4494,6 +4513,55 @@ fn slice_cache_token_range(
     F32Tensor::new(values, [batch, heads, token_count, dim])
 }
 
+fn write_cold_layer_token_blocks(
+    store: &mut cache::ColdKvBlockStore,
+    layer_index: usize,
+    append_position: usize,
+    keys: &F32Tensor,
+    values: &F32Tensor,
+    block_tokens: usize,
+) -> Result<()> {
+    if block_tokens == 0 {
+        return Err(Error::cache("cold KV block size must be positive"));
+    }
+    let key_tokens = keys
+        .dims()
+        .get(2)
+        .copied()
+        .ok_or_else(|| Error::cache("cold KV keys must have rank 4 [B,H,T,D]"))?;
+    let value_tokens = values
+        .dims()
+        .get(2)
+        .copied()
+        .ok_or_else(|| Error::cache("cold KV values must have rank 4 [B,H,T,D]"))?;
+    if key_tokens == 0 || key_tokens != value_tokens {
+        return Err(Error::cache(format!(
+            "cold KV key/value token counts must match and be positive, got K={key_tokens}, V={value_tokens}"
+        )));
+    }
+    if key_tokens <= block_tokens {
+        store.write_layer_block(layer_index, append_position, keys, values)?;
+        return Ok(());
+    }
+
+    let mut token_offset = 0;
+    while token_offset < key_tokens {
+        let token_count = block_tokens.min(key_tokens - token_offset);
+        let key_block =
+            slice_cache_token_range("cold KV key block", keys, token_offset, token_count)?;
+        let value_block =
+            slice_cache_token_range("cold KV value block", values, token_offset, token_count)?;
+        store.write_layer_block(
+            layer_index,
+            append_position + token_offset,
+            &key_block,
+            &value_block,
+        )?;
+        token_offset += token_count;
+    }
+    Ok(())
+}
+
 fn slice_index_token_range(
     context: &str,
     tensor: &F32Tensor,
@@ -4672,26 +4740,41 @@ mod tests {
 
     #[test]
     fn native_prefill_chunks_cover_the_prompt_without_exceeding_device_limit() {
-        let prompt_token_count = 19;
+        let prompt_token_count = 515;
         let mut ranges = Vec::new();
-        let mut start = model::MAX_DEVICE_SEQUENCE_TOKENS.min(prompt_token_count);
+        let mut start = model::MAX_DEVICE_PREFILL_TOKENS.min(prompt_token_count);
         while start < prompt_token_count {
-            let end = next_prefill_chunk_end(start, prompt_token_count);
+            let end = next_prefill_chunk_end(start, prompt_token_count, 2_048);
             ranges.push(start..end);
             start = end;
         }
 
-        assert_eq!(ranges, vec![8..16, 16..19]);
+        assert_eq!(ranges, vec![512..515]);
         assert!(ranges
             .iter()
-            .all(|range| range.len() <= model::MAX_DEVICE_SEQUENCE_TOKENS));
+            .all(|range| range.len() <= model::MAX_DEVICE_PREFILL_TOKENS));
     }
 
     #[test]
     fn native_prefill_chunk_end_never_exceeds_prompt_tail() {
-        assert_eq!(next_prefill_chunk_end(1, 2), 2);
-        assert_eq!(next_prefill_chunk_end(1, 9), 9);
-        assert_eq!(next_prefill_chunk_end(9, 10), 10);
+        assert_eq!(next_prefill_chunk_end(1, 2, 2_048), 2);
+        assert_eq!(next_prefill_chunk_end(1, 9, 2_048), 9);
+        assert_eq!(next_prefill_chunk_end(9, 10, 2_048), 10);
+    }
+
+    #[test]
+    fn native_prefill_chunks_do_not_cross_the_dsa_boundary() {
+        assert_eq!(next_prefill_chunk_end(2_040, 2_100, 2_048), 2_048);
+        assert_eq!(next_prefill_chunk_end(2_044, 2_100, 2_048), 2_048);
+        assert_eq!(next_prefill_chunk_end(2_047, 2_100, 2_048), 2_048);
+        assert_eq!(next_prefill_chunk_end(2_048, 2_100, 2_048), 2_049);
+        assert_eq!(next_prefill_chunk_end(2_049, 2_100, 2_048), 2_050);
+    }
+
+    #[test]
+    fn native_prefill_uses_single_rows_when_dense_dsa_window_is_disabled() {
+        assert_eq!(next_prefill_chunk_end(0, 8, 0), 1);
+        assert_eq!(next_prefill_chunk_end(1, 8, 0), 2);
     }
 
     #[test]
@@ -5095,13 +5178,113 @@ mod tests {
     }
 
     #[test]
-    fn eight_row_device_seed_is_causal_and_initializes_all_kv_rows() {
+    fn five_hundred_twelve_row_prefill_chunk_preserves_the_first_causal_row_with_past_kv() {
         let Ok(backend) = MetalBackend::new() else {
             return;
         };
         let path = write_gguf_model_fixture(GgmlType::Q2K);
         let gguf = GgufFile::open(&path).unwrap();
-        let config = tiny_config();
+        let mut config = tiny_config();
+        config.max_context = 1_024;
+        config.dsa_index_topk = 1_024;
+        let model = Model::open_from_gguf(&gguf, &config, &backend, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS)
+            .unwrap();
+
+        let single_seed = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("single-row seed device path");
+        let mut single_cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
+            1,
+            &single_seed.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        let single = run_cached_device_prefill_chunk_without_append(
+            &model,
+            &config,
+            &backend,
+            &[2],
+            false,
+            &mut single_cache,
+            1,
+            "test.prefill.single",
+            "test.prefill.single.model",
+        )
+        .unwrap();
+
+        let sequence_seed = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("sequence seed device path");
+        let mut sequence_cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
+            1,
+            &sequence_seed.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        let sequence_ids = (0..model::MAX_DEVICE_PREFILL_TOKENS)
+            .map(|index| 2 + (index % 6) as u32)
+            .collect::<Vec<_>>();
+        let sequence = run_cached_device_prefill_chunk_without_append(
+            &model,
+            &config,
+            &backend,
+            &sequence_ids,
+            false,
+            &mut sequence_cache,
+            model::MAX_DEVICE_PREFILL_TOKENS,
+            "test.prefill.sequence",
+            "test.prefill.sequence.model",
+        )
+        .unwrap();
+
+        assert!(single.next_token.is_none());
+        assert!(sequence.next_token.is_none());
+        assert_eq!(single.layer_kv_cache.len(), sequence.layer_kv_cache.len());
+        for (single_layer, sequence_layer) in
+            single.layer_kv_cache.iter().zip(&sequence.layer_kv_cache)
+        {
+            assert_eq!(single_layer.layer_index, sequence_layer.layer_index);
+            for (label, single_value, sequence_value) in [
+                ("K", &single_layer.cache_k, &sequence_layer.cache_k),
+                ("V", &single_layer.cache_v, &sequence_layer.cache_v),
+            ] {
+                let single_tensor = backend.device_download_f32_tensor(single_value).unwrap();
+                let sequence_tensor = backend.device_download_f32_tensor(sequence_value).unwrap();
+                let sequence_first =
+                    slice_cache_token_range(label, &sequence_tensor, 0, 1).unwrap();
+                assert_eq!(single_tensor.dims(), sequence_first.dims());
+                for (element, (&expected, &actual)) in single_tensor
+                    .values()
+                    .iter()
+                    .zip(sequence_first.values())
+                    .enumerate()
+                {
+                    let tolerance = 1e-4_f32 * expected.abs().max(actual.abs()).max(1.0);
+                    assert!(
+                        (expected - actual).abs() <= tolerance,
+                        "layer {} first {label} row differs at element {element}: single={expected}, sequence={actual}",
+                        single_layer.layer_index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn five_hundred_twelve_row_device_seed_is_causal_and_initializes_all_kv_rows() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_gguf_model_fixture(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let mut config = tiny_config();
+        config.max_context = 1_024;
         let model = Model::open_from_gguf(&gguf, &config, &backend, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS)
             .unwrap();
 
@@ -5109,10 +5292,13 @@ mod tests {
             .prefill_seed_device(&config, &[1], &backend)
             .unwrap()
             .expect("single-row seed device path");
+        let sequence_ids = (0..model::MAX_DEVICE_PREFILL_TOKENS)
+            .map(|index| 1 + (index % 7) as u32)
+            .collect::<Vec<_>>();
         let sequence = model
-            .prefill_seed_device(&config, &[1, 2, 3, 4, 5, 6, 7, 1], &backend)
+            .prefill_seed_device(&config, &sequence_ids, &backend)
             .unwrap()
-            .expect("eight-row seed device path");
+            .expect("batched seed device path");
         let single_hidden = backend
             .device_download_f32_tensor(&single.hidden_states)
             .unwrap();
@@ -5121,7 +5307,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(single_hidden.dims(), &[1, 1, config.hidden_size]);
-        assert_eq!(sequence_hidden.dims(), &[1, 8, config.hidden_size]);
+        assert_eq!(
+            sequence_hidden.dims(),
+            &[1, model::MAX_DEVICE_PREFILL_TOKENS, config.hidden_size]
+        );
         for (hidden_index, (&single_value, &sequence_value)) in single_hidden
             .values()
             .iter()
@@ -5134,10 +5323,10 @@ mod tests {
                 "first seed row differs at hidden {hidden_index}: single={single_value}, sequence={sequence_value}"
             );
         }
-        assert!(sequence
-            .layer_kv_cache
-            .iter()
-            .all(|layer| layer.cache_k.dims()[2] == 8 && layer.cache_v.dims()[2] == 8));
+        assert!(sequence.layer_kv_cache.iter().all(|layer| {
+            layer.cache_k.dims()[2] == model::MAX_DEVICE_PREFILL_TOKENS
+                && layer.cache_v.dims()[2] == model::MAX_DEVICE_PREFILL_TOKENS
+        }));
 
         let cache = DevicePagedRuntimeCache::new_from_device_seed(
             model.max_context(),
@@ -5147,7 +5336,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cache.cached_tokens().unwrap(), 8);
+        assert_eq!(
+            cache.cached_tokens().unwrap(),
+            model::MAX_DEVICE_PREFILL_TOKENS
+        );
     }
 
     #[test]

@@ -440,10 +440,10 @@ impl<'a> Model<'a> {
         input_ids: &[u32],
         backend: &B,
     ) -> Result<Option<crate::layer_stack::LayerStackDecodeDeviceTensors>> {
-        if input_ids.is_empty() || input_ids.len() > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if input_ids.is_empty() || input_ids.len() > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Err(Error::model(format!(
                 "device seed prefill requires one to {} token ids, got {}",
-                crate::MAX_DEVICE_SEQUENCE_TOKENS,
+                crate::MAX_DEVICE_PREFILL_TOKENS,
                 input_ids.len()
             )));
         }
@@ -765,10 +765,10 @@ impl<'a> Model<'a> {
         S: FnMut(usize, &[u32]) -> Result<Option<backend::DeviceSelectedKvView>>,
         I: FnMut(usize) -> Result<Option<backend::DeviceValue>>,
     {
-        if input_token_ids.is_empty() || input_token_ids.len() > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if input_token_ids.is_empty() || input_token_ids.len() > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Err(Error::model(format!(
                 "GLM-5.2 device prefill chunk expects one to {} token ids, got {}",
-                crate::MAX_DEVICE_SEQUENCE_TOKENS,
+                crate::MAX_DEVICE_PREFILL_TOKENS,
                 input_token_ids.len()
             )));
         }

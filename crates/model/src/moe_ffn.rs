@@ -833,7 +833,7 @@ impl<'a> MoeFfn<'a> {
         let flat_token_count = batch
             .checked_mul(tokens)
             .ok_or_else(|| Error::moe("GGUF device MoE FFN flat token count overflow"))?;
-        if flat_token_count == 0 || flat_token_count > crate::MAX_DEVICE_SEQUENCE_TOKENS {
+        if flat_token_count == 0 || flat_token_count > crate::MAX_DEVICE_PREFILL_TOKENS {
             return Ok(None);
         }
 
