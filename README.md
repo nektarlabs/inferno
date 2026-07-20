@@ -344,9 +344,20 @@ Each turn currently re-prefills the accumulated conversation into a fresh
 request KV cache. This preserves multi-turn correctness while persistent
 cross-turn KV reuse remains a future latency optimization.
 
-IndexShare and KVShare follow the model metadata. MTP support remains present,
-but ordinary single-token decode is the current automatic policy for streamed
-Q2 experts.
+IndexShare and KVShare follow the model metadata. Ordinary single-token decode
+remains the default for streamed Q2 experts. Enable the experimental MTP path
+explicitly when benchmarking it:
+
+```bash
+target/release/inferno generate \
+  --model models/glm-5.2 \
+  --prompt "Tell me the capital of Italy." \
+  --max-new-tokens 16 \
+  --measure-tokens-per-second
+```
+
+For the default interactive chat, use
+`target/release/inferno`.
 
 Run with telemetry and throughput measurement:
 
@@ -414,6 +425,77 @@ Measure SSD KV bandwidth and Metal hot-load latency:
 ```bash
 cargo bench -p runtime --bench ssd_kv
 ```
+
+## CLI Reference
+
+```txt
+inferno [GLOBAL OPTIONS] [COMMAND]
+```
+
+Without a command, Inferno starts `chat` with `models/glm-5.2`.
+
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `generate` | Runs one prompt, streams the generated text, and exits. |
+| `chat` | Opens a persistent interactive session that keeps the model and expert cache alive across turns. |
+| `help [COMMAND]` | Prints root help or detailed help for one command. |
+
+### Global options
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--speculative-mtp` | Disabled | Enables MTP speculative decoding. It requires the model MTP head, shared MTP index metadata, the native Metal device-KV path, and room for at least three generated tokens. The option may appear before or after a subcommand. |
+| `-h`, `--help` | - | Prints help for the root command or selected subcommand. |
+
+### `generate`
+
+```txt
+inferno generate [OPTIONS] --model <PATH> --prompt <TEXT>
+```
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--model <PATH>` | Required | Model directory containing the Q2 GGUF, configuration, tokenizer, and optional ExpertPack. |
+| `--config <PATH>` | `<model>/config.json` | Overrides automatic configuration discovery. |
+| `--tokenizer <PATH>` | `<model>/tokenizer.json` | Overrides automatic tokenizer discovery. |
+| `--page-size <TOKENS>` | `128` | Number of token positions represented by one paged-KV page. It must be greater than zero. |
+| `--prompt <TEXT>` | Required | User text encoded and passed through the GLM chat template. |
+| `--max-new-tokens <COUNT>` | EOS or context limit | Sets the maximum number of generated tokens. It is not a character or word limit. |
+| `--add-special-tokens` | Disabled | Asks the tokenizer post-processor to add its configured special tokens. The GLM prompt template normally supplies the required structure. |
+| `--skip-special-tokens <BOOL>` | `true` | Controls whether special tokens are removed from decoded output. Accepted values are `true` and `false`. |
+| `--profile-runtime <PATH>` | Disabled | Writes low-level Q2 runtime timing records to a TSV file. |
+| `--profile-layers <PATH>` | Disabled | Writes per-layer timing records to a TSV file. |
+| `--measure-tokens-per-second` | Disabled | Prints generation throughput after completion, separating time to first token from decode throughput. |
+| `--throughput-file <PATH>` | Disabled | Appends the same throughput metrics to a TSV file for comparisons across runs. |
+| `--profile-token-costs` | Disabled | Prints a synchronized per-token subsystem breakdown. Synchronization makes this diagnostic path slower than normal generation, and it cannot be combined with MTP. |
+| `--expert-cache-gb <GB>` | Automatic | Overrides the RAM budget for resident routed-expert weights. The value uses decimal gigabytes. |
+| `--hot-kv-cache-gb <GB>` | Automatic | Overrides the RAM budget for the hot Metal KV tier. The value uses decimal gigabytes. |
+| `--enable-telemetry` | Disabled | Prints process, system, Metal, swap, and SSD-KV memory snapshots during generation. |
+| `--telemetry-file <PATH>` | Disabled | Enables telemetry and writes snapshots to a file instead of interleaving them with generated text. |
+
+### `chat`
+
+```txt
+inferno chat [OPTIONS] --model <PATH>
+```
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--model <PATH>` | Required | Model directory for the persistent chat session. Bare `inferno` instead uses `models/glm-5.2`. |
+| `--config <PATH>` | `<model>/config.json` | Overrides automatic configuration discovery. |
+| `--tokenizer <PATH>` | `<model>/tokenizer.json` | Overrides automatic tokenizer discovery. |
+| `--page-size <TOKENS>` | `128` | Number of token positions represented by one paged-KV page. |
+| `--max-new-tokens <COUNT>` | EOS or context limit | Sets the maximum number of generated tokens for each answer. |
+| `--expert-cache-gb <GB>` | Automatic | Overrides the decimal-GB RAM budget for routed experts. The cache remains alive across turns. |
+| `--hot-kv-cache-gb <GB>` | Automatic | Overrides the decimal-GB RAM budget for the hot Metal KV tier. |
+| `--enable-telemetry` | Disabled | Prints memory telemetry while answers are generated. |
+| `--telemetry-file <PATH>` | Disabled | Enables telemetry and writes it to a file instead of the terminal. |
+
+The `--speculative-mtp` global option applies to both `generate` and `chat`.
+Ordinary decode remains the default because it is currently faster in the warm
+expert-cache benchmark.
 
 ## License
 

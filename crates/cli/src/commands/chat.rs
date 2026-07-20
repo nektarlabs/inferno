@@ -39,6 +39,7 @@ pub fn run(
     tokenizer_path: Option<&Path>,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    speculative_mtp: bool,
     expert_cache_gb: Option<f64>,
     hot_kv_cache_gb: Option<f64>,
     enable_telemetry: bool,
@@ -94,6 +95,7 @@ pub fn run(
         &readiness.artifact_file_name,
         page_size,
         max_new_tokens,
+        speculative_mtp,
         hot_kv_cache_budget_bytes,
     )
 }
@@ -108,6 +110,7 @@ fn run_interactive_loop(
     artifact_file_name: &str,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    speculative_mtp: bool,
     hot_kv_cache_budget_bytes: Option<usize>,
 ) -> Result<()> {
     let stdin = io::stdin();
@@ -174,6 +177,7 @@ fn run_interactive_loop(
                 hot_kv_cache_budget_bytes,
                 dynamic_cache_budget: None,
                 profile_token_costs: false,
+                speculative_mtp,
             },
             |token_id| {
                 if let Some(text) = decoded.push(token_id)? {

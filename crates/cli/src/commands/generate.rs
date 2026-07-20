@@ -37,6 +37,7 @@ pub fn run(
     measure_tokens_per_second: bool,
     throughput_file: Option<&Path>,
     profile_token_costs: bool,
+    speculative_mtp: bool,
     expert_cache_gb: Option<f64>,
     hot_kv_cache_gb: Option<f64>,
     enable_telemetry: bool,
@@ -116,6 +117,7 @@ pub fn run(
             hot_kv_cache_budget_bytes,
             dynamic_cache_budget: None,
             profile_token_costs,
+            speculative_mtp,
         },
         |token_id| {
             throughput.record_token();

@@ -56,17 +56,13 @@ const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
 const MTP_DRAFTS_PER_STEP: usize = 2;
-// Batched MTP verification increases the number of distinct routed experts per
-// pass. With SSD-streamed Q2 weights it measured slower than ordinary decode
-// after predictive prefetch, so keep the implementation available but do not
-// select it automatically until the expert scheduler can amortize that traffic.
-const ENABLE_STREAMED_EXPERT_MTP: bool = false;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GenerationOptions {
     pub hot_kv_cache_budget_bytes: Option<usize>,
     pub dynamic_cache_budget: Option<CacheBudgetSpec>,
     pub profile_token_costs: bool,
+    pub speculative_mtp: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1250,7 +1246,11 @@ where
         page_size,
         prefill_strategy,
     )?;
-    let use_mtp = should_enable_mtp(mtp_available, effective_max_new_tokens);
+    let use_mtp = resolve_mtp_enabled(
+        options.speculative_mtp,
+        mtp_available,
+        effective_max_new_tokens,
+    )?;
     let mut mtp_metrics = MtpMetrics {
         enabled: use_mtp,
         ..MtpMetrics::default()
@@ -2004,10 +2004,27 @@ fn build_pending_mtp_drafts<B: Backend>(
     Ok(Some(PendingMtpDrafts { token_ids }))
 }
 
-fn should_enable_mtp(mtp_available: bool, effective_max_new_tokens: usize) -> bool {
-    // The prefill pass already emits the first generated token. MTP only helps
-    // when decode has room to verify a draft and emit at least one more token.
-    ENABLE_STREAMED_EXPERT_MTP && mtp_available && effective_max_new_tokens > 2
+fn resolve_mtp_enabled(
+    requested: bool,
+    available: bool,
+    effective_max_new_tokens: usize,
+) -> Result<bool> {
+    if !requested {
+        return Ok(false);
+    }
+    if !available {
+        return Err(Error::runtime(
+            "speculative MTP requires a model MTP head, shared MTP index metadata, and the native Metal device-KV path",
+        ));
+    }
+    // Prefill emits the first token. At least two decode positions are needed
+    // to draft and verify an additional token.
+    if effective_max_new_tokens <= 2 {
+        return Err(Error::runtime(
+            "speculative MTP requires room for at least 3 generated tokens",
+        ));
+    }
+    Ok(true)
 }
 
 fn mtp_draft_count(remaining_tokens: usize) -> usize {
@@ -5054,11 +5071,15 @@ mod tests {
     }
 
     #[test]
-    fn streamed_expert_policy_does_not_enable_mtp_automatically() {
-        assert!(!should_enable_mtp(false, 3));
-        assert!(!should_enable_mtp(true, 1));
-        assert!(!should_enable_mtp(true, 2));
-        assert!(!should_enable_mtp(true, 3));
+    fn speculative_mtp_is_explicit_and_validated() {
+        assert!(!resolve_mtp_enabled(false, true, 3).unwrap());
+        assert!(resolve_mtp_enabled(true, true, 3).unwrap());
+
+        let unavailable = resolve_mtp_enabled(true, false, 3).unwrap_err();
+        assert!(unavailable.to_string().contains("native Metal"));
+
+        let too_short = resolve_mtp_enabled(true, true, 2).unwrap_err();
+        assert!(too_short.to_string().contains("at least 3"));
     }
 
     #[test]

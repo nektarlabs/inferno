@@ -11,6 +11,10 @@ use std::path::PathBuf;
 #[command(name = "inferno")]
 #[command(about = "Lightweight GLM-5.2 inference engine for Apple Silicon")]
 struct Cli {
+    /// Enable opt-in MTP speculative decoding.
+    #[arg(long, global = true, default_value_t = false)]
+    speculative_mtp: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -129,7 +133,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    let command = Cli::parse().command.unwrap_or_else(Command::default_chat);
+    let cli = Cli::parse();
+    let speculative_mtp = cli.speculative_mtp;
+    let command = cli.command.unwrap_or_else(Command::default_chat);
     tracing_init::init(
         command.telemetry_to_stderr(),
         command.token_costs_to_stderr(),
@@ -167,6 +173,7 @@ fn main() -> Result<()> {
             measure_tokens_per_second,
             throughput_file.as_deref(),
             profile_token_costs,
+            speculative_mtp,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
@@ -188,6 +195,7 @@ fn main() -> Result<()> {
             tokenizer.as_deref(),
             page_size,
             max_new_tokens,
+            speculative_mtp,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
@@ -458,6 +466,32 @@ mod tests {
     }
 
     #[test]
+    fn generate_mtp_is_explicitly_opt_in() {
+        let default_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+        ])
+        .unwrap();
+        assert!(!default_cli.speculative_mtp);
+
+        let enabled_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--speculative-mtp",
+        ])
+        .unwrap();
+        assert!(enabled_cli.speculative_mtp);
+    }
+
+    #[test]
     fn generate_accepts_cache_budget_overrides() {
         let cli = Cli::try_parse_from([
             "inferno",
@@ -577,6 +611,7 @@ mod tests {
     #[test]
     fn no_subcommand_selects_default_local_chat() {
         let cli = Cli::try_parse_from(["inferno"]).unwrap();
+        assert!(!cli.speculative_mtp);
         let command = cli.command.unwrap_or_else(Command::default_chat);
 
         let Command::Chat {
@@ -591,6 +626,13 @@ mod tests {
         assert_eq!(model, PathBuf::from("models/glm-5.2"));
         assert_eq!(page_size, runtime::DEFAULT_KV_PAGE_SIZE);
         assert_eq!(max_new_tokens, None);
+    }
+
+    #[test]
+    fn default_chat_accepts_global_mtp_flag() {
+        let cli = Cli::try_parse_from(["inferno", "--speculative-mtp"]).unwrap();
+        assert!(cli.speculative_mtp);
+        assert!(cli.command.is_none());
     }
 
     #[test]
@@ -620,6 +662,7 @@ mod tests {
             "/tmp/model",
             "--max-new-tokens",
             "64",
+            "--speculative-mtp",
             "--expert-cache-gb",
             "10.5",
             "--hot-kv-cache-gb",
@@ -627,6 +670,7 @@ mod tests {
             "--enable-telemetry",
         ])
         .unwrap();
+        assert!(cli.speculative_mtp);
 
         let Command::Chat {
             max_new_tokens,
