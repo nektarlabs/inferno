@@ -276,6 +276,12 @@ expert payload remains byte-for-byte identical to the Q2 data published by
 Antirez. Inferno changes only the on-disk ordering required for efficient expert
 streaming.
 
+Prebuilt ExpertPack repository:
+
+```txt
+https://huggingface.co/allemanfredi/inferno-glm-5.2-q2-expertpack
+```
+
 Credit and thanks to Antirez for producing and publishing the GLM-5.2 Q2 GGUF
 artifact that makes Inferno's local Apple Silicon work possible.
 
@@ -302,7 +308,16 @@ models/glm-5.2/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf
 models/glm-5.2/GLM-5.2-UD-Q2_K_RoutedQ2K-Inferno-ExpertPack-v1.q2pack
 ```
 
-Create the lossless expert pack once after downloading the GGUF artifact:
+Download the prebuilt ExpertPack directly into the model directory:
+
+```bash
+hf download allemanfredi/inferno-glm-5.2-q2-expertpack \
+  GLM-5.2-UD-Q2_K_RoutedQ2K-Inferno-ExpertPack-v1.q2pack \
+  --local-dir models/glm-5.2
+```
+
+Alternatively, create the lossless ExpertPack locally after downloading the
+GGUF artifact:
 
 ```bash
 cargo run --release -p inferno --example pack_experts -- \
