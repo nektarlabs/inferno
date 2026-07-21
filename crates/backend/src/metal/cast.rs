@@ -11,7 +11,7 @@ use super::{
     pipeline::compute_pipeline,
 };
 
-const F32_TO_F16_KERNEL: &str = "f32_to_f16_kernel";
+const F32_TO_F16_KERNEL: &str = "f32_to_f16_packed4_kernel";
 const Q8_ROWS_TO_F32_KERNEL: &str = "q8_rows_to_f32_kernel";
 
 pub(crate) struct MetalCast {
@@ -43,7 +43,7 @@ impl MetalCast {
             command_buffer,
             &self.f32_to_f16,
             &[input, &output, &len_buffer],
-            len,
+            len.div_ceil(4),
         )?;
         Ok(output)
     }
@@ -111,4 +111,22 @@ fn validate_q8_rows_payload(
         )));
     }
     require_byte_capacity(payload, payload_len, "Q8 row payload")
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod tests {
+    use crate::metal::Metal;
+
+    #[test]
+    fn packed_f32_to_f16_handles_full_vectors_and_tail() {
+        let Some(metal) = Metal::new().ok() else {
+            return;
+        };
+        let values = [0.0_f32, 1.0, -2.0, 0.5, 4.0, -8.0, 0.25];
+
+        let buffer = metal.batch_upload_f32_as_f16(&values).unwrap();
+        let actual = metal.batch_read_f16_as_f32(&buffer, values.len()).unwrap();
+
+        assert_eq!(actual, values);
+    }
 }

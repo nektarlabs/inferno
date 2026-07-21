@@ -5,16 +5,22 @@ use tracing::trace;
 use super::{
     arena::MetalArena,
     buffers::{f32_buffer, read_f32_buffer, require_f32_capacity},
-    command::{dispatch_1d, encode_1d},
+    command::{dispatch_1d, dispatch_1d_threadgroups, encode_1d, encode_1d_threadgroups},
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{validate_rope_slice_buffer, validate_rope_slice_f32},
 };
 
-const ROPE_SLICE_KERNEL: &str = "rope_slice_f32_kernel";
+const ROPE_PAIR_KERNEL: &str = "rope_slice_f32_pair_kernel";
+const ROPE_SHARED4_KERNEL: &str = "rope_slice_f32_shared4_kernel";
+const SHARED_HEADS_PER_GROUP: usize = 4;
+const SHARED_THREADS_PER_GROUP: usize = 256;
+const SHARED_ROPE_DIM: usize = 64;
+const SHARED_MIN_TOKEN_COUNT: usize = 32;
 
 pub(crate) struct MetalRope {
-    pipeline: ComputePipelineState,
+    pair_pipeline: ComputePipelineState,
+    shared4_pipeline: ComputePipelineState,
     arena: MetalArena,
 }
 
@@ -28,12 +34,14 @@ pub struct MetalRopeReport {
     pub position_offset: usize,
     pub theta: f32,
     pub thread_count: usize,
+    pub shared_coefficients: bool,
 }
 
 impl MetalRope {
     pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         Ok(Self {
-            pipeline: compute_pipeline(device, library, ROPE_SLICE_KERNEL)?,
+            pair_pipeline: compute_pipeline(device, library, ROPE_PAIR_KERNEL)?,
+            shared4_pipeline: compute_pipeline(device, library, ROPE_SHARED4_KERNEL)?,
             arena,
         })
     }
@@ -91,21 +99,37 @@ impl MetalRope {
             "running native Metal RoPE"
         );
 
-        dispatch_1d(
-            queue,
-            &self.pipeline,
-            &[
-                &input_buffer,
-                &output_buffer,
-                &batch_count_buffer,
-                &token_count_buffer,
-                &head_count_buffer,
-                &rope_dim_buffer,
-                &position_offset_buffer,
-                &theta_buffer,
-            ],
-            input.len(),
-        )?;
+        let buffers = [
+            &input_buffer,
+            &output_buffer,
+            &batch_count_buffer,
+            &token_count_buffer,
+            &head_count_buffer,
+            &rope_dim_buffer,
+            &position_offset_buffer,
+            &theta_buffer,
+        ];
+        let shared_coefficients = uses_shared_coefficients(token_count, head_count, rope_dim);
+        let thread_count = if shared_coefficients {
+            let group_count = shared_group_count(batch_count, token_count, head_count)?;
+            dispatch_1d_threadgroups(
+                queue,
+                &self.shared4_pipeline,
+                &buffers,
+                group_count,
+                SHARED_THREADS_PER_GROUP,
+            )?;
+            group_count
+                .checked_mul(SHARED_THREADS_PER_GROUP)
+                .ok_or_else(|| Error::backend("shared RoPE thread count overflow"))?
+        } else {
+            let pair_threads = input
+                .len()
+                .checked_div(2)
+                .ok_or_else(|| Error::backend("RoPE pair thread count overflow"))?;
+            dispatch_1d(queue, &self.pair_pipeline, &buffers, pair_threads)?;
+            pair_threads
+        };
 
         let values = read_f32_buffer(&output_buffer, input.len())?;
 
@@ -117,7 +141,8 @@ impl MetalRope {
             rope_dim,
             position_offset,
             theta,
-            thread_count: input.len(),
+            thread_count,
+            shared_coefficients,
         })
     }
 
@@ -179,23 +204,42 @@ impl MetalRope {
             "encoding batched RoPE"
         );
 
-        encode_1d(
-            command_buffer,
-            &self.pipeline,
-            &[
-                input,
-                &output_buffer,
-                &batch_count_buffer,
-                &token_count_buffer,
-                &head_count_buffer,
-                &rope_dim_buffer,
-                &position_offset_buffer,
-                &theta_buffer,
-            ],
-            input_len,
-        )?;
+        let buffers = [
+            input,
+            &output_buffer,
+            &batch_count_buffer,
+            &token_count_buffer,
+            &head_count_buffer,
+            &rope_dim_buffer,
+            &position_offset_buffer,
+            &theta_buffer,
+        ];
+        if uses_shared_coefficients(token_count, head_count, rope_dim) {
+            encode_1d_threadgroups(
+                command_buffer,
+                &self.shared4_pipeline,
+                &buffers,
+                shared_group_count(batch_count, token_count, head_count)?,
+                SHARED_THREADS_PER_GROUP,
+            )?;
+        } else {
+            encode_1d(command_buffer, &self.pair_pipeline, &buffers, input_len / 2)?;
+        }
         Ok(output_buffer)
     }
+}
+
+fn uses_shared_coefficients(token_count: usize, head_count: usize, rope_dim: usize) -> bool {
+    token_count >= SHARED_MIN_TOKEN_COUNT
+        && head_count >= SHARED_HEADS_PER_GROUP
+        && rope_dim == SHARED_ROPE_DIM
+}
+
+fn shared_group_count(batch_count: usize, token_count: usize, head_count: usize) -> Result<usize> {
+    batch_count
+        .checked_mul(token_count)
+        .and_then(|count| count.checked_mul(head_count.div_ceil(SHARED_HEADS_PER_GROUP)))
+        .ok_or_else(|| Error::backend("shared RoPE threadgroup count overflow"))
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
@@ -243,7 +287,49 @@ mod tests {
         assert_eq!(report.head_count, head_count);
         assert_eq!(report.rope_dim, rope_dim);
         assert_eq!(report.position_offset, position_offset);
-        assert_eq!(report.thread_count, input.len());
+        assert_eq!(report.thread_count, input.len() / 2);
+        assert!(!report.shared_coefficients);
+        assert_close(&report.values, &expected, 1e-5);
+    }
+
+    #[test]
+    fn shared_head_coefficients_match_cpu_for_glm_prefill_shape() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let batch_count = 1;
+        let token_count = 32;
+        let head_count = 64;
+        let rope_dim = 64;
+        let position_offset = 7;
+        let theta = 10_000.0;
+        let input = (0..batch_count * token_count * head_count * rope_dim)
+            .map(|index| ((index % 251) as f32 - 125.0) / 64.0)
+            .collect::<Vec<_>>();
+
+        let report = metal
+            .rope_slice_f32_report(
+                &input,
+                batch_count,
+                token_count,
+                head_count,
+                rope_dim,
+                position_offset,
+                theta,
+            )
+            .unwrap();
+        let expected = cpu_rope_slice(
+            &input,
+            batch_count,
+            token_count,
+            head_count,
+            rope_dim,
+            position_offset,
+            theta,
+        );
+
+        assert!(report.shared_coefficients);
+        assert_eq!(report.thread_count, token_count * 16 * 256);
         assert_close(&report.values, &expected, 1e-5);
     }
 

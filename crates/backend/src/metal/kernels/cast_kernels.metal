@@ -2,16 +2,30 @@
 
 using namespace metal;
 
-kernel void f32_to_f16_kernel(
+kernel void f32_to_f16_packed4_kernel(
     const device float* input [[buffer(0)]],
     device half* output [[buffer(1)]],
     constant uint& len [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= len) {
+    uint first = gid * 4u;
+    if (first >= len) {
         return;
     }
-    output[gid] = half(input[gid]);
+
+    uint remaining = len - first;
+    if (remaining >= 4u) {
+        const device packed_float4* input4 =
+            reinterpret_cast<const device packed_float4*>(input + first);
+        device packed_half4* output4 =
+            reinterpret_cast<device packed_half4*>(output + first);
+        *output4 = packed_half4(half4(float4(*input4)));
+        return;
+    }
+
+    for (uint offset = 0u; offset < remaining; offset++) {
+        output[first + offset] = half(input[first + offset]);
+    }
 }
 
 kernel void q8_rows_to_f32_kernel(

@@ -19,3 +19,7 @@ libc.workspace = true
 metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 tracing.workspace = true
+
+[[bench]]
+name = "dsa_topk"
+harness = false

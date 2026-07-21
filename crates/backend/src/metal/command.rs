@@ -55,6 +55,32 @@ pub(crate) fn dispatch_1d_many(queue: &CommandQueue, dispatches: &[Dispatch1d<'_
     }
 }
 
+pub(crate) fn dispatch_1d_threadgroups(
+    queue: &CommandQueue,
+    pipeline: &ComputePipelineState,
+    buffers: &[&Buffer],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    let command_buffer = queue.new_command_buffer();
+    encode_1d_threadgroups(
+        command_buffer,
+        pipeline,
+        buffers,
+        threadgroup_count,
+        threads_per_group,
+    )?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    match command_buffer.status() {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        status => Err(Error::backend(format!(
+            "Metal command buffer did not complete: {status:?}"
+        ))),
+    }
+}
+
 pub(crate) fn dispatch_2d(
     queue: &CommandQueue,
     pipeline: &ComputePipelineState,

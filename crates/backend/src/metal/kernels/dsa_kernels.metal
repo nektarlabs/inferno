@@ -176,50 +176,218 @@ kernel void dsa_scores_f32_kernel(
     scores[gid] = score;
 }
 
-kernel void dsa_topk_scores_u32_kernel(
+constant uint DSA_TOPK_BLOCK_THREADS = 256;
+constant uint DSA_INVALID_TOKEN = 0xffffffffu;
+constant float DSA_LOWEST_SCORE = -3.402823466e+38F;
+
+static inline bool dsa_precedes(
+    float left_score,
+    uint left_id,
+    float right_score,
+    uint right_id
+) {
+    if (left_id == DSA_INVALID_TOKEN) {
+        return false;
+    }
+    if (right_id == DSA_INVALID_TOKEN) {
+        return true;
+    }
+    return left_score > right_score
+        || (left_score == right_score && left_id < right_id);
+}
+
+static inline float dsa_token_score(
+    const device float* scores,
+    uint score_row_offset,
+    uint token_id
+) {
+    return token_id == DSA_INVALID_TOKEN
+        ? DSA_LOWEST_SCORE
+        : scores[score_row_offset + token_id];
+}
+
+// Sort one block of scores entirely in threadgroup memory. This avoids a
+// device-memory gather for every comparator in the bitonic network.
+kernel void dsa_topk_block_sort_u32_kernel(
     const device float* scores [[buffer(0)]],
-    device uint* token_ids [[buffer(1)]],
+    device uint* output_ids [[buffer(1)]],
     constant uint& batch_count [[buffer(2)]],
     constant uint& key_tokens [[buffer(3)]],
-    constant uint& top_k [[buffer(4)]],
-    uint batch [[thread_position_in_grid]]
+    constant uint& blocks_per_batch [[buffer(4)]],
+    constant uint& block_top_k [[buffer(5)]],
+    constant uint& output_stride [[buffer(6)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
 ) {
+    uint group = threadgroup_position.x;
+    uint batch = group / blocks_per_batch;
+    uint block = group - (batch * blocks_per_batch);
+    if (batch >= batch_count || lane >= DSA_TOPK_BLOCK_THREADS) {
+        return;
+    }
+
+    uint token_id = (block * DSA_TOPK_BLOCK_THREADS) + lane;
+    bool valid = token_id < key_tokens;
+    threadgroup float block_scores[DSA_TOPK_BLOCK_THREADS];
+    threadgroup uint block_ids[DSA_TOPK_BLOCK_THREADS];
+    block_scores[lane] = valid
+        ? scores[(batch * key_tokens) + token_id]
+        : DSA_LOWEST_SCORE;
+    block_ids[lane] = valid ? token_id : DSA_INVALID_TOKEN;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint sequence = 2; sequence <= DSA_TOPK_BLOCK_THREADS; sequence <<= 1) {
+        for (uint distance = sequence >> 1; distance > 0; distance >>= 1) {
+            uint partner = lane ^ distance;
+            if (partner > lane) {
+                bool left_must_precede = (lane & sequence) == 0;
+                float left_score = block_scores[lane];
+                uint left_id = block_ids[lane];
+                float right_score = block_scores[partner];
+                uint right_id = block_ids[partner];
+                bool right_precedes_left = dsa_precedes(
+                    right_score,
+                    right_id,
+                    left_score,
+                    left_id
+                );
+                bool left_precedes_right = dsa_precedes(
+                    left_score,
+                    left_id,
+                    right_score,
+                    right_id
+                );
+                bool swap = left_must_precede
+                    ? right_precedes_left
+                    : left_precedes_right;
+                if (swap) {
+                    block_scores[lane] = right_score;
+                    block_ids[lane] = right_id;
+                    block_scores[partner] = left_score;
+                    block_ids[partner] = left_id;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (lane < block_top_k) {
+        uint output_base = (batch * output_stride) + (block * block_top_k);
+        output_ids[output_base + lane] = block_ids[lane];
+    }
+}
+
+// Merge two descending candidate runs. Threads divide the output into short
+// contiguous ranges, find each range's merge partition by binary search, and
+// then merge that range sequentially from registers.
+kernel void dsa_topk_merge_u32_kernel(
+    const device float* scores [[buffer(0)]],
+    const device uint* input_ids [[buffer(1)]],
+    device uint* output_ids [[buffer(2)]],
+    constant uint& batch_count [[buffer(3)]],
+    constant uint& key_tokens [[buffer(4)]],
+    constant uint& input_run_count [[buffer(5)]],
+    constant uint& input_run_length [[buffer(6)]],
+    constant uint& output_run_length [[buffer(7)]],
+    constant uint& input_stride [[buffer(8)]],
+    constant uint& output_stride [[buffer(9)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    uint output_run_count = (input_run_count + 1u) / 2u;
+    uint group = threadgroup_position.x;
+    uint batch = group / output_run_count;
+    uint output_run = group - (batch * output_run_count);
     if (batch >= batch_count) {
         return;
     }
 
-    constexpr uint max_top_k = 2048;
-    float top_scores[max_top_k];
-    uint top_ids[max_top_k];
-
-    for (uint rank = 0; rank < max_top_k; rank++) {
-        top_scores[rank] = -3.402823466e+38F;
-        top_ids[rank] = 0;
+    uint left_run = output_run * 2u;
+    uint right_run = left_run + 1u;
+    uint left_length = left_run < input_run_count ? input_run_length : 0u;
+    uint right_length = right_run < input_run_count ? input_run_length : 0u;
+    uint total_length = left_length + right_length;
+    uint input_base = batch * input_stride;
+    const device uint* left = input_ids + input_base + (left_run * input_run_length);
+    const device uint* right = right_run < input_run_count
+        ? input_ids + input_base + (right_run * input_run_length)
+        : left;
+    uint output_base = (batch * output_stride) + (output_run * output_run_length);
+    uint score_row_offset = batch * key_tokens;
+    uint chunk = (output_run_length + threads_per_group.x - 1u) / threads_per_group.x;
+    uint output_start = lane * chunk;
+    uint output_end = min(output_start + chunk, output_run_length);
+    if (output_start >= output_run_length) {
+        return;
     }
 
-    for (uint token = 0; token < key_tokens; token++) {
-        float score = scores[(batch * key_tokens) + token];
-        uint insert_at = top_k;
-        for (uint rank = 0; rank < top_k; rank++) {
-            bool better = score > top_scores[rank]
-                || (score == top_scores[rank] && token < top_ids[rank]);
-            if (better) {
-                insert_at = rank;
-                break;
+    uint merge_end = min(output_end, total_length);
+    if (output_start < total_length) {
+        uint low = output_start > right_length
+            ? output_start - right_length
+            : 0u;
+        uint high = min(output_start, left_length);
+        while (low < high) {
+            uint left_index = (low + high) >> 1;
+            uint right_index = output_start - left_index - 1u;
+            uint left_id = left[left_index];
+            uint right_id = right[right_index];
+            float left_score = dsa_token_score(
+                scores,
+                score_row_offset,
+                left_id
+            );
+            float right_score = dsa_token_score(
+                scores,
+                score_row_offset,
+                right_id
+            );
+            if (dsa_precedes(left_score, left_id, right_score, right_id)) {
+                low = left_index + 1u;
+            } else {
+                high = left_index;
             }
         }
 
-        if (insert_at < top_k) {
-            for (uint rank = top_k - 1u; rank > insert_at; rank--) {
-                top_scores[rank] = top_scores[rank - 1u];
-                top_ids[rank] = top_ids[rank - 1u];
+        uint left_index = low;
+        uint right_index = output_start - left_index;
+        for (uint output_index = output_start;
+             output_index < merge_end;
+             output_index++) {
+            uint selected_id;
+            if (left_index >= left_length) {
+                selected_id = right[right_index++];
+            } else if (right_index >= right_length) {
+                selected_id = left[left_index++];
+            } else {
+                uint left_id = left[left_index];
+                uint right_id = right[right_index];
+                float left_score = dsa_token_score(
+                    scores,
+                    score_row_offset,
+                    left_id
+                );
+                float right_score = dsa_token_score(
+                    scores,
+                    score_row_offset,
+                    right_id
+                );
+                if (dsa_precedes(left_score, left_id, right_score, right_id)) {
+                    selected_id = left_id;
+                    left_index++;
+                } else {
+                    selected_id = right_id;
+                    right_index++;
+                }
             }
-            top_scores[insert_at] = score;
-            top_ids[insert_at] = token;
+            output_ids[output_base + output_index] = selected_id;
         }
     }
 
-    for (uint rank = 0; rank < top_k; rank++) {
-        token_ids[(batch * top_k) + rank] = top_ids[rank];
+    for (uint output_index = max(output_start, total_length);
+         output_index < output_end;
+         output_index++) {
+        output_ids[output_base + output_index] = DSA_INVALID_TOKEN;
     }
 }

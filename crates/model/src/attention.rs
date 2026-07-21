@@ -2069,9 +2069,20 @@ impl<'a> Attention<'a> {
             "attention.input_norm",
             || self.input_norm.forward_device(hidden_states, backend),
         ));
+        let paired_q_kv_a = if tokens == 1 {
+            profile::run_layer_stage(self.layer_index, "attention.q_kv_a_projection", || {
+                self.q_a
+                    .forward_q8_pair_device(&self.kv_a_mqa, &input_norm, backend)
+            })?
+        } else {
+            None
+        };
         let (q_no_rope, q_rope_after_rope, q_recombined) = crate::try_device!(
             profile::run_layer_stage(self.layer_index, "attention.q_projection", || {
-                let q_a = crate::try_device!(self.q_a.forward_device(&input_norm, backend));
+                let q_a = match paired_q_kv_a.as_ref() {
+                    Some((q_a, _)) => q_a.clone(),
+                    None => crate::try_device!(self.q_a.forward_device(&input_norm, backend)),
+                };
                 let q_a_norm = crate::try_device!(self.q_a_norm.forward_device(&q_a, backend));
                 let q_b = crate::try_device!(self.q_b.forward_device(&q_a_norm, backend));
                 let q_heads = q_b.reshape(vec![
@@ -2104,8 +2115,12 @@ impl<'a> Attention<'a> {
 
         let (kv_latent_norm, k_rope_after_rope, k_heads, v_heads) = crate::try_device!(
             profile::run_layer_stage(self.layer_index, "attention.kv_projection", || {
-                let kv_a_mqa =
-                    crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend));
+                let kv_a_mqa = match paired_q_kv_a.as_ref() {
+                    Some((_, kv_a_mqa)) => kv_a_mqa.clone(),
+                    None => {
+                        crate::try_device!(self.kv_a_mqa.forward_device(&input_norm, backend))
+                    }
+                };
                 let (kv_a_norm, k_rope_after_rope) = crate::try_device!(backend
                     .mla_kv_postprocess_device(
                         &kv_a_mqa,

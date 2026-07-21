@@ -30,7 +30,6 @@ kernel void rms_norm_f32_kernel(
     }
 
     threadgroup float simd_sums[RMS_NORM_SIMDGROUPS];
-    threadgroup float scale;
 
     float simd_sumsq = simd_sum(local_sumsq);
     if (simd_lane == 0 && simd_group < RMS_NORM_SIMDGROUPS) {
@@ -38,14 +37,12 @@ kernel void rms_norm_f32_kernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0) {
-        float sumsq = 0.0f;
-        for (uint i = 0; i < RMS_NORM_SIMDGROUPS; i++) {
-            sumsq += simd_sums[i];
-        }
-        scale = rsqrt((sumsq / float(hidden_size)) + eps);
+    float partial = 0.0f;
+    if (simd_lane < RMS_NORM_SIMDGROUPS) {
+        partial = simd_sums[simd_lane];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sumsq = simd_sum(partial);
+    float scale = rsqrt((sumsq / float(hidden_size)) + eps);
 
     for (uint i = tid; i < hidden_size; i += RMS_NORM_THREADS) {
         output[base + i] = input[base + i] * scale * weight[i];
@@ -81,21 +78,18 @@ kernel void mla_kv_postprocess_f32_kernel(
     }
 
     threadgroup float simd_sums[RMS_NORM_SIMDGROUPS];
-    threadgroup float norm_scale;
     float simd_sumsq = simd_sum(local_sumsq);
     if (simd_lane == 0 && simd_group < RMS_NORM_SIMDGROUPS) {
         simd_sums[simd_group] = simd_sumsq;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0) {
-        float sumsq = 0.0f;
-        for (uint group = 0; group < RMS_NORM_SIMDGROUPS; group++) {
-            sumsq += simd_sums[group];
-        }
-        norm_scale = rsqrt((sumsq / float(latent_dim)) + eps);
+    float partial = 0.0f;
+    if (simd_lane < RMS_NORM_SIMDGROUPS) {
+        partial = simd_sums[simd_lane];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sumsq = simd_sum(partial);
+    float norm_scale = rsqrt((sumsq / float(latent_dim)) + eps);
 
     uint latent_base = row * latent_dim;
     for (uint dim = tid; dim < latent_dim; dim += RMS_NORM_THREADS) {

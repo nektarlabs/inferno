@@ -513,6 +513,11 @@ mod tests {
 
     #[test]
     fn unified_memory_controller_is_explicitly_opt_in() {
+        let default_chat_cli =
+            Cli::try_parse_from(["inferno", "--enable-unified-memory-controller"]).unwrap();
+        assert!(default_chat_cli.enable_unified_memory_controller);
+        assert!(default_chat_cli.command.is_none());
+
         let default_cli = Cli::try_parse_from([
             "inferno",
             "generate",

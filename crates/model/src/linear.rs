@@ -249,6 +249,109 @@ impl<'a> QuantizedLinear<'a> {
         Ok(Some(output))
     }
 
+    pub(crate) fn forward_q8_pair_device<B: Backend>(
+        &self,
+        other: &Self,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<(backend::DeviceValue, backend::DeviceValue)>> {
+        if self.tensor_ref.ty != GgmlType::Q8_0 || other.tensor_ref.ty != GgmlType::Q8_0 {
+            return Ok(None);
+        }
+        if self.in_features != other.in_features {
+            return Err(Error::model(format!(
+                "paired Q8 projections require the same input width, got {} and {}",
+                self.in_features, other.in_features
+            )));
+        }
+        let (row_count, expected_a) = validate_input_dims(
+            "GGUF paired Q8 projection A",
+            input.dims(),
+            self.in_features,
+            self.out_features,
+        )?;
+        let (other_rows, expected_b) = validate_input_dims(
+            "GGUF paired Q8 projection B",
+            input.dims(),
+            other.in_features,
+            other.out_features,
+        )?;
+        validate_exact_shape(
+            "GGUF paired Q8 projection rows",
+            &[other_rows],
+            &[row_count],
+        )?;
+        let weights_a = self.gguf.tensor_quantized_storage(&self.tensor_ref.name)?;
+        let weights_b = other
+            .gguf
+            .tensor_quantized_storage(&other.tensor_ref.name)?;
+        let Some((output_a, output_b)) = backend.q8_0_matvec_pair_device(
+            weights_a.bytes,
+            weights_b.bytes,
+            input,
+            row_count,
+            self.in_features,
+            self.out_features,
+            other.out_features,
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_exact_shape(
+            "GGUF paired Q8 projection A output",
+            output_a.dims(),
+            &expected_a,
+        )?;
+        validate_exact_shape(
+            "GGUF paired Q8 projection B output",
+            output_b.dims(),
+            &expected_b,
+        )?;
+        Ok(Some((output_a, output_b)))
+    }
+
+    pub(crate) fn forward_q8_gate_up_swiglu_device<B: Backend>(
+        &self,
+        up: &Self,
+        input: &backend::DeviceValue,
+        backend: &B,
+    ) -> Result<Option<backend::DeviceValue>> {
+        if self.tensor_ref.ty != GgmlType::Q8_0 || up.tensor_ref.ty != GgmlType::Q8_0 {
+            return Ok(None);
+        }
+        if self.in_features != up.in_features || self.out_features != up.out_features {
+            return Err(Error::model(format!(
+                "fused Q8 gate/up requires equal shapes, got [{}, {}] and [{}, {}]",
+                self.out_features, self.in_features, up.out_features, up.in_features
+            )));
+        }
+        let (row_count, expected_output) = validate_input_dims(
+            "GGUF fused Q8 gate/up",
+            input.dims(),
+            self.in_features,
+            self.out_features,
+        )?;
+        let gate_weights = self.gguf.tensor_quantized_storage(&self.tensor_ref.name)?;
+        let up_weights = up.gguf.tensor_quantized_storage(&up.tensor_ref.name)?;
+        let Some(output) = backend.q8_0_gate_up_swiglu_device(
+            gate_weights.bytes,
+            up_weights.bytes,
+            input,
+            row_count,
+            self.in_features,
+            self.out_features,
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_exact_shape(
+            "GGUF fused Q8 gate/up output",
+            output.dims(),
+            &expected_output,
+        )?;
+        Ok(Some(output))
+    }
+
     /// Batched device-resident variant of `forward_f32_tensor_add_residual`.
     /// Q2_K uses the fused matvec+add kernel; Q8_0 uses native matvec followed
     /// by a native add so the path remains GPU-resident.

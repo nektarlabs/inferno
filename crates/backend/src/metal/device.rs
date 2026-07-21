@@ -1416,6 +1416,60 @@ impl Metal {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q8_0_matvec_pair(
+        &self,
+        weights_a: &[u8],
+        weights_b: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features_a: usize,
+        out_features_b: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_q8_0_matvec_pair(
+                command_buffer,
+                &self.device,
+                weights_a,
+                weights_b,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features_a,
+                out_features_b,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_q8_0_gate_up_swiglu(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_q8_0_gate_up_swiglu(
+                command_buffer,
+                &self.device,
+                gate_weights,
+                up_weights,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_packed_heads_transposed_matvec(
         &self,
         kind: QuantMatvecKind,

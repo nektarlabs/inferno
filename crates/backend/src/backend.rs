@@ -829,6 +829,33 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_matvec_pair_device(
+        &self,
+        _weights_a: &[u8],
+        _weights_b: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features_a: usize,
+        _out_features_b: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_gate_up_swiglu_device(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     fn q8_0_transposed_matvec_device(
         &self,
         _weights: &[u8],
@@ -3711,6 +3738,111 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (weights, input, row_count, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_matvec_pair_device(
+        &self,
+        weights_a: &[u8],
+        weights_b: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features_a: usize,
+        out_features_b: usize,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows_a, output_shape_a) =
+                matvec_dims_shape(input.dims(), in_features, out_features_a)?;
+            let (actual_rows_b, output_shape_b) =
+                matvec_dims_shape(input.dims(), in_features, out_features_b)?;
+            validate_exact_shape(
+                "device_paired_q8_matvec_rows_a",
+                &[actual_rows_a],
+                &[row_count],
+            )?;
+            validate_exact_shape(
+                "device_paired_q8_matvec_rows_b",
+                &[actual_rows_b],
+                &[row_count],
+            )?;
+            let (buffer_a, buffer_b) = native_metal.batched_q8_0_matvec_pair(
+                weights_a,
+                weights_b,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+                in_features,
+                out_features_a,
+                out_features_b,
+            )?;
+            Ok(Some((
+                DeviceValue::new(output_shape_a, buffer_a),
+                DeviceValue::new(output_shape_b, buffer_b),
+            )))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights_a,
+                weights_b,
+                input,
+                row_count,
+                in_features,
+                out_features_a,
+                out_features_b,
+            );
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn q8_0_gate_up_swiglu_device(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, output_shape) =
+                matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape("device_fused_q8_gate_up_rows", &[actual_rows], &[row_count])?;
+            let output = native_metal.batched_q8_0_gate_up_swiglu(
+                gate_weights,
+                up_weights,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            Ok(Some(DeviceValue::new(output_shape, output)))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            );
             Ok(None)
         }
     }
@@ -7874,6 +8006,71 @@ mod tests {
             .expect("Metal DSA top-k");
 
         assert_eq!(topk, vec![2, 3]);
+    }
+
+    #[test]
+    fn dsa_decode_topk_device_merges_multiple_score_blocks() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let batch = 2;
+        let past_tokens = 300;
+        let top_k = 260;
+        let hidden = F32Tensor::new(vec![1.0; batch], [batch, 1, 1]).unwrap();
+        let q_raw = F32Tensor::new(vec![1.0, 0.0, 1.0, 0.0], [batch, 1, 2]).unwrap();
+        let mut past_values = Vec::with_capacity(batch * past_tokens * 2);
+        for _ in 0..past_tokens {
+            past_values.push(1.0);
+            past_values.push(0.0);
+        }
+        for token in 0..past_tokens {
+            past_values.push((token + 1) as f32);
+            past_values.push(0.0);
+        }
+        let past_keys = F32Tensor::new(past_values, [batch, past_tokens, 2]).unwrap();
+        let current_key = F32Tensor::new(vec![1.0, 0.0, 1_000.0, 0.0], [batch, 1, 2]).unwrap();
+        let weights_proj = F32Tensor::new(vec![1.0], [1, 1]).unwrap();
+
+        let hidden = backend
+            .device_upload_f32_tensor(&hidden)
+            .unwrap()
+            .expect("Metal device value");
+        let q_raw = backend
+            .device_upload_f32_tensor(&q_raw)
+            .unwrap()
+            .expect("Metal device value");
+        let past_keys = backend
+            .device_upload_f32_tensor(&past_keys)
+            .unwrap()
+            .expect("Metal device value");
+        let current_key = backend
+            .device_upload_f32_tensor(&current_key)
+            .unwrap()
+            .expect("Metal device value");
+
+        let actual = backend
+            .dsa_decode_topk_device(
+                &hidden,
+                &q_raw,
+                &past_keys,
+                &current_key,
+                &weights_proj,
+                1,
+                2,
+                2,
+                0,
+                10_000.0,
+                top_k,
+            )
+            .unwrap()
+            .expect("Metal DSA top-k");
+        let expected_tied = (0..top_k as u32).collect::<Vec<_>>();
+        let expected_ranked = std::iter::once(past_tokens as u32)
+            .chain((41_u32..past_tokens as u32).rev())
+            .collect::<Vec<_>>();
+
+        assert_eq!(&actual[..top_k], expected_tied);
+        assert_eq!(&actual[top_k..], expected_ranked);
     }
 
     #[test]

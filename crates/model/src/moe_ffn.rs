@@ -894,30 +894,50 @@ impl<'a> MoeFfn<'a> {
                 })
             });
             let shared_result: Result<backend::DeviceValue> = (|| {
-                let shared_gate = require_moe_device_stage(
-                    "sparse_moe.shared_gate",
+                let fused_shared = if flat_token_count == 1 {
                     profile::run_layer_stage(
                         self.layer_index,
-                        "sparse_moe.shared_gate.device",
-                        || self.shared_gate.forward_device(&flat_tokens, backend),
-                    ),
-                )?;
-                let shared_up = require_moe_device_stage(
-                    "sparse_moe.shared_up",
-                    profile::run_layer_stage(
-                        self.layer_index,
-                        "sparse_moe.shared_up.device",
-                        || self.shared_up.forward_device(&flat_tokens, backend),
-                    ),
-                )?;
-                let shared_gated = require_moe_device_stage(
-                    "sparse_moe.shared_swiglu",
-                    profile::run_layer_stage(
-                        self.layer_index,
-                        "sparse_moe.shared_swiglu.device",
-                        || backend.swiglu_device(&shared_gate, &shared_up),
-                    ),
-                )?;
+                        "sparse_moe.shared_gate_up_swiglu.device",
+                        || {
+                            self.shared_gate.forward_q8_gate_up_swiglu_device(
+                                &self.shared_up,
+                                &flat_tokens,
+                                backend,
+                            )
+                        },
+                    )?
+                } else {
+                    None
+                };
+                let shared_gated = match fused_shared {
+                    Some(gated) => gated,
+                    None => {
+                        let shared_gate = require_moe_device_stage(
+                            "sparse_moe.shared_gate",
+                            profile::run_layer_stage(
+                                self.layer_index,
+                                "sparse_moe.shared_gate.device",
+                                || self.shared_gate.forward_device(&flat_tokens, backend),
+                            ),
+                        )?;
+                        let shared_up = require_moe_device_stage(
+                            "sparse_moe.shared_up",
+                            profile::run_layer_stage(
+                                self.layer_index,
+                                "sparse_moe.shared_up.device",
+                                || self.shared_up.forward_device(&flat_tokens, backend),
+                            ),
+                        )?;
+                        require_moe_device_stage(
+                            "sparse_moe.shared_swiglu",
+                            profile::run_layer_stage(
+                                self.layer_index,
+                                "sparse_moe.shared_swiglu.device",
+                                || backend.swiglu_device(&shared_gate, &shared_up),
+                            ),
+                        )?
+                    }
+                };
                 let shared_down = require_moe_device_stage(
                     "sparse_moe.shared_down",
                     profile::run_layer_stage(

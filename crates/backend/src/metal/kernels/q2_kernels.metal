@@ -14,6 +14,12 @@ constant uint Q8_0_BLOCK_VALUES = 32;
 constant uint Q8_0_BLOCK_BYTES = 34;
 constant uint Q8_0_MAX_SIMDGROUPS_PER_OUTPUT = 8;
 constant uint Q8_0_BATCH_ROW_TILE = 4;
+constant uint Q8_0_OUTPUT_FEATURE_TILE = 4;
+constant uint Q8_0_MMA_TOKEN_TILE = 32;
+constant uint Q8_0_MMA_TOKEN_GROUPS = 4;
+constant uint Q8_0_MMA_OUTPUT_TILE = 32;
+constant uint Q8_0_MMA_K_TILE = 32;
+constant uint Q8_0_MMA_THREAD_COUNT = 128;
 
 static inline float f16_bits_to_f32(ushort bits) {
     return float(as_type<half>(bits));
@@ -1191,6 +1197,227 @@ kernel void q8_0_matvec_tiled_f32_kernel(
     }
 }
 
+// Decode-time output projection. Four adjacent vocabulary rows consume the
+// same hidden-state vector, so load each activation once and apply it to four
+// independent Q8_0 rows. Each row keeps the same two-stage SIMD reduction as
+// q8_0_matvec_tiled_f32_kernel, preserving its arithmetic order.
+kernel void q8_0_matvec_output4_tiled_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    constant uint& simdgroups_per_output [[buffer(7)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint tiles_per_input_row = (out_features + Q8_0_OUTPUT_FEATURE_TILE - 1)
+        / Q8_0_OUTPUT_FEATURE_TILE;
+    uint input_row = threadgroup_position.x / tiles_per_input_row;
+    uint output_tile = threadgroup_position.x - (input_row * tiles_per_input_row);
+    uint output_feature_start = output_tile * Q8_0_OUTPUT_FEATURE_TILE;
+    if (input_row >= row_count
+        || output_feature_start >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+    uint active_features = min(Q8_0_OUTPUT_FEATURE_TILE, out_features - output_feature_start);
+    uint input_row_offset = input_row * in_features;
+    float sums[Q8_0_OUTPUT_FEATURE_TILE];
+    for (uint feature = 0; feature < Q8_0_OUTPUT_FEATURE_TILE; feature++) {
+        sums[feature] = 0.0f;
+    }
+
+    for (uint block_in_row = simdgroup_index;
+         block_in_row < blocks_per_row;
+         block_in_row += simdgroups_per_output) {
+        uint input_index = input_row_offset
+            + (block_in_row * Q8_0_BLOCK_VALUES)
+            + simd_lane;
+        float input_value = input[input_index];
+        for (uint feature = 0; feature < active_features; feature++) {
+            uint output_feature = output_feature_start + feature;
+            uint block_index = (output_feature * blocks_per_row) + block_in_row;
+            uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+            sums[feature] += input_value
+                * q8_0_block_value(weights, block_offset, simd_lane);
+        }
+    }
+
+    threadgroup float partial_sums[
+        Q8_0_OUTPUT_FEATURE_TILE * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint feature = 0; feature < active_features; feature++) {
+        float simdgroup_sum = simd_sum(sums[feature]);
+        if (simd_lane == 0) {
+            partial_sums[
+                (feature * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT) + simdgroup_index
+            ] = simdgroup_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0) {
+        for (uint feature = 0; feature < active_features; feature++) {
+            float partial = simd_lane < simdgroups_per_output
+                ? partial_sums[
+                    (feature * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT) + simd_lane
+                ]
+                : 0.0f;
+            float reduced_sum = simd_sum(partial);
+            if (simd_lane == 0) {
+                output[(input_row * out_features) + output_feature_start + feature]
+                    = reduced_sum;
+            }
+        }
+    }
+}
+
+// Decode Q-A and KV-A together. Both matrices consume the same activation
+// row, so each lane loads one input value and applies it to both independent
+// Q8_0 weight streams while both output rows are active.
+kernel void q8_0_matvec_pair_tiled_f32_kernel(
+    const device uchar* weights_a [[buffer(0)]],
+    const device uchar* weights_b [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    device float* output_a [[buffer(3)]],
+    device float* output_b [[buffer(4)]],
+    constant uint& row_count [[buffer(5)]],
+    constant uint& in_features [[buffer(6)]],
+    constant uint& out_features_a [[buffer(7)]],
+    constant uint& out_features_b [[buffer(8)]],
+    constant uint& blocks_per_row [[buffer(9)]],
+    constant uint& simdgroups_per_output [[buffer(10)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint max_out_features = max(out_features_a, out_features_b);
+    uint input_row = threadgroup_position.x / max_out_features;
+    uint output_feature = threadgroup_position.x - (input_row * max_out_features);
+    if (input_row >= row_count
+        || output_feature >= max_out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    uint input_row_offset = input_row * in_features;
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+    for (uint block_in_row = simdgroup_index;
+         block_in_row < blocks_per_row;
+         block_in_row += simdgroups_per_output) {
+        uint input_index = input_row_offset
+            + (block_in_row * Q8_0_BLOCK_VALUES)
+            + simd_lane;
+        float input_value = input[input_index];
+        uint block_index = (output_feature * blocks_per_row) + block_in_row;
+        uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+        if (output_feature < out_features_a) {
+            sum_a += input_value
+                * q8_0_block_value(weights_a, block_offset, simd_lane);
+        }
+        if (output_feature < out_features_b) {
+            sum_b += input_value
+                * q8_0_block_value(weights_b, block_offset, simd_lane);
+        }
+    }
+
+    threadgroup float partial_a[Q8_0_MAX_SIMDGROUPS_PER_OUTPUT];
+    threadgroup float partial_b[Q8_0_MAX_SIMDGROUPS_PER_OUTPUT];
+    float simd_sum_a = simd_sum(sum_a);
+    float simd_sum_b = simd_sum(sum_b);
+    if (simd_lane == 0) {
+        partial_a[simdgroup_index] = simd_sum_a;
+        partial_b[simdgroup_index] = simd_sum_b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0) {
+        float lane_a = simd_lane < simdgroups_per_output ? partial_a[simd_lane] : 0.0f;
+        float lane_b = simd_lane < simdgroups_per_output ? partial_b[simd_lane] : 0.0f;
+        float reduced_a = simd_sum(lane_a);
+        float reduced_b = simd_sum(lane_b);
+        if (simd_lane == 0) {
+            if (output_feature < out_features_a) {
+                output_a[(input_row * out_features_a) + output_feature] = reduced_a;
+            }
+            if (output_feature < out_features_b) {
+                output_b[(input_row * out_features_b) + output_feature] = reduced_b;
+            }
+        }
+    }
+}
+
+kernel void q8_0_gate_up_swiglu_tiled_f32_kernel(
+    const device uchar* gate_weights [[buffer(0)]],
+    const device uchar* up_weights [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& row_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    constant uint& simdgroups_per_output [[buffer(8)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint input_row = threadgroup_position.x / out_features;
+    uint output_feature = threadgroup_position.x - (input_row * out_features);
+    if (input_row >= row_count
+        || output_feature >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    uint input_row_offset = input_row * in_features;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (uint block_in_row = simdgroup_index;
+         block_in_row < blocks_per_row;
+         block_in_row += simdgroups_per_output) {
+        uint input_index = input_row_offset
+            + (block_in_row * Q8_0_BLOCK_VALUES)
+            + simd_lane;
+        float input_value = input[input_index];
+        uint block_index = (output_feature * blocks_per_row) + block_in_row;
+        uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+        gate_sum += input_value
+            * q8_0_block_value(gate_weights, block_offset, simd_lane);
+        up_sum += input_value
+            * q8_0_block_value(up_weights, block_offset, simd_lane);
+    }
+
+    threadgroup float partial_gate[Q8_0_MAX_SIMDGROUPS_PER_OUTPUT];
+    threadgroup float partial_up[Q8_0_MAX_SIMDGROUPS_PER_OUTPUT];
+    float simd_gate = simd_sum(gate_sum);
+    float simd_up = simd_sum(up_sum);
+    if (simd_lane == 0) {
+        partial_gate[simdgroup_index] = simd_gate;
+        partial_up[simdgroup_index] = simd_up;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0) {
+        float gate_partial = simd_lane < simdgroups_per_output
+            ? partial_gate[simd_lane]
+            : 0.0f;
+        float up_partial = simd_lane < simdgroups_per_output
+            ? partial_up[simd_lane]
+            : 0.0f;
+        float gate = simd_sum(gate_partial);
+        float up = simd_sum(up_partial);
+        if (simd_lane == 0) {
+            output[(input_row * out_features) + output_feature]
+                = (gate / (1.0f + exp(-gate))) * up;
+        }
+    }
+}
+
 // Dense Q8_0 projections share the same weight matrix across MTP and prefill
 // rows. Decode each weight value once per row tile before moving to the next
 // block; row_count may contain any number of four-row tiles.
@@ -1254,6 +1481,180 @@ kernel void q8_0_batched_matvec_tiled_f32_kernel(
                 output[((row_start + row) * out_features) + output_feature] = reduced_sum;
             }
         }
+    }
+}
+
+static inline void q8_0_stage_prefill_mma_tile(
+    const device uchar* weights,
+    const device float* input,
+    threadgroup half* input_tile,
+    threadgroup half* weight_tile,
+    uint token_start,
+    uint output_start,
+    uint active_tokens,
+    uint in_features,
+    uint blocks_per_row,
+    uint block_in_row,
+    uint thread_index
+) {
+    for (uint index = thread_index;
+         index < Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE;
+         index += Q8_0_MMA_THREAD_COUNT) {
+        uint token = index / Q8_0_MMA_K_TILE;
+        uint input_column = index - (token * Q8_0_MMA_K_TILE);
+        input_tile[index] = token < active_tokens
+            ? half(input[
+                ((token_start + token) * in_features)
+                + (block_in_row * Q8_0_MMA_K_TILE)
+                + input_column
+            ])
+            : half(0.0f);
+    }
+    for (uint index = thread_index;
+         index < Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE;
+         index += Q8_0_MMA_THREAD_COUNT) {
+        uint output_feature = index / Q8_0_MMA_K_TILE;
+        uint input_column = index - (output_feature * Q8_0_MMA_K_TILE);
+        uint block_index = ((output_start + output_feature) * blocks_per_row)
+            + block_in_row;
+        uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+        weight_tile[index] = half(q8_0_block_value(
+            weights,
+            block_offset,
+            input_column
+        ));
+    }
+}
+
+// Prompt-time Q8_0 matrix multiplication. Four SIMD groups share 32
+// activation rows and one dequantized weight tile. Each group computes eight
+// adjacent output features for all four 8-token subtiles. Alternating the K
+// tile storage removes the overwrite barrier between tiles, reducing weight
+// decoding and synchronization without materializing F16 tensors.
+kernel void q8_0_prefill_mma_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint output_tiles = out_features / Q8_0_MMA_OUTPUT_TILE;
+    uint token_tile = threadgroup_position.x / output_tiles;
+    uint output_tile = threadgroup_position.x - (token_tile * output_tiles);
+    uint token_start = token_tile * Q8_0_MMA_TOKEN_TILE;
+    uint output_start = output_tile * Q8_0_MMA_OUTPUT_TILE;
+    uint active_tokens = min(Q8_0_MMA_TOKEN_TILE, row_count - token_start);
+
+    threadgroup half input_tiles[2 * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE];
+    threadgroup half weight_tiles[2 * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE];
+    threadgroup float output_tile_values[
+        Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_OUTPUT_TILE
+    ];
+    simdgroup_float8x8 accumulators[Q8_0_MMA_TOKEN_GROUPS];
+    for (uint group = 0; group < Q8_0_MMA_TOKEN_GROUPS; group++) {
+        accumulators[group] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    q8_0_stage_prefill_mma_tile(
+        weights,
+        input,
+        input_tiles,
+        weight_tiles,
+        token_start,
+        output_start,
+        active_tokens,
+        in_features,
+        blocks_per_row,
+        0,
+        thread_index
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint tile_index = 0;
+    for (uint block_in_row = 0; block_in_row < blocks_per_row; block_in_row++) {
+        threadgroup half* input_tile = input_tiles
+            + (tile_index * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE);
+        threadgroup half* weight_tile = weight_tiles
+            + (tile_index * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE);
+
+        for (uint k_offset = 0; k_offset < Q8_0_MMA_K_TILE; k_offset += 8u) {
+            simdgroup_half8x8 weight_matrix;
+            simdgroup_load(
+                weight_matrix,
+                weight_tile
+                    + (simdgroup_index * 8u * Q8_0_MMA_K_TILE)
+                    + k_offset,
+                Q8_0_MMA_K_TILE,
+                0,
+                true
+            );
+            for (uint group = 0; group < Q8_0_MMA_TOKEN_GROUPS; group++) {
+                simdgroup_half8x8 input_matrix;
+                simdgroup_load(
+                    input_matrix,
+                    input_tile
+                        + (group * 8u * Q8_0_MMA_K_TILE)
+                        + k_offset,
+                    Q8_0_MMA_K_TILE,
+                    0,
+                    false
+                );
+                simdgroup_multiply_accumulate(
+                    accumulators[group],
+                    input_matrix,
+                    weight_matrix,
+                    accumulators[group]
+                );
+            }
+        }
+
+        uint next_block = block_in_row + 1u;
+        if (next_block < blocks_per_row) {
+            tile_index ^= 1u;
+            q8_0_stage_prefill_mma_tile(
+                weights,
+                input,
+                input_tiles
+                    + (tile_index * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE),
+                weight_tiles
+                    + (tile_index * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE),
+                token_start,
+                output_start,
+                active_tokens,
+                in_features,
+                blocks_per_row,
+                next_block,
+                thread_index
+            );
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint group = 0; group < Q8_0_MMA_TOKEN_GROUPS; group++) {
+        simdgroup_store(
+            accumulators[group],
+            output_tile_values
+                + (group * 8u * Q8_0_MMA_OUTPUT_TILE)
+                + (simdgroup_index * 8u),
+            Q8_0_MMA_OUTPUT_TILE,
+            0,
+            false
+        );
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint index = thread_index;
+         index < active_tokens * Q8_0_MMA_OUTPUT_TILE;
+         index += Q8_0_MMA_OUTPUT_TILE * 4u) {
+        uint token = index / Q8_0_MMA_OUTPUT_TILE;
+        uint output_feature = index - (token * Q8_0_MMA_OUTPUT_TILE);
+        output[((token_start + token) * out_features) + output_start + output_feature]
+            = output_tile_values[index];
     }
 }
 

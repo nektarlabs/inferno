@@ -4,7 +4,7 @@ use common::{validate_exact_shape, Error, Result};
 use super::{
     arena::MetalArena,
     buffers::{read_u32_buffer, require_f32_capacity, ImmutableF32BufferCache},
-    command::encode_1d,
+    command::{encode_1d, encode_1d_threadgroups},
     library::MetalLibrary,
     pipeline::compute_pipeline,
 };
@@ -12,16 +12,19 @@ use super::{
 const DSA_KEY_NORM_ROPE_KERNEL: &str = "dsa_key_norm_rope_f32_kernel";
 const DSA_QUERY_WEIGHTS_KERNEL: &str = "dsa_query_weights_f32_kernel";
 const DSA_SCORES_KERNEL: &str = "dsa_scores_f32_kernel";
-const DSA_TOPK_KERNEL: &str = "dsa_topk_scores_u32_kernel";
+const DSA_TOPK_BLOCK_SORT_KERNEL: &str = "dsa_topk_block_sort_u32_kernel";
+const DSA_TOPK_MERGE_KERNEL: &str = "dsa_topk_merge_u32_kernel";
 const INDEXER_LAYER_NORM_EPS: f32 = 1e-6;
 const MAX_DSA_TOP_K: usize = 2048;
+const DSA_TOPK_BLOCK_THREADS: usize = 256;
 
 pub(crate) struct MetalDsa {
     arena: MetalArena,
     key_norm_rope_pipeline: ComputePipelineState,
     query_weights_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
-    topk_pipeline: ComputePipelineState,
+    topk_block_sort_pipeline: ComputePipelineState,
+    topk_merge_pipeline: ComputePipelineState,
     weight_buffers: ImmutableF32BufferCache,
 }
 
@@ -38,7 +41,12 @@ impl MetalDsa {
             key_norm_rope_pipeline: compute_pipeline(device, library, DSA_KEY_NORM_ROPE_KERNEL)?,
             query_weights_pipeline: compute_pipeline(device, library, DSA_QUERY_WEIGHTS_KERNEL)?,
             scores_pipeline: compute_pipeline(device, library, DSA_SCORES_KERNEL)?,
-            topk_pipeline: compute_pipeline(device, library, DSA_TOPK_KERNEL)?,
+            topk_block_sort_pipeline: compute_pipeline(
+                device,
+                library,
+                DSA_TOPK_BLOCK_SORT_KERNEL,
+            )?,
+            topk_merge_pipeline: compute_pipeline(device, library, DSA_TOPK_MERGE_KERNEL)?,
             weight_buffers: ImmutableF32BufferCache::default(),
         })
     }
@@ -224,11 +232,6 @@ impl MetalDsa {
                 .checked_mul(key_tokens)
                 .ok_or_else(|| Error::backend("DSA decode scores length overflow"))?,
         )?;
-        let output_len = batch
-            .checked_mul(top_k)
-            .ok_or_else(|| Error::backend("DSA top-k output length overflow"))?;
-        let token_ids = self.arena.empty_u32(output_len)?;
-
         let batch_buffer = self.arena.u32(to_u32(batch, "DSA batch")?)?;
         let hidden_size_buffer = self.arena.u32(to_u32(hidden_size, "DSA hidden")?)?;
         let heads_buffer = self.arena.u32(to_u32(heads, "DSA heads")?)?;
@@ -281,20 +284,147 @@ impl MetalDsa {
                 .ok_or_else(|| Error::backend("DSA score thread count overflow"))?,
         )?;
 
-        let key_tokens_buffer = self.arena.u32(to_u32(key_tokens, "DSA key_tokens")?)?;
-        let top_k_buffer = self.arena.u32(to_u32(top_k, "DSA top_k")?)?;
-        encode_1d(
+        self.encode_score_topk(command_buffer, &scores, batch, key_tokens, top_k)
+    }
+
+    fn encode_score_topk(
+        &self,
+        command_buffer: &CommandBufferRef,
+        scores: &Buffer,
+        batch: usize,
+        key_tokens: usize,
+        top_k: usize,
+    ) -> Result<MetalDsaTopKBuffers> {
+        let output_len = batch
+            .checked_mul(top_k)
+            .ok_or_else(|| Error::backend("DSA top-k output length overflow"))?;
+        let token_ids = self.arena.empty_u32(output_len)?;
+        let block_count = key_tokens.div_ceil(DSA_TOPK_BLOCK_THREADS);
+        let block_top_k = top_k.min(DSA_TOPK_BLOCK_THREADS);
+        let padded_block_count = block_count
+            .checked_next_power_of_two()
+            .ok_or_else(|| Error::backend("DSA top-k block count overflow"))?;
+        let scratch_stride = padded_block_count
+            .checked_mul(block_top_k)
+            .ok_or_else(|| Error::backend("DSA top-k scratch stride overflow"))?;
+
+        let batch_buffer = self.arena.u32(to_u32(batch, "DSA top-k batch")?)?;
+        let key_tokens_buffer = self
+            .arena
+            .u32(to_u32(key_tokens, "DSA top-k key_tokens")?)?;
+        let block_count_buffer = self
+            .arena
+            .u32(to_u32(block_count, "DSA top-k block_count")?)?;
+        let block_top_k_buffer = self
+            .arena
+            .u32(to_u32(block_top_k, "DSA top-k block_top_k")?)?;
+
+        if block_count == 1 {
+            let output_stride_buffer = self.arena.u32(to_u32(top_k, "DSA top-k output stride")?)?;
+            encode_1d_threadgroups(
+                command_buffer,
+                &self.topk_block_sort_pipeline,
+                &[
+                    scores,
+                    &token_ids,
+                    &batch_buffer,
+                    &key_tokens_buffer,
+                    &block_count_buffer,
+                    &block_top_k_buffer,
+                    &output_stride_buffer,
+                ],
+                batch,
+                DSA_TOPK_BLOCK_THREADS,
+            )?;
+            return Ok(MetalDsaTopKBuffers {
+                token_ids,
+                output_len,
+            });
+        }
+
+        let scratch_len = batch
+            .checked_mul(scratch_stride)
+            .ok_or_else(|| Error::backend("DSA top-k scratch length overflow"))?;
+        let scratch_a = self.arena.empty_u32(scratch_len)?;
+        let scratch_b = self.arena.empty_u32(scratch_len)?;
+        let scratch_stride_buffer = self
+            .arena
+            .u32(to_u32(scratch_stride, "DSA top-k scratch stride")?)?;
+        encode_1d_threadgroups(
             command_buffer,
-            &self.topk_pipeline,
+            &self.topk_block_sort_pipeline,
             &[
-                &scores,
-                &token_ids,
+                scores,
+                &scratch_a,
                 &batch_buffer,
                 &key_tokens_buffer,
-                &top_k_buffer,
+                &block_count_buffer,
+                &block_top_k_buffer,
+                &scratch_stride_buffer,
             ],
-            batch,
+            batch
+                .checked_mul(block_count)
+                .ok_or_else(|| Error::backend("DSA block-sort dispatch overflow"))?,
+            DSA_TOPK_BLOCK_THREADS,
         )?;
+
+        let mut source_is_a = true;
+        let mut run_count = block_count;
+        let mut run_length = block_top_k;
+        while run_count > 1 {
+            let output_run_count = run_count.div_ceil(2);
+            let output_run_length = run_length
+                .checked_mul(2)
+                .ok_or_else(|| Error::backend("DSA top-k merge run length overflow"))?
+                .min(top_k);
+            let final_merge = output_run_count == 1;
+            let source = if source_is_a { &scratch_a } else { &scratch_b };
+            let destination = if final_merge {
+                &token_ids
+            } else if source_is_a {
+                &scratch_b
+            } else {
+                &scratch_a
+            };
+            let destination_stride = if final_merge { top_k } else { scratch_stride };
+            let run_count_buffer = self
+                .arena
+                .u32(to_u32(run_count, "DSA top-k input run count")?)?;
+            let run_length_buffer = self
+                .arena
+                .u32(to_u32(run_length, "DSA top-k input run length")?)?;
+            let output_run_length_buffer = self
+                .arena
+                .u32(to_u32(output_run_length, "DSA top-k output run length")?)?;
+            let destination_stride_buffer = self
+                .arena
+                .u32(to_u32(destination_stride, "DSA top-k destination stride")?)?;
+
+            encode_1d_threadgroups(
+                command_buffer,
+                &self.topk_merge_pipeline,
+                &[
+                    scores,
+                    source,
+                    destination,
+                    &batch_buffer,
+                    &key_tokens_buffer,
+                    &run_count_buffer,
+                    &run_length_buffer,
+                    &output_run_length_buffer,
+                    &scratch_stride_buffer,
+                    &destination_stride_buffer,
+                ],
+                batch
+                    .checked_mul(output_run_count)
+                    .ok_or_else(|| Error::backend("DSA merge dispatch overflow"))?,
+                DSA_TOPK_BLOCK_THREADS,
+            )?;
+
+            source_is_a = !source_is_a;
+            run_count = output_run_count;
+            run_length = output_run_length;
+        }
 
         Ok(MetalDsaTopKBuffers {
             token_ids,

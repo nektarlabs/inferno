@@ -321,16 +321,29 @@ impl<'a> DenseFfn<'a> {
             self.post_attention_norm
                 .forward_device(hidden_states, backend),
         )?;
-        let gate = require_dense_ffn_device_stage(
-            "dense_ffn.gate",
-            self.gate.forward_device(&normed, backend),
-        )?;
-        let up = require_dense_ffn_device_stage(
-            "dense_ffn.up",
-            self.up.forward_device(&normed, backend),
-        )?;
-        let gated =
-            require_dense_ffn_device_stage("dense_ffn.swiglu", backend.swiglu_device(&gate, &up))?;
+        let fused_gated = if tokens == 1 {
+            self.gate
+                .forward_q8_gate_up_swiglu_device(&self.up, &normed, backend)?
+        } else {
+            None
+        };
+        let gated = match fused_gated {
+            Some(gated) => gated,
+            None => {
+                let gate = require_dense_ffn_device_stage(
+                    "dense_ffn.gate",
+                    self.gate.forward_device(&normed, backend),
+                )?;
+                let up = require_dense_ffn_device_stage(
+                    "dense_ffn.up",
+                    self.up.forward_device(&normed, backend),
+                )?;
+                require_dense_ffn_device_stage(
+                    "dense_ffn.swiglu",
+                    backend.swiglu_device(&gate, &up),
+                )?
+            }
+        };
         validate_exact_shape(
             "gguf_device_dense_ffn_gated",
             gated.dims(),
