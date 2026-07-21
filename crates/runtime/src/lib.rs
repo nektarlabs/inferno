@@ -6,8 +6,12 @@ mod cache_budget;
 mod telemetry;
 
 pub use cache_budget::{
-    CacheBudgetAdjustment, CacheBudgetPlan, CacheBudgetSignals, CacheBudgetSpec, ContextTier,
-    DEFAULT_DYNAMIC_CACHE_BUDGET_BYTES,
+    AdaptiveCachePolicy, CacheBudgetAdjustment, CacheBudgetDecision, CacheBudgetPlan,
+    CacheBudgetSignals, CacheBudgetSpec, CacheResource, ContextTier, MemoryPressure,
+    DEFAULT_DECISION_WINDOW_TOKENS, DEFAULT_EXPERT_CACHE_SLOTS_PER_LAYER,
+    DEFAULT_HARD_HEADROOM_BYTES, DEFAULT_HOT_KV_CACHE_BUDGET_BYTES,
+    DEFAULT_MAX_EXPERT_CACHE_SLOTS_PER_LAYER, DEFAULT_MIN_EXPERT_CACHE_SLOTS_PER_LAYER,
+    DEFAULT_TARGET_HEADROOM_BYTES,
 };
 
 use std::{
@@ -56,6 +60,107 @@ const F16_BYTES: u64 = 2;
 const Q2_K_BLOCK_VALUES: usize = 256;
 const Q2_K_BLOCK_BYTES: usize = 84;
 const MTP_DRAFTS_PER_STEP: usize = 2;
+const MIN_ADAPTIVE_HOT_KV_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ADAPTIVE_HOT_KV_BUDGET_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
+pub fn q2_memory_controller_spec(
+    config: &Config,
+    page_size: usize,
+    fixed_expert_slots_per_layer: Option<usize>,
+    fixed_hot_kv_budget_bytes: Option<usize>,
+    include_mtp_cache: bool,
+) -> Result<CacheBudgetSpec> {
+    let matrix_values = config
+        .hidden_size
+        .checked_mul(config.moe_intermediate_size)
+        .ok_or_else(|| Error::runtime("Q2 expert matrix value count overflow"))?;
+    if matrix_values % Q2_K_BLOCK_VALUES != 0 {
+        return Err(Error::runtime(format!(
+            "Q2 expert matrix values {matrix_values} must be divisible by {Q2_K_BLOCK_VALUES}"
+        )));
+    }
+    let expert_bytes_per_layer_slot = matrix_values
+        .checked_div(Q2_K_BLOCK_VALUES)
+        .and_then(|blocks| blocks.checked_mul(Q2_K_BLOCK_BYTES))
+        .and_then(|component_bytes| component_bytes.checked_mul(3))
+        .ok_or_else(|| Error::runtime("Q2 expert triplet byte count overflow"))?;
+    let sparse_layers = config
+        .sparse_moe_layers
+        .unwrap_or_else(|| config.num_layers.saturating_sub(config.dense_layers));
+    let mtp_layers = if include_mtp_cache {
+        config.num_nextn_predict_layers
+    } else {
+        0
+    };
+    let routed_layer_count = sparse_layers
+        .checked_add(mtp_layers)
+        .ok_or_else(|| Error::runtime("routed cache layer count overflow"))?;
+    let kv_layer_count = config
+        .num_layers
+        .checked_add(mtp_layers)
+        .ok_or_else(|| Error::runtime("KV cache layer count overflow"))?;
+    let kv_bytes_per_token = config
+        .kv_lora_rank
+        .checked_add(config.qk_rope_dim)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_mul(kv_layer_count))
+        .ok_or_else(|| Error::runtime("MLA KV bytes per token overflow"))?;
+
+    let initial_expert_slots_per_layer =
+        fixed_expert_slots_per_layer.unwrap_or(DEFAULT_EXPERT_CACHE_SLOTS_PER_LAYER);
+    let (min_expert_slots_per_layer, max_expert_slots_per_layer) =
+        match fixed_expert_slots_per_layer {
+            Some(slots) => (slots, slots),
+            None => (
+                DEFAULT_MIN_EXPERT_CACHE_SLOTS_PER_LAYER,
+                DEFAULT_MAX_EXPERT_CACHE_SLOTS_PER_LAYER,
+            ),
+        };
+    let initial_hot_kv_budget_bytes =
+        fixed_hot_kv_budget_bytes.unwrap_or(DEFAULT_HOT_KV_CACHE_BUDGET_BYTES);
+    let (min_hot_kv_budget_bytes, max_hot_kv_budget_bytes) = match fixed_hot_kv_budget_bytes {
+        Some(bytes) => (bytes, bytes),
+        None => (
+            MIN_ADAPTIVE_HOT_KV_BUDGET_BYTES,
+            MAX_ADAPTIVE_HOT_KV_BUDGET_BYTES,
+        ),
+    };
+    let spec = CacheBudgetSpec {
+        kv_bytes_per_token,
+        expert_bytes_per_layer_slot,
+        routed_layer_count,
+        page_size,
+        initial_expert_slots_per_layer,
+        min_expert_slots_per_layer,
+        max_expert_slots_per_layer,
+        initial_hot_kv_budget_bytes,
+        min_hot_kv_budget_bytes,
+        max_hot_kv_budget_bytes,
+        target_headroom_bytes: DEFAULT_TARGET_HEADROOM_BYTES,
+        hard_headroom_bytes: DEFAULT_HARD_HEADROOM_BYTES,
+        decision_window_tokens: DEFAULT_DECISION_WINDOW_TOKENS,
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+fn resume_adaptive_expert_budget(
+    spec: &mut CacheBudgetSpec,
+    configured_slots_per_layer: u64,
+) -> Result<()> {
+    if spec.min_expert_slots_per_layer == spec.max_expert_slots_per_layer
+        || configured_slots_per_layer == 0
+    {
+        return Ok(());
+    }
+    let configured_slots_per_layer = usize::try_from(configured_slots_per_layer)
+        .map_err(|_| Error::runtime("configured expert slots exceed usize"))?;
+    spec.initial_expert_slots_per_layer = configured_slots_per_layer.clamp(
+        spec.min_expert_slots_per_layer,
+        spec.max_expert_slots_per_layer,
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GenerationOptions {
@@ -82,6 +187,7 @@ pub struct KvCacheMetrics {
     pub cold_bytes: u64,
     pub cached_tokens: u64,
     pub read_nanoseconds: u64,
+    pub full_layer_read_nanoseconds: u64,
     pub write_nanoseconds: u64,
 }
 
@@ -115,7 +221,7 @@ impl KvCacheMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StreamingGenerationReport {
     pub kv_cache: KvCacheMetrics,
     pub decode_expert_cache: ExpertCacheMetrics,
@@ -141,7 +247,7 @@ impl MtpMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CacheBudgetRuntimeReport {
     pub total_bytes: usize,
     pub expert_slots_per_layer: usize,
@@ -151,6 +257,11 @@ pub struct CacheBudgetRuntimeReport {
     pub all_layers_fit: bool,
     pub rebalances: usize,
     pub memory_pressure: bool,
+    pub pressure_events: usize,
+    pub prefill_metal_high_water_bytes: Option<u64>,
+    pub decode_metal_high_water_bytes: Option<u64>,
+    pub minimum_effective_headroom_bytes: Option<u64>,
+    pub last_measured_tokens_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -343,143 +454,449 @@ fn log_token_cost(report: TokenCostReport) {
     );
 }
 
-const CACHE_SIGNAL_INTERVAL_TOKENS: usize = 8;
-const CACHE_MEMORY_INTERVAL_TOKENS: usize = 128;
-const CACHE_PRESSURE_FREE_BYTES: u64 = 512 * 1024 * 1024;
-const CACHE_PRESSURE_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const CACHE_PRESSURE_SWAP_BYTES: u64 = 1024 * 1024 * 1024;
-const CACHE_PRESSURE_SWAP_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
+const CACHE_PRESSURE_SWAP_GROWTH_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_PRESSURE_COMPRESSION_GROWTH_BYTES: u64 = 256 * 1024 * 1024;
+const CACHE_PRESSURE_METAL_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
+static MEMORY_CONTROLLER_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+pub fn enable_memory_controller_log(path: &Path) -> Result<()> {
+    let mut file = File::create(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    writeln!(
+        file,
+        "decision\tphase\tcontext_tokens\taction\tresource\tpressure\tprevious_expert_slots\tnext_expert_slots\tprevious_hot_kv_bytes\tnext_hot_kv_bytes\twindow_tokens\twindow_seconds\tmeasured_tps\tcomparison_tps\texpert_hit_rate\texpert_ssd_bytes\tkv_miss_rate\tkv_ssd_bytes\teffective_available_bytes\tmetal_allocated_bytes\tmetal_headroom_bytes\tswap_used_bytes\tcompressed_bytes"
+    )
+    .map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = memory_controller_file()
+        .lock()
+        .map_err(|_| Error::runtime("memory controller file lock poisoned"))?;
+    if writer.is_some() {
+        return Err(Error::runtime(
+            "memory controller decision logging is already enabled",
+        ));
+    }
+    *writer = Some(file);
+    Ok(())
+}
+
+fn memory_controller_file() -> &'static Mutex<Option<File>> {
+    MEMORY_CONTROLLER_FILE.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryControllerPhase {
+    Prefill,
+    Decode,
+}
 
 struct CacheBudgetController {
     spec: CacheBudgetSpec,
-    current: CacheBudgetPlan,
-    signals: CacheBudgetSignals,
-    last_signal_context: usize,
-    last_memory_context: Option<usize>,
-    last_expert_lookups: u64,
-    last_expert_hits: u64,
-    last_kv_lookups: u64,
-    last_kv_misses: u64,
-    baseline_swap_bytes: Option<u64>,
+    policy: AdaptiveCachePolicy,
+    phase: MemoryControllerPhase,
+    window_tokens: usize,
+    window_elapsed_nanoseconds: u64,
+    window_experts: ExpertCacheMetrics,
+    window_kv: KvCacheMetrics,
+    pressure_reference_swap_bytes: Option<u64>,
+    pressure_reference_compressed_bytes: Option<u64>,
+    prefill_metal_high_water_bytes: Option<u64>,
+    decode_metal_high_water_bytes: Option<u64>,
+    minimum_effective_headroom_bytes: Option<u64>,
+    last_measured_tokens_per_second: Option<f64>,
+    decision_count: usize,
     rebalances: usize,
+    pressure_events: usize,
+    memory_pressure: bool,
 }
 
 impl CacheBudgetController {
     fn new(spec: CacheBudgetSpec, context_len: usize) -> Result<Self> {
-        let current = spec.plan(context_len, CacheBudgetSignals::default())?;
+        spec.validate()?;
         Ok(Self {
             spec,
-            current,
-            signals: CacheBudgetSignals::default(),
-            last_signal_context: context_len,
-            last_memory_context: None,
-            last_expert_lookups: 0,
-            last_expert_hits: 0,
-            last_kv_lookups: 0,
-            last_kv_misses: 0,
-            baseline_swap_bytes: None,
+            policy: AdaptiveCachePolicy::new(spec, context_len)?,
+            phase: MemoryControllerPhase::Prefill,
+            window_tokens: 0,
+            window_elapsed_nanoseconds: 0,
+            window_experts: ExpertCacheMetrics::default(),
+            window_kv: KvCacheMetrics::default(),
+            pressure_reference_swap_bytes: None,
+            pressure_reference_compressed_bytes: None,
+            prefill_metal_high_water_bytes: None,
+            decode_metal_high_water_bytes: None,
+            minimum_effective_headroom_bytes: None,
+            last_measured_tokens_per_second: None,
+            decision_count: 0,
             rebalances: 0,
+            pressure_events: 0,
+            memory_pressure: false,
         })
     }
 
-    fn maybe_rebalance<B: Backend>(
+    fn current(&self) -> CacheBudgetPlan {
+        self.policy.current()
+    }
+
+    fn track_prefill_memory<B: Backend>(&mut self, backend: &B, runtime_kv: RuntimeKvMemoryBytes) {
+        let memory = capture_memory_snapshot(backend, runtime_kv);
+        self.update_high_water(memory);
+        if self.pressure_reference_swap_bytes.is_none() {
+            self.reset_pressure_reference(memory);
+        }
+    }
+
+    fn observe_prefill<B: Backend>(
         &mut self,
         context_len: usize,
         backend: &B,
         cache: &mut DevicePagedRuntimeCache,
     ) -> Result<()> {
-        let context_plan = self.spec.plan(context_len, self.signals)?;
-        let page_changed = context_plan.capacity_tokens != self.current.capacity_tokens;
-        let signal_due = context_len
-            >= self
-                .last_signal_context
-                .saturating_add(CACHE_SIGNAL_INTERVAL_TOKENS);
-        if !page_changed && !signal_due {
+        let memory = capture_memory_snapshot(backend, cache.runtime_kv_memory());
+        self.update_high_water(memory);
+        let pressure = self.memory_pressure(memory);
+        if self.can_absorb_prefill_growth(memory, pressure) {
+            // Loading the fixed model and warming experts naturally replaces
+            // reclaimable pages. Decode gets a fresh baseline after prefill;
+            // only absolute headroom pressure justifies sacrificing cache here.
+            self.reset_pressure_reference(memory);
             return Ok(());
         }
-
-        if signal_due {
-            let experts = backend.expert_cache_metrics()?;
-            let kv = cache.cache_metrics();
-            self.signals.expert_lookups = experts.lookups.saturating_sub(self.last_expert_lookups);
-            self.signals.expert_hits = experts.hits.saturating_sub(self.last_expert_hits);
-            self.signals.kv_lookups = kv.lookups().saturating_sub(self.last_kv_lookups);
-            self.signals.kv_misses = kv.misses().saturating_sub(self.last_kv_misses);
-            self.last_expert_lookups = experts.lookups;
-            self.last_expert_hits = experts.hits;
-            self.last_kv_lookups = kv.lookups();
-            self.last_kv_misses = kv.misses();
-            self.last_signal_context = context_len;
-
-            let memory_due = self.last_memory_context.is_none_or(|last| {
-                context_len >= last.saturating_add(CACHE_MEMORY_INTERVAL_TOKENS)
-            });
-            if memory_due {
-                let memory = capture_memory_snapshot(backend, cache.runtime_kv_memory());
-                let baseline_swap = *self
-                    .baseline_swap_bytes
-                    .get_or_insert(memory.swap_used_bytes.unwrap_or(0));
-                self.signals.memory_pressure = memory_pressure(memory, baseline_swap);
-                self.last_memory_context = Some(context_len);
-            }
+        if !pressure.is_pressure() {
+            return Ok(());
         }
-
-        let next = self.spec.plan(context_len, self.signals)?;
-        if next.expert_slots_per_layer != self.current.expert_slots_per_layer {
-            backend.resize_expert_cache_slots_per_layer(next.expert_slots_per_layer)?;
-        }
-        if next.hot_kv_budget_bytes != self.current.hot_kv_budget_bytes {
-            cache.set_hot_all_layers_budget(next.hot_kv_budget_bytes)?;
-        }
-        if next.expert_slots_per_layer != self.current.expert_slots_per_layer
-            || next.hot_kv_budget_bytes != self.current.hot_kv_budget_bytes
-        {
-            self.rebalances = self.rebalances.saturating_add(1);
-            tracing::info!(
-                target: "inferno::cache_budget",
-                context_len,
-                tier = ?next.tier,
-                adjustment = ?next.adjustment,
-                expert_slots_per_layer = next.expert_slots_per_layer,
-                expert_cache_gb = next.expert_bytes as f64 / 1_000_000_000.0,
-                hot_kv_budget_gb = next.hot_kv_budget_bytes as f64 / 1_000_000_000.0,
-                all_layers_fit = next.all_layers_fit,
-                expert_hit_rate = rate_u64(self.signals.expert_hits, self.signals.expert_lookups),
-                kv_miss_rate = rate_u64(self.signals.kv_misses, self.signals.kv_lookups),
-                memory_pressure = self.signals.memory_pressure,
-                "rebalanced shared expert and hot KV cache budget"
-            );
-        }
-        self.current = next;
+        let previous = self.policy.current();
+        let signals = self.signals(
+            0,
+            0,
+            backend.expert_cache_metrics()?,
+            cache.cache_metrics(),
+            memory,
+            pressure,
+        );
+        let decision = self.policy.observe(context_len, signals)?;
+        let adjustment_nanoseconds =
+            self.apply_decision(previous, decision.plan, backend, cache)?;
+        self.pressure_events = self.pressure_events.saturating_add(1);
+        self.memory_pressure = true;
+        self.record_decision(previous, decision, signals, memory)?;
+        self.reset_pressure_reference(memory);
+        self.window_elapsed_nanoseconds = self
+            .window_elapsed_nanoseconds
+            .saturating_add(adjustment_nanoseconds);
         Ok(())
     }
 
-    fn report(&self) -> CacheBudgetRuntimeReport {
-        CacheBudgetRuntimeReport {
-            total_bytes: self.spec.total_bytes,
-            expert_slots_per_layer: self.current.expert_slots_per_layer,
-            expert_bytes: self.current.expert_bytes,
-            hot_kv_budget_bytes: self.current.hot_kv_budget_bytes,
-            all_layer_hot_bytes: self.current.all_layer_hot_bytes,
-            all_layers_fit: self.current.all_layers_fit,
-            rebalances: self.rebalances,
-            memory_pressure: self.signals.memory_pressure,
+    fn finish_prefill<B: Backend>(
+        &mut self,
+        context_len: usize,
+        backend: &B,
+        cache: &mut DevicePagedRuntimeCache,
+    ) -> Result<()> {
+        let before_release = capture_memory_snapshot(backend, cache.runtime_kv_memory());
+        self.update_high_water(before_release);
+        backend.release_prefill_resources()?;
+        let after_release = capture_memory_snapshot(backend, cache.runtime_kv_memory());
+        self.phase = MemoryControllerPhase::Decode;
+        self.update_high_water(after_release);
+        self.window_experts = backend.expert_cache_metrics()?;
+        self.window_kv = cache.cache_metrics();
+        self.window_tokens = 0;
+        self.window_elapsed_nanoseconds = 0;
+        self.reset_pressure_reference(after_release);
+        let previous = self.policy.current();
+        let decision = self.policy.phase_transition(context_len)?;
+        let signals = self.signals(
+            0,
+            0,
+            self.window_experts,
+            self.window_kv,
+            after_release,
+            MemoryPressure::None,
+        );
+        self.record_decision(previous, decision, signals, after_release)
+    }
+
+    fn observe_decode_step<B: Backend>(
+        &mut self,
+        context_len: usize,
+        emitted_tokens: usize,
+        elapsed: Duration,
+        backend: &B,
+        cache: &mut DevicePagedRuntimeCache,
+    ) -> Result<()> {
+        self.window_tokens = self.window_tokens.saturating_add(emitted_tokens);
+        self.window_elapsed_nanoseconds = self
+            .window_elapsed_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(elapsed));
+        let memory = capture_memory_snapshot(backend, cache.runtime_kv_memory());
+        self.update_high_water(memory);
+        let pressure = self.memory_pressure(memory);
+        if !pressure.is_pressure() && self.window_tokens < self.spec.decision_window_tokens {
+            return Ok(());
+        }
+
+        let experts = backend.expert_cache_metrics()?;
+        let kv = cache.cache_metrics();
+        let signals = self.signals(
+            self.window_tokens,
+            self.window_elapsed_nanoseconds,
+            experts,
+            kv,
+            memory,
+            pressure,
+        );
+        let previous = self.policy.current();
+        let decision = self.policy.observe(context_len, signals)?;
+        let adjustment_nanoseconds =
+            self.apply_decision(previous, decision.plan, backend, cache)?;
+        if pressure.is_pressure() {
+            self.pressure_events = self.pressure_events.saturating_add(1);
+        }
+        self.memory_pressure = pressure.is_pressure();
+        self.last_measured_tokens_per_second = Some(signals.tokens_per_second());
+        self.record_decision(previous, decision, signals, memory)?;
+        self.window_experts = experts;
+        self.window_kv = kv;
+        self.window_tokens = 0;
+        self.window_elapsed_nanoseconds = adjustment_nanoseconds;
+        self.reset_pressure_reference(memory);
+        Ok(())
+    }
+
+    fn signals(
+        &self,
+        tokens: usize,
+        elapsed_nanoseconds: u64,
+        experts: ExpertCacheMetrics,
+        kv: KvCacheMetrics,
+        memory: RuntimeMemorySnapshot,
+        pressure: MemoryPressure,
+    ) -> CacheBudgetSignals {
+        CacheBudgetSignals {
+            tokens,
+            elapsed_nanoseconds,
+            expert_lookups: experts.lookups.saturating_sub(self.window_experts.lookups),
+            expert_hits: experts.hits.saturating_sub(self.window_experts.hits),
+            expert_ssd_read_bytes: experts
+                .ssd_read_bytes
+                .saturating_sub(self.window_experts.ssd_read_bytes),
+            expert_ssd_load_nanoseconds: experts
+                .ssd_load_nanoseconds
+                .saturating_sub(self.window_experts.ssd_load_nanoseconds),
+            kv_lookups: kv
+                .full_layer_lookups
+                .saturating_sub(self.window_kv.full_layer_lookups),
+            kv_misses: kv
+                .full_layer_misses
+                .saturating_sub(self.window_kv.full_layer_misses),
+            kv_ssd_read_bytes: kv
+                .ssd_read_bytes
+                .saturating_sub(self.window_kv.ssd_read_bytes),
+            kv_read_nanoseconds: kv
+                .full_layer_read_nanoseconds
+                .saturating_sub(self.window_kv.full_layer_read_nanoseconds),
+            effective_available_bytes: memory.effective_available_bytes(),
+            metal_headroom_bytes: memory.metal_headroom_bytes(),
+            pressure,
         }
     }
-}
 
-fn memory_pressure(snapshot: RuntimeMemorySnapshot, baseline_swap_bytes: u64) -> bool {
-    let swap_used = snapshot.swap_used_bytes.unwrap_or(0);
-    let swap_growth = swap_used.saturating_sub(baseline_swap_bytes);
-    let swap_pressure =
-        swap_used >= CACHE_PRESSURE_SWAP_BYTES || swap_growth >= CACHE_PRESSURE_SWAP_GROWTH_BYTES;
-    let compressed_pressure = snapshot
-        .system_compressed_bytes
-        .is_some_and(|bytes| bytes >= CACHE_PRESSURE_COMPRESSED_BYTES);
-    let low_free_memory = snapshot
-        .system_free_bytes
-        .is_some_and(|bytes| bytes <= CACHE_PRESSURE_FREE_BYTES);
-    swap_pressure || (compressed_pressure && low_free_memory)
+    fn apply_decision<B: Backend>(
+        &mut self,
+        previous: CacheBudgetPlan,
+        next: CacheBudgetPlan,
+        backend: &B,
+        cache: &mut DevicePagedRuntimeCache,
+    ) -> Result<u64> {
+        let started = Instant::now();
+        let mut changed = false;
+        if next.expert_slots_per_layer != previous.expert_slots_per_layer {
+            backend.resize_expert_cache_slots_per_layer(next.expert_slots_per_layer)?;
+            changed = true;
+        }
+        if next.hot_kv_budget_bytes != previous.hot_kv_budget_bytes {
+            cache.set_hot_all_layers_budget(next.hot_kv_budget_bytes, backend)?;
+            changed = true;
+        }
+        if changed {
+            self.rebalances = self.rebalances.saturating_add(1);
+        }
+        Ok(if changed {
+            elapsed_nanoseconds_u64(started.elapsed())
+        } else {
+            0
+        })
+    }
+
+    fn memory_pressure(&self, memory: RuntimeMemorySnapshot) -> MemoryPressure {
+        let swap_growth = memory.swap_used_bytes.unwrap_or(0).saturating_sub(
+            self.pressure_reference_swap_bytes
+                .unwrap_or(memory.swap_used_bytes.unwrap_or(0)),
+        );
+        if swap_growth >= CACHE_PRESSURE_SWAP_GROWTH_BYTES {
+            return MemoryPressure::SwapGrowth;
+        }
+        let compressed_growth = memory.system_compressed_bytes.unwrap_or(0).saturating_sub(
+            self.pressure_reference_compressed_bytes
+                .unwrap_or(memory.system_compressed_bytes.unwrap_or(0)),
+        );
+        if compressed_growth >= CACHE_PRESSURE_COMPRESSION_GROWTH_BYTES {
+            return MemoryPressure::CompressionGrowth;
+        }
+        if memory
+            .effective_available_bytes()
+            .is_some_and(|bytes| bytes < self.spec.hard_headroom_bytes)
+        {
+            return MemoryPressure::CriticalHeadroom;
+        }
+        if memory
+            .effective_available_bytes()
+            .is_some_and(|bytes| bytes < self.spec.target_headroom_bytes)
+        {
+            return MemoryPressure::Headroom;
+        }
+        if memory
+            .metal_headroom_bytes()
+            .is_some_and(|bytes| bytes < CACHE_PRESSURE_METAL_HEADROOM_BYTES)
+        {
+            return MemoryPressure::MetalWorkingSet;
+        }
+        MemoryPressure::None
+    }
+
+    fn can_absorb_prefill_growth(
+        &self,
+        memory: RuntimeMemorySnapshot,
+        pressure: MemoryPressure,
+    ) -> bool {
+        matches!(
+            pressure,
+            MemoryPressure::SwapGrowth | MemoryPressure::CompressionGrowth
+        ) && memory
+            .effective_available_bytes()
+            .is_some_and(|bytes| bytes >= self.spec.target_headroom_bytes)
+            && memory
+                .metal_headroom_bytes()
+                .is_none_or(|bytes| bytes >= CACHE_PRESSURE_METAL_HEADROOM_BYTES)
+    }
+
+    fn reset_pressure_reference(&mut self, memory: RuntimeMemorySnapshot) {
+        self.pressure_reference_swap_bytes = memory.swap_used_bytes;
+        self.pressure_reference_compressed_bytes = memory.system_compressed_bytes;
+    }
+
+    fn update_high_water(&mut self, memory: RuntimeMemorySnapshot) {
+        if let Some(bytes) = memory.metal_current_allocated_bytes {
+            let high_water = match self.phase {
+                MemoryControllerPhase::Prefill => &mut self.prefill_metal_high_water_bytes,
+                MemoryControllerPhase::Decode => &mut self.decode_metal_high_water_bytes,
+            };
+            *high_water = Some(high_water.map_or(bytes, |current| current.max(bytes)));
+        }
+        if let Some(bytes) = memory.effective_available_bytes() {
+            self.minimum_effective_headroom_bytes = Some(
+                self.minimum_effective_headroom_bytes
+                    .map_or(bytes, |current| current.min(bytes)),
+            );
+        }
+    }
+
+    fn record_decision(
+        &mut self,
+        previous: CacheBudgetPlan,
+        decision: CacheBudgetDecision,
+        signals: CacheBudgetSignals,
+        memory: RuntimeMemorySnapshot,
+    ) -> Result<()> {
+        self.decision_count = self.decision_count.saturating_add(1);
+        tracing::info!(
+            target: "inferno::memory_controller",
+            decision = self.decision_count,
+            phase = ?self.phase,
+            context_tokens = decision.plan.context_len,
+            action = ?decision.action,
+            resource = ?decision.resource,
+            pressure = ?signals.pressure,
+            previous_expert_slots = previous.expert_slots_per_layer,
+            next_expert_slots = decision.plan.expert_slots_per_layer,
+            previous_hot_kv_gb = previous.hot_kv_budget_bytes as f64 / 1_000_000_000.0,
+            next_hot_kv_gb = decision.plan.hot_kv_budget_bytes as f64 / 1_000_000_000.0,
+            measured_tokens_per_second = decision.measured_tokens_per_second,
+            comparison_tokens_per_second = ?decision.comparison_tokens_per_second,
+            effective_available_gb = memory.effective_available_bytes().map(|bytes| bytes as f64 / 1_000_000_000.0),
+            metal_allocated_gb = memory.metal_current_allocated_bytes.map(|bytes| bytes as f64 / 1_000_000_000.0),
+            swap_used_gb = memory.swap_used_bytes.map(|bytes| bytes as f64 / 1_000_000_000.0),
+            "recorded adaptive memory decision"
+        );
+
+        let mut writer = memory_controller_file()
+            .lock()
+            .map_err(|_| Error::runtime("memory controller file lock poisoned"))?;
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        writeln!(
+            writer,
+            "{}\t{:?}\t{}\t{:?}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.decision_count,
+            self.phase,
+            decision.plan.context_len,
+            decision.action,
+            decision.resource,
+            signals.pressure,
+            previous.expert_slots_per_layer,
+            decision.plan.expert_slots_per_layer,
+            previous.hot_kv_budget_bytes,
+            decision.plan.hot_kv_budget_bytes,
+            signals.tokens,
+            signals.elapsed_nanoseconds as f64 / 1_000_000_000.0,
+            decision.measured_tokens_per_second,
+            decision
+                .comparison_tokens_per_second
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_default(),
+            signals.expert_hit_rate(),
+            signals.expert_ssd_read_bytes,
+            signals.kv_miss_rate(),
+            signals.kv_ssd_read_bytes,
+            memory.effective_available_bytes().unwrap_or(0),
+            memory.metal_current_allocated_bytes.unwrap_or(0),
+            memory.metal_headroom_bytes().unwrap_or(0),
+            memory.swap_used_bytes.unwrap_or(0),
+            memory.system_compressed_bytes.unwrap_or(0),
+        )
+        .map_err(|source| Error::runtime(format!("memory controller log write failed: {source}")))?;
+        writer.flush().map_err(|source| {
+            Error::runtime(format!("memory controller log flush failed: {source}"))
+        })
+    }
+
+    fn report(&self) -> CacheBudgetRuntimeReport {
+        let current = self.policy.current();
+        CacheBudgetRuntimeReport {
+            total_bytes: current
+                .expert_bytes
+                .saturating_add(current.hot_kv_budget_bytes),
+            expert_slots_per_layer: current.expert_slots_per_layer,
+            expert_bytes: current.expert_bytes,
+            hot_kv_budget_bytes: current.hot_kv_budget_bytes,
+            all_layer_hot_bytes: current.all_layer_hot_bytes,
+            all_layers_fit: current.all_layers_fit,
+            rebalances: self.rebalances,
+            memory_pressure: self.memory_pressure,
+            pressure_events: self.pressure_events,
+            prefill_metal_high_water_bytes: self.prefill_metal_high_water_bytes,
+            decode_metal_high_water_bytes: self.decode_metal_high_water_bytes,
+            minimum_effective_headroom_bytes: self.minimum_effective_headroom_bytes,
+            last_measured_tokens_per_second: self.last_measured_tokens_per_second,
+        }
+    }
 }
 
 fn rate_u64(numerator: u64, denominator: u64) -> f64 {
@@ -1272,15 +1689,19 @@ where
         .transpose()?;
     let mut cache_budget_controller = options
         .dynamic_cache_budget
-        .map(|spec| CacheBudgetController::new(spec, prompt_token_ids.len()))
+        .map(|mut spec| {
+            let configured_slots_per_layer =
+                backend.expert_cache_metrics()?.configured_slots_per_layer;
+            resume_adaptive_expert_budget(&mut spec, configured_slots_per_layer)?;
+            CacheBudgetController::new(spec, prompt_token_ids.len())
+        })
         .transpose()?;
     if let Some(controller) = cache_budget_controller.as_ref() {
-        backend
-            .configure_expert_cache_slots_per_layer(controller.current.expert_slots_per_layer)?;
+        backend.resize_expert_cache_slots_per_layer(controller.current().expert_slots_per_layer)?;
     }
     let initial_hot_kv_budget = cache_budget_controller
         .as_ref()
-        .map(|controller| controller.current.hot_kv_budget_bytes)
+        .map(|controller| controller.current().hot_kv_budget_bytes)
         .or(options.hot_kv_cache_budget_bytes);
     log_memory_snapshot(
         "generate.start",
@@ -1288,6 +1709,9 @@ where
         backend,
         RuntimeKvMemoryBytes::default(),
     );
+    if let Some(controller) = cache_budget_controller.as_mut() {
+        controller.track_prefill_memory(backend, RuntimeKvMemoryBytes::default());
+    }
 
     let prefill_started_at = Instant::now();
     set_layer_profile_context(0, "prefill.seed")?;
@@ -1336,6 +1760,9 @@ where
         backend,
         RuntimeKvMemoryBytes::default(),
     );
+    if let Some(controller) = cache_budget_controller.as_mut() {
+        controller.track_prefill_memory(backend, RuntimeKvMemoryBytes::default());
+    }
     let cache_started_at = Instant::now();
     let mut device_kv_cache = if use_device_kv {
         let seed_layer_kv_cache = device_seed_layer_kv_cache
@@ -1351,6 +1778,7 @@ where
     } else {
         None
     };
+    drop(device_seed_layer_kv_cache);
     let mut host_kv_cache = if use_device_kv {
         None
     } else {
@@ -1367,6 +1795,11 @@ where
         backend,
         runtime_kv_memory(&device_kv_cache, &host_kv_cache),
     );
+    if let (Some(controller), Some(cache)) =
+        (cache_budget_controller.as_mut(), device_kv_cache.as_mut())
+    {
+        controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
+    }
 
     let mut mtp_device_cache = None;
 
@@ -1385,13 +1818,6 @@ where
                 let chunk = &prompt_token_ids[chunk_start..chunk_end];
                 let prefill_index = chunk_end - 1;
                 let emit_next_token = chunk_end == prompt_token_ids.len();
-                if let Some(controller) = cache_budget_controller.as_mut() {
-                    controller.maybe_rebalance(
-                        cache.cached_tokens()?.saturating_add(chunk.len()),
-                        backend,
-                        cache,
-                    )?;
-                }
                 cache.set_profile_step_index(prefill_index);
                 log_memory_snapshot(
                     "prefill.chunk.before_model",
@@ -1445,6 +1871,9 @@ where
                     backend,
                     cache.runtime_kv_memory(),
                 );
+                if let Some(controller) = cache_budget_controller.as_mut() {
+                    controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
+                }
                 chunk_start = chunk_end;
             }
         } else {
@@ -1452,13 +1881,6 @@ where
                 prompt_token_ids.iter().copied().enumerate().skip(1)
             {
                 if let Some(cache) = device_kv_cache.as_mut() {
-                    if let Some(controller) = cache_budget_controller.as_mut() {
-                        controller.maybe_rebalance(
-                            cache.cached_tokens()?.saturating_add(1),
-                            backend,
-                            cache,
-                        )?;
-                    }
                     cache.set_profile_step_index(prefill_index);
                 }
                 log_memory_snapshot(
@@ -1504,6 +1926,11 @@ where
                     backend,
                     runtime_kv_memory(&device_kv_cache, &host_kv_cache),
                 );
+                if let (Some(controller), Some(cache)) =
+                    (cache_budget_controller.as_mut(), device_kv_cache.as_mut())
+                {
+                    controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
+                }
             }
         }
     }
@@ -1513,6 +1940,16 @@ where
     let mut generated_token_count = 1_usize;
     if let Some(snapshot) = prefill_cost_snapshot {
         log_token_cost(snapshot.finish(0, true, prefill_token_id, backend, &device_kv_cache)?);
+    }
+    if !use_mtp {
+        last_main_hidden_device = None;
+    }
+    if let (Some(controller), Some(cache)) =
+        (cache_budget_controller.as_mut(), device_kv_cache.as_mut())
+    {
+        controller.finish_prefill(cache.cached_tokens()?, backend, cache)?;
+    } else {
+        backend.release_prefill_resources()?;
     }
     let prefill_expert_cache = backend.expert_cache_metrics()?;
     on_token(prefill_token_id)?;
@@ -1561,14 +1998,8 @@ where
         if max_new_tokens.is_none() && prefill_strategy == PrefillStrategy::Dense {
             validate_reference_memory_bounds(config, prompt_token_ids.len())?;
         }
+        let decode_step_started_at = Instant::now();
         if let Some(cache) = device_kv_cache.as_mut() {
-            if let Some(controller) = cache_budget_controller.as_mut() {
-                controller.maybe_rebalance(
-                    cache.cached_tokens()?.saturating_add(1),
-                    backend,
-                    cache,
-                )?;
-            }
             cache.set_profile_step_index(step_index);
         }
         if let Some(cache) = host_kv_cache.as_mut() {
@@ -1653,11 +2084,13 @@ where
             )?;
 
             let mut stopped = false;
+            let mut emitted_token_count = 0_usize;
             for token_id in emitted {
                 generated_token_count = generated_token_count
                     .checked_add(1)
                     .ok_or_else(|| Error::runtime("generated token count overflow"))?;
                 on_token(token_id)?;
+                emitted_token_count = emitted_token_count.saturating_add(1);
                 next_input_token_id = token_id;
                 if contains_stop_token(token_id, stop_token_ids)
                     || generated_token_count >= effective_max_new_tokens
@@ -1672,8 +2105,17 @@ where
                     "decode.after_cache_append",
                     Some(step_index),
                     backend,
-                    runtime_kv_memory(&device_kv_cache, &host_kv_cache),
+                    cache.runtime_kv_memory(),
                 );
+                if let Some(controller) = cache_budget_controller.as_mut() {
+                    controller.observe_decode_step(
+                        cache.cached_tokens()?,
+                        emitted_token_count,
+                        decode_step_started_at.elapsed(),
+                        backend,
+                        cache,
+                    )?;
+                }
                 break;
             }
 
@@ -1696,8 +2138,17 @@ where
                 "decode.after_cache_append",
                 Some(step_index),
                 backend,
-                runtime_kv_memory(&device_kv_cache, &host_kv_cache),
+                cache.runtime_kv_memory(),
             );
+            if let Some(controller) = cache_budget_controller.as_mut() {
+                controller.observe_decode_step(
+                    cache.cached_tokens()?,
+                    emitted_token_count,
+                    decode_step_started_at.elapsed(),
+                    backend,
+                    cache,
+                )?;
+            }
             continue;
         }
 
@@ -1730,11 +2181,23 @@ where
                 &device_kv_cache,
             )?);
         }
+        let decode_step_elapsed = decode_step_started_at.elapsed();
 
         generated_token_count = generated_token_count
             .checked_add(1)
             .ok_or_else(|| Error::runtime("generated token count overflow"))?;
         on_token(token_id)?;
+        if let (Some(controller), Some(cache)) =
+            (cache_budget_controller.as_mut(), device_kv_cache.as_mut())
+        {
+            controller.observe_decode_step(
+                cache.cached_tokens()?,
+                1,
+                decode_step_elapsed,
+                backend,
+                cache,
+            )?;
+        }
         if contains_stop_token(token_id, stop_token_ids) {
             break;
         }
@@ -2611,6 +3074,7 @@ fn expert_cache_metrics_delta(
     before: ExpertCacheMetrics,
 ) -> ExpertCacheMetrics {
     ExpertCacheMetrics {
+        configured_slots_per_layer: after.configured_slots_per_layer,
         lookups: after.lookups.saturating_sub(before.lookups),
         hits: after.hits.saturating_sub(before.hits),
         misses: after.misses.saturating_sub(before.misses),
@@ -3016,21 +3480,81 @@ impl DevicePagedRuntimeCache {
         }
     }
 
-    fn set_hot_all_layers_budget(&mut self, budget_bytes: usize) -> Result<()> {
+    fn set_hot_all_layers_budget<B: Backend>(
+        &mut self,
+        budget_bytes: usize,
+        backend: &B,
+    ) -> Result<()> {
         if budget_bytes == 0 {
             return Err(Error::cache("hot KV cache budget must be positive"));
         }
         self.policy.hot_all_layers_budget_bytes = budget_bytes;
+        let needed_capacity = device_capacity_tokens(
+            self.cached_tokens.max(1),
+            self.spec.page_size,
+            self.spec.max_context,
+        )?;
+        let all_layer_bytes = self.hot_all_layers_bytes(needed_capacity)?;
         if !self.hot_layers.is_empty() {
-            let capacity_tokens = self
-                .hot_layers
-                .first()
-                .map(|layer| layer.capacity_tokens)
-                .unwrap_or(0);
-            if self.hot_all_layers_bytes(capacity_tokens)? > budget_bytes {
+            if all_layer_bytes > budget_bytes {
                 self.hot_layers.clear();
             }
+            return Ok(());
         }
+        if self.cached_tokens > 0 && all_layer_bytes <= budget_bytes {
+            self.restore_all_hot_layers(backend, needed_capacity)?;
+        }
+        Ok(())
+    }
+
+    fn restore_all_hot_layers<B: Backend>(
+        &mut self,
+        backend: &B,
+        capacity_tokens: usize,
+    ) -> Result<()> {
+        let token_count = self.cached_tokens()?;
+        let mut restored = Vec::with_capacity(self.layers.len());
+        let mut reader = self.cold.store().clone_reader()?;
+        for layer in &self.layers {
+            let (keys, values) =
+                reader.read_layer_range_contiguous(layer.layer_index, 0, token_count)?;
+            let hot =
+                self.allocate_hot_window(backend, capacity_tokens, Some(layer.layer_index))?;
+            let source_k = require_device_value(
+                "restored device KV K upload",
+                backend.device_upload_f32_tensor(&keys)?,
+            )?;
+            let source_v = require_device_value(
+                "restored device KV V upload",
+                backend.device_upload_f32_tensor(&values)?,
+            )?;
+            copy_logical_kv_tokens(
+                backend,
+                &source_k,
+                token_count,
+                &hot.k,
+                hot.capacity_tokens,
+                0,
+                token_count,
+                self.spec.batch,
+                self.spec.attention_heads,
+                self.spec.key_head_dim,
+            )?;
+            copy_logical_kv_tokens(
+                backend,
+                &source_v,
+                token_count,
+                &hot.v,
+                hot.capacity_tokens,
+                0,
+                token_count,
+                self.spec.batch,
+                self.spec.attention_heads,
+                self.spec.value_head_dim,
+            )?;
+            restored.push(hot);
+        }
+        self.hot_layers = restored;
         Ok(())
     }
 
@@ -3264,6 +3788,10 @@ impl DevicePagedRuntimeCache {
                 .metrics
                 .read_nanoseconds
                 .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
+            self.metrics.full_layer_read_nanoseconds = self
+                .metrics
+                .full_layer_read_nanoseconds
+                .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
             return Ok(Some(view));
         }
         self.metrics.full_layer_misses = self.metrics.full_layer_misses.saturating_add(1);
@@ -3346,6 +3874,10 @@ impl DevicePagedRuntimeCache {
         self.metrics.read_nanoseconds = self
             .metrics
             .read_nanoseconds
+            .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
+        self.metrics.full_layer_read_nanoseconds = self
+            .metrics
+            .full_layer_read_nanoseconds
             .saturating_add(elapsed_nanoseconds_u64(started_at.elapsed()));
         Ok(Some(view))
     }
@@ -4739,6 +5271,132 @@ mod tests {
     use super::*;
 
     #[test]
+    fn glm_q2_memory_controller_uses_exact_expert_and_mla_cache_sizes() {
+        let config = config::load_embedded_config().unwrap();
+        let spec = q2_memory_controller_spec(&config, 128, None, None, false).unwrap();
+
+        assert_eq!(spec.expert_bytes_per_layer_slot, 12_386_304);
+        assert_eq!(spec.routed_layer_count, 75);
+        assert_eq!(spec.kv_bytes_per_token, 78 * 576 * 4);
+        assert_eq!(
+            spec.initial_expert_slots_per_layer,
+            DEFAULT_EXPERT_CACHE_SLOTS_PER_LAYER
+        );
+        assert_eq!(
+            spec.initial_hot_kv_budget_bytes,
+            DEFAULT_HOT_KV_CACHE_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn explicit_cache_sizes_are_fixed_controller_boundaries() {
+        let config = config::load_embedded_config().unwrap();
+        let spec =
+            q2_memory_controller_spec(&config, 128, Some(24), Some(1_024 * 1024 * 1024), false)
+                .unwrap();
+
+        assert_eq!(spec.min_expert_slots_per_layer, 24);
+        assert_eq!(spec.max_expert_slots_per_layer, 24);
+        assert_eq!(spec.min_hot_kv_budget_bytes, 1_024 * 1024 * 1024);
+        assert_eq!(spec.max_hot_kv_budget_bytes, 1_024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_expert_budget_resumes_the_live_chat_capacity() {
+        let config = config::load_embedded_config().unwrap();
+        let mut adaptive = q2_memory_controller_spec(&config, 128, None, None, false).unwrap();
+        resume_adaptive_expert_budget(&mut adaptive, 20).unwrap();
+        assert_eq!(adaptive.initial_expert_slots_per_layer, 20);
+
+        let mut fixed = q2_memory_controller_spec(&config, 128, Some(24), None, false).unwrap();
+        resume_adaptive_expert_budget(&mut fixed, 20).unwrap();
+        assert_eq!(fixed.initial_expert_slots_per_layer, 24);
+    }
+
+    fn controller_memory_snapshot(
+        metal_allocated_bytes: u64,
+        effective_available_bytes: u64,
+        swap_used_bytes: u64,
+        compressed_bytes: u64,
+    ) -> RuntimeMemorySnapshot {
+        RuntimeMemorySnapshot {
+            total_physical_bytes: Some(64 * 1024 * 1024 * 1024),
+            process_rss_bytes: Some(1),
+            process_virtual_bytes: Some(1),
+            system_free_bytes: Some(effective_available_bytes),
+            system_active_bytes: Some(1),
+            system_inactive_bytes: Some(0),
+            system_wired_bytes: Some(1),
+            system_compressed_bytes: Some(compressed_bytes),
+            system_purgeable_bytes: Some(0),
+            system_speculative_bytes: Some(0),
+            swap_used_bytes: Some(swap_used_bytes),
+            metal_current_allocated_bytes: Some(metal_allocated_bytes),
+            metal_recommended_max_working_set_bytes: Some(56 * 1024 * 1024 * 1024),
+            runtime_kv_hot_bytes: Some(0),
+            runtime_kv_cold_bytes: Some(0),
+        }
+    }
+
+    #[test]
+    fn controller_tracks_prefill_and_decode_metal_high_water_separately() {
+        let config = config::load_embedded_config().unwrap();
+        let spec = q2_memory_controller_spec(&config, 128, None, None, false).unwrap();
+        let mut controller = CacheBudgetController::new(spec, 8).unwrap();
+        controller.update_high_water(controller_memory_snapshot(10, 8_000, 0, 0));
+        controller.phase = MemoryControllerPhase::Decode;
+        controller.update_high_water(controller_memory_snapshot(20, 6_000, 0, 0));
+        controller.update_high_water(controller_memory_snapshot(15, 7_000, 0, 0));
+
+        let report = controller.report();
+        assert_eq!(report.prefill_metal_high_water_bytes, Some(10));
+        assert_eq!(report.decode_metal_high_water_bytes, Some(20));
+        assert_eq!(report.minimum_effective_headroom_bytes, Some(6_000));
+    }
+
+    #[test]
+    fn controller_detects_cumulative_swap_growth_without_shell_sampling() {
+        let config = config::load_embedded_config().unwrap();
+        let spec = q2_memory_controller_spec(&config, 128, None, None, false).unwrap();
+        let mut controller = CacheBudgetController::new(spec, 8).unwrap();
+        let baseline = controller_memory_snapshot(10, 8 * 1024 * 1024 * 1024, 0, 0);
+        controller.reset_pressure_reference(baseline);
+        let pressured = controller_memory_snapshot(
+            10,
+            8 * 1024 * 1024 * 1024,
+            CACHE_PRESSURE_SWAP_GROWTH_BYTES,
+            0,
+        );
+
+        assert_eq!(
+            controller.memory_pressure(pressured),
+            MemoryPressure::SwapGrowth
+        );
+    }
+
+    #[test]
+    fn prefill_growth_is_ignored_only_while_absolute_headroom_is_safe() {
+        let config = config::load_embedded_config().unwrap();
+        let spec = q2_memory_controller_spec(&config, 128, None, None, false).unwrap();
+        let controller = CacheBudgetController::new(spec, 8).unwrap();
+        let safe = controller_memory_snapshot(
+            48 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            0,
+            12 * 1024 * 1024 * 1024,
+        );
+        let critical = controller_memory_snapshot(
+            55 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            0,
+            12 * 1024 * 1024 * 1024,
+        );
+
+        assert!(controller.can_absorb_prefill_growth(safe, MemoryPressure::CompressionGrowth));
+        assert!(!controller.can_absorb_prefill_growth(critical, MemoryPressure::CompressionGrowth));
+    }
+
+    #[test]
     fn native_prefill_chunks_cover_the_prompt_without_exceeding_device_limit() {
         let prompt_token_count = 515;
         let mut ranges = Vec::new();
@@ -5175,6 +5833,44 @@ mod tests {
             );
         }
         assert_eq!(single.token_ids[0], sequence.token_ids[0]);
+    }
+
+    #[test]
+    fn hot_kv_budget_can_release_and_restore_the_resident_layer_window() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let path = write_gguf_model_fixture(GgmlType::Q2K);
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = tiny_config();
+        let model = Model::open_from_gguf(&gguf, &config, &backend, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS)
+            .unwrap();
+        let seed = model
+            .prefill_seed_device(&config, &[1], &backend)
+            .unwrap()
+            .expect("device seed path");
+        let mut cache = DevicePagedRuntimeCache::new_from_device_seed(
+            model.max_context(),
+            1,
+            &seed.layer_kv_cache,
+            &backend,
+            None,
+        )
+        .unwrap();
+        let resident_bytes = cache.hot_all_layers_bytes(1).unwrap();
+        assert_eq!(cache.hot_layers.len(), seed.layer_kv_cache.len());
+
+        cache.set_hot_all_layers_budget(1, &backend).unwrap();
+        assert!(cache.hot_layers.is_empty());
+
+        cache
+            .set_hot_all_layers_budget(resident_bytes, &backend)
+            .unwrap();
+        assert_eq!(cache.hot_layers.len(), seed.layer_kv_cache.len());
+        assert!(cache
+            .hot_layers
+            .iter()
+            .all(|layer| layer.capacity_tokens == 1));
     }
 
     #[test]

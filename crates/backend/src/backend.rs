@@ -30,6 +30,17 @@ pub struct BackendCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BackendMemoryReport {
+    pub total_physical_bytes: Option<u64>,
+    pub process_rss_bytes: Option<u64>,
+    pub process_virtual_bytes: Option<u64>,
+    pub system_free_bytes: Option<u64>,
+    pub system_active_bytes: Option<u64>,
+    pub system_inactive_bytes: Option<u64>,
+    pub system_wired_bytes: Option<u64>,
+    pub system_compressed_bytes: Option<u64>,
+    pub system_purgeable_bytes: Option<u64>,
+    pub system_speculative_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
     pub metal_current_allocated_bytes: Option<u64>,
     pub metal_recommended_max_working_set_bytes: Option<u64>,
 }
@@ -41,6 +52,7 @@ pub struct BackendMemoryReport {
 /// triplet is looked up once and the assignments share it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExpertCacheMetrics {
+    pub configured_slots_per_layer: u64,
     pub lookups: u64,
     pub hits: u64,
     pub misses: u64,
@@ -374,6 +386,9 @@ pub trait Backend: Sync {
     }
     fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
         self.configure_expert_cache_slots_per_layer(slots_per_layer)
+    }
+    fn release_prefill_resources(&self) -> Result<()> {
+        Ok(())
     }
     fn configure_expert_pack(&self, _path: &Path, _header: ExpertPackHeader) -> Result<()> {
         Err(Error::backend(
@@ -1370,12 +1385,7 @@ impl Backend for MetalBackend {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             if let Some(native_metal) = self.native_metal() {
-                return BackendMemoryReport {
-                    metal_current_allocated_bytes: Some(native_metal.current_allocated_bytes()),
-                    metal_recommended_max_working_set_bytes: Some(
-                        native_metal.recommended_max_working_set_bytes(),
-                    ),
-                };
+                return native_metal.memory_report();
             }
         }
 
@@ -1414,6 +1424,17 @@ impl Backend for MetalBackend {
         }
 
         let _ = slots_per_layer;
+        Ok(())
+    }
+
+    fn release_prefill_resources(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.release_prefill_resources();
+            }
+        }
+
         Ok(())
     }
 

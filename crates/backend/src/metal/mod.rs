@@ -10,6 +10,7 @@ mod dsa;
 mod layout;
 mod library;
 mod matmul;
+mod memory;
 mod moe;
 mod pipeline;
 mod q2;

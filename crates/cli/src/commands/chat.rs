@@ -14,7 +14,8 @@ use model::{
     expected_expert_pack_header, validate_routing_policy, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
-    enable_memory_telemetry, enable_memory_telemetry_file, run_generate_streaming_with_options,
+    enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
+    q2_memory_controller_spec, run_generate_streaming_with_options, CacheBudgetSpec,
     GenerationOptions,
 };
 use rustix::termios::{
@@ -24,7 +25,8 @@ use tokenizer::{render_chat_prompt, ChatTurn, Tokenizer};
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    load_q2_readiness, resolve_q2_artifact, validate_generation_request, DecodedTextStream,
+    load_q2_readiness, resolve_q2_artifact, validate_generation_request,
+    validate_memory_controller_options, DecodedTextStream,
 };
 
 const THINK_END: &str = "</think>";
@@ -40,11 +42,14 @@ pub fn run(
     page_size: usize,
     max_new_tokens: Option<usize>,
     speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
     hot_kv_cache_gb: Option<f64>,
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
 ) -> Result<()> {
+    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
@@ -58,13 +63,17 @@ pub fn run(
     let expert_cache_budget_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
     let hot_kv_cache_budget_bytes = cache_gb_to_bytes("hot KV cache", hot_kv_cache_gb)?;
     let backend = MetalBackend::new()?;
-    if let Some(expert_cache_budget_bytes) = expert_cache_budget_bytes {
-        let slots_per_layer = expert_cache_slots_per_layer(
-            &readiness.index,
-            config.num_routed_experts,
-            config.num_nextn_predict_layers > 0,
-            expert_cache_budget_bytes,
-        )?;
+    let expert_cache_slots = expert_cache_budget_bytes
+        .map(|expert_cache_budget_bytes| {
+            expert_cache_slots_per_layer(
+                &readiness.index,
+                config.num_routed_experts,
+                config.num_nextn_predict_layers > 0,
+                expert_cache_budget_bytes,
+            )
+        })
+        .transpose()?;
+    if let Some(slots_per_layer) = expert_cache_slots {
         backend.configure_expert_cache_slots_per_layer(slots_per_layer)?;
     }
     let expert_pack_path = model_path.join(EXPERT_PACK_FILE_NAME);
@@ -85,6 +94,20 @@ pub fn run(
     } else if enable_telemetry {
         enable_memory_telemetry();
     }
+    if let Some(path) = memory_controller_log {
+        enable_memory_controller_log(path)?;
+    }
+    let dynamic_cache_budget = enable_unified_memory_controller
+        .then(|| {
+            q2_memory_controller_spec(
+                &config,
+                page_size,
+                expert_cache_slots,
+                hot_kv_cache_budget_bytes,
+                speculative_mtp,
+            )
+        })
+        .transpose()?;
 
     run_interactive_loop(
         &model,
@@ -97,6 +120,7 @@ pub fn run(
         max_new_tokens,
         speculative_mtp,
         hot_kv_cache_budget_bytes,
+        dynamic_cache_budget,
     )
 }
 
@@ -112,6 +136,7 @@ fn run_interactive_loop(
     max_new_tokens: Option<usize>,
     speculative_mtp: bool,
     hot_kv_cache_budget_bytes: Option<usize>,
+    dynamic_cache_budget: Option<CacheBudgetSpec>,
 ) -> Result<()> {
     let stdin = io::stdin();
     let input_is_terminal = stdin.is_terminal();
@@ -175,7 +200,7 @@ fn run_interactive_loop(
             eos_token_ids,
             GenerationOptions {
                 hot_kv_cache_budget_bytes,
-                dynamic_cache_budget: None,
+                dynamic_cache_budget,
                 profile_token_costs: false,
                 speculative_mtp,
             },

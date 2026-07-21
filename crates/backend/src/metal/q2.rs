@@ -85,10 +85,14 @@ const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
 const ROUTED_EXPERT_COUNT: usize = 256;
 // Thirty Q2 expert triplets per routed layer allocate about 27.9 GB on the
-// 64 GB target. This is the measured decode optimum: thirty-two slots caused
-// severe memory pressure, while a smaller adaptive cache produced more SSD
-// misses. Long-context runtime rebalancing may still shrink this base cache.
+// 64 GB target. This is the measured decode optimum: thirty-one and thirty-two
+// slots reduce SSD reads but lose throughput to unified-memory pressure.
 const ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER: usize = 30;
+// Keep the minimum dynamic budget in one contiguous slab so the common path
+// can use offset-based kernels. Extra slots are independent allocations: the
+// memory controller can then drop them without retaining a 30-slot Metal
+// allocation for every routed layer.
+const ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER: usize = 16;
 const ROUTED_EXPERT_PROTECTED_PERCENT: usize = 25;
 // Chunking bounds thread creation while exposing enough independent large
 // reads to keep the sidecar's no-cache SSD path busy.
@@ -236,9 +240,14 @@ struct Q2ExpertSlotBuffers {
 
 #[derive(Debug)]
 struct Q2ExpertLayerBuffers {
+    base_capacity: usize,
+    gate_stride: usize,
+    up_stride: usize,
+    down_stride: usize,
     gate: LockedMetalSlab,
     up: LockedMetalSlab,
     down: LockedMetalSlab,
+    expansion: Vec<Option<Q2ExpertSlotBuffers>>,
 }
 
 #[derive(Debug, Default)]
@@ -566,6 +575,8 @@ impl MetalQ2Matvec {
             .ok_or_else(|| Error::backend("Q2 expert cache capacity bytes overflow"))?;
 
         Ok(ExpertCacheMetrics {
+            configured_slots_per_layer: u64::try_from(cache.slots_per_layer)
+                .map_err(|_| Error::backend("Q2 configured expert slots do not fit u64"))?,
             lookups: self.expert_cache_counters.lookups.load(Ordering::Relaxed),
             hits: self.expert_cache_counters.hits.load(Ordering::Relaxed),
             misses: self.expert_cache_counters.misses.load(Ordering::Relaxed),
@@ -656,11 +667,27 @@ impl MetalQ2Matvec {
                 "Q2 expert cache slots per layer must be within 1..=256",
             ));
         }
+        self.finish_ready_expert_submissions()?;
         let mut cache = self
             .ready_expert_cache
             .lock()
             .map_err(|_| Error::backend("Q2 per-layer expert cache lock poisoned"))?;
         cache.resize(slots_per_layer)
+    }
+
+    pub(crate) fn release_prefill_resources(&self) -> Result<()> {
+        self.finish_ready_expert_submissions()?;
+        *self
+            .scratch
+            .lock()
+            .map_err(|_| Error::backend("Q2 scratch buffer lock poisoned"))? =
+            Q2ScratchBuffers::default();
+        *self
+            .transient_expert_pool
+            .lock()
+            .map_err(|_| Error::backend("Q2 transient expert pool lock poisoned"))? =
+            Q2TransientExpertPool::default();
+        Ok(())
     }
 
     pub(crate) fn configure_expert_pack(
@@ -3856,20 +3883,47 @@ impl Q2ExpertLayerBuffers {
             })
         };
         Ok(Self {
+            base_capacity: capacity,
+            gate_stride,
+            up_stride,
+            down_stride,
             gate: LockedMetalSlab::new(device, slab_bytes(gate_stride, "gate")?)?,
             up: LockedMetalSlab::new(device, slab_bytes(up_stride, "up")?)?,
             down: LockedMetalSlab::new(device, slab_bytes(down_stride, "down")?)?,
+            expansion: Vec::new(),
         })
     }
 
     fn ready_buffers(
         &mut self,
+        device: &Device,
         slot: usize,
         gate_stride: usize,
         up_stride: usize,
         down_stride: usize,
         lock_ranges: bool,
     ) -> Result<ReadyExpertBuffers> {
+        validate_exact_len("Q2 expert layer gate stride", gate_stride, self.gate_stride)?;
+        validate_exact_len("Q2 expert layer up stride", up_stride, self.up_stride)?;
+        validate_exact_len("Q2 expert layer down stride", down_stride, self.down_stride)?;
+        if slot >= self.base_capacity {
+            let expansion_index = slot - self.base_capacity;
+            if expansion_index >= self.expansion.len() {
+                self.expansion.resize_with(expansion_index + 1, || None);
+            }
+            if self.expansion[expansion_index].is_none() {
+                self.expansion[expansion_index] = Some(Q2ExpertSlotBuffers::new(
+                    device,
+                    gate_stride,
+                    up_stride,
+                    down_stride,
+                )?);
+            }
+            return self.expansion[expansion_index]
+                .as_ref()
+                .map(Q2ExpertSlotBuffers::ready_buffers)
+                .ok_or_else(|| Error::backend("Q2 expert expansion slot allocation failed"));
+        }
         let gate_offset = slot
             .checked_mul(gate_stride)
             .ok_or_else(|| Error::backend("Q2 gate expert slab offset overflow"))?;
@@ -3893,6 +3947,39 @@ impl Q2ExpertLayerBuffers {
             down_offset,
             slot_index: Some(slot),
         })
+    }
+
+    fn release_slot(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.base_capacity {
+            let expansion_index = slot - self.base_capacity;
+            if let Some(expansion) = self.expansion.get_mut(expansion_index) {
+                *expansion = None;
+            }
+            while self.expansion.last().is_some_and(Option::is_none) {
+                self.expansion.pop();
+            }
+            return Ok(());
+        }
+
+        self.gate.release_range(
+            slot.checked_mul(self.gate_stride)
+                .ok_or_else(|| Error::backend("Q2 gate expert release offset overflow"))?,
+            self.gate_stride,
+            "gate",
+        )?;
+        self.up.release_range(
+            slot.checked_mul(self.up_stride)
+                .ok_or_else(|| Error::backend("Q2 up expert release offset overflow"))?,
+            self.up_stride,
+            "up",
+        )?;
+        self.down.release_range(
+            slot.checked_mul(self.down_stride)
+                .ok_or_else(|| Error::backend("Q2 down expert release offset overflow"))?,
+            self.down_stride,
+            "down",
+        )?;
+        Ok(())
     }
 }
 
@@ -3934,6 +4021,7 @@ impl Q2TransientExpertPool {
 
     fn ready_buffers(
         &mut self,
+        device: &Device,
         slot: usize,
         gate_stride: usize,
         up_stride: usize,
@@ -3953,8 +4041,14 @@ impl Q2TransientExpertPool {
             .initialized_slots
             .get(slot)
             .ok_or_else(|| Error::backend("Q2 transient expert initialization is missing"))?;
-        let mut buffers =
-            storage.ready_buffers(slot, gate_stride, up_stride, down_stride, !initialized)?;
+        let mut buffers = storage.ready_buffers(
+            device,
+            slot,
+            gate_stride,
+            up_stride,
+            down_stride,
+            !initialized,
+        )?;
         self.initialized_slots[slot] = true;
         // Transient and persistent experts can share one wave, so dispatch by
         // explicit GPU addresses instead of treating this as a layer-cache slot.
@@ -4000,6 +4094,48 @@ impl LockedMetalSlab {
                 byte_len,
                 error = %io::Error::last_os_error(),
                 "could not lock Q2 expert slab range; entry remains pageable"
+            );
+        }
+        Ok(())
+    }
+
+    fn release_range(&mut self, offset: usize, byte_len: usize, component: &str) -> Result<()> {
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| Error::backend("Q2 expert slab release range overflow"))?;
+        if end > self.buffer.length() as usize {
+            return Err(Error::backend(format!(
+                "Q2 {component} expert slab release ends at {end}, beyond {} bytes",
+                self.buffer.length()
+            )));
+        }
+        let pointer = self.buffer.contents().cast::<u8>();
+        if pointer.is_null() {
+            return Ok(());
+        }
+        if let Some(index) = self
+            .locked_ranges
+            .iter()
+            .position(|range| *range == (offset, byte_len))
+        {
+            // SAFETY: this is the exact live range previously passed to
+            // `mlock` and removed below so it cannot be unlocked twice.
+            let _ = unsafe { libc::munlock(pointer.add(offset).cast_const().cast(), byte_len) };
+            self.locked_ranges.swap_remove(index);
+        }
+        // SAFETY: the range belongs to this shared Metal allocation. All
+        // command buffers using it have completed before cache resize starts.
+        // A future cache miss overwrites every byte before the GPU reads it.
+        let advised =
+            unsafe { libc::madvise(pointer.add(offset).cast(), byte_len, libc::MADV_FREE) };
+        if advised != 0 {
+            debug!(
+                target: "inferno::expert_cache",
+                component,
+                offset,
+                byte_len,
+                error = %io::Error::last_os_error(),
+                "could not mark released Q2 expert pages reusable"
             );
         }
         Ok(())
@@ -4209,7 +4345,38 @@ impl Q2ExpertLayerCache {
         if capacity == self.initialized_slots.len() {
             return Ok(());
         }
-        *self = Self::new(capacity);
+
+        let old_capacity = self.initialized_slots.len();
+        if capacity < old_capacity {
+            for slot in capacity..old_capacity {
+                if let Some(expert_id) = self.slot_experts[slot] {
+                    let index = expert_directory_index(expert_id)?;
+                    if self.directory[index].queue != ExpertQueueKind::None {
+                        self.unlink(expert_id)?;
+                    }
+                    self.directory[index].slot = None;
+                    self.slot_experts[slot] = None;
+                    self.resident_count = self.resident_count.saturating_sub(1);
+                }
+                if self.initialized_slots[slot] {
+                    if let Some(storage) = self.storage.as_mut() {
+                        storage.release_slot(slot)?;
+                    }
+                }
+            }
+            self.initialized_slots.truncate(capacity);
+            self.slot_experts.truncate(capacity);
+        } else {
+            self.initialized_slots.resize(capacity, false);
+            self.slot_experts.resize(capacity, None);
+        }
+
+        self.protected_capacity = expert_protected_capacity(capacity);
+        self.enforce_protected_capacity()?;
+        self.free_slots = (0..capacity)
+            .rev()
+            .filter(|&slot| self.slot_experts[slot].is_none())
+            .collect();
         Ok(())
     }
 
@@ -4300,9 +4467,13 @@ impl Q2ExpertLayerCache {
             Error::backend(format!("Q2 layer expert slot {slot} is out of bounds"))
         })?;
         if self.storage.is_none() {
+            let base_capacity = self
+                .initialized_slots
+                .len()
+                .min(ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER);
             self.storage = Some(Q2ExpertLayerBuffers::new(
                 device,
-                self.initialized_slots.len(),
+                base_capacity,
                 gate_stride,
                 up_stride,
                 down_stride,
@@ -4312,7 +4483,14 @@ impl Q2ExpertLayerCache {
             .storage
             .as_mut()
             .ok_or_else(|| Error::backend("Q2 layer expert slab allocation failed"))?
-            .ready_buffers(slot, gate_stride, up_stride, down_stride, !initialized)?;
+            .ready_buffers(
+                device,
+                slot,
+                gate_stride,
+                up_stride,
+                down_stride,
+                !initialized,
+            )?;
         self.initialized_slots[slot] = true;
         Ok(buffers)
     }
@@ -4607,6 +4785,7 @@ fn prepare_ready_expert_groups<'a>(
                             )?;
                         }
                         let buffers = pool.ready_buffers(
+                            device,
                             transient_slot,
                             gate_stride,
                             up_stride,
@@ -5111,7 +5290,8 @@ mod tests {
         },
         expert_protected_capacity, prioritize_ready_expert_seeds, ExpertQueueKind,
         LayerSlotResolution, Q2ExpertLayerCache, Q2PerLayerExpertCache, Q2TransientExpertPool,
-        QuantMatvecKind, ReadyExpertSeed, ROUTED_EXPERT_COUNT, ROUTED_EXPERT_WAVE_MIN_GROUPS,
+        QuantMatvecKind, ReadyExpertSeed, ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER,
+        ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER, ROUTED_EXPERT_COUNT, ROUTED_EXPERT_WAVE_MIN_GROUPS,
     };
 
     fn resolve_one(cache: &mut Q2ExpertLayerCache, expert_id: u32) -> LayerSlotResolution {
@@ -5246,9 +5426,9 @@ mod tests {
         };
         let mut pool = Q2TransientExpertPool::default();
         pool.ensure(metal.device(), 4, 64, 64, 32).unwrap();
-        let first = pool.ready_buffers(1, 64, 64, 32).unwrap();
+        let first = pool.ready_buffers(metal.device(), 1, 64, 64, 32).unwrap();
         pool.ensure(metal.device(), 2, 64, 64, 32).unwrap();
-        let second = pool.ready_buffers(1, 64, 64, 32).unwrap();
+        let second = pool.ready_buffers(metal.device(), 1, 64, 64, 32).unwrap();
 
         assert_eq!(first.gate.gpu_address(), second.gate.gpu_address());
         assert_eq!(first.up.gpu_address(), second.up.gpu_address());
@@ -5357,6 +5537,83 @@ mod tests {
         }
 
         assert_eq!(cache.resident_count, 30);
+    }
+
+    #[test]
+    fn resizing_preserves_residents_in_retained_slots() {
+        let mut cache = Q2ExpertLayerCache::new(3);
+        resolve_one(&mut cache, 1);
+        resolve_one(&mut cache, 2);
+        resolve_one(&mut cache, 3);
+
+        cache.resize(2).unwrap();
+
+        assert!(cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(!cache.contains(3));
+        assert_cache_consistent(&cache);
+
+        cache.resize(3).unwrap();
+        assert!(matches!(
+            resolve_one(&mut cache, 1),
+            LayerSlotResolution::Hit(_)
+        ));
+        assert!(matches!(
+            resolve_one(&mut cache, 4),
+            LayerSlotResolution::Miss(2)
+        ));
+        assert_cache_consistent(&cache);
+    }
+
+    #[test]
+    fn growth_allocates_only_expansion_slots_and_shrink_drops_them() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let mut cache = Q2ExpertLayerCache::new(2);
+        cache.buffers(metal.device(), 0, 64, 64, 32).unwrap();
+        cache.resize(3).unwrap();
+        cache.buffers(metal.device(), 2, 64, 64, 32).unwrap();
+
+        let storage = cache.storage.as_ref().unwrap();
+        assert_eq!(storage.base_capacity, 2);
+        assert_eq!(storage.expansion.len(), 1);
+
+        cache.resize(2).unwrap();
+
+        assert!(cache.storage.as_ref().unwrap().expansion.is_empty());
+        assert!(cache.initialized_slots[0]);
+    }
+
+    #[test]
+    fn default_cache_uses_a_releasable_growth_tier() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let mut cache = Q2ExpertLayerCache::new(ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER);
+        cache.buffers(metal.device(), 0, 64, 64, 32).unwrap();
+        cache
+            .buffers(
+                metal.device(),
+                ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER,
+                64,
+                64,
+                32,
+            )
+            .unwrap();
+
+        let storage = cache.storage.as_ref().unwrap();
+        assert_eq!(
+            storage.base_capacity,
+            ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER
+        );
+        assert_eq!(storage.expansion.len(), 1);
+
+        cache
+            .resize(ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER)
+            .unwrap();
+
+        assert!(cache.storage.as_ref().unwrap().expansion.is_empty());
     }
 
     #[test]

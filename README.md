@@ -192,16 +192,28 @@ target/release/inferno generate \
   --telemetry-file /tmp/inferno-memory.log
 ```
 
+Record adaptive cache decisions:
+
+```bash
+target/release/inferno generate \
+  --model models/glm-5.2 \
+  --prompt "Tell me the capital of Italy." \
+  --enable-unified-memory-controller \
+  --memory-controller-log /tmp/inferno-memory-controller.tsv
+```
+
 ### Common Options
 
 | Option | Purpose |
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
-| `--expert-cache-gb <GB>` | Overrides the routed-expert RAM budget. |
-| `--hot-kv-cache-gb <GB>` | Overrides the hot Metal KV budget. |
+| `--expert-cache-gb <GB>` | Pins the routed-expert RAM budget. |
+| `--hot-kv-cache-gb <GB>` | Pins the hot Metal KV budget. |
+| `--enable-unified-memory-controller` | Enables adaptive expert and hot-KV memory rebalancing. |
 | `--enable-telemetry` | Prints runtime memory telemetry. |
 | `--telemetry-file <PATH>` | Writes memory telemetry to a file. |
+| `--memory-controller-log <PATH>` | Writes adaptive memory decisions to TSV. |
 | `--speculative-mtp` | Enables the experimental MTP path. |
 
 Use the executable help as the authoritative CLI reference:
@@ -246,8 +258,19 @@ The source GGUF remains memory-mapped so macOS can manage always-used weights
 through its page cache.
 
 The expert cache and hot KV window compete for the same physical unified
-memory. Inferno chooses defaults for the 64 GB target; `--expert-cache-gb` and
-`--hot-kv-cache-gb` allow explicit measurement and tuning.
+memory. Inferno's fixed default starts from 30 expert slots per routed layer
+and a 512 MiB hot KV budget. `--enable-unified-memory-controller` enables a
+native controller that samples Mach and Metal counters without starting
+subprocesses, tracks separate prefill and decode Metal high-water marks, and
+releases prefill-only buffers before decode.
+
+During decode, the controller changes one cache at a time and measures the next
+eight-token window. It keeps a change only when decode throughput improves;
+otherwise it restores the previous budget. Expert slots and hot KV are tuned
+independently. The controller targets 4 GiB of effective headroom, treats 3 GiB
+as the hard floor, and shrinks immediately when swap or compression grows.
+Explicit cache-size options pin that cache and disable automatic resizing for
+it.
 
 ## Development
 

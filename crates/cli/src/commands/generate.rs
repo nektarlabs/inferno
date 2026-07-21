@@ -17,8 +17,9 @@ use model::{
     validate_routing_policy, FfnIndex, Index, IndexSummary, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
-    enable_memory_telemetry, enable_memory_telemetry_file, enable_q2_runtime_profile,
-    run_generate_streaming_with_options, GenerationOptions, KvCacheMetrics, MtpMetrics,
+    enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
+    enable_q2_runtime_profile, q2_memory_controller_spec, run_generate_streaming_with_options,
+    GenerationOptions, KvCacheMetrics, MtpMetrics,
 };
 use tokenizer::{render_user_prompt, Tokenizer};
 
@@ -38,11 +39,14 @@ pub fn run(
     throughput_file: Option<&Path>,
     profile_token_costs: bool,
     speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
     hot_kv_cache_gb: Option<f64>,
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
 ) -> Result<()> {
+    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
@@ -69,13 +73,17 @@ pub fn run(
     let expert_cache_budget_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
     let hot_kv_cache_budget_bytes = cache_gb_to_bytes("hot KV cache", hot_kv_cache_gb)?;
     let backend = MetalBackend::new()?;
-    if let Some(expert_cache_budget_bytes) = expert_cache_budget_bytes {
-        let slots_per_layer = expert_cache_slots_per_layer(
-            &readiness.index,
-            config.num_routed_experts,
-            config.num_nextn_predict_layers > 0,
-            expert_cache_budget_bytes,
-        )?;
+    let expert_cache_slots = expert_cache_budget_bytes
+        .map(|expert_cache_budget_bytes| {
+            expert_cache_slots_per_layer(
+                &readiness.index,
+                config.num_routed_experts,
+                config.num_nextn_predict_layers > 0,
+                expert_cache_budget_bytes,
+            )
+        })
+        .transpose()?;
+    if let Some(slots_per_layer) = expert_cache_slots {
         backend.configure_expert_cache_slots_per_layer(slots_per_layer)?;
     }
     let expert_pack_path = model_path.join(EXPERT_PACK_FILE_NAME);
@@ -101,6 +109,20 @@ pub fn run(
     } else if enable_telemetry {
         enable_memory_telemetry();
     }
+    if let Some(path) = memory_controller_log {
+        enable_memory_controller_log(path)?;
+    }
+    let dynamic_cache_budget = enable_unified_memory_controller
+        .then(|| {
+            q2_memory_controller_spec(
+                &config,
+                page_size,
+                expert_cache_slots,
+                hot_kv_cache_budget_bytes,
+                speculative_mtp,
+            )
+        })
+        .transpose()?;
     let mut stdout = io::stdout().lock();
     let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
     let mut generated_token_count = 0_usize;
@@ -115,7 +137,7 @@ pub fn run(
         &generation_config.eos_token_ids,
         GenerationOptions {
             hot_kv_cache_budget_bytes,
-            dynamic_cache_budget: None,
+            dynamic_cache_budget,
             profile_token_costs,
             speculative_mtp,
         },
@@ -156,6 +178,18 @@ pub fn run(
         if let Some(path) = throughput_file {
             append_tokens_per_second_report(path, &throughput_report)?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_memory_controller_options(
+    enabled: bool,
+    decision_log: Option<&Path>,
+) -> InfernoResult<()> {
+    if decision_log.is_some() && !enabled {
+        return Err(Error::runtime(
+            "--memory-controller-log requires --enable-unified-memory-controller",
+        ));
     }
     Ok(())
 }
@@ -797,6 +831,15 @@ mod tests {
         );
         assert!(cache_gb_to_bytes("cache", Some(0.0)).is_err());
         assert!(cache_gb_to_bytes("cache", Some(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn controller_decision_log_requires_the_opt_in_controller() {
+        let path = Path::new("/tmp/inferno-memory-controller.tsv");
+
+        assert!(validate_memory_controller_options(false, Some(path)).is_err());
+        validate_memory_controller_options(true, Some(path)).unwrap();
+        validate_memory_controller_options(false, None).unwrap();
     }
 
     #[test]

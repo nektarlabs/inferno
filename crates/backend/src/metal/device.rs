@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use crate::{DevicePagedKvView, DeviceRouterTopK, ExpertCacheMetrics, Q2ExpertSource};
+use crate::{
+    BackendMemoryReport, DevicePagedKvView, DeviceRouterTopK, ExpertCacheMetrics, Q2ExpertSource,
+};
 use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, Error, PagedKvView, Result};
 use inferno_io::ExpertPackHeader;
@@ -91,6 +93,14 @@ impl Metal {
         self.device.recommended_max_working_set_size()
     }
 
+    pub fn memory_report(&self) -> BackendMemoryReport {
+        let mut report = super::memory::native_memory_report();
+        report.metal_current_allocated_bytes = Some(self.current_allocated_bytes());
+        report.metal_recommended_max_working_set_bytes =
+            Some(self.recommended_max_working_set_bytes());
+        report
+    }
+
     pub fn expert_cache_metrics(&self) -> Result<ExpertCacheMetrics> {
         self.q2_matvec.expert_cache_metrics()
     }
@@ -103,6 +113,10 @@ impl Metal {
     pub fn resize_expert_cache_slots_per_layer(&self, slots_per_layer: usize) -> Result<()> {
         self.q2_matvec
             .resize_expert_cache_slots_per_layer(slots_per_layer)
+    }
+
+    pub fn release_prefill_resources(&self) -> Result<()> {
+        self.q2_matvec.release_prefill_resources()
     }
 
     pub fn configure_expert_pack(&self, path: &Path, header: ExpertPackHeader) -> Result<()> {

@@ -15,6 +15,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     speculative_mtp: bool,
 
+    /// Enable adaptive expert-cache and hot-KV memory rebalancing.
+    #[arg(long, global = true, default_value_t = false)]
+    enable_unified_memory_controller: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -90,6 +94,10 @@ enum Command {
         /// Write runtime memory telemetry to a file instead of interleaving it with streamed text.
         #[arg(long)]
         telemetry_file: Option<PathBuf>,
+
+        /// Write every adaptive memory-controller decision to a TSV file. Requires --enable-unified-memory-controller.
+        #[arg(long)]
+        memory_controller_log: Option<PathBuf>,
     },
 
     /// Start a persistent local GLM-5.2 chat session.
@@ -129,12 +137,17 @@ enum Command {
         /// Write runtime memory telemetry to a file instead of the terminal.
         #[arg(long)]
         telemetry_file: Option<PathBuf>,
+
+        /// Write every adaptive memory-controller decision to a TSV file. Requires --enable-unified-memory-controller.
+        #[arg(long)]
+        memory_controller_log: Option<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let speculative_mtp = cli.speculative_mtp;
+    let enable_unified_memory_controller = cli.enable_unified_memory_controller;
     let command = cli.command.unwrap_or_else(Command::default_chat);
     tracing_init::init(
         command.telemetry_to_stderr(),
@@ -159,6 +172,7 @@ fn main() -> Result<()> {
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file,
+            memory_controller_log,
         } => commands::generate::run(
             model.as_path(),
             config.as_deref(),
@@ -174,10 +188,12 @@ fn main() -> Result<()> {
             throughput_file.as_deref(),
             profile_token_costs,
             speculative_mtp,
+            enable_unified_memory_controller,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file.as_deref(),
+            memory_controller_log.as_deref(),
         )?,
         Command::Chat {
             model,
@@ -189,6 +205,7 @@ fn main() -> Result<()> {
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file,
+            memory_controller_log,
         } => commands::chat::run(
             model.as_path(),
             config.as_deref(),
@@ -196,10 +213,12 @@ fn main() -> Result<()> {
             page_size,
             max_new_tokens,
             speculative_mtp,
+            enable_unified_memory_controller,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
             telemetry_file.as_deref(),
+            memory_controller_log.as_deref(),
         )?,
     }
 
@@ -218,6 +237,7 @@ impl Command {
             hot_kv_cache_gb: None,
             enable_telemetry: false,
             telemetry_file: None,
+            memory_controller_log: None,
         }
     }
 
@@ -492,6 +512,32 @@ mod tests {
     }
 
     #[test]
+    fn unified_memory_controller_is_explicitly_opt_in() {
+        let default_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+        ])
+        .unwrap();
+        assert!(!default_cli.enable_unified_memory_controller);
+
+        let enabled_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--enable-unified-memory-controller",
+        ])
+        .unwrap();
+        assert!(enabled_cli.enable_unified_memory_controller);
+    }
+
+    #[test]
     fn generate_accepts_cache_budget_overrides() {
         let cli = Cli::try_parse_from([
             "inferno",
@@ -592,6 +638,33 @@ mod tests {
     }
 
     #[test]
+    fn generate_accepts_memory_controller_log_file() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--memory-controller-log",
+            "/tmp/inferno-memory-controller.tsv",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            memory_controller_log,
+            ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(
+            memory_controller_log.unwrap(),
+            PathBuf::from("/tmp/inferno-memory-controller.tsv")
+        );
+    }
+
+    #[test]
     fn generate_rejects_quantization_argument() {
         let err = Cli::try_parse_from([
             "inferno",
@@ -612,6 +685,7 @@ mod tests {
     fn no_subcommand_selects_default_local_chat() {
         let cli = Cli::try_parse_from(["inferno"]).unwrap();
         assert!(!cli.speculative_mtp);
+        assert!(!cli.enable_unified_memory_controller);
         let command = cli.command.unwrap_or_else(Command::default_chat);
 
         let Command::Chat {

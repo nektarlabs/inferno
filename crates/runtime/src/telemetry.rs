@@ -2,8 +2,6 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
-    process::Command,
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex, OnceLock,
@@ -51,6 +49,7 @@ pub(crate) struct RuntimeKvMemoryBytes {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimeMemorySnapshot {
+    pub total_physical_bytes: Option<u64>,
     pub process_rss_bytes: Option<u64>,
     pub process_virtual_bytes: Option<u64>,
     pub system_free_bytes: Option<u64>,
@@ -58,11 +57,34 @@ pub(crate) struct RuntimeMemorySnapshot {
     pub system_inactive_bytes: Option<u64>,
     pub system_wired_bytes: Option<u64>,
     pub system_compressed_bytes: Option<u64>,
+    pub system_purgeable_bytes: Option<u64>,
+    pub system_speculative_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
     pub metal_current_allocated_bytes: Option<u64>,
     pub metal_recommended_max_working_set_bytes: Option<u64>,
     pub runtime_kv_hot_bytes: Option<u64>,
     pub runtime_kv_cold_bytes: Option<u64>,
+}
+
+impl RuntimeMemorySnapshot {
+    pub(crate) fn effective_available_bytes(self) -> Option<u64> {
+        let available = self
+            .system_free_bytes?
+            .saturating_add(self.system_inactive_bytes.unwrap_or(0))
+            .saturating_add(self.system_purgeable_bytes.unwrap_or(0))
+            .saturating_add(self.system_speculative_bytes.unwrap_or(0));
+        Some(
+            self.total_physical_bytes
+                .map_or(available, |total| available.min(total)),
+        )
+    }
+
+    pub(crate) fn metal_headroom_bytes(self) -> Option<u64> {
+        Some(
+            self.metal_recommended_max_working_set_bytes?
+                .saturating_sub(self.metal_current_allocated_bytes?),
+        )
+    }
 }
 
 pub(crate) fn log_memory_snapshot<B: Backend>(
@@ -84,6 +106,7 @@ pub(crate) fn log_memory_snapshot<B: Backend>(
         target: "inferno::memory",
         stage,
         step_index,
+        total_physical_gb = %format_gb(snapshot.total_physical_bytes),
         process_rss_gb = %format_gb(snapshot.process_rss_bytes),
         process_virtual_gb = %format_gb(snapshot.process_virtual_bytes),
         system_free_gb = %format_gb(snapshot.system_free_bytes),
@@ -91,9 +114,13 @@ pub(crate) fn log_memory_snapshot<B: Backend>(
         system_inactive_gb = %format_gb(snapshot.system_inactive_bytes),
         system_wired_gb = %format_gb(snapshot.system_wired_bytes),
         system_compressed_gb = %format_gb(snapshot.system_compressed_bytes),
+        system_purgeable_gb = %format_gb(snapshot.system_purgeable_bytes),
+        system_speculative_gb = %format_gb(snapshot.system_speculative_bytes),
+        effective_available_gb = %format_gb(snapshot.effective_available_bytes()),
         swap_used_gb = %format_gb(snapshot.swap_used_bytes),
         metal_current_allocated_gb = %format_gb(snapshot.metal_current_allocated_bytes),
         metal_recommended_max_working_set_gb = %format_gb(snapshot.metal_recommended_max_working_set_bytes),
+        metal_headroom_gb = %format_gb(snapshot.metal_headroom_bytes()),
         runtime_kv_hot_gb = %format_gb(snapshot.runtime_kv_hot_bytes),
         runtime_kv_cold_gb = %format_gb(snapshot.runtime_kv_cold_bytes),
         "runtime memory snapshot"
@@ -109,11 +136,12 @@ fn write_memory_snapshot_to_file(
     let writer = writer.as_mut()?;
     writeln!(
         writer,
-        "runtime memory snapshot stage=\"{}\" step_index={} process_rss_gb={} process_virtual_gb={} system_free_gb={} system_active_gb={} system_inactive_gb={} system_wired_gb={} system_compressed_gb={} swap_used_gb={} metal_current_allocated_gb={} metal_recommended_max_working_set_gb={} runtime_kv_hot_gb={} runtime_kv_cold_gb={}",
+        "runtime memory snapshot stage=\"{}\" step_index={} total_physical_gb={} process_rss_gb={} process_virtual_gb={} system_free_gb={} system_active_gb={} system_inactive_gb={} system_wired_gb={} system_compressed_gb={} system_purgeable_gb={} system_speculative_gb={} effective_available_gb={} swap_used_gb={} metal_current_allocated_gb={} metal_recommended_max_working_set_gb={} metal_headroom_gb={} runtime_kv_hot_gb={} runtime_kv_cold_gb={}",
         stage,
         step_index
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        format_gb(snapshot.total_physical_bytes),
         format_gb(snapshot.process_rss_bytes),
         format_gb(snapshot.process_virtual_bytes),
         format_gb(snapshot.system_free_bytes),
@@ -121,9 +149,13 @@ fn write_memory_snapshot_to_file(
         format_gb(snapshot.system_inactive_bytes),
         format_gb(snapshot.system_wired_bytes),
         format_gb(snapshot.system_compressed_bytes),
+        format_gb(snapshot.system_purgeable_bytes),
+        format_gb(snapshot.system_speculative_bytes),
+        format_gb(snapshot.effective_available_bytes()),
         format_gb(snapshot.swap_used_bytes),
         format_gb(snapshot.metal_current_allocated_bytes),
         format_gb(snapshot.metal_recommended_max_working_set_bytes),
+        format_gb(snapshot.metal_headroom_bytes()),
         format_gb(snapshot.runtime_kv_hot_bytes),
         format_gb(snapshot.runtime_kv_cold_bytes),
     )
@@ -143,17 +175,19 @@ pub(crate) fn capture_memory_snapshot<B: Backend>(
     backend: &B,
     runtime_kv: RuntimeKvMemoryBytes,
 ) -> RuntimeMemorySnapshot {
-    let os = os_memory_snapshot();
     let backend = backend.memory_report();
     RuntimeMemorySnapshot {
-        process_rss_bytes: os.process_rss_bytes,
-        process_virtual_bytes: os.process_virtual_bytes,
-        system_free_bytes: os.system_free_bytes,
-        system_active_bytes: os.system_active_bytes,
-        system_inactive_bytes: os.system_inactive_bytes,
-        system_wired_bytes: os.system_wired_bytes,
-        system_compressed_bytes: os.system_compressed_bytes,
-        swap_used_bytes: os.swap_used_bytes,
+        total_physical_bytes: backend.total_physical_bytes,
+        process_rss_bytes: backend.process_rss_bytes,
+        process_virtual_bytes: backend.process_virtual_bytes,
+        system_free_bytes: backend.system_free_bytes,
+        system_active_bytes: backend.system_active_bytes,
+        system_inactive_bytes: backend.system_inactive_bytes,
+        system_wired_bytes: backend.system_wired_bytes,
+        system_compressed_bytes: backend.system_compressed_bytes,
+        system_purgeable_bytes: backend.system_purgeable_bytes,
+        system_speculative_bytes: backend.system_speculative_bytes,
+        swap_used_bytes: backend.swap_used_bytes,
         metal_current_allocated_bytes: backend.metal_current_allocated_bytes,
         metal_recommended_max_working_set_bytes: backend.metal_recommended_max_working_set_bytes,
         runtime_kv_hot_bytes: runtime_kv.hot_bytes,
@@ -161,157 +195,13 @@ pub(crate) fn capture_memory_snapshot<B: Backend>(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct OsMemorySnapshot {
-    process_rss_bytes: Option<u64>,
-    process_virtual_bytes: Option<u64>,
-    system_free_bytes: Option<u64>,
-    system_active_bytes: Option<u64>,
-    system_inactive_bytes: Option<u64>,
-    system_wired_bytes: Option<u64>,
-    system_compressed_bytes: Option<u64>,
-    swap_used_bytes: Option<u64>,
-}
-
-fn os_memory_snapshot() -> OsMemorySnapshot {
-    let process = process_memory_bytes();
-    let mut snapshot = OsMemorySnapshot {
-        process_rss_bytes: process.process_rss_bytes,
-        process_virtual_bytes: process.process_virtual_bytes,
-        ..OsMemorySnapshot::default()
-    };
-
-    if cfg!(target_os = "macos") {
-        if let Some(vm_stat) = run_command("/usr/bin/vm_stat", &[]) {
-            snapshot = merge_vm_stat(snapshot, &vm_stat);
-        }
-        if let Some(swap) = run_command("/usr/sbin/sysctl", &["-n", "vm.swapusage"]) {
-            snapshot.swap_used_bytes = parse_swapusage_used_bytes(&swap);
-        }
-    }
-
-    snapshot
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ProcessMemoryBytes {
-    process_rss_bytes: Option<u64>,
-    process_virtual_bytes: Option<u64>,
-}
-
-fn process_memory_bytes() -> ProcessMemoryBytes {
-    let pid = std::process::id().to_string();
-    let Some(output) = run_command("/bin/ps", &["-o", "rss=,vsz=", "-p", &pid]) else {
-        return ProcessMemoryBytes::default();
-    };
-    parse_ps_memory_bytes(&output)
-}
-
-fn run_command(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
 fn memory_telemetry_file() -> &'static Mutex<Option<File>> {
     MEMORY_TELEMETRY_FILE.get_or_init(|| Mutex::new(None))
-}
-
-fn merge_vm_stat(mut snapshot: OsMemorySnapshot, vm_stat: &str) -> OsMemorySnapshot {
-    let page_size = parse_vm_page_size(vm_stat).unwrap_or(4096);
-    snapshot.system_free_bytes =
-        parse_vm_page_count(vm_stat, "Pages free").and_then(|pages| pages.checked_mul(page_size));
-    snapshot.system_active_bytes =
-        parse_vm_page_count(vm_stat, "Pages active").and_then(|pages| pages.checked_mul(page_size));
-    snapshot.system_inactive_bytes = parse_vm_page_count(vm_stat, "Pages inactive")
-        .and_then(|pages| pages.checked_mul(page_size));
-    snapshot.system_wired_bytes = parse_vm_page_count(vm_stat, "Pages wired down")
-        .and_then(|pages| pages.checked_mul(page_size));
-    snapshot.system_compressed_bytes = parse_vm_page_count(vm_stat, "Pages occupied by compressor")
-        .and_then(|pages| pages.checked_mul(page_size));
-    snapshot
-}
-
-fn parse_ps_memory_bytes(output: &str) -> ProcessMemoryBytes {
-    let mut fields = output.split_whitespace();
-    let process_rss_bytes = fields
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|kib| kib.checked_mul(1024));
-    let process_virtual_bytes = fields
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|kib| kib.checked_mul(1024));
-    ProcessMemoryBytes {
-        process_rss_bytes,
-        process_virtual_bytes,
-    }
-}
-
-fn parse_vm_page_size(output: &str) -> Option<u64> {
-    let first_line = output.lines().next()?;
-    let start = first_line.find("page size of ")? + "page size of ".len();
-    let suffix = &first_line[start..];
-    let end = suffix.find(" bytes")?;
-    suffix[..end].trim().parse::<u64>().ok()
-}
-
-fn parse_vm_page_count(output: &str, label: &str) -> Option<u64> {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(label) else {
-            continue;
-        };
-        let Some(value) = rest.split(':').nth(1) else {
-            continue;
-        };
-        let value = value.trim().trim_end_matches('.').replace('_', "");
-        return u64::from_str(&value).ok();
-    }
-    None
-}
-
-fn parse_swapusage_used_bytes(output: &str) -> Option<u64> {
-    let used = output.split_whitespace().collect::<Vec<_>>();
-    let index = used.iter().position(|part| *part == "used")?;
-    let value = *used.get(index + 2)?;
-    parse_binary_size_bytes(value)
-}
-
-fn parse_binary_size_bytes(value: &str) -> Option<u64> {
-    let value = value.trim().trim_end_matches(',');
-    let unit_start = value
-        .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(value.len());
-    let number = value[..unit_start].parse::<f64>().ok()?;
-    let unit = value[unit_start..].to_ascii_uppercase();
-    let multiplier = match unit.as_str() {
-        "K" | "KB" => 1024.0,
-        "M" | "MB" => 1024.0 * 1024.0,
-        "G" | "GB" => 1024.0 * 1024.0 * 1024.0,
-        "T" | "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "" => 1.0,
-        _ => return None,
-    };
-    Some((number * multiplier) as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_ps_rss_as_bytes() {
-        assert_eq!(
-            parse_ps_memory_bytes(" 1234 5678\n"),
-            ProcessMemoryBytes {
-                process_rss_bytes: Some(1_263_616),
-                process_virtual_bytes: Some(5_814_272),
-            }
-        );
-    }
 
     #[test]
     fn formats_bytes_as_decimal_gb() {
@@ -320,28 +210,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_vm_stat_page_values() {
-        let vm_stat = "\
-Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                               100.
-Pages active:                             200.
-Pages inactive:                           300.
-Pages wired down:                         400.
-Pages occupied by compressor:             500.
-";
-        let snapshot = merge_vm_stat(OsMemorySnapshot::default(), vm_stat);
-        assert_eq!(snapshot.system_free_bytes, Some(1_638_400));
-        assert_eq!(snapshot.system_active_bytes, Some(3_276_800));
-        assert_eq!(snapshot.system_inactive_bytes, Some(4_915_200));
-        assert_eq!(snapshot.system_wired_bytes, Some(6_553_600));
-        assert_eq!(snapshot.system_compressed_bytes, Some(8_192_000));
-    }
+    fn calculates_effective_available_memory_from_reclaimable_pages() {
+        let snapshot = RuntimeMemorySnapshot {
+            total_physical_bytes: Some(64_000),
+            process_rss_bytes: None,
+            process_virtual_bytes: None,
+            system_free_bytes: Some(1_000),
+            system_active_bytes: None,
+            system_inactive_bytes: Some(2_000),
+            system_wired_bytes: None,
+            system_compressed_bytes: None,
+            system_purgeable_bytes: Some(3_000),
+            system_speculative_bytes: Some(4_000),
+            swap_used_bytes: None,
+            metal_current_allocated_bytes: Some(40_000),
+            metal_recommended_max_working_set_bytes: Some(55_000),
+            runtime_kv_hot_bytes: None,
+            runtime_kv_cold_bytes: None,
+        };
 
-    #[test]
-    fn parses_swap_usage() {
-        assert_eq!(
-            parse_swapusage_used_bytes("total = 2048.00M  used = 512.50M  free = 1535.50M"),
-            Some(537_395_200)
-        );
+        assert_eq!(snapshot.effective_available_bytes(), Some(10_000));
+        assert_eq!(snapshot.metal_headroom_bytes(), Some(15_000));
     }
 }
