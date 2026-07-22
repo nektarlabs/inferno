@@ -2,6 +2,8 @@
 
 //! Tokenizer loading, encoding, decoding, and streaming decode support.
 
+mod agent;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -9,6 +11,11 @@ use std::{
 
 use common::{Error, Result};
 use tokenizers::Tokenizer as HfTokenizer;
+
+pub use agent::{
+    is_supported_codex_function, parse_agent_output, render_codex_prompt, AgentFunctionCall,
+    AgentOutput, AgentOutputItem,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenizerMetadata {

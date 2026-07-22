@@ -5,7 +5,7 @@ mod tracing_init;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "inferno")]
@@ -142,6 +142,53 @@ enum Command {
         #[arg(long)]
         memory_controller_log: Option<PathBuf>,
     },
+
+    /// Serve GLM-5.2 to Codex through the local Responses API.
+    Serve {
+        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        #[arg(long, default_value = "models/glm-5.2")]
+        model: PathBuf,
+
+        /// Optional config.json path. Defaults to <model>/config.json.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Optional tokenizer.json path. Defaults to <model>/tokenizer.json.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+
+        /// Local address exposed to Codex.
+        #[arg(long, default_value = "127.0.0.1:11435")]
+        bind: SocketAddr,
+
+        /// Page size for the paged KV cache.
+        #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
+        page_size: usize,
+
+        /// Optional generated-token safety limit for each Codex turn.
+        #[arg(long)]
+        max_new_tokens: Option<usize>,
+
+        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        #[arg(long)]
+        expert_cache_gb: Option<f64>,
+
+        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        #[arg(long)]
+        hot_kv_cache_gb: Option<f64>,
+
+        /// Emit runtime memory telemetry while serving Codex.
+        #[arg(long, default_value_t = false)]
+        enable_telemetry: bool,
+
+        /// Write runtime memory telemetry to a file.
+        #[arg(long)]
+        telemetry_file: Option<PathBuf>,
+
+        /// Write adaptive memory decisions to TSV. Requires --enable-unified-memory-controller.
+        #[arg(long)]
+        memory_controller_log: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -220,6 +267,33 @@ fn main() -> Result<()> {
             telemetry_file.as_deref(),
             memory_controller_log.as_deref(),
         )?,
+        Command::Serve {
+            model,
+            config,
+            tokenizer,
+            bind,
+            page_size,
+            max_new_tokens,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+            memory_controller_log,
+        } => commands::serve::run(
+            model.as_path(),
+            config.as_deref(),
+            tokenizer.as_deref(),
+            bind,
+            page_size,
+            max_new_tokens,
+            speculative_mtp,
+            enable_unified_memory_controller,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file.as_deref(),
+            memory_controller_log.as_deref(),
+        )?,
     }
 
     Ok(())
@@ -253,6 +327,11 @@ impl Command {
                 telemetry_file,
                 ..
             } => *enable_telemetry && telemetry_file.is_none(),
+            Command::Serve {
+                enable_telemetry,
+                telemetry_file,
+                ..
+            } => *enable_telemetry && telemetry_file.is_none(),
         }
     }
 
@@ -263,6 +342,7 @@ impl Command {
                 ..
             } => *profile_token_costs,
             Command::Chat { .. } => false,
+            Command::Serve { .. } => false,
         }
     }
 }
@@ -293,6 +373,24 @@ mod tests {
             panic!("expected generate command");
         };
         assert!(!skip_special_tokens);
+    }
+
+    #[test]
+    fn serve_uses_local_codex_defaults() {
+        let cli = Cli::try_parse_from(["inferno", "serve"]).unwrap();
+
+        let Command::Serve {
+            model,
+            bind,
+            max_new_tokens,
+            ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(model, PathBuf::from("models/glm-5.2"));
+        assert_eq!(bind, "127.0.0.1:11435".parse::<SocketAddr>().unwrap());
+        assert_eq!(max_new_tokens, None);
     }
 
     #[test]

@@ -16,6 +16,8 @@ inferno-io = { package = "io", path = "../io" }
 model = { path = "../model" }
 runtime = { path = "../runtime" }
 rustix.workspace = true
+serde_json.workspace = true
+server = { path = "../server" }
 tokenizer = { path = "../tokenizer" }
 tracing.workspace = true
 tracing-subscriber.workspace = true

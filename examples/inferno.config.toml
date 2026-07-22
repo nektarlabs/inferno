@@ -1,0 +1,31 @@
+model = "glm-5.2-q2"
+model_provider = "inferno"
+model_context_window = 32768
+model_auto_compact_token_limit = 28000
+model_catalog_json = "inferno.models.json"
+include_permissions_instructions = false
+include_apps_instructions = false
+include_collaboration_mode_instructions = false
+web_search = "disabled"
+
+[tools.experimental_request_user_input]
+enabled = false
+
+[skills]
+include_instructions = false
+
+[skills.bundled]
+enabled = false
+
+[features]
+multi_agent = false
+
+[model_providers.inferno]
+name = "Inferno"
+base_url = "http://127.0.0.1:11435/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 3600000

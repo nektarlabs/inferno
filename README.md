@@ -171,6 +171,41 @@ target/release/inferno generate \
 Without `--max-new-tokens`, generation continues until an EOS token or the
 context limit.
 
+### Codex
+
+Inferno can act as the local model provider for Codex. Start the persistent
+model process in one terminal:
+
+```bash
+target/release/inferno serve --model models/glm-5.2
+```
+
+Install the included Codex profile:
+
+```bash
+mkdir -p ~/.codex
+cp examples/inferno.config.toml ~/.codex/inferno.config.toml
+cp examples/inferno.models.json ~/.codex/inferno.models.json
+```
+
+Then start Codex in a repository:
+
+```bash
+codex --profile inferno
+```
+
+Codex sends each turn through its streaming Responses API. Inferno translates
+the conversation and direct function tools into GLM-5.2's native prompt,
+generates either text or a tool call, and returns that action to Codex. Codex
+executes the tool locally and sends the result back for the next model turn.
+The model, Metal backend, and expert cache remain alive between requests.
+
+Requests are processed one at a time because they share one Metal runtime.
+The profile exposes only `exec_command` and `write_stdin` to GLM. Codex still
+enforces its sandbox and approval policy, but omitting unrelated tool schemas
+keeps the expensive GLM prefill small. Plugin namespaces and hosted web search
+are not part of this first integration.
+
 ### Measurement
 
 Measure decode throughput:
@@ -222,6 +257,7 @@ Use the executable help as the authoritative CLI reference:
 target/release/inferno --help
 target/release/inferno generate --help
 target/release/inferno chat --help
+target/release/inferno serve --help
 ```
 
 ## Memory Strategy
