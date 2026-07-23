@@ -7,26 +7,31 @@ use std::{
 use anyhow::Result;
 use backend::{Backend, MetalBackend};
 use common::{Error, Result as InfernoResult};
-use config::{load_config, load_generation_config};
+use config::{
+    detect_model_architecture, load_config, load_generation_config, load_laguna_config,
+    LagunaConfig, ModelArchitecture,
+};
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
-    expected_expert_pack_header, validate_routing_policy, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    expected_expert_pack_header, validate_routing_policy, LagunaModel, Model,
+    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
     q2_memory_controller_spec, run_generate_streaming_with_options, CacheBudgetSpec,
-    GenerationOptions,
+    GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
 };
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, LocalModes, OptionalActions, QueueSelector, Termios,
 };
-use tokenizer::{render_chat_prompt, ChatTurn, Tokenizer};
+use tokenizer::{render_chat_prompt, render_laguna_chat_prompt, ChatTurn, Tokenizer};
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    load_q2_readiness, resolve_q2_artifact, validate_generation_request,
-    validate_memory_controller_options, DecodedTextStream,
+    laguna_expert_cache_capacity, load_q2_readiness, resolve_q2_artifact,
+    validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
+    validate_memory_controller_options, DecodedTextStream, LAGUNA_TOKENIZER_CONTRACT,
 };
 
 const THINK_END: &str = "</think>";
@@ -49,9 +54,26 @@ pub fn run(
     telemetry_file: Option<&Path>,
     memory_controller_log: Option<&Path>,
 ) -> Result<()> {
-    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
+    if detect_model_architecture(&discovered_config)? == ModelArchitecture::Laguna {
+        return run_laguna(
+            model_path,
+            &discovered_config,
+            &discovered_tokenizer,
+            page_size,
+            max_new_tokens,
+            speculative_mtp,
+            enable_unified_memory_controller,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+            memory_controller_log,
+        );
+    }
+
+    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
     let config = load_config(&discovered_config)?;
     let artifact = resolve_q2_artifact(model_path)?;
@@ -122,6 +144,140 @@ pub fn run(
         hot_kv_cache_budget_bytes,
         dynamic_cache_budget,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_laguna(
+    model_path: &Path,
+    config_path: &Path,
+    tokenizer_path: &Path,
+    page_size: usize,
+    max_new_tokens: Option<usize>,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> Result<()> {
+    validate_laguna_service_options(
+        page_size,
+        speculative_mtp,
+        enable_unified_memory_controller,
+        hot_kv_cache_gb,
+        enable_telemetry,
+        telemetry_file,
+        memory_controller_log,
+    )?;
+    let config = load_laguna_config(config_path)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    let backend = MetalBackend::new()?;
+    let model = LagunaModel::open(model_path, config.clone(), &backend)?;
+    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
+    // Reserve against Laguna's full configured context because chat history can
+    // grow across turns while the expert cache remains persistent.
+    let expert_cache_capacity =
+        laguna_expert_cache_capacity(&model, &config, &backend, 1, None, explicit_cache_bytes)?;
+    let mut runtime = LagunaRuntime::new(LagunaGenerationOptions {
+        expert_cache_capacity,
+    })?;
+
+    run_laguna_interactive_loop(
+        &model,
+        &config,
+        &backend,
+        &tokenizer,
+        max_new_tokens,
+        &mut runtime,
+    )
+}
+
+fn run_laguna_interactive_loop(
+    model: &LagunaModel,
+    config: &LagunaConfig,
+    backend: &MetalBackend,
+    tokenizer: &Tokenizer,
+    max_new_tokens: Option<usize>,
+    runtime: &mut LagunaRuntime,
+) -> Result<()> {
+    let stdin = io::stdin();
+    let input_is_terminal = stdin.is_terminal();
+    let stdout = io::stdout();
+    let output_is_terminal = stdout.is_terminal();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let mut history = Vec::<ChatTurn>::new();
+    let mut line = String::new();
+
+    loop {
+        if input_is_terminal {
+            output.write_all(b"inferno> ")?;
+            output.flush()?;
+        }
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            if input_is_terminal {
+                output.write_all(b"\n")?;
+            }
+            return Ok(());
+        }
+
+        let prompt = line.trim();
+        match classify_input(prompt) {
+            ChatInput::Empty => continue,
+            ChatInput::Exit => return Ok(()),
+            ChatInput::Clear => {
+                history.clear();
+                output.write_all(b"history cleared\n")?;
+                output.flush()?;
+                continue;
+            }
+            ChatInput::Prompt => {}
+        }
+
+        let rendered = render_laguna_chat_prompt(&history, prompt);
+        let encoded = tokenizer.encode(&rendered.rendered, false)?;
+        validate_laguna_prompt(config, &encoded.token_ids, max_new_tokens)?;
+
+        let mut input_guard = TerminalInputGuard::suspend(&input, input_is_terminal)?;
+        set_thinking_color(&mut output, output_is_terminal)?;
+        let mut decoded = DecodedTextStream::new(tokenizer, true);
+        let mut assistant = AssistantStream::default();
+        let generation_result = runtime.generate_streaming(
+            model,
+            backend,
+            &encoded.token_ids,
+            max_new_tokens,
+            &config.eos_token_id,
+            |token_id| {
+                if let Some(text) = decoded.push(token_id)? {
+                    write_events(&mut output, assistant.push(&text), output_is_terminal)?;
+                }
+                Ok(())
+            },
+        );
+        let finish_result = if generation_result.is_ok() {
+            write_events(&mut output, assistant.finish(), output_is_terminal)
+        } else {
+            Ok(())
+        };
+        let color_result = reset_color(&mut output, output_is_terminal);
+        let input_result = input_guard.restore();
+
+        generation_result?;
+        finish_result?;
+        color_result?;
+        input_result?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+
+        history.push(ChatTurn {
+            user: prompt.to_string(),
+            assistant: assistant.answer().trim().to_string(),
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

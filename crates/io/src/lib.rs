@@ -1,11 +1,16 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! File IO helpers for large GLM weight shards.
+//! File IO helpers for large, locally streamed model weights.
 
 mod expert_pack;
+mod safetensors;
 
 pub use expert_pack::{
     ExpertComponent, ExpertPackHeader, EXPERT_PACK_FILE_NAME, EXPERT_PACK_HEADER_BYTES,
+};
+pub use safetensors::{
+    SafeTensorDtype, SafeTensorHandle, SafeTensorIndex, SafeTensorInfo, SafeTensorModel,
+    SafeTensorShard, SAFETENSORS_INDEX_FILE,
 };
 
 #[cfg(unix)]
@@ -183,6 +188,47 @@ impl MappedFile {
         #[cfg(unix)]
         {
             self.prefetch_ranges_parallel(ranges)?;
+        }
+
+        #[cfg(not(unix))]
+        let _ = ranges;
+
+        Ok(())
+    }
+
+    /// Reads several ranges on the current worker with one reusable buffer.
+    ///
+    /// Higher layers use this when they already parallelize independent
+    /// experts. It avoids creating a nested thread pool and allocating one
+    /// temporary buffer per tensor component.
+    pub(crate) fn prefetch_ranges_serial(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        let ranges = ranges
+            .iter()
+            .copied()
+            .filter(|(_, byte_len)| *byte_len != 0)
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        for &(offset, byte_len) in &ranges {
+            self.validate_range("prefetch", offset, byte_len)?;
+            self.advise_range(MappedFileAdvice::WillNeed, offset, byte_len)?;
+        }
+
+        #[cfg(unix)]
+        {
+            let largest_range = ranges
+                .iter()
+                .map(|(_, byte_len)| *byte_len)
+                .max()
+                .unwrap_or(1);
+            let buffer_len = usize::try_from(largest_range)
+                .unwrap_or(PREFETCH_CHUNK_BYTES)
+                .clamp(1, PREFETCH_CHUNK_BYTES);
+            let mut buffer = vec![0_u8; buffer_len];
+            for (offset, byte_len) in ranges {
+                self.prefetch_range_with_buffer(offset, byte_len, &mut buffer)?;
+            }
         }
 
         #[cfg(not(unix))]

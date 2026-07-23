@@ -14,8 +14,9 @@ static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
 /// The subset of a Codex Responses request consumed by Inferno.
 ///
 /// Input items and tool specifications stay as JSON because Codex can add new
-/// item variants without changing the core Responses envelope. The GLM adapter
-/// validates and translates only the item kinds needed for a coding turn.
+/// item variants without changing the core Responses envelope. The loaded
+/// model adapter validates and translates only the item kinds needed for a
+/// coding turn.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,

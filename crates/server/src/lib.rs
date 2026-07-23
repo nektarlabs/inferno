@@ -22,7 +22,8 @@ pub use responses::{ResponseUsage, ResponsesRequest, ResponsesStream};
 
 use http::{read_request, write_json_error, write_json_response};
 
-pub const CODEX_MODEL_ID: &str = "glm-5.2-q2";
+pub const GLM_CODEX_MODEL_ID: &str = "glm-5.2-q2";
+pub const LAGUNA_CODEX_MODEL_ID: &str = "laguna-s-2.1-int4";
 const CODEX_MODEL_CATALOG: &str = include_str!("../../../examples/inferno.models.json");
 
 /// Executes one Responses request using an already-loaded model runtime.
@@ -39,17 +40,22 @@ pub trait ResponsesHandler {
 }
 
 /// Serves local Codex requests until the process is terminated.
-pub fn serve(listener: TcpListener, handler: &mut impl ResponsesHandler) -> Result<()> {
+pub fn serve(
+    listener: TcpListener,
+    handler: &mut impl ResponsesHandler,
+    model_id: &str,
+) -> Result<()> {
     let bound_addr = listener.local_addr().map_err(|source| Error::Io {
         path: "inferno-listener".into(),
         source,
     })?;
+    let model_catalog = codex_model_catalog(model_id)?;
     info!(addr = %bound_addr, "Inferno Responses server ready");
 
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("inferno-http".to_string())
-        .spawn(move || accept_connections(listener, sender))
+        .spawn(move || accept_connections(listener, sender, model_catalog))
         .map_err(|source| Error::Io {
             path: "inferno-http-thread".into(),
             source,
@@ -80,12 +86,16 @@ enum InferenceWork {
     ListenerFailed(String),
 }
 
-fn accept_connections(listener: TcpListener, sender: Sender<InferenceWork>) {
+fn accept_connections(
+    listener: TcpListener,
+    sender: Sender<InferenceWork>,
+    model_catalog: serde_json::Value,
+) {
     for connection in listener.incoming() {
         match connection {
             Ok(socket) => {
                 let peer = socket.peer_addr().ok();
-                if let Err(error) = route_connection(socket, &sender) {
+                if let Err(error) = route_connection(socket, &sender, &model_catalog) {
                     warn!(?peer, %error, "Inferno Responses request failed");
                 }
             }
@@ -99,7 +109,11 @@ fn accept_connections(listener: TcpListener, sender: Sender<InferenceWork>) {
     }
 }
 
-fn route_connection(mut socket: TcpStream, sender: &Sender<InferenceWork>) -> Result<()> {
+fn route_connection(
+    mut socket: TcpStream,
+    sender: &Sender<InferenceWork>,
+    model_catalog: &serde_json::Value,
+) -> Result<()> {
     let request = match read_request(&mut socket) {
         Ok(request) => request,
         Err(error) => {
@@ -114,7 +128,7 @@ fn route_connection(mut socket: TcpStream, sender: &Sender<InferenceWork>) -> Re
             200,
             &serde_json::json!({"status": "ok", "service": "inferno"}),
         ),
-        ("GET", "/v1/models") => write_json_response(&mut socket, 200, &codex_model_catalog()),
+        ("GET", "/v1/models") => write_json_response(&mut socket, 200, model_catalog),
         ("POST", "/v1/responses") => {
             let request = match ResponsesRequest::parse(&request.body) {
                 Ok(request) => request,
@@ -157,9 +171,19 @@ fn handle_responses(
     }
 }
 
-fn codex_model_catalog() -> serde_json::Value {
-    serde_json::from_str(CODEX_MODEL_CATALOG)
-        .expect("checked-in Inferno Codex model catalog must be valid JSON")
+fn codex_model_catalog(model_id: &str) -> Result<serde_json::Value> {
+    let mut catalog: serde_json::Value = serde_json::from_str(CODEX_MODEL_CATALOG)?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| Error::runtime("Inferno model catalog is missing a models array"))?;
+    models.retain(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(model_id));
+    if models.len() != 1 {
+        return Err(Error::runtime(format!(
+            "Inferno model catalog does not contain exactly one entry for {model_id:?}"
+        )));
+    }
+    Ok(catalog)
 }
 
 #[cfg(test)]
@@ -196,12 +220,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            route_connection(stream, &sender).unwrap();
+            let catalog = codex_model_catalog(GLM_CODEX_MODEL_ID).unwrap();
+            route_connection(stream, &sender, &catalog).unwrap();
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
         let body = serde_json::json!({
-            "model": "glm-5.2-q2",
+            "model": GLM_CODEX_MODEL_ID,
             "instructions": "Be concise.",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
             "tools": [],
@@ -239,15 +264,23 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_describes_only_infernos_codex_model() {
-        let catalog = codex_model_catalog();
-        let models = catalog["models"].as_array().unwrap();
+    fn model_catalog_describes_only_the_loaded_model() {
+        for model_id in [GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID] {
+            let catalog = codex_model_catalog(model_id).unwrap();
+            let models = catalog["models"].as_array().unwrap();
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0]["slug"], "glm-5.2-q2");
-        assert_eq!(models[0]["shell_type"], "unified_exec");
-        assert_eq!(models[0]["supports_parallel_tool_calls"], false);
-        assert_eq!(models[0]["supports_reasoning_summaries"], false);
-        assert_eq!(models[0]["context_window"], 32768);
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0]["slug"], model_id);
+            assert_eq!(models[0]["shell_type"], "unified_exec");
+            assert_eq!(models[0]["supports_parallel_tool_calls"], false);
+            assert_eq!(models[0]["supports_reasoning_summaries"], false);
+            assert_eq!(models[0]["context_window"], 32768);
+        }
+    }
+
+    #[test]
+    fn model_catalog_rejects_unknown_runtime_model() {
+        let error = codex_model_catalog("unknown").unwrap_err();
+        assert!(error.to_string().contains("unknown"));
     }
 }

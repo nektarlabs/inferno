@@ -9,19 +9,35 @@ use std::{
 use anyhow::Result;
 use backend::{Backend, ExpertCacheMetrics, MetalBackend};
 use common::{Error, Result as InfernoResult};
-use config::{load_config, load_generation_config, Config};
+use config::{
+    detect_model_architecture, load_config, load_generation_config, load_laguna_config, Config,
+    LagunaConfig, ModelArchitecture,
+};
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
     antirez_q2_artifact, enable_layer_profile, expected_expert_pack_header,
-    validate_routing_policy, FfnIndex, Index, IndexSummary, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    validate_routing_policy, FfnIndex, Index, IndexSummary, LagunaModel, Model,
+    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
     enable_q2_runtime_profile, q2_memory_controller_spec, run_generate_streaming_with_options,
-    GenerationOptions, KvCacheMetrics, MtpMetrics,
+    run_laguna_generate_streaming, GenerationOptions, KvCacheMetrics, LagunaGenerationOptions,
+    MtpMetrics,
 };
-use tokenizer::{render_user_prompt, Tokenizer};
+use tokenizer::{render_laguna_user_prompt, render_user_prompt, Tokenizer};
+
+const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
+const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 3_500_000_000;
+pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 6] = [
+    ("〈|UNK|〉", 0),
+    ("〈|EOS|〉", 2),
+    ("〈|PAD|〉", 9),
+    ("<think>", 18),
+    ("<assistant>", 23),
+    ("</assistant>", 24),
+];
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -49,6 +65,30 @@ pub fn run(
     validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
+    if detect_model_architecture(&discovered_config)? == ModelArchitecture::Laguna {
+        return run_laguna(
+            model_path,
+            &discovered_config,
+            &discovered_tokenizer,
+            page_size,
+            prompt,
+            max_new_tokens,
+            add_special_tokens,
+            skip_special_tokens,
+            profile_runtime,
+            profile_layers,
+            measure_tokens_per_second,
+            throughput_file,
+            profile_token_costs,
+            speculative_mtp,
+            enable_unified_memory_controller,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+            memory_controller_log,
+        );
+    }
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
     let config = load_config(&discovered_config)?;
     let artifact = resolve_q2_artifact(model_path)?;
@@ -180,6 +220,408 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_laguna(
+    model_path: &Path,
+    config_path: &Path,
+    tokenizer_path: &Path,
+    page_size: usize,
+    prompt: &str,
+    max_new_tokens: Option<usize>,
+    add_special_tokens: bool,
+    skip_special_tokens: bool,
+    profile_runtime: Option<&Path>,
+    profile_layers: Option<&Path>,
+    measure_tokens_per_second: bool,
+    throughput_file: Option<&Path>,
+    profile_token_costs: bool,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> Result<()> {
+    validate_laguna_options(
+        page_size,
+        add_special_tokens,
+        profile_runtime,
+        profile_layers,
+        profile_token_costs,
+        speculative_mtp,
+        enable_unified_memory_controller,
+        hot_kv_cache_gb,
+        enable_telemetry,
+        telemetry_file,
+        memory_controller_log,
+    )?;
+    let config = load_laguna_config(config_path)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    let rendered_prompt = render_laguna_user_prompt(prompt);
+    let encoded = tokenizer.encode(&rendered_prompt.rendered, add_special_tokens)?;
+    validate_laguna_prompt(&config, &encoded.token_ids, max_new_tokens)?;
+
+    let backend = MetalBackend::new()?;
+    let model = LagunaModel::open(model_path, config.clone(), &backend)?;
+    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
+    let expert_cache_capacity = laguna_expert_cache_capacity(
+        &model,
+        &config,
+        &backend,
+        encoded.token_ids.len(),
+        max_new_tokens,
+        explicit_cache_bytes,
+    )?;
+
+    let mut stdout = io::stdout().lock();
+    let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
+    let mut throughput = ThroughputRecorder::start();
+    let generation_report = run_laguna_generate_streaming(
+        &model,
+        &backend,
+        &encoded.token_ids,
+        max_new_tokens,
+        &config.eos_token_id,
+        LagunaGenerationOptions {
+            expert_cache_capacity,
+        },
+        |token_id| {
+            throughput.record_token();
+            if let Some(text) = stream.push(token_id)? {
+                stdout
+                    .write_all(text.as_bytes())
+                    .map_err(|source| Error::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    })?;
+                stdout.flush().map_err(|source| Error::Io {
+                    path: PathBuf::from("<stdout>"),
+                    source,
+                })?;
+            }
+            Ok(())
+        },
+    )?;
+    let throughput_report = throughput.finish(encoded.token_ids.len(), config.num_experts_per_tok);
+    stdout.write_all(b"\n")?;
+    if measure_tokens_per_second {
+        write_laguna_tokens_per_second_report(&throughput_report, &generation_report)?;
+    }
+    if let Some(path) = throughput_file {
+        append_laguna_tokens_per_second_report(path, &throughput_report, &generation_report)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_laguna_options(
+    page_size: usize,
+    add_special_tokens: bool,
+    profile_runtime: Option<&Path>,
+    profile_layers: Option<&Path>,
+    profile_token_costs: bool,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> InfernoResult<()> {
+    validate_laguna_service_options(
+        page_size,
+        speculative_mtp,
+        enable_unified_memory_controller,
+        hot_kv_cache_gb,
+        enable_telemetry,
+        telemetry_file,
+        memory_controller_log,
+    )?;
+    if add_special_tokens {
+        return Err(Error::tokenizer(
+            "Laguna's published chat template already inserts its BOS marker; --add-special-tokens would duplicate it",
+        ));
+    }
+    let unsupported = [
+        (profile_runtime.is_some(), "--profile-runtime"),
+        (profile_layers.is_some(), "--profile-layers"),
+        (profile_token_costs, "--profile-token-costs"),
+    ];
+    if let Some((_, flag)) = unsupported.into_iter().find(|(enabled, _)| *enabled) {
+        return Err(Error::runtime(format!(
+            "{flag} is outside the Laguna S 2.1 INT4 runtime contract"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_laguna_service_options(
+    page_size: usize,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> InfernoResult<()> {
+    if page_size != runtime::DEFAULT_KV_PAGE_SIZE {
+        return Err(Error::runtime(
+            "--page-size applies only to GLM; Laguna uses exact full/sliding FP8 caches",
+        ));
+    }
+    let unsupported = [
+        (speculative_mtp, "--speculative-mtp"),
+        (
+            enable_unified_memory_controller,
+            "--enable-unified-memory-controller",
+        ),
+        (hot_kv_cache_gb.is_some(), "--hot-kv-cache-gb"),
+        (enable_telemetry, "--enable-telemetry"),
+        (telemetry_file.is_some(), "--telemetry-file"),
+        (memory_controller_log.is_some(), "--memory-controller-log"),
+    ];
+    if let Some((_, flag)) = unsupported.into_iter().find(|(enabled, _)| *enabled) {
+        return Err(Error::runtime(format!(
+            "{flag} is outside the Laguna S 2.1 INT4 runtime contract"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_laguna_prompt(
+    config: &LagunaConfig,
+    prompt_token_ids: &[u32],
+    max_new_tokens: Option<usize>,
+) -> InfernoResult<()> {
+    if prompt_token_ids.is_empty() {
+        return Err(Error::runtime(
+            "Laguna inference requires at least one prompt token",
+        ));
+    }
+    validate_laguna_prompt_boundary(prompt_token_ids)?;
+    if max_new_tokens == Some(0) {
+        return Err(Error::runtime(
+            "max_new_tokens must be positive when provided",
+        ));
+    }
+    let generated_tokens =
+        laguna_generated_token_limit(config, prompt_token_ids.len(), max_new_tokens)?;
+    let requested = prompt_token_ids
+        .len()
+        .checked_add(generated_tokens)
+        .ok_or_else(|| Error::runtime("Laguna requested context token count overflow"))?;
+    if requested > config.max_position_embeddings {
+        return Err(Error::runtime(format!(
+            "Laguna requested context {requested} exceeds maximum {}",
+            config.max_position_embeddings
+        )));
+    }
+    if let Some(token_id) = prompt_token_ids
+        .iter()
+        .copied()
+        .find(|token_id| *token_id as usize >= config.vocab_size)
+    {
+        return Err(Error::tokenizer(format!(
+            "Laguna prompt token ID {token_id} is outside vocabulary size {}",
+            config.vocab_size
+        )));
+    }
+    Ok(())
+}
+
+fn validate_laguna_prompt_boundary(prompt_token_ids: &[u32]) -> InfernoResult<()> {
+    const BOS_ID: u32 = 2;
+    const ASSISTANT_ID: u32 = 23;
+    const THINK_ID: u32 = 18;
+
+    if prompt_token_ids.first() != Some(&BOS_ID)
+        || !prompt_token_ids.ends_with(&[ASSISTANT_ID, THINK_ID])
+    {
+        return Err(Error::tokenizer(format!(
+            "Laguna prompt must tokenize as BOS={BOS_ID} ... assistant={ASSISTANT_ID} think={THINK_ID}; got first={:?}, tail={:?}",
+            prompt_token_ids.first(),
+            prompt_token_ids.get(prompt_token_ids.len().saturating_sub(2)..)
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn laguna_expert_cache_capacity<B: Backend>(
+    model: &LagunaModel,
+    config: &LagunaConfig,
+    backend: &B,
+    prompt_tokens: usize,
+    max_new_tokens: Option<usize>,
+    explicit_cache_bytes: Option<usize>,
+) -> InfernoResult<usize> {
+    let generated_tokens = laguna_generated_token_limit(config, prompt_tokens, max_new_tokens)?;
+    let context_capacity = prompt_tokens
+        .checked_add(generated_tokens.saturating_sub(1))
+        .ok_or_else(|| Error::runtime("Laguna context capacity overflow"))?;
+    let kv_bytes = config.fp8_kv_cache_budget(1, context_capacity)?.total_bytes;
+    let budget_bytes = match explicit_cache_bytes {
+        Some(bytes) => u64::try_from(bytes)
+            .map_err(|_| Error::runtime("Laguna expert-cache budget does not fit u64"))?,
+        None => {
+            let available_bytes = backend
+                .memory_report()
+                .metal_recommended_max_working_set_bytes
+                .ok_or_else(|| {
+                    Error::backend(
+                        "Metal did not report a recommended working-set limit; pass --expert-cache-gb explicitly",
+                    )
+                })?
+                .saturating_sub(model.prepared_matrix_bytes())
+                .saturating_sub(kv_bytes)
+                .saturating_sub(LAGUNA_AUTO_CACHE_HEADROOM_BYTES);
+            laguna_default_expert_cache_bytes(available_bytes)
+        }
+    };
+    let bytes_per_expert = model.weight_summary().bytes_per_expert;
+    let capacity = budget_bytes / bytes_per_expert;
+    let capacity = usize::try_from(capacity)
+        .map_err(|_| Error::runtime("Laguna expert-cache capacity does not fit usize"))?;
+    let maximum = config
+        .num_hidden_layers
+        .saturating_sub(1)
+        .checked_mul(config.num_experts)
+        .ok_or_else(|| Error::runtime("Laguna total routed expert count overflow"))?;
+    let capacity = capacity.min(maximum);
+    let minimum = config.num_experts_per_tok;
+    if capacity < minimum {
+        return Err(Error::runtime(format!(
+            "Laguna expert cache budget {:.3} GB holds {capacity} experts; global top-{} execution requires at least {minimum}",
+            budget_bytes as f64 / 1_000_000_000.0,
+            config.num_experts_per_tok,
+        )));
+    }
+    Ok(capacity)
+}
+
+fn laguna_default_expert_cache_bytes(available_bytes: u64) -> u64 {
+    available_bytes.min(LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES)
+}
+
+fn laguna_generated_token_limit(
+    config: &LagunaConfig,
+    prompt_tokens: usize,
+    max_new_tokens: Option<usize>,
+) -> InfernoResult<usize> {
+    let available = config
+        .max_position_embeddings
+        .checked_sub(prompt_tokens)
+        .ok_or_else(|| {
+            Error::runtime(format!(
+                "Laguna prompt length {prompt_tokens} exceeds context {}",
+                config.max_position_embeddings
+            ))
+        })?;
+    Ok(max_new_tokens.unwrap_or(available))
+}
+
+fn write_laguna_tokens_per_second_report(
+    throughput: &ThroughputReport,
+    generation: &runtime::LagunaGenerationReport,
+) -> InfernoResult<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "inferno throughput: prompt_tokens={} generated_tokens={} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} decode_tokens_per_second={:.3} expert_lookups={} expert_hits={} expert_misses={} expert_hit_rate={:.4} expert_evictions={} expert_resident_loads={} expert_ready_waves={} expert_ssd_read_gb={:.3} resident_experts={} expert_cache_capacity={} expert_cache_resident_gb={:.3} expert_cache_capacity_gb={:.3}",
+        throughput.prompt_tokens,
+        throughput.generated_tokens,
+        throughput.total_tokens_per_second,
+        throughput.time_to_first_token_seconds,
+        throughput.decode_tokens_per_second,
+        generation.expert_cache.lookups,
+        generation.expert_cache.hits,
+        generation.expert_cache.misses,
+        generation.expert_cache.hit_rate(),
+        generation.expert_cache.evictions,
+        generation.expert_cache.resident_loads,
+        generation.expert_cache.ready_waves,
+        bytes_to_gb(generation.expert_cache.ssd_read_bytes),
+        generation.expert_cache.resident_experts,
+        generation.expert_cache.capacity_experts,
+        bytes_to_gb(generation.expert_cache.resident_bytes),
+        bytes_to_gb(generation.expert_cache.capacity_bytes),
+    )
+    .map_err(|source| Error::Io {
+        path: PathBuf::from("<stderr>"),
+        source,
+    })
+}
+
+fn append_laguna_tokens_per_second_report(
+    path: &Path,
+    throughput: &ThroughputReport,
+    generation: &runtime::LagunaGenerationReport,
+) -> InfernoResult<()> {
+    const HEADER: &str = "prompt_tokens\tgenerated_tokens\ttotal_tokens_per_second\ttime_to_first_token_seconds\tdecode_tokens_per_second\texpert_lookups\texpert_hits\texpert_misses\texpert_hit_rate\texpert_evictions\texpert_resident_loads\texpert_ready_waves\texpert_ssd_read_gb\tresident_experts\texpert_cache_capacity\texpert_cache_resident_gb\texpert_cache_capacity_gb";
+    let needs_header = match path.metadata() {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !needs_header {
+        let contents = fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if contents.lines().next().unwrap_or_default() != HEADER {
+            return Err(Error::runtime(format!(
+                "Laguna throughput report {} uses an incompatible schema",
+                path.display()
+            )));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if needs_header {
+        writeln!(file, "{HEADER}").map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    writeln!(
+        file,
+        "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{:.6}\t{:.6}",
+        throughput.prompt_tokens,
+        throughput.generated_tokens,
+        throughput.total_tokens_per_second,
+        throughput.time_to_first_token_seconds,
+        throughput.decode_tokens_per_second,
+        generation.expert_cache.lookups,
+        generation.expert_cache.hits,
+        generation.expert_cache.misses,
+        generation.expert_cache.hit_rate(),
+        generation.expert_cache.evictions,
+        generation.expert_cache.resident_loads,
+        generation.expert_cache.ready_waves,
+        bytes_to_gb(generation.expert_cache.ssd_read_bytes),
+        generation.expert_cache.resident_experts,
+        generation.expert_cache.capacity_experts,
+        bytes_to_gb(generation.expert_cache.resident_bytes),
+        bytes_to_gb(generation.expert_cache.capacity_bytes),
+    )
+    .map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub(super) fn validate_memory_controller_options(
@@ -834,12 +1276,52 @@ mod tests {
     }
 
     #[test]
+    fn laguna_default_uses_measured_metal_expert_budget() {
+        assert_eq!(
+            laguna_default_expert_cache_bytes(50_000_000_000),
+            3_500_000_000
+        );
+        assert_eq!(
+            laguna_default_expert_cache_bytes(2_000_000_000),
+            2_000_000_000
+        );
+    }
+
+    #[test]
     fn controller_decision_log_requires_the_opt_in_controller() {
         let path = Path::new("/tmp/inferno-memory-controller.tsv");
 
         assert!(validate_memory_controller_options(false, Some(path)).is_err());
         validate_memory_controller_options(true, Some(path)).unwrap();
         validate_memory_controller_options(false, None).unwrap();
+    }
+
+    #[test]
+    fn laguna_rejects_duplicate_tokenizer_special_tokens() {
+        let error = validate_laguna_options(
+            runtime::DEFAULT_KV_PAGE_SIZE,
+            true,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("Laguna's chat template already contains its BOS marker");
+
+        assert!(error.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn laguna_prompt_requires_published_control_token_boundary() {
+        validate_laguna_prompt_boundary(&[2, 42, 23, 18]).unwrap();
+
+        assert!(validate_laguna_prompt_boundary(&[42, 23, 18]).is_err());
+        assert!(validate_laguna_prompt_boundary(&[2, 42, 23]).is_err());
     }
 
     #[test]

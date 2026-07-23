@@ -13,8 +13,8 @@ use common::{Error, Result};
 use tokenizers::Tokenizer as HfTokenizer;
 
 pub use agent::{
-    is_supported_codex_function, parse_agent_output, render_codex_prompt, AgentFunctionCall,
-    AgentOutput, AgentOutputItem,
+    is_supported_codex_function, parse_agent_output, render_codex_prompt,
+    render_laguna_codex_prompt, AgentFunctionCall, AgentOutput, AgentOutputItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +156,32 @@ impl Tokenizer {
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id)
     }
+
+    /// Validates the vocabulary and control-token IDs required by one exact
+    /// model artifact before inference starts.
+    pub fn validate_contract(
+        &self,
+        expected_vocab_size: usize,
+        required_tokens: &[(&str, u32)],
+    ) -> Result<()> {
+        let actual_vocab_size = self.tokenizer.get_vocab_size(true);
+        if actual_vocab_size != expected_vocab_size {
+            return Err(Error::tokenizer(format!(
+                "tokenizer vocabulary must contain {expected_vocab_size} entries, got {actual_vocab_size}"
+            )));
+        }
+        for &(token, expected_id) in required_tokens {
+            let actual_id = self.tokenizer.token_to_id(token).ok_or_else(|| {
+                Error::tokenizer(format!("tokenizer is missing required token {token:?}"))
+            })?;
+            if actual_id != expected_id {
+                return Err(Error::tokenizer(format!(
+                    "tokenizer token {token:?} must have ID {expected_id}, got {actual_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +208,47 @@ fn encode_decode_round_trip(
 
 pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
     render_chat_prompt(&[], prompt)
+}
+
+/// Renders one user turn with Laguna S 2.1's published chat template.
+///
+/// This is intentionally the exact no-tools, thinking-enabled case used by
+/// Inferno's generate command. General Jinja interpretation does not belong in
+/// the inference hot path.
+pub fn render_laguna_user_prompt(prompt: &str) -> ChatPrompt {
+    render_laguna_chat_prompt(&[], prompt)
+}
+
+/// Renders a Laguna S 2.1 conversation using the checkpoint's published
+/// thinking-enabled chat contract.
+pub fn render_laguna_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatPrompt {
+    const DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+
+    let history_bytes = history.iter().fold(0_usize, |total, turn| {
+        total
+            .saturating_add(turn.user.len())
+            .saturating_add(turn.assistant.len())
+    });
+    let mut rendered = String::with_capacity(
+        "〈|EOS|〉<system></system>\n<user></user>\n<assistant><think>".len()
+            + DEFAULT_SYSTEM.len()
+            + history_bytes
+            + prompt.len(),
+    );
+    rendered.push_str("〈|EOS|〉<system>");
+    rendered.push_str(DEFAULT_SYSTEM);
+    rendered.push_str("</system>\n");
+    for turn in history {
+        rendered.push_str("<user>");
+        rendered.push_str(&turn.user);
+        rendered.push_str("</user>\n<assistant><think></think>");
+        rendered.push_str(turn.assistant.trim());
+        rendered.push_str("</assistant>\n");
+    }
+    rendered.push_str("<user>");
+    rendered.push_str(prompt);
+    rendered.push_str("</user>\n<assistant><think>");
+    ChatPrompt { rendered }
 }
 
 pub fn render_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatPrompt {
@@ -240,6 +307,19 @@ mod tests {
     }
 
     #[test]
+    fn validates_exact_vocabulary_and_control_token_ids() {
+        let tokenizer_path = write_tiny_tokenizer();
+        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+
+        tokenizer
+            .validate_contract(5, &[("<unk>", 0), ("Hello", 1)])
+            .unwrap();
+        assert!(tokenizer.validate_contract(6, &[("<unk>", 0)]).is_err());
+        assert!(tokenizer.validate_contract(5, &[("Hello", 2)]).is_err());
+        assert!(tokenizer.validate_contract(5, &[("missing", 4)]).is_err());
+    }
+
+    #[test]
     fn reports_special_tokens_from_tokenizer_json() {
         let tokenizer_path = write_tiny_tokenizer();
         let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
@@ -282,6 +362,30 @@ mod tests {
         assert_eq!(
             rendered.rendered,
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello GLM<|assistant|><think>"
+        );
+    }
+
+    #[test]
+    fn renders_laguna_single_user_prompt_from_published_template() {
+        let rendered = render_laguna_user_prompt("Hello Laguna");
+
+        assert_eq!(
+            rendered.rendered,
+            "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>Hello Laguna</user>\n<assistant><think>"
+        );
+    }
+
+    #[test]
+    fn renders_laguna_history_with_closed_assistant_turns() {
+        let history = vec![ChatTurn {
+            user: "What is the capital of Italy?".to_string(),
+            assistant: "Rome.".to_string(),
+        }];
+        let rendered = render_laguna_chat_prompt(&history, "And France?");
+
+        assert_eq!(
+            rendered.rendered,
+            "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>What is the capital of Italy?</user>\n<assistant><think></think>Rome.</assistant>\n<user>And France?</user>\n<assistant><think>"
         );
     }
 

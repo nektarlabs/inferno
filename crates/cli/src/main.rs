@@ -9,13 +9,13 @@ use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "inferno")]
-#[command(about = "Lightweight GLM-5.2 inference engine for Apple Silicon")]
+#[command(about = "Lightweight MoE inference engine for Apple Silicon")]
 struct Cli {
-    /// Enable opt-in MTP speculative decoding.
+    /// Enable opt-in GLM MTP speculative decoding.
     #[arg(long, global = true, default_value_t = false)]
     speculative_mtp: bool,
 
-    /// Enable adaptive expert-cache and hot-KV memory rebalancing.
+    /// Enable GLM adaptive expert-cache and hot-KV memory rebalancing.
     #[arg(long, global = true, default_value_t = false)]
     enable_unified_memory_controller: bool,
 
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate text from a quantized GLM-5.2 model.
+    /// Generate text with a supported quantized model.
     Generate {
         /// Model directory. config.json and tokenizer.json are discovered from this directory unless overridden.
         #[arg(long)]
@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -59,11 +59,11 @@ enum Command {
         #[arg(long, default_value_t = true, action = ArgAction::Set)]
         skip_special_tokens: bool,
 
-        /// Optional TSV output path for Q2 runtime timings.
+        /// Optional TSV output path for GLM Q2 runtime timings.
         #[arg(long)]
         profile_runtime: Option<PathBuf>,
 
-        /// Optional TSV output path for Q2 model-layer timings.
+        /// Optional TSV output path for GLM Q2 model-layer timings.
         #[arg(long)]
         profile_layers: Option<PathBuf>,
 
@@ -79,11 +79,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         profile_token_costs: bool,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Total RAM budget in decimal GB for routed expert weights.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 
@@ -100,9 +100,9 @@ enum Command {
         memory_controller_log: Option<PathBuf>,
     },
 
-    /// Start a persistent local GLM-5.2 chat session.
+    /// Start a persistent local chat session.
     Chat {
-        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        /// Directory containing a supported model.
         #[arg(long)]
         model: PathBuf,
 
@@ -114,7 +114,7 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -122,11 +122,11 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Total RAM budget in decimal GB for routed expert weights.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 
@@ -143,9 +143,9 @@ enum Command {
         memory_controller_log: Option<PathBuf>,
     },
 
-    /// Serve GLM-5.2 to Codex through the local Responses API.
+    /// Serve a supported model through the local Responses API.
     Serve {
-        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        /// Directory containing a supported model.
         #[arg(long, default_value = "models/glm-5.2")]
         model: PathBuf,
 
@@ -161,7 +161,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:11435")]
         bind: SocketAddr,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -169,11 +169,11 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Total RAM budget in decimal GB for routed expert weights.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 

@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Backend selection and operation boundaries for GLM inference.
+//! Backend selection and operation boundaries for native model inference.
 
 mod backend;
 mod device_value;
@@ -8,8 +8,9 @@ mod device_value;
 mod metal;
 
 pub use backend::{
-    Backend, BackendCapabilities, BackendMemoryReport, DevicePagedKvView, DeviceRoutedExperts,
-    DeviceRouterTopK, DeviceSelectedKvView, ExpertCacheMetrics, MetalBackend, Q2ExpertSource,
-    RouterTopK,
+    Backend, BackendCapabilities, BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView,
+    DeviceRopeTable, DeviceRoutedExperts, DeviceRouterTopK, DeviceSelectedKvView, DeviceW4Weight,
+    ExpertCacheMetrics, LagunaAttentionProjections, LagunaFp8KvCache, LagunaKvRetention,
+    MetalBackend, Q2ExpertSource, RouterTopK, W4ExpertGroup, W4WeightSource,
 };
 pub use device_value::DeviceValue;

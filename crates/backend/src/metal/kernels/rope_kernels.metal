@@ -104,3 +104,126 @@ kernel void rope_slice_f32_shared4_kernel(
     output[base + even_dim] = even * cos_angle - odd * sin_angle;
     output[base + odd_dim] = even * sin_angle + odd * cos_angle;
 }
+
+// Laguna normalizes every Q/K head independently before applying RoPE. The
+// checkpoint uses the non-interleaved (half-split) rotation convention:
+// [x0..xN, y0..yN] -> [-y0..-yN, x0..xN]. Global layers rotate 64 of the 128
+// head channels with YaRN; sliding layers rotate all 128 channels with the
+// default frequency table. One SIMD group owns one complete head row.
+kernel void qk_rms_norm_half_split_rope_f32_kernel(
+    const device float* input [[buffer(0)]],
+    const device float* norm_weight [[buffer(1)]],
+    const device float* inverse_frequency [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& row_count [[buffer(4)]],
+    constant uint& token_count [[buffer(5)]],
+    constant uint& head_count [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& rotary_dim [[buffer(8)]],
+    constant uint& position_offset [[buffer(9)]],
+    constant float& epsilon [[buffer(10)]],
+    constant float& attention_factor [[buffer(11)]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint3 group_position [[threadgroup_position_in_grid]]
+) {
+    uint row = group_position.x;
+    if (row >= row_count) {
+        return;
+    }
+
+    uint base = row * head_dim;
+    float local_sumsq = 0.0f;
+    for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
+        float value = input[base + dim];
+        local_sumsq += value * value;
+    }
+    float inverse_rms = rsqrt(simd_sum(local_sumsq) / float(head_dim) + epsilon);
+
+    uint token = (row / head_count) % token_count;
+    float position = float(position_offset + token);
+    uint rotary_half = rotary_dim / 2u;
+
+    for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
+        float normalized = input[base + dim] * norm_weight[dim] * inverse_rms;
+        if (dim >= rotary_dim) {
+            output[base + dim] = normalized;
+            continue;
+        }
+
+        uint frequency_index = dim % rotary_half;
+        uint paired_dim = dim < rotary_half ? dim + rotary_half : dim - rotary_half;
+        float paired = input[base + paired_dim] * norm_weight[paired_dim] * inverse_rms;
+        float rotated = dim < rotary_half ? -paired : paired;
+        float angle = position * inverse_frequency[frequency_index];
+        float cos_angle = cos(angle) * attention_factor;
+        float sin_angle = sin(angle) * attention_factor;
+        output[base + dim] = normalized * cos_angle + rotated * sin_angle;
+    }
+}
+
+// Q and K use the same position table but different head counts and learned
+// RMSNorm weights. A single dispatch walks both row sets, avoiding a second
+// encoder boundary while keeping their output buffers separate for GQA.
+kernel void laguna_qk_rms_norm_half_split_rope_pair_f32_kernel(
+    const device float* query_input [[buffer(0)]],
+    const device float* key_input [[buffer(1)]],
+    const device float* query_norm_weight [[buffer(2)]],
+    const device float* key_norm_weight [[buffer(3)]],
+    const device float* inverse_frequency [[buffer(4)]],
+    device float* query_output [[buffer(5)]],
+    device float* key_output [[buffer(6)]],
+    constant uint& query_row_count [[buffer(7)]],
+    constant uint& key_row_count [[buffer(8)]],
+    constant uint& token_count [[buffer(9)]],
+    constant uint& query_head_count [[buffer(10)]],
+    constant uint& key_head_count [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& rotary_dim [[buffer(13)]],
+    constant uint& position_offset [[buffer(14)]],
+    constant float& epsilon [[buffer(15)]],
+    constant float& attention_factor [[buffer(16)]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint3 group_position [[threadgroup_position_in_grid]]
+) {
+    uint combined_row = group_position.x;
+    if (combined_row >= query_row_count + key_row_count) {
+        return;
+    }
+
+    bool is_query = combined_row < query_row_count;
+    uint row = is_query ? combined_row : combined_row - query_row_count;
+    uint head_count = is_query ? query_head_count : key_head_count;
+    const device float* input = is_query ? query_input : key_input;
+    const device float* norm_weight = is_query
+        ? query_norm_weight
+        : key_norm_weight;
+    device float* output = is_query ? query_output : key_output;
+    uint base = row * head_dim;
+
+    float local_sumsq = 0.0f;
+    for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
+        float value = input[base + dim];
+        local_sumsq += value * value;
+    }
+    float inverse_rms = rsqrt(simd_sum(local_sumsq) / float(head_dim) + epsilon);
+
+    uint token = (row / head_count) % token_count;
+    float position = float(position_offset + token);
+    uint rotary_half = rotary_dim / 2u;
+    for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
+        float normalized = input[base + dim] * norm_weight[dim] * inverse_rms;
+        if (dim >= rotary_dim) {
+            output[base + dim] = normalized;
+            continue;
+        }
+
+        uint frequency_index = dim % rotary_half;
+        uint paired_dim = dim < rotary_half ? dim + rotary_half : dim - rotary_half;
+        float paired = input[base + paired_dim] * norm_weight[paired_dim] * inverse_rms;
+        float rotated = dim < rotary_half ? -paired : paired;
+        float angle = position * inverse_frequency[frequency_index];
+        float cos_angle = cos(angle) * attention_factor;
+        float sin_angle = sin(angle) * attention_factor;
+        output[base + dim] = normalized * cos_angle + rotated * sin_angle;
+    }
+}

@@ -3,6 +3,7 @@
 //! GLM-5.2 production runtime orchestration.
 
 mod cache_budget;
+mod laguna;
 mod telemetry;
 
 pub use cache_budget::{
@@ -12,6 +13,9 @@ pub use cache_budget::{
     DEFAULT_HARD_HEADROOM_BYTES, DEFAULT_HOT_KV_CACHE_BUDGET_BYTES,
     DEFAULT_MAX_EXPERT_CACHE_SLOTS_PER_LAYER, DEFAULT_MIN_EXPERT_CACHE_SLOTS_PER_LAYER,
     DEFAULT_TARGET_HEADROOM_BYTES,
+};
+pub use laguna::{
+    run_laguna_generate_streaming, LagunaGenerationOptions, LagunaGenerationReport, LagunaRuntime,
 };
 
 use std::{

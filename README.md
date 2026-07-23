@@ -4,15 +4,16 @@
   <img src="assets/logo.svg" alt="Inferno logo" width="150">
 </p>
 
-Inferno is a lightweight Rust inference engine built specifically for running
-GLM-5.2 Q2 on Apple Silicon through native Metal kernels. Its primary target is
-a MacBook Pro with 64 GB of unified memory.
+Inferno is a lightweight Rust inference engine for running selected
+Mixture-of-Experts models on Apple Silicon through native Metal kernels. It
+currently supports GLM-5.2 Q2 and Laguna S 2.1 INT4. Its primary target is a
+MacBook Pro with 64 GB of unified memory.
 
-The name reflects the engineering challenge: the model is much larger than the
+The name reflects the engineering challenge: these models are larger than the
 available memory, so useful local inference requires careful coordination of
-Metal, unified memory, and SSD streaming. Inferno stays deliberately narrow. It
-supports one model layout and optimizes that path instead of becoming a general
-inference framework.
+Metal, unified memory, caching, and SSD streaming. Inferno stays deliberately
+narrow. It supports a small set of exact model layouts and optimizes each path
+independently instead of becoming a general inference framework.
 
 > [!WARNING]
 > Inferno is experimental and under active development. It is not production
@@ -22,27 +23,30 @@ inference framework.
 ## Current Scope
 
 - Apple Silicon and Metal only.
-- `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` only.
-- Exact top-8 routed-expert execution.
+- GLM-5.2 Q2 through `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf`.
+- Laguna S 2.1 INT4 through its official sharded Safetensors checkpoint.
+- Exact top-8 routing for GLM and exact top-10 routing for Laguna.
 - Native Metal execution with no CPU compute fallback.
-- Interactive chat and one-shot generation.
-- SSD-streamed routed experts and compressed KV history.
+- Interactive chat, one-shot generation, and a streaming Responses API.
+- Persistent expert caches across chat turns and server requests.
+- Model-specific expert and KV cache policies.
 - Greedy decoding.
-- Experimental MTP speculative decoding, disabled by default because it is
+- Experimental GLM MTP speculative decoding, disabled by default because it is
   currently slower than ordinary decode on the 64 GB target.
 
 Inferno is not a general model loader and does not support arbitrary GGUF
-architectures or quantization formats.
+or Safetensors architectures and quantization formats.
 
 ## Performance
 
-| Metric | Result |
+| Model | Decode throughput |
 | --- | ---: |
-| Decode throughput | **1.711 tokens/s** |
+| GLM-5.2 Q2 | **1.711 tokens/s** |
+| Laguna S 2.1 INT4 | **4.680 tokens/s** |
 
-Measured with exact top-8 routing on a 64 GB Apple Silicon MacBook Pro using a
-release build. Prompt prefill is excluded. Results depend on prompt length,
-expert-cache state, SSD activity, and memory pressure.
+Best observed decode results on a 64 GB Apple Silicon MacBook Pro using release
+builds and exact routing. Prompt prefill is excluded. Results depend on prompt
+length, expert-cache state, SSD activity, thermal state, and memory pressure.
 
 ## Requirements
 
@@ -50,8 +54,10 @@ expert-cache state, SSD activity, and memory pressure.
 - 64 GB of unified memory is the current development target.
 - Rust and Cargo.
 - The Hugging Face CLI for the download commands below.
-- More than 503 GB of free SSD space for the source GGUF and ExpertPack,
-  excluding temporary KV data and build outputs.
+- GLM requires more than 503 GB of free SSD space for its source GGUF and
+  ExpertPack, excluding temporary KV data and build outputs.
+- Laguna requires approximately 72 GB for its INT4 checkpoint; additional free
+  space is required for build outputs and normal system operation.
 
 Install the Hugging Face CLI with Homebrew if needed:
 
@@ -59,7 +65,9 @@ Install the Hugging Face CLI with Homebrew if needed:
 brew install hf
 ```
 
-## Model
+## Models
+
+### GLM-5.2 Q2
 
 Inferno uses the Q2 GGUF published by Antirez:
 
@@ -78,7 +86,7 @@ optional, but the documented performance assumes it is present.
 ExpertPack:
 [allemanfredi/inferno-glm-5.2-q2-expertpack](https://huggingface.co/allemanfredi/inferno-glm-5.2-q2-expertpack)
 
-### Download
+#### Download
 
 Create the model directory:
 
@@ -128,6 +136,27 @@ cargo run --release -p inferno --example pack_experts -- \
 
 Creation is resumable at complete expert-record boundaries.
 
+### Laguna S 2.1 INT4
+
+Inferno supports the official
+[poolside/Laguna-S-2.1-INT4](https://huggingface.co/poolside/Laguna-S-2.1-INT4)
+checkpoint directly. It reads the published configuration, tokenizer,
+Safetensors index, and 15 weight shards. No conversion step is required.
+
+Accept the model license on Hugging Face and authenticate the CLI, then
+download the checkpoint:
+
+```bash
+hf auth login
+mkdir -p models/laguna-s-2.1-int4
+hf download poolside/Laguna-S-2.1-INT4 \
+  --local-dir models/laguna-s-2.1-int4
+```
+
+The directory must contain `config.json`, `generation_config.json`,
+`tokenizer.json`, `model.safetensors.index.json`, and all 15
+`model-*.safetensors` shards.
+
 ## Build
 
 ```bash
@@ -154,11 +183,16 @@ Use `/clear` to reset the conversation and `/exit` to close the session. The
 model and expert cache stay alive across turns, but each turn currently
 re-prefills the accumulated conversation into a new request KV cache.
 
-Use an explicit model directory when needed:
+Start Laguna chat explicitly:
 
 ```bash
-target/release/inferno chat --model /path/to/model
+target/release/inferno chat \
+  --model models/laguna-s-2.1-int4
 ```
+
+Inferno detects the architecture from `config.json`. Laguna keeps its global
+expert cache alive across turns and resets only the sequence-specific FP8 KV
+state before re-prefilling the conversation.
 
 ### One-Shot Generation
 
@@ -168,43 +202,69 @@ target/release/inferno generate \
   --prompt "Tell me the capital of Italy."
 ```
 
+Run the same request with Laguna:
+
+```bash
+target/release/inferno generate \
+  --model models/laguna-s-2.1-int4 \
+  --prompt "Tell me the capital of Italy."
+```
+
 Without `--max-new-tokens`, generation continues until an EOS token or the
 context limit.
 
-### Codex
+### Responses API and Codex
 
-Inferno can act as the local model provider for Codex. Start the persistent
-model process in one terminal:
+Inferno serves either model through its local streaming Responses API. Start
+the selected persistent model process in one terminal.
+
+GLM:
 
 ```bash
 target/release/inferno serve --model models/glm-5.2
 ```
 
-Install the included Codex profile:
+Laguna:
+
+```bash
+target/release/inferno serve --model models/laguna-s-2.1-int4
+```
+
+The server exposes only the loaded model from `/v1/models`. Requests must use
+`glm-5.2-q2` for GLM or `laguna-s-2.1-int4` for Laguna.
+
+Install the included Codex catalog and profiles:
 
 ```bash
 mkdir -p ~/.codex
 cp examples/inferno.config.toml ~/.codex/inferno.config.toml
+cp examples/inferno-laguna.config.toml ~/.codex/inferno-laguna.config.toml
 cp examples/inferno.models.json ~/.codex/inferno.models.json
 ```
 
-Then start Codex in a repository:
+Start Codex with GLM:
 
 ```bash
 codex --profile inferno
 ```
 
-Codex sends each turn through its streaming Responses API. Inferno translates
-the conversation and direct function tools into GLM-5.2's native prompt,
-generates either text or a tool call, and returns that action to Codex. Codex
-executes the tool locally and sends the result back for the next model turn.
-The model, Metal backend, and expert cache remain alive between requests.
+Start Codex with Laguna:
+
+```bash
+codex --profile inferno-laguna
+```
+
+Codex sends each turn through the streaming Responses API. Inferno translates
+the conversation and direct function tools into the loaded model's native
+prompt, generates either text or a tool call, and returns that action to Codex.
+The model, Metal backend, and model-specific expert cache remain alive between
+requests.
 
 Requests are processed one at a time because they share one Metal runtime.
-The profile exposes only `exec_command` and `write_stdin` to GLM. Codex still
-enforces its sandbox and approval policy, but omitting unrelated tool schemas
-keeps the expensive GLM prefill small. Plugin namespaces and hosted web search
-are not part of this first integration.
+The profiles expose only `exec_command` and `write_stdin` to the model. Codex
+still enforces its sandbox and approval policy, but omitting unrelated tool
+schemas keeps model prefill smaller. Plugin namespaces and hosted web search
+are not exposed to the local model.
 
 ### Measurement
 
@@ -217,6 +277,8 @@ target/release/inferno generate \
   --max-new-tokens 8 \
   --measure-tokens-per-second
 ```
+
+Replace the model path with `models/laguna-s-2.1-int4` to measure Laguna.
 
 Record memory telemetry without mixing it into generated text:
 
@@ -244,12 +306,12 @@ target/release/inferno generate \
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert RAM budget. |
-| `--hot-kv-cache-gb <GB>` | Pins the hot Metal KV budget. |
-| `--enable-unified-memory-controller` | Enables adaptive expert and hot-KV memory rebalancing. |
-| `--enable-telemetry` | Prints runtime memory telemetry. |
-| `--telemetry-file <PATH>` | Writes memory telemetry to a file. |
-| `--memory-controller-log <PATH>` | Writes adaptive memory decisions to TSV. |
-| `--speculative-mtp` | Enables the experimental MTP path. |
+| `--hot-kv-cache-gb <GB>` | Pins the GLM hot Metal KV budget. |
+| `--enable-unified-memory-controller` | Enables GLM adaptive expert and hot-KV memory rebalancing. |
+| `--enable-telemetry` | Prints GLM runtime memory telemetry. |
+| `--telemetry-file <PATH>` | Writes GLM memory telemetry to a file. |
+| `--memory-controller-log <PATH>` | Writes GLM adaptive memory decisions to TSV. |
+| `--speculative-mtp` | Enables the experimental GLM MTP path. |
 
 Use the executable help as the authoritative CLI reference:
 
@@ -263,25 +325,29 @@ target/release/inferno serve --help
 ## Memory Strategy
 
 Inferno uses the SSD as a large, slower storage tier and unified memory as a
-smaller, faster tier. It maintains two separate caches.
+smaller, faster tier. Cache policy is model-specific because GLM and Laguna
+show different expert-locality and attention behavior.
 
-**Expert cache.** For every token, the router selects eight experts. If an
-expert is already resident in a Metal cache slot, Inferno uses it immediately.
-Otherwise, Inferno reads that expert's Q2 weights from the ExpertPack on SSD,
-places them in a reusable slot, and executes it. When the cache is full, a less
-useful expert is replaced. Reusing a resident expert avoids another SSD read.
+**Expert cache.** GLM selects eight experts and uses a per-layer SLRU cache.
+Keeping layer budgets separate matches GLM's measured locality and prevents one
+layer from evicting useful experts from another.
+
+Laguna selects ten experts and uses one global O(1) LRU cache across its routed
+layers. Its reuse is uneven across layers, so a global budget lets layers with
+useful locality keep more experts while avoiding empty or underused per-layer
+partitions. The measured default is 3.5 GB. Laguna loads missing INT4 experts
+from the indexed Safetensors shards using parallel I/O workers and executes
+ready experts without waiting for every miss to finish.
 
 ```text
 selected expert -> cache hit  -> execute from Metal
                 -> cache miss -> read from SSD -> cache -> execute
 ```
 
-**KV cache.** The KV cache is the model's memory of previous tokens. Inferno
-stores the complete compressed history in an append-only Q8 block store on SSD.
-A bounded Metal window contains only the rows currently needed by attention.
-If a row is not in that window, Inferno reads it from SSD and loads it into the
-window. DSA reduces this work by selecting only the most relevant history rows
-for long-context attention.
+**GLM KV cache.** Inferno stores the complete compressed history in an
+append-only Q8 block store on SSD. A bounded Metal window contains only the
+rows currently needed by attention. DSA reduces this work by selecting the
+most relevant history rows for long-context attention.
 
 ```text
 required KV row -> hot hit  -> read from Metal
@@ -293,10 +359,15 @@ values per token and layer instead of expanded K/V for every attention head.
 The source GGUF remains memory-mapped so macOS can manage always-used weights
 through its page cache.
 
-The expert cache and hot KV window compete for the same physical unified
-memory. Inferno's fixed default starts from 30 expert slots per routed layer
+**Laguna KV cache.** Laguna keeps FP8 KV directly on Metal. Twelve layers retain
+the full context, while 36 sliding-attention layers retain only their 512-token
+window. This bounded sliding state lowers KV pressure and leaves more unified
+memory available to the global expert cache.
+
+For GLM, the expert cache and hot KV window compete for the same physical
+unified memory. Its fixed default starts from 30 expert slots per routed layer
 and a 512 MiB hot KV budget. `--enable-unified-memory-controller` enables a
-native controller that samples Mach and Metal counters without starting
+native GLM controller that samples Mach and Metal counters without starting
 subprocesses, tracks separate prefill and decode Metal high-water marks, and
 releases prefill-only buffers before decode.
 
@@ -322,6 +393,9 @@ cargo test --workspace
 
 The target Q2 GGUF was produced and published by Antirez in
 [antirez/glm-5.2-gguf](https://huggingface.co/antirez/glm-5.2-gguf).
+
+[Laguna S 2.1](https://huggingface.co/poolside/Laguna-S-2.1-INT4) was created
+and published by Poolside.
 
 ## License
 

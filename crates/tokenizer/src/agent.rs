@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 use crate::ChatPrompt;
 
 const PROMPT_PREFIX: &str = "[gMASK]<sop><|system|>Reasoning Effort: Max";
+const LAGUNA_PROMPT_PREFIX: &str = "〈|EOS|〉";
+const LAGUNA_DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
 const THINK_END: &str = "</think>";
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
@@ -56,7 +58,46 @@ pub fn render_codex_prompt(
     Ok(ChatPrompt { rendered })
 }
 
-/// Parses one complete GLM generation into Responses-compatible output items.
+/// Renders a Codex Responses turn using Laguna S 2.1's published chat and
+/// direct-function tool grammar.
+pub fn render_laguna_codex_prompt(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+) -> Result<ChatPrompt> {
+    let normalized_tools = normalize_laguna_tools(tools)?;
+    let system = if instructions.trim().is_empty() {
+        LAGUNA_DEFAULT_SYSTEM
+    } else {
+        instructions.trim()
+    };
+    let mut rendered = String::with_capacity(
+        LAGUNA_PROMPT_PREFIX.len()
+            + system.len()
+            + input
+                .iter()
+                .map(|value| value.to_string().len())
+                .sum::<usize>()
+            + normalized_tools
+                .iter()
+                .map(|value| value.to_string().len())
+                .sum::<usize>()
+            + 1_024,
+    );
+    rendered.push_str(LAGUNA_PROMPT_PREFIX);
+    rendered.push_str("<system>");
+    rendered.push_str(system);
+    render_laguna_tools(&mut rendered, &normalized_tools)?;
+    rendered.push_str("</system>\n");
+    for item in input {
+        render_laguna_input_item(&mut rendered, item)?;
+    }
+    rendered.push_str("<assistant><think>");
+    Ok(ChatPrompt { rendered })
+}
+
+/// Parses one complete GLM or Laguna generation into Responses-compatible
+/// output items. Both checkpoints use the same reasoning and tool-call tags.
 pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
     let (reasoning, visible) = output
         .split_once(THINK_END)
@@ -85,10 +126,7 @@ pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
 }
 
 fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
-    let normalized = tools
-        .iter()
-        .filter_map(normalize_function_tool)
-        .collect::<Result<Vec<_>>>()?;
+    let normalized = normalize_tools(tools)?;
     if normalized.is_empty() {
         return Ok(());
     }
@@ -102,6 +140,45 @@ fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
     rendered.push_str(
         "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>",
     );
+    Ok(())
+}
+
+fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>> {
+    tools
+        .iter()
+        .filter_map(normalize_function_tool)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_laguna_tools(tools: &[Value]) -> Result<Vec<Value>> {
+    normalize_tools(tools)?
+        .into_iter()
+        .map(|tool| {
+            let mut function = tool
+                .as_object()
+                .cloned()
+                .ok_or_else(|| Error::tokenizer("normalized Laguna tool must be an object"))?;
+            function.remove("type");
+            Ok(serde_json::json!({
+                "type": "function",
+                "function": function,
+            }))
+        })
+        .collect()
+}
+
+fn render_laguna_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
+    if tools.is_empty() {
+        return Ok(());
+    }
+    rendered.push_str(
+        "\n\n### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n",
+    );
+    for tool in tools {
+        rendered.push_str(&serde_json::to_string(tool)?);
+        rendered.push('\n');
+    }
+    rendered.push_str("</available_tools>");
     Ok(())
 }
 
@@ -164,6 +241,24 @@ fn render_input_item(rendered: &mut String, item: &Value) -> Result<()> {
     }
 }
 
+fn render_laguna_input_item(rendered: &mut String, item: &Value) -> Result<()> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::tokenizer("Codex Responses input item is missing a string type"))?;
+    match item_type {
+        "message" => render_laguna_message(rendered, item),
+        "function_call" | "custom_tool_call" => render_laguna_historical_tool_call(rendered, item),
+        "function_call_output" | "custom_tool_call_output" => {
+            render_laguna_tool_output(rendered, item)
+        }
+        "reasoning" => Ok(()),
+        other => Err(Error::tokenizer(format!(
+            "unsupported Codex Responses input item type {other:?}"
+        ))),
+    }
+}
+
 fn render_message(rendered: &mut String, item: &Value) -> Result<()> {
     let role = item
         .get("role")
@@ -187,7 +282,55 @@ fn render_message(rendered: &mut String, item: &Value) -> Result<()> {
     Ok(())
 }
 
+fn render_laguna_message(rendered: &mut String, item: &Value) -> Result<()> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::tokenizer("Codex message input is missing a string role"))?;
+    let content = visible_content(
+        item.get("content")
+            .ok_or_else(|| Error::tokenizer("Codex message input is missing content"))?,
+    )?;
+    match role {
+        "user" => {
+            rendered.push_str("<user>");
+            rendered.push_str(&content);
+            rendered.push_str("</user>\n");
+        }
+        "system" | "developer" => {
+            rendered.push_str("<system>");
+            rendered.push_str(&content);
+            rendered.push_str("</system>\n");
+        }
+        "assistant" => {
+            rendered.push_str("<assistant><think></think>");
+            rendered.push_str(&content);
+            rendered.push_str("</assistant>\n");
+        }
+        other => {
+            return Err(Error::tokenizer(format!(
+                "unsupported Codex message role {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn render_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
+    let (name, arguments) = historical_tool_call(item)?;
+    rendered.push_str("<|assistant|><think></think>");
+    render_tool_call(rendered, name, &arguments)
+}
+
+fn render_laguna_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
+    let (name, arguments) = historical_tool_call(item)?;
+    rendered.push_str("<assistant><think></think>");
+    render_tool_call(rendered, name, &arguments)?;
+    rendered.push_str("</assistant>\n");
+    Ok(())
+}
+
+fn historical_tool_call(item: &Value) -> Result<(&str, Map<String, Value>)> {
     let name = item
         .get("name")
         .and_then(Value::as_str)
@@ -205,8 +348,15 @@ fn render_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()
     let arguments = arguments.as_object().ok_or_else(|| {
         Error::tokenizer("Codex function_call arguments must encode a JSON object")
     })?;
+    Ok((name, arguments.clone()))
+}
 
-    rendered.push_str("<|assistant|><think></think><tool_call>");
+fn render_tool_call(
+    rendered: &mut String,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<()> {
+    rendered.push_str("<tool_call>");
     rendered.push_str(name);
     for (key, value) in arguments {
         rendered.push_str(ARG_KEY_OPEN);
@@ -231,6 +381,17 @@ fn render_tool_output(rendered: &mut String, item: &Value) -> Result<()> {
     rendered.push_str("<|observation|><tool_response>");
     rendered.push_str(&output);
     rendered.push_str("</tool_response>");
+    Ok(())
+}
+
+fn render_laguna_tool_output(rendered: &mut String, item: &Value) -> Result<()> {
+    let output = item
+        .get("output")
+        .ok_or_else(|| Error::tokenizer("Codex function_call_output is missing output"))?;
+    let output = visible_content(output)?;
+    rendered.push_str("<tool_response>");
+    rendered.push_str(&output);
+    rendered.push_str("</tool_response>\n");
     Ok(())
 }
 
@@ -373,6 +534,45 @@ mod tests {
             .rendered
             .contains("<|observation|><tool_response>README.md</tool_response>"));
         assert!(prompt.rendered.ends_with("<|assistant|><think>"));
+    }
+
+    #[test]
+    fn renders_codex_tools_messages_and_observations_for_laguna() {
+        let prompt = render_laguna_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List files"}]}),
+                json!({"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_1"}),
+                json!({"type": "function_call_output", "call_id": "call_1", "output": "README.md"}),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                "strict": false
+            })],
+        )
+        .unwrap();
+
+        assert!(prompt
+            .rendered
+            .starts_with("〈|EOS|〉<system>Work carefully."));
+        assert!(prompt.rendered.contains("### Tools"));
+        assert!(prompt.rendered.contains("<available_tools>"));
+        assert!(prompt.rendered.contains("\"name\":\"exec_command\""));
+        assert!(prompt
+            .rendered
+            .contains("\"function\":{\"description\":\"Run a command\""));
+        assert!(!prompt.rendered.contains("\"strict\""));
+        assert!(prompt.rendered.contains("<user>List files</user>"));
+        assert!(prompt.rendered.contains(
+            "<assistant><think></think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls</arg_value></tool_call></assistant>"
+        ));
+        assert!(prompt
+            .rendered
+            .contains("<tool_response>README.md</tool_response>"));
+        assert!(prompt.rendered.ends_with("<assistant><think>"));
     }
 
     #[test]

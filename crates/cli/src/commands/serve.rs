@@ -8,28 +8,36 @@ use std::{
 use anyhow::Result;
 use backend::{Backend, MetalBackend};
 use common::{Error, Result as InfernoResult};
-use config::{load_config, load_generation_config, Config};
+use config::{
+    detect_model_architecture, load_config, load_generation_config, load_laguna_config, Config,
+    LagunaConfig, ModelArchitecture,
+};
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
-    expected_expert_pack_header, validate_routing_policy, Model, DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
+    expected_expert_pack_header, validate_routing_policy, LagunaModel, Model,
+    DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
     q2_memory_controller_spec, run_generate_streaming_with_options, CacheBudgetSpec,
-    GenerationOptions,
+    GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
 };
-use server::{ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, CODEX_MODEL_ID};
+use server::{
+    ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, GLM_CODEX_MODEL_ID,
+    LAGUNA_CODEX_MODEL_ID,
+};
 use tokenizer::{
-    is_supported_codex_function, parse_agent_output, render_codex_prompt, AgentOutputItem,
-    Tokenizer,
+    is_supported_codex_function, parse_agent_output, render_codex_prompt,
+    render_laguna_codex_prompt, AgentOutputItem, Tokenizer,
 };
 use tracing::info;
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    load_q2_readiness, resolve_q2_artifact, validate_generation_request,
-    validate_memory_controller_options, DecodedTextStream,
+    laguna_expert_cache_capacity, load_q2_readiness, resolve_q2_artifact,
+    validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
+    validate_memory_controller_options, DecodedTextStream, LAGUNA_TOKENIZER_CONTRACT,
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -50,16 +58,66 @@ pub fn run(
     telemetry_file: Option<&Path>,
     memory_controller_log: Option<&Path>,
 ) -> Result<()> {
-    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
+    match detect_model_architecture(&discovered_config)? {
+        ModelArchitecture::GlmMoeDsa => run_glm(
+            model_path,
+            &discovered_config,
+            &discovered_tokenizer,
+            bind,
+            page_size,
+            max_new_tokens,
+            speculative_mtp,
+            enable_unified_memory_controller,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+            memory_controller_log,
+        ),
+        ModelArchitecture::Laguna => run_laguna(
+            model_path,
+            &discovered_config,
+            &discovered_tokenizer,
+            bind,
+            page_size,
+            max_new_tokens,
+            speculative_mtp,
+            enable_unified_memory_controller,
+            expert_cache_gb,
+            hot_kv_cache_gb,
+            enable_telemetry,
+            telemetry_file,
+            memory_controller_log,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_glm(
+    model_path: &Path,
+    config_path: &Path,
+    tokenizer_path: &Path,
+    bind: SocketAddr,
+    page_size: usize,
+    max_new_tokens: Option<usize>,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> Result<()> {
+    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
-    let config = load_config(&discovered_config)?;
+    let config = load_config(config_path)?;
     let artifact = resolve_q2_artifact(model_path)?;
     let gguf = GgufFile::open(&artifact.gguf_path)?;
     validate_routing_policy(&config, &gguf)?;
     let readiness = load_q2_readiness(&gguf, &artifact, &config)?;
-    let tokenizer = Tokenizer::from_file(&discovered_tokenizer)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
 
     let expert_cache_budget_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
     let hot_kv_cache_budget_bytes = cache_gb_to_bytes("hot KV cache", hot_kv_cache_gb)?;
@@ -111,7 +169,7 @@ pub fn run(
         .transpose()?;
 
     let listener = TcpListener::bind(bind)?;
-    let mut handler = CodexHandler {
+    let mut handler = GlmCodexHandler {
         model: &model,
         config: &config,
         backend: &backend,
@@ -124,12 +182,65 @@ pub fn run(
         hot_kv_cache_budget_bytes,
         dynamic_cache_budget,
     };
-    info!(%bind, model = CODEX_MODEL_ID, "Inferno model loaded for Codex");
-    server::serve(listener, &mut handler)?;
+    info!(%bind, model = GLM_CODEX_MODEL_ID, "Inferno model loaded for Codex");
+    server::serve(listener, &mut handler, GLM_CODEX_MODEL_ID)?;
     Ok(())
 }
 
-struct CodexHandler<'runtime, 'weights> {
+#[allow(clippy::too_many_arguments)]
+fn run_laguna(
+    model_path: &Path,
+    config_path: &Path,
+    tokenizer_path: &Path,
+    bind: SocketAddr,
+    page_size: usize,
+    max_new_tokens: Option<usize>,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> Result<()> {
+    validate_laguna_service_options(
+        page_size,
+        speculative_mtp,
+        enable_unified_memory_controller,
+        hot_kv_cache_gb,
+        enable_telemetry,
+        telemetry_file,
+        memory_controller_log,
+    )?;
+    let config = load_laguna_config(config_path)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    let backend = MetalBackend::new()?;
+    let model = LagunaModel::open(model_path, config.clone(), &backend)?;
+    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
+    // A server can receive any prompt size, so reserve cache headroom against
+    // Laguna's complete configured KV context.
+    let expert_cache_capacity =
+        laguna_expert_cache_capacity(&model, &config, &backend, 1, None, explicit_cache_bytes)?;
+    let runtime = LagunaRuntime::new(LagunaGenerationOptions {
+        expert_cache_capacity,
+    })?;
+
+    let listener = TcpListener::bind(bind)?;
+    let mut handler = LagunaCodexHandler {
+        model: &model,
+        config: &config,
+        backend: &backend,
+        tokenizer: &tokenizer,
+        runtime,
+        max_new_tokens,
+    };
+    info!(%bind, model = LAGUNA_CODEX_MODEL_ID, "Inferno model loaded for Codex");
+    server::serve(listener, &mut handler, LAGUNA_CODEX_MODEL_ID)?;
+    Ok(())
+}
+
+struct GlmCodexHandler<'runtime, 'weights> {
     model: &'runtime Model<'weights>,
     config: &'runtime Config,
     backend: &'runtime MetalBackend,
@@ -143,18 +254,13 @@ struct CodexHandler<'runtime, 'weights> {
     dynamic_cache_budget: Option<CacheBudgetSpec>,
 }
 
-impl ResponsesHandler for CodexHandler<'_, '_> {
+impl ResponsesHandler for GlmCodexHandler<'_, '_> {
     fn generate(
         &mut self,
         request: ResponsesRequest,
         stream: &mut ResponsesStream<'_>,
     ) -> InfernoResult<ResponseUsage> {
-        if request.model != CODEX_MODEL_ID {
-            return Err(Error::runtime(format!(
-                "Inferno serves model {CODEX_MODEL_ID:?}, got {:?}",
-                request.model
-            )));
-        }
+        validate_requested_model(&request.model, GLM_CODEX_MODEL_ID)?;
         let allowed_tools = tool_names(&request.tools)?;
         let prompt = render_codex_prompt(&request.instructions, &request.input, &request.tools)?;
         let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
@@ -198,34 +304,103 @@ impl ResponsesHandler for CodexHandler<'_, '_> {
             },
         )?;
 
-        let output = parse_agent_output(&generated_text)?;
-        for item in output.items {
-            match item {
-                AgentOutputItem::Text(text) => {
-                    stream.text_delta(&text)?;
-                    stream.message_done(&text)?;
-                }
-                AgentOutputItem::FunctionCall(call) => {
-                    if !allowed_tools.contains(&call.name) {
-                        return Err(Error::runtime(format!(
-                            "GLM requested undeclared Codex tool {:?}",
-                            call.name
-                        )));
-                    }
-                    let call_id = format!(
-                        "call_inferno_{}",
-                        NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
-                    );
-                    stream.function_call_done(&call_id, &call.name, &call.arguments)?;
-                }
-            }
-        }
+        emit_agent_output(&generated_text, &allowed_tools, "GLM", stream)?;
 
         Ok(ResponseUsage {
             input_tokens: encoded.token_ids.len(),
             output_tokens,
         })
     }
+}
+
+struct LagunaCodexHandler<'runtime> {
+    model: &'runtime LagunaModel,
+    config: &'runtime LagunaConfig,
+    backend: &'runtime MetalBackend,
+    tokenizer: &'runtime Tokenizer,
+    runtime: LagunaRuntime,
+    max_new_tokens: Option<usize>,
+}
+
+impl ResponsesHandler for LagunaCodexHandler<'_> {
+    fn generate(
+        &mut self,
+        request: ResponsesRequest,
+        stream: &mut ResponsesStream<'_>,
+    ) -> InfernoResult<ResponseUsage> {
+        validate_requested_model(&request.model, LAGUNA_CODEX_MODEL_ID)?;
+        let allowed_tools = tool_names(&request.tools)?;
+        let prompt =
+            render_laguna_codex_prompt(&request.instructions, &request.input, &request.tools)?;
+        let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
+        validate_laguna_prompt(self.config, &encoded.token_ids, self.max_new_tokens)?;
+
+        let mut decoded = DecodedTextStream::new(self.tokenizer, true);
+        let mut generated_text = String::new();
+        let mut output_tokens = 0_usize;
+        self.runtime.generate_streaming(
+            self.model,
+            self.backend,
+            &encoded.token_ids,
+            self.max_new_tokens,
+            &self.config.eos_token_id,
+            |token_id| {
+                output_tokens = output_tokens
+                    .checked_add(1)
+                    .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
+                if let Some(text) = decoded.push(token_id)? {
+                    generated_text.push_str(&text);
+                }
+                stream.heartbeat()
+            },
+        )?;
+
+        emit_agent_output(&generated_text, &allowed_tools, "Laguna", stream)?;
+        Ok(ResponseUsage {
+            input_tokens: encoded.token_ids.len(),
+            output_tokens,
+        })
+    }
+}
+
+fn emit_agent_output(
+    generated_text: &str,
+    allowed_tools: &HashSet<String>,
+    model_name: &str,
+    stream: &mut ResponsesStream<'_>,
+) -> InfernoResult<()> {
+    let output = parse_agent_output(generated_text)?;
+    for item in output.items {
+        match item {
+            AgentOutputItem::Text(text) => {
+                stream.text_delta(&text)?;
+                stream.message_done(&text)?;
+            }
+            AgentOutputItem::FunctionCall(call) => {
+                if !allowed_tools.contains(&call.name) {
+                    return Err(Error::runtime(format!(
+                        "{model_name} requested undeclared Codex tool {:?}",
+                        call.name
+                    )));
+                }
+                let call_id = format!(
+                    "call_inferno_{}",
+                    NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
+                );
+                stream.function_call_done(&call_id, &call.name, &call.arguments)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_requested_model(requested: &str, loaded: &str) -> InfernoResult<()> {
+    if requested != loaded {
+        return Err(Error::runtime(format!(
+            "Inferno serves model {loaded:?}, got {requested:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn tool_names(tools: &[serde_json::Value]) -> InfernoResult<HashSet<String>> {
@@ -268,5 +443,14 @@ mod tests {
         assert!(names.contains("exec_command"));
         assert!(names.contains("write_stdin"));
         assert!(!names.contains("update_plan"));
+    }
+
+    #[test]
+    fn accepts_only_the_model_loaded_by_this_server_process() {
+        validate_requested_model(LAGUNA_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID).unwrap();
+        let error =
+            validate_requested_model(GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID).unwrap_err();
+        assert!(error.to_string().contains(GLM_CODEX_MODEL_ID));
+        assert!(error.to_string().contains(LAGUNA_CODEX_MODEL_ID));
     }
 }

@@ -192,6 +192,11 @@ pub(crate) fn write_u32_buffer(buffer: &Buffer, values: &[u32]) -> Result<()> {
     write_buffer(buffer, 0, values)
 }
 
+#[cfg(test)]
+pub(crate) fn write_u8_buffer(buffer: &Buffer, values: &[u8]) -> Result<()> {
+    write_buffer(buffer, 0, values)
+}
+
 fn write_buffer<T>(buffer: &Buffer, element_offset: usize, values: &[T]) -> Result<()> {
     let offset_bytes = byte_len::<T>(element_offset)?;
     let value_bytes = byte_len::<T>(values.len())?;
