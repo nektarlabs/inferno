@@ -305,7 +305,7 @@ target/release/inferno generate \
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
-| `--expert-cache-gb <GB>` | Pins the routed-expert RAM budget. |
+| `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget. |
 | `--hot-kv-cache-gb <GB>` | Pins the GLM hot Metal KV budget. |
 | `--enable-unified-memory-controller` | Enables GLM adaptive expert and hot-KV memory rebalancing. |
 | `--enable-telemetry` | Prints GLM runtime memory telemetry. |
@@ -335,9 +335,12 @@ layer from evicting useful experts from another.
 Laguna selects ten experts and uses one global O(1) LRU cache across its routed
 layers. Its reuse is uneven across layers, so a global budget lets layers with
 useful locality keep more experts while avoiding empty or underused per-layer
-partitions. The measured default is 3.5 GB. Laguna loads missing INT4 experts
-from the indexed Safetensors shards using parallel I/O workers and executes
-ready experts without waiting for every miss to finish.
+partitions. Cached experts are direct Metal views over the mapped INT4 tensors,
+not second copies. macOS can therefore use the remaining unified memory as a
+reclaimable model-page cache. On the 64 GB target, the automatic working-set cap
+is 24 GB; smaller available-memory budgets reduce it automatically. Laguna
+prefetches missing experts with parallel I/O workers and executes ready experts
+without waiting for every miss to finish.
 
 ```text
 selected expert -> cache hit  -> execute from Metal

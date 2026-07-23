@@ -18,8 +18,8 @@ pub struct LagunaTokenOutput {
 /// Immutable Laguna S 2.1 INT4 model state.
 ///
 /// Always-used BF16 matrices are prepared once on Metal. Routed INT4 experts
-/// remain indexed safetensors ranges and enter Metal only after the router
-/// selects them.
+/// remain indexed Safetensors ranges and become direct Metal views only after
+/// the router selects them.
 #[derive(Debug)]
 pub struct LagunaModel {
     config: LagunaConfig,

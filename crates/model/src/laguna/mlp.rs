@@ -670,7 +670,7 @@ fn load_expert<B: Backend>(
     backend: &B,
 ) -> Result<ExpertLoadReady> {
     job.source.prefetch()?;
-    let weights = LagunaDeviceExpertWeights::prepare_resident(job.source, config, backend)?;
+    let weights = LagunaDeviceExpertWeights::prepare_cached(job.source, config, backend)?;
     Ok(ExpertLoadReady {
         weights,
         source_bytes: job.source_bytes,

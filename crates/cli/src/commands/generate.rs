@@ -29,7 +29,7 @@ use runtime::{
 use tokenizer::{render_laguna_user_prompt, render_user_prompt, Tokenizer};
 
 const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
-const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 3_500_000_000;
+const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
 pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 6] = [
     ("〈|UNK|〉", 0),
     ("〈|EOS|〉", 2),
@@ -1276,10 +1276,10 @@ mod tests {
     }
 
     #[test]
-    fn laguna_default_uses_measured_metal_expert_budget() {
+    fn laguna_default_uses_measured_mapped_expert_working_set() {
         assert_eq!(
             laguna_default_expert_cache_bytes(50_000_000_000),
-            3_500_000_000
+            24_000_000_000
         );
         assert_eq!(
             laguna_default_expert_cache_bytes(2_000_000_000),

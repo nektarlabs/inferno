@@ -1,4 +1,6 @@
-use backend::{Backend, DeviceBf16Matrix, DeviceRopeTable, DeviceW4Weight};
+use std::sync::Arc;
+
+use backend::{Backend, DeviceBf16Matrix, DeviceRopeTable, DeviceW4Weight, W4WeightSource};
 use common::{Error, F32Tensor, Result};
 use config::LagunaConfig;
 use inferno_io::SafeTensorHandle;
@@ -70,6 +72,22 @@ pub struct LagunaDeviceExpertWeights {
     pub gate: DeviceW4Weight,
     pub up: DeviceW4Weight,
     pub down: DeviceW4Weight,
+}
+
+#[derive(Debug)]
+struct LagunaMappedW4Source {
+    packed: SafeTensorHandle,
+    scales: SafeTensorHandle,
+}
+
+impl W4WeightSource for LagunaMappedW4Source {
+    fn packed_bytes(&self) -> Result<&[u8]> {
+        self.packed.bytes()
+    }
+
+    fn scale_bytes(&self) -> Result<&[u8]> {
+        self.scales.bytes()
+    }
 }
 
 #[derive(Debug)]
@@ -152,12 +170,12 @@ fn prepare_rope_table<B: Backend>(
 }
 
 impl LagunaDeviceExpertWeights {
-    /// Copies one selected expert into Metal-owned buffers.
+    /// Creates Metal views over one selected expert's mapped INT4 tensors.
     ///
-    /// Laguna's small resident cache reuses these prepared buffers across
-    /// tokens. This avoids repeated page faults while a selected expert kernel
-    /// is reading its gate, up, and down matrices.
-    pub fn prepare_resident<B: Backend>(
+    /// The cache owns the views and their Safetensors handles, while macOS owns
+    /// physical page residency. This avoids keeping both mapped source pages and
+    /// copied Metal buffers for the same expert in unified memory.
+    pub fn prepare_cached<B: Backend>(
         source: &LagunaExpertWeights,
         config: &LagunaConfig,
         backend: &B,
@@ -166,21 +184,21 @@ impl LagunaDeviceExpertWeights {
         Ok(Self {
             layer_index: source.layer_index,
             expert_id: source.expert_id,
-            gate: prepare_resident_w4(
+            gate: prepare_mapped_w4(
                 &source.gate_packed,
                 &source.gate_scales,
                 config.hidden_size,
                 config.moe_intermediate_size,
                 backend,
             )?,
-            up: prepare_resident_w4(
+            up: prepare_mapped_w4(
                 &source.up_packed,
                 &source.up_scales,
                 config.hidden_size,
                 config.moe_intermediate_size,
                 backend,
             )?,
-            down: prepare_resident_w4(
+            down: prepare_mapped_w4(
                 &source.down_packed,
                 &source.down_scales,
                 config.moe_intermediate_size,
@@ -300,24 +318,22 @@ fn prepare_scalar(tensor: &SafeTensorHandle) -> Result<f32> {
     Ok(*value)
 }
 
-fn prepare_resident_w4<B: Backend>(
+fn prepare_mapped_w4<B: Backend>(
     packed: &SafeTensorHandle,
     scales: &SafeTensorHandle,
     in_features: usize,
     out_features: usize,
     backend: &B,
 ) -> Result<DeviceW4Weight> {
+    let source = Arc::new(LagunaMappedW4Source {
+        packed: packed.clone(),
+        scales: scales.clone(),
+    });
     backend
-        .prepare_w4_groupwise_weight(
-            packed.bytes()?,
-            scales.bytes()?,
-            in_features,
-            out_features,
-            32,
-        )?
+        .prepare_w4_groupwise_weight_no_copy(source, in_features, out_features, 32)?
         .ok_or_else(|| {
             Error::backend(format!(
-                "native backend cannot prepare resident Laguna INT4 matrix {}",
+                "native backend cannot map cached Laguna INT4 matrix {}",
                 packed.info().name
             ))
         })

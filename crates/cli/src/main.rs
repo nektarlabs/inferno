@@ -79,7 +79,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         profile_token_costs: bool,
 
-        /// Total RAM budget in decimal GB for routed expert weights.
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
@@ -122,7 +122,7 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed expert weights.
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
@@ -169,7 +169,7 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed expert weights.
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
