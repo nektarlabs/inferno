@@ -4,6 +4,7 @@
 
 mod cache_budget;
 mod laguna;
+mod laguna_memory;
 mod telemetry;
 
 pub use cache_budget::{
@@ -17,6 +18,13 @@ pub use cache_budget::{
 pub use laguna::{
     run_laguna_generate_streaming, GenerationControl, LagunaGenerationOptions,
     LagunaGenerationReport, LagunaRuntime,
+};
+pub use laguna_memory::{
+    enable_laguna_memory_controller_log, LagunaMemoryAction, LagunaMemoryControllerReport,
+    LagunaMemoryControllerSpec, LagunaMemoryDecision, LagunaMemoryPressure,
+    DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS, DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS, DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
 };
 
 use std::{

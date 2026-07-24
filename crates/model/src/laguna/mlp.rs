@@ -135,6 +135,7 @@ struct LruDirectory<Key> {
     capacity: usize,
     positions: HashMap<Key, usize>,
     nodes: Vec<Option<LruNode<Key>>>,
+    free_slots: Vec<usize>,
     least_recent: Option<usize>,
     most_recent: Option<usize>,
 }
@@ -148,6 +149,7 @@ where
             capacity,
             positions: HashMap::with_capacity(capacity),
             nodes: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
             least_recent: None,
             most_recent: None,
         }
@@ -173,19 +175,9 @@ where
         }
 
         let (slot, evicted) = if self.positions.len() == self.capacity {
-            let slot = self
-                .least_recent
-                .ok_or_else(|| Error::cache("full Laguna LRU has no least-recent slot"))?;
-            let evicted_key = self
-                .nodes
-                .get(slot)
-                .and_then(Option::as_ref)
-                .map(|node| node.key)
-                .ok_or_else(|| Error::cache("Laguna LRU eviction slot is empty"))?;
-            self.detach(slot)?;
-            self.nodes[slot] = None;
-            self.positions.remove(&evicted_key);
-            (slot, true)
+            (self.remove_least_recent()?, true)
+        } else if let Some(slot) = self.free_slots.pop() {
+            (slot, false)
         } else {
             let slot = self.nodes.len();
             self.nodes.push(None);
@@ -207,9 +199,34 @@ where
         Ok((slot, evicted))
     }
 
+    /// Changes the logical capacity and returns storage slots evicted by a
+    /// shrink. Existing entries keep their slots, so growth never invalidates
+    /// the corresponding Metal views.
+    fn resize_capacity(&mut self, capacity: usize) -> Result<Vec<usize>> {
+        if capacity == 0 {
+            return Err(Error::cache("Laguna LRU capacity must be positive"));
+        }
+        if capacity > self.capacity {
+            self.positions
+                .reserve(capacity.saturating_sub(self.positions.len()));
+            self.nodes
+                .reserve(capacity.saturating_sub(self.nodes.len()));
+        }
+
+        let mut evicted_slots = Vec::with_capacity(self.len().saturating_sub(capacity));
+        while self.len() > capacity {
+            let slot = self.remove_least_recent()?;
+            self.free_slots.push(slot);
+            evicted_slots.push(slot);
+        }
+        self.capacity = capacity;
+        Ok(evicted_slots)
+    }
+
     fn clear(&mut self) {
         self.positions.clear();
         self.nodes.clear();
+        self.free_slots.clear();
         self.least_recent = None;
         self.most_recent = None;
     }
@@ -253,6 +270,26 @@ where
         Ok(())
     }
 
+    fn remove_least_recent(&mut self) -> Result<usize> {
+        let slot = self
+            .least_recent
+            .ok_or_else(|| Error::cache("non-empty Laguna LRU has no least-recent slot"))?;
+        let key = self
+            .nodes
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map(|node| node.key)
+            .ok_or_else(|| Error::cache("Laguna LRU eviction slot is empty"))?;
+        self.detach(slot)?;
+        self.nodes[slot] = None;
+        if self.positions.remove(&key) != Some(slot) {
+            return Err(Error::cache(
+                "Laguna LRU hash directory disagrees with its eviction slot",
+            ));
+        }
+        Ok(slot)
+    }
+
     fn node_mut(&mut self, slot: usize) -> Result<&mut LruNode<Key>> {
         self.nodes
             .get_mut(slot)
@@ -275,6 +312,7 @@ pub struct LagunaExpertCache {
     bytes_per_expert: u64,
     routed_layer_count: usize,
     experts_per_layer: usize,
+    top_k: usize,
     metrics: LagunaExpertCacheMetrics,
 }
 
@@ -330,6 +368,7 @@ impl LagunaExpertCache {
             bytes_per_expert,
             routed_layer_count,
             experts_per_layer,
+            top_k,
             metrics: LagunaExpertCacheMetrics {
                 capacity_bytes,
                 capacity_experts,
@@ -347,6 +386,44 @@ impl LagunaExpertCache {
                 .saturating_mul(self.bytes_per_expert),
             ..self.metrics
         }
+    }
+
+    /// Resizes Laguna's global logical expert working set in place.
+    ///
+    /// Growth preserves every cached expert. Shrink removes least-recently
+    /// used entries first and drops their mapped Metal views immediately.
+    pub fn resize_capacity(&mut self, capacity_experts: usize) -> Result<()> {
+        self.validate_capacity(capacity_experts)?;
+        if capacity_experts == self.metrics.capacity_experts {
+            return Ok(());
+        }
+
+        if capacity_experts > self.metrics.capacity_experts {
+            self.weights
+                .reserve(capacity_experts.saturating_sub(self.weights.capacity()));
+        }
+        let evicted_slots = self.directory.resize_capacity(capacity_experts)?;
+        for slot in &evicted_slots {
+            let entry = self
+                .weights
+                .get_mut(*slot)
+                .ok_or_else(|| Error::cache("Laguna resized LRU returned an invalid slot"))?;
+            if entry.take().is_none() {
+                return Err(Error::cache(
+                    "Laguna resized LRU returned an empty expert slot",
+                ));
+            }
+        }
+        self.metrics.evictions = self
+            .metrics
+            .evictions
+            .saturating_add(evicted_slots.len() as u64);
+        self.metrics.capacity_experts = capacity_experts;
+        self.metrics.capacity_bytes = u64::try_from(capacity_experts)
+            .ok()
+            .and_then(|capacity| capacity.checked_mul(self.bytes_per_expert))
+            .ok_or_else(|| Error::cache("Laguna resident expert cache byte budget overflow"))?;
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -418,6 +495,25 @@ impl LagunaExpertCache {
             return Err(Error::cache(format!(
                 "Laguna expert {expert_id} is outside 0..{}",
                 self.experts_per_layer
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_capacity(&self, capacity_experts: usize) -> Result<()> {
+        if capacity_experts < self.top_k {
+            return Err(Error::cache(format!(
+                "Laguna expert cache capacity {capacity_experts} must hold at least one top-k set of {} experts",
+                self.top_k
+            )));
+        }
+        let maximum_capacity = self
+            .routed_layer_count
+            .checked_mul(self.experts_per_layer)
+            .ok_or_else(|| Error::cache("Laguna maximum expert cache capacity overflow"))?;
+        if capacity_experts > maximum_capacity {
+            return Err(Error::cache(format!(
+                "Laguna expert cache capacity {capacity_experts} exceeds all {maximum_capacity} routed experts"
             )));
         }
         Ok(())
@@ -844,6 +940,33 @@ mod tests {
     }
 
     #[test]
+    fn global_lru_resize_preserves_hot_entries_and_reuses_slots() {
+        let mut lru = LruDirectory::new(4);
+        for expert_id in 10..14 {
+            let (_, evicted) = lru.insert((1, expert_id)).unwrap();
+            assert!(!evicted);
+        }
+
+        // Expert 10 becomes newest. Shrinking must therefore evict 11 and 12.
+        assert!(lru.get((1, 10)).unwrap().is_some());
+        let evicted_slots = lru.resize_capacity(2).unwrap();
+        assert_eq!(evicted_slots.len(), 2);
+        assert_eq!(lru.get((1, 11)).unwrap(), None);
+        assert_eq!(lru.get((1, 12)).unwrap(), None);
+        assert!(lru.get((1, 13)).unwrap().is_some());
+        assert!(lru.get((1, 10)).unwrap().is_some());
+
+        lru.resize_capacity(4).unwrap();
+        let (_, evicted) = lru.insert((2, 20)).unwrap();
+        assert!(!evicted);
+        let (_, evicted) = lru.insert((2, 21)).unwrap();
+        assert!(!evicted);
+        assert_eq!(lru.len(), 4);
+        assert!(lru.get((2, 20)).unwrap().is_some());
+        assert!(lru.get((2, 21)).unwrap().is_some());
+    }
+
+    #[test]
     fn groups_token_major_topk_assignments_by_expert() {
         let groups = group_assignments(&[3, 1, 3, 2, 1, 2], 2, 3, 4).unwrap();
         assert_eq!(groups.len(), 3);
@@ -882,6 +1005,23 @@ mod tests {
         assert_eq!(metrics.capacity_experts, 20);
         assert_eq!(metrics.resident_experts, 0);
         assert_eq!(metrics.resident_bytes, 0);
+    }
+
+    #[test]
+    fn empty_cache_can_resize_within_model_bounds() {
+        let mut cache = LagunaExpertCache::new(20, 10, 128, 2, 256).unwrap();
+
+        cache.resize_capacity(30).unwrap();
+        assert_eq!(cache.metrics().capacity_experts, 30);
+        assert_eq!(cache.metrics().capacity_bytes, 3_840);
+
+        cache.resize_capacity(10).unwrap();
+        assert_eq!(cache.metrics().capacity_experts, 10);
+        assert_eq!(cache.metrics().capacity_bytes, 1_280);
+        assert_eq!(cache.metrics().evictions, 0);
+
+        assert!(cache.resize_capacity(9).is_err());
+        assert!(cache.resize_capacity(513).is_err());
     }
 
     #[test]

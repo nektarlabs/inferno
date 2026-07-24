@@ -21,15 +21,21 @@ use model::{
     DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
-    enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
-    enable_q2_runtime_profile, q2_memory_controller_spec, run_generate_streaming_with_options,
-    run_laguna_generate_streaming, GenerationOptions, KvCacheMetrics, LagunaGenerationOptions,
-    MtpMetrics,
+    enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
+    enable_memory_telemetry_file, enable_q2_runtime_profile, q2_memory_controller_spec,
+    run_generate_streaming_with_options, run_laguna_generate_streaming, GenerationOptions,
+    KvCacheMetrics, LagunaGenerationOptions, LagunaMemoryControllerSpec, MtpMetrics,
+    DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS, DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS, DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
 };
 use tokenizer::{render_laguna_user_prompt, render_user_prompt, TokenDecoder, Tokenizer};
 
 const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
 const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
+const LAGUNA_MINIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 16_000_000_000;
+const LAGUNA_MAXIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 32_000_000_000;
+const LAGUNA_ADAPTIVE_EXPERT_CACHE_STEP_BYTES: u64 = 1_000_000_000;
 pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 6] = [
     ("〈|UNK|〉", 0),
     ("〈|EOS|〉", 2),
@@ -257,6 +263,7 @@ fn run_laguna(
         enable_telemetry,
         telemetry_file,
         memory_controller_log,
+        expert_cache_gb,
     )?;
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
@@ -276,6 +283,12 @@ fn run_laguna(
         max_new_tokens,
         explicit_cache_bytes,
     )?;
+    let memory_controller = enable_unified_memory_controller
+        .then(|| laguna_memory_controller_spec(&model, &config, expert_cache_capacity))
+        .transpose()?;
+    if let Some(path) = memory_controller_log {
+        enable_laguna_memory_controller_log(path)?;
+    }
 
     let mut stdout = io::stdout().lock();
     let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
@@ -288,6 +301,7 @@ fn run_laguna(
         &config.eos_token_id,
         LagunaGenerationOptions {
             expert_cache_capacity,
+            memory_controller,
         },
         |token_id| {
             throughput.record_token();
@@ -330,6 +344,7 @@ fn validate_laguna_options(
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
     memory_controller_log: Option<&Path>,
+    expert_cache_gb: Option<f64>,
 ) -> InfernoResult<()> {
     validate_laguna_service_options(
         page_size,
@@ -339,6 +354,7 @@ fn validate_laguna_options(
         enable_telemetry,
         telemetry_file,
         memory_controller_log,
+        expert_cache_gb,
     )?;
     if add_special_tokens {
         return Err(Error::tokenizer(
@@ -367,7 +383,9 @@ pub(super) fn validate_laguna_service_options(
     enable_telemetry: bool,
     telemetry_file: Option<&Path>,
     memory_controller_log: Option<&Path>,
+    expert_cache_gb: Option<f64>,
 ) -> InfernoResult<()> {
+    validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     if page_size != runtime::DEFAULT_KV_PAGE_SIZE {
         return Err(Error::runtime(
             "--page-size applies only to GLM; Laguna uses exact full/sliding FP8 caches",
@@ -375,19 +393,19 @@ pub(super) fn validate_laguna_service_options(
     }
     let unsupported = [
         (speculative_mtp, "--speculative-mtp"),
-        (
-            enable_unified_memory_controller,
-            "--enable-unified-memory-controller",
-        ),
         (hot_kv_cache_gb.is_some(), "--hot-kv-cache-gb"),
         (enable_telemetry, "--enable-telemetry"),
         (telemetry_file.is_some(), "--telemetry-file"),
-        (memory_controller_log.is_some(), "--memory-controller-log"),
     ];
     if let Some((_, flag)) = unsupported.into_iter().find(|(enabled, _)| *enabled) {
         return Err(Error::runtime(format!(
             "{flag} is outside the Laguna S 2.1 INT4 runtime contract"
         )));
+    }
+    if enable_unified_memory_controller && expert_cache_gb.is_some() {
+        return Err(Error::runtime(
+            "--expert-cache-gb fixes Laguna's cache size and cannot be combined with --enable-unified-memory-controller",
+        ));
     }
     Ok(())
 }
@@ -500,6 +518,52 @@ pub(super) fn laguna_expert_cache_capacity<B: Backend>(
         )));
     }
     Ok(capacity)
+}
+
+pub(super) fn laguna_memory_controller_spec(
+    model: &LagunaModel,
+    config: &LagunaConfig,
+    initial_expert_capacity: usize,
+) -> InfernoResult<LagunaMemoryControllerSpec> {
+    let bytes_per_expert = model.weight_summary().bytes_per_expert;
+    let total_experts = config
+        .num_hidden_layers
+        .saturating_sub(1)
+        .checked_mul(config.num_experts)
+        .ok_or_else(|| Error::runtime("Laguna total routed expert count overflow"))?;
+    // Routed experts are zero-copy views over mapped Safetensors. Their
+    // logical cache budget must not subtract private Metal allocations a
+    // second time. The live controller enforces actual RAM/Metal headroom and
+    // rolls back trials that reduce throughput.
+    let maximum_expert_capacity =
+        usize::try_from(LAGUNA_MAXIMUM_ADAPTIVE_EXPERT_CACHE_BYTES / bytes_per_expert)
+            .map_err(|_| Error::runtime("Laguna adaptive maximum capacity does not fit usize"))?
+            .min(total_experts)
+            .max(initial_expert_capacity);
+    let minimum_expert_capacity =
+        usize::try_from(LAGUNA_MINIMUM_ADAPTIVE_EXPERT_CACHE_BYTES / bytes_per_expert)
+            .map_err(|_| Error::runtime("Laguna adaptive minimum capacity does not fit usize"))?
+            .max(config.num_experts_per_tok)
+            .min(initial_expert_capacity);
+    let expert_capacity_step =
+        usize::try_from(LAGUNA_ADAPTIVE_EXPERT_CACHE_STEP_BYTES / bytes_per_expert)
+            .map_err(|_| Error::runtime("Laguna adaptive capacity step does not fit usize"))?
+            .max(1);
+
+    let spec = LagunaMemoryControllerSpec {
+        initial_expert_capacity,
+        minimum_expert_capacity,
+        maximum_expert_capacity,
+        expert_capacity_step,
+        bytes_per_expert,
+        decision_window_tokens: DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS,
+        trial_warmup_tokens: DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
+        stabilization_windows: DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS,
+        target_headroom_bytes: DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
+        hard_headroom_bytes: DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES,
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
 fn laguna_default_expert_cache_bytes(available_bytes: u64) -> u64 {
@@ -1286,10 +1350,39 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .expect_err("Laguna's chat template already contains its BOS marker");
 
         assert!(error.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn laguna_controller_is_supported_but_cannot_override_a_fixed_cache() {
+        validate_laguna_service_options(
+            runtime::DEFAULT_KV_PAGE_SIZE,
+            false,
+            true,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let error = validate_laguna_service_options(
+            runtime::DEFAULT_KV_PAGE_SIZE,
+            false,
+            true,
+            None,
+            false,
+            None,
+            None,
+            Some(24.0),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
     }
 
     #[test]

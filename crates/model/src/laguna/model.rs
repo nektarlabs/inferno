@@ -314,6 +314,10 @@ impl LagunaSession {
         self.expert_cache.metrics()
     }
 
+    pub fn resize_expert_cache_capacity(&mut self, capacity_experts: usize) -> Result<()> {
+        self.expert_cache.resize_capacity(capacity_experts)
+    }
+
     /// Starts a new sequence while retaining routed experts already in RAM.
     pub fn reset_sequence(&mut self) {
         for cache in &mut self.attention_caches {

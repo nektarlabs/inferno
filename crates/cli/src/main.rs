@@ -15,7 +15,7 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     speculative_mtp: bool,
 
-    /// Enable GLM adaptive expert-cache and hot-KV memory rebalancing.
+    /// Enable the model-specific adaptive unified-memory controller.
     #[arg(long, global = true, default_value_t = false)]
     enable_unified_memory_controller: bool,
 
@@ -638,6 +638,26 @@ mod tests {
         ])
         .unwrap();
         assert!(enabled_cli.enable_unified_memory_controller);
+
+        let chat_cli = Cli::try_parse_from([
+            "inferno",
+            "chat",
+            "--model",
+            "/tmp/model",
+            "--enable-unified-memory-controller",
+        ])
+        .unwrap();
+        assert!(chat_cli.enable_unified_memory_controller);
+
+        let serve_cli = Cli::try_parse_from([
+            "inferno",
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--enable-unified-memory-controller",
+        ])
+        .unwrap();
+        assert!(serve_cli.enable_unified_memory_controller);
     }
 
     #[test]

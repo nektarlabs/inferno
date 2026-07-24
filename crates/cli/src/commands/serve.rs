@@ -19,9 +19,9 @@ use model::{
     DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
-    enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
-    q2_memory_controller_spec, run_generate_streaming_with_options, CacheBudgetSpec,
-    GenerationControl, GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
+    enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
+    enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
+    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
 };
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, GLM_CODEX_MODEL_ID,
@@ -36,9 +36,10 @@ use tracing::info;
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    laguna_expert_cache_capacity, load_q2_readiness, resolve_q2_artifact,
-    validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
-    validate_memory_controller_options, DecodedTextStream, LAGUNA_TOKENIZER_CONTRACT,
+    laguna_expert_cache_capacity, laguna_memory_controller_spec, load_q2_readiness,
+    resolve_q2_artifact, validate_generation_request, validate_laguna_prompt,
+    validate_laguna_service_options, validate_memory_controller_options, DecodedTextStream,
+    LAGUNA_TOKENIZER_CONTRACT,
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -212,6 +213,7 @@ fn run_laguna(
         enable_telemetry,
         telemetry_file,
         memory_controller_log,
+        expert_cache_gb,
     )?;
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
@@ -223,8 +225,15 @@ fn run_laguna(
     // Laguna's complete configured KV context.
     let expert_cache_capacity =
         laguna_expert_cache_capacity(&model, &config, &backend, 1, None, explicit_cache_bytes)?;
+    let memory_controller = enable_unified_memory_controller
+        .then(|| laguna_memory_controller_spec(&model, &config, expert_cache_capacity))
+        .transpose()?;
+    if let Some(path) = memory_controller_log {
+        enable_laguna_memory_controller_log(path)?;
+    }
     let runtime = LagunaRuntime::new(LagunaGenerationOptions {
         expert_cache_capacity,
+        memory_controller,
     })?;
 
     let listener = TcpListener::bind(bind)?;

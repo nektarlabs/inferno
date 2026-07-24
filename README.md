@@ -242,6 +242,9 @@ cp examples/inferno-laguna.config.toml ~/.codex/inferno-laguna.config.toml
 cp examples/inferno.models.json ~/.codex/inferno.models.json
 ```
 
+Restart Codex after replacing `inferno.models.json`; the `/models` picker reads
+the catalog when the session starts.
+
 Start Codex with GLM:
 
 ```bash
@@ -307,10 +310,10 @@ target/release/inferno generate \
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget. |
 | `--hot-kv-cache-gb <GB>` | Pins the GLM hot Metal KV budget. |
-| `--enable-unified-memory-controller` | Enables GLM adaptive expert and hot-KV memory rebalancing. |
+| `--enable-unified-memory-controller` | Enables the model-specific adaptive memory controller; disabled by default. |
 | `--enable-telemetry` | Prints GLM runtime memory telemetry. |
 | `--telemetry-file <PATH>` | Writes GLM memory telemetry to a file. |
-| `--memory-controller-log <PATH>` | Writes GLM adaptive memory decisions to TSV. |
+| `--memory-controller-log <PATH>` | Writes adaptive memory decisions to TSV. |
 | `--speculative-mtp` | Enables the experimental GLM MTP path. |
 
 Use the executable help as the authoritative CLI reference:
@@ -381,6 +384,30 @@ independently. The controller targets 4 GiB of effective headroom, treats 3 GiB
 as the hard floor, and shrinks immediately when swap or compression grows.
 Explicit cache-size options pin that cache and disable automatic resizing for
 it.
+
+Laguna has a separate controller because its experts use zero-copy mapped
+Safetensors and its FP8 KV cache is already bounded by sliding attention. It
+starts from an automatically measured global expert working set capped at 24 GB
+and observes 32-token decode windows. A proposed cache size is warmed and
+measured, then the previous size is restored and measured again. The change is
+retained only when the candidate beats both baseline samples by at least 10%.
+A long generation can complete multiple controller windows without waiting for
+another request. Short responses contribute their decode samples to the next
+turn, while prompt prefill is excluded from timing and expert-cache counters.
+Trial phases therefore continue across persistent chat turns and server
+requests without counting unrelated prefill work. High expert SSD traffic can
+trigger a larger-cache trial; smaller capacities are selected at the next
+observation under measured memory pressure. Persistent runtimes pay the initial
+stabilization window once and retain cache contents and controller decisions
+across requests. After accepting or rejecting a candidate, the controller
+waits 2,048 decode tokens before probing again. Normal compression of
+reclaimable mapped pages is not treated as pressure while effective RAM
+headroom remains safe. Swap growth, critically low headroom, or Metal
+working-set pressure causes a shrink.
+
+For Laguna, `--expert-cache-gb` selects a fixed working set and cannot be
+combined with the adaptive controller. This keeps fixed benchmarks
+deterministic and prevents an explicit budget from being silently overridden.
 
 ## Development
 

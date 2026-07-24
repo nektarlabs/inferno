@@ -4,6 +4,12 @@ use backend::Backend;
 use common::{Error, Result};
 use model::{LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
 
+use crate::{
+    laguna_memory::LagunaMemoryController,
+    telemetry::{capture_memory_snapshot, RuntimeKvMemoryBytes},
+    LagunaMemoryControllerReport, LagunaMemoryControllerSpec,
+};
+
 const LAGUNA_PREFILL_CHUNK_TOKENS: usize = 4_096;
 const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
 
@@ -16,6 +22,7 @@ pub enum GenerationControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LagunaGenerationOptions {
     pub expert_cache_capacity: usize,
+    pub memory_controller: Option<LagunaMemoryControllerSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +32,7 @@ pub struct LagunaGenerationReport {
     pub total_duration: Duration,
     pub time_to_first_token: Option<Duration>,
     pub expert_cache: LagunaExpertCacheMetrics,
+    pub memory_controller: Option<LagunaMemoryControllerReport>,
 }
 
 impl LagunaGenerationReport {
@@ -46,6 +54,7 @@ impl LagunaGenerationReport {
 #[derive(Debug)]
 pub struct LagunaRuntime {
     expert_cache_capacity: usize,
+    memory_controller: Option<LagunaMemoryController>,
     session: Option<LagunaSession>,
 }
 
@@ -56,8 +65,21 @@ impl LagunaRuntime {
                 "Laguna runtime expert-cache capacity must be positive",
             ));
         }
+        let memory_controller = options
+            .memory_controller
+            .map(|spec| {
+                if spec.initial_expert_capacity != options.expert_cache_capacity {
+                    return Err(Error::runtime(format!(
+                        "Laguna memory controller initial capacity {} does not match runtime capacity {}",
+                        spec.initial_expert_capacity, options.expert_cache_capacity
+                    )));
+                }
+                LagunaMemoryController::new(spec)
+            })
+            .transpose()?;
         Ok(Self {
             expert_cache_capacity: options.expert_cache_capacity,
+            memory_controller,
             session: None,
         })
     }
@@ -134,6 +156,10 @@ impl LagunaRuntime {
                 total_duration: Duration::ZERO,
                 time_to_first_token: None,
                 expert_cache: LagunaExpertCacheMetrics::default(),
+                memory_controller: self
+                    .memory_controller
+                    .as_ref()
+                    .map(LagunaMemoryController::report),
             });
         }
 
@@ -160,40 +186,79 @@ impl LagunaRuntime {
         }
         let mut decode_token = [0_u32; 1];
 
-        while generated_tokens < generated_limit {
-            let input: &[u32] = if generated_tokens == 0 {
-                &prompt_token_ids[final_prompt_chunk_start..]
-            } else {
-                &decode_token
-            };
-            let required_end = session
-                .position()?
-                .checked_add(input.len())
-                .ok_or_else(|| Error::runtime("Laguna sequence capacity overflow"))?;
-            if required_end > session.context_capacity() {
-                let next_capacity = next_context_capacity(
-                    session.context_capacity(),
-                    required_end,
-                    config.max_position_embeddings,
-                )?;
-                model.grow_session_capacity(session, next_capacity, backend)?;
+        let generation_result = (|| -> Result<()> {
+            while generated_tokens < generated_limit {
+                let input: &[u32] = if generated_tokens == 0 {
+                    &prompt_token_ids[final_prompt_chunk_start..]
+                } else {
+                    &decode_token
+                };
+                let required_end = session
+                    .position()?
+                    .checked_add(input.len())
+                    .ok_or_else(|| Error::runtime("Laguna sequence capacity overflow"))?;
+                if required_end > session.context_capacity() {
+                    let next_capacity = next_context_capacity(
+                        session.context_capacity(),
+                        required_end,
+                        config.max_position_embeddings,
+                    )?;
+                    model.grow_session_capacity(session, next_capacity, backend)?;
+                }
+                let model_started_at = self.memory_controller.as_ref().map(|_| Instant::now());
+                let output = model.forward_next_token(session, input, backend)?;
+                let model_elapsed = model_started_at.map(|started_at| started_at.elapsed());
+                if time_to_first_token.is_none() {
+                    time_to_first_token = Some(started_at.elapsed());
+                }
+
+                if let Some(controller) = self.memory_controller.as_mut() {
+                    if generated_tokens == 0 {
+                        controller.begin_decode(
+                            session.expert_cache_metrics(),
+                            capture_memory_snapshot(backend, RuntimeKvMemoryBytes::default()),
+                        );
+                    } else {
+                        controller.record_decode_step(model_elapsed.ok_or_else(|| {
+                            Error::runtime("Laguna controller decode timer was not started")
+                        })?);
+                        if controller.observation_due() {
+                            let memory =
+                                capture_memory_snapshot(backend, RuntimeKvMemoryBytes::default());
+                            let decision = controller.observe(
+                                session.position()?,
+                                session.expert_cache_metrics(),
+                                memory,
+                            )?;
+                            if decision.changes_capacity() {
+                                session
+                                    .resize_expert_cache_capacity(decision.next_expert_capacity)?;
+                                self.expert_cache_capacity = decision.next_expert_capacity;
+                            }
+                            controller.record_decision(decision, memory)?;
+                        }
+                    }
+                }
+
+                let control = on_token(output.token_id)?;
+                generated_tokens = generated_tokens
+                    .checked_add(1)
+                    .ok_or_else(|| Error::runtime("Laguna generated-token count overflow"))?;
+                if control == GenerationControl::Stop
+                    || stop_token_ids.contains(&output.token_id)
+                    || generated_tokens == generated_limit
+                {
+                    break;
+                }
+                decode_token[0] = output.token_id;
             }
-            let output = model.forward_next_token(session, input, backend)?;
-            if time_to_first_token.is_none() {
-                time_to_first_token = Some(started_at.elapsed());
-            }
-            let control = on_token(output.token_id)?;
-            generated_tokens = generated_tokens
-                .checked_add(1)
-                .ok_or_else(|| Error::runtime("Laguna generated-token count overflow"))?;
-            if control == GenerationControl::Stop
-                || stop_token_ids.contains(&output.token_id)
-                || generated_tokens == generated_limit
-            {
-                break;
-            }
-            decode_token[0] = output.token_id;
+            Ok(())
+        })();
+
+        if let Some(controller) = self.memory_controller.as_mut() {
+            controller.pause_decode(session.expert_cache_metrics());
         }
+        generation_result?;
 
         let expert_cache = session.expert_cache_metrics();
         expert_cache.validate()?;
@@ -203,6 +268,10 @@ impl LagunaRuntime {
             total_duration: started_at.elapsed(),
             time_to_first_token,
             expert_cache,
+            memory_controller: self
+                .memory_controller
+                .as_ref()
+                .map(LagunaMemoryController::report),
         })
     }
 
@@ -312,20 +381,45 @@ mod tests {
         LagunaGenerationOptions, LagunaRuntime, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
         LAGUNA_PREFILL_CHUNK_TOKENS,
     };
+    use crate::LagunaMemoryControllerSpec;
 
     #[test]
     fn persistent_runtime_requires_a_real_expert_cache() {
         let error = LagunaRuntime::new(LagunaGenerationOptions {
             expert_cache_capacity: 0,
+            memory_controller: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("must be positive"));
 
         let runtime = LagunaRuntime::new(LagunaGenerationOptions {
             expert_cache_capacity: 10,
+            memory_controller: None,
         })
         .unwrap();
         assert_eq!(runtime.expert_cache_capacity(), 10);
+    }
+
+    #[test]
+    fn controller_and_runtime_must_start_with_the_same_capacity() {
+        let error = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: 10,
+            memory_controller: Some(LagunaMemoryControllerSpec {
+                initial_expert_capacity: 11,
+                minimum_expert_capacity: 10,
+                maximum_expert_capacity: 12,
+                expert_capacity_step: 1,
+                bytes_per_expert: 1,
+                decision_window_tokens: 2,
+                trial_warmup_tokens: 1,
+                stabilization_windows: 0,
+                target_headroom_bytes: 2,
+                hard_headroom_bytes: 1,
+            }),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
