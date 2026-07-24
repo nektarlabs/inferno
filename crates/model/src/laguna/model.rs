@@ -113,6 +113,25 @@ impl LagunaModel {
         Ok(())
     }
 
+    /// Expands the active sequence's full-attention KV buffers without
+    /// discarding already cached tokens. Sliding-window buffers stay fixed.
+    pub fn grow_session_capacity<B: Backend>(
+        &self,
+        session: &mut LagunaSession,
+        context_capacity: usize,
+        backend: &B,
+    ) -> Result<()> {
+        self.validate_session_shape(session.batch, context_capacity)?;
+        if context_capacity <= session.context_capacity {
+            return Ok(());
+        }
+        for cache in &mut session.attention_caches {
+            cache.grow_full_capacity(context_capacity, backend)?;
+        }
+        session.context_capacity = context_capacity;
+        Ok(())
+    }
+
     /// Appends one prompt/decode chunk and returns the greedy next token.
     ///
     /// Input IDs have logical shape `[1,T]`. Embeddings and hidden states are

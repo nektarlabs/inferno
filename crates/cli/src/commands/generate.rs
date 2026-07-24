@@ -26,7 +26,7 @@ use runtime::{
     run_laguna_generate_streaming, GenerationOptions, KvCacheMetrics, LagunaGenerationOptions,
     MtpMetrics,
 };
-use tokenizer::{render_laguna_user_prompt, render_user_prompt, Tokenizer};
+use tokenizer::{render_laguna_user_prompt, render_user_prompt, TokenDecoder, Tokenizer};
 
 const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
 const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
@@ -1017,42 +1017,18 @@ fn percentile_seconds(mut values: Vec<Duration>, percentile: usize) -> f64 {
 }
 
 pub(super) struct DecodedTextStream<'a> {
-    tokenizer: &'a Tokenizer,
-    skip_special_tokens: bool,
-    token_ids: Vec<u32>,
-    emitted_text: String,
+    decoder: TokenDecoder<'a>,
 }
 
 impl<'a> DecodedTextStream<'a> {
     pub(super) fn new(tokenizer: &'a Tokenizer, skip_special_tokens: bool) -> Self {
         Self {
-            tokenizer,
-            skip_special_tokens,
-            token_ids: Vec::new(),
-            emitted_text: String::new(),
+            decoder: tokenizer.decoder(skip_special_tokens),
         }
     }
 
     pub(super) fn push(&mut self, token_id: u32) -> InfernoResult<Option<String>> {
-        self.token_ids.push(token_id);
-        let decoded = self
-            .tokenizer
-            .decode(&self.token_ids, self.skip_special_tokens)?;
-        if decoded.len() <= self.emitted_text.len() {
-            return Ok(None);
-        }
-
-        let suffix = decoded
-            .strip_prefix(&self.emitted_text)
-            .ok_or_else(|| Error::tokenizer("streaming decode produced non-monotonic text"))?
-            .to_string();
-        self.emitted_text = decoded;
-
-        if suffix.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(suffix))
-        }
+        self.decoder.push(token_id)
     }
 }
 

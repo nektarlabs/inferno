@@ -21,15 +21,16 @@ use model::{
 use runtime::{
     enable_memory_controller_log, enable_memory_telemetry, enable_memory_telemetry_file,
     q2_memory_controller_spec, run_generate_streaming_with_options, CacheBudgetSpec,
-    GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
+    GenerationControl, GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
 };
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, GLM_CODEX_MODEL_ID,
     LAGUNA_CODEX_MODEL_ID,
 };
 use tokenizer::{
-    is_supported_codex_function, parse_agent_output, render_codex_prompt,
-    render_laguna_codex_prompt, AgentOutputItem, Tokenizer,
+    is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
+    render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentOutput,
+    AgentOutputItem, Tokenizer,
 };
 use tracing::info;
 
@@ -337,8 +338,10 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
 
         let mut decoded = DecodedTextStream::new(self.tokenizer, true);
         let mut generated_text = String::new();
+        let mut streamed_text = String::new();
+        let mut completed_output = None;
         let mut output_tokens = 0_usize;
-        self.runtime.generate_streaming(
+        self.runtime.generate_streaming_controlled(
             self.model,
             self.backend,
             &encoded.token_ids,
@@ -351,16 +354,72 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 if let Some(text) = decoded.push(token_id)? {
                     generated_text.push_str(&text);
                 }
-                stream.heartbeat()
+                if let Some(visible_text) = streamable_agent_text(&generated_text) {
+                    let delta = visible_text.strip_prefix(&streamed_text).ok_or_else(|| {
+                        Error::tokenizer("Laguna agent visible text changed after it was streamed")
+                    })?;
+                    if !delta.is_empty() {
+                        stream.text_delta(delta)?;
+                        streamed_text.push_str(delta);
+                    }
+                }
+                let control = match parse_complete_agent_tool_call(&generated_text)? {
+                    Some(output) => {
+                        completed_output = Some(output);
+                        GenerationControl::Stop
+                    }
+                    None => GenerationControl::Continue,
+                };
+                stream.heartbeat()?;
+                Ok(control)
             },
         )?;
 
-        emit_agent_output(&generated_text, &allowed_tools, "Laguna", stream)?;
+        match completed_output {
+            Some(output) => {
+                emit_laguna_agent_output(output, &streamed_text, &allowed_tools, "Laguna", stream)?
+            }
+            None => {
+                let output = parse_agent_output(&generated_text)?;
+                emit_laguna_agent_output(output, &streamed_text, &allowed_tools, "Laguna", stream)?;
+            }
+        }
         Ok(ResponseUsage {
             input_tokens: encoded.token_ids.len(),
             output_tokens,
         })
     }
+}
+
+fn emit_laguna_agent_output(
+    output: AgentOutput,
+    streamed_text: &str,
+    allowed_tools: &HashSet<String>,
+    model_name: &str,
+    stream: &mut ResponsesStream<'_>,
+) -> InfernoResult<()> {
+    let mut streamed_message_finished = false;
+    for item in output.items {
+        match item {
+            AgentOutputItem::Text(text) if !streamed_text.is_empty() => {
+                if streamed_message_finished || text != streamed_text.trim() {
+                    return Err(Error::runtime(
+                        "Laguna streamed text does not match its completed agent output",
+                    ));
+                }
+                stream.message_done(streamed_text)?;
+                streamed_message_finished = true;
+            }
+            AgentOutputItem::Text(text) => {
+                stream.text_delta(&text)?;
+                stream.message_done(&text)?;
+            }
+            AgentOutputItem::FunctionCall(call) => {
+                emit_function_call(call, allowed_tools, model_name, stream)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn emit_agent_output(
@@ -370,6 +429,15 @@ fn emit_agent_output(
     stream: &mut ResponsesStream<'_>,
 ) -> InfernoResult<()> {
     let output = parse_agent_output(generated_text)?;
+    emit_parsed_agent_output(output, allowed_tools, model_name, stream)
+}
+
+fn emit_parsed_agent_output(
+    output: AgentOutput,
+    allowed_tools: &HashSet<String>,
+    model_name: &str,
+    stream: &mut ResponsesStream<'_>,
+) -> InfernoResult<()> {
     for item in output.items {
         match item {
             AgentOutputItem::Text(text) => {
@@ -377,21 +445,30 @@ fn emit_agent_output(
                 stream.message_done(&text)?;
             }
             AgentOutputItem::FunctionCall(call) => {
-                if !allowed_tools.contains(&call.name) {
-                    return Err(Error::runtime(format!(
-                        "{model_name} requested undeclared Codex tool {:?}",
-                        call.name
-                    )));
-                }
-                let call_id = format!(
-                    "call_inferno_{}",
-                    NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
-                );
-                stream.function_call_done(&call_id, &call.name, &call.arguments)?;
+                emit_function_call(call, allowed_tools, model_name, stream)?;
             }
         }
     }
     Ok(())
+}
+
+fn emit_function_call(
+    call: tokenizer::AgentFunctionCall,
+    allowed_tools: &HashSet<String>,
+    model_name: &str,
+    stream: &mut ResponsesStream<'_>,
+) -> InfernoResult<()> {
+    if !allowed_tools.contains(&call.name) {
+        return Err(Error::runtime(format!(
+            "{model_name} requested undeclared Codex tool {:?}",
+            call.name
+        )));
+    }
+    let call_id = format!(
+        "call_inferno_{}",
+        NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    stream.function_call_done(&call_id, &call.name, &call.arguments)
 }
 
 fn validate_requested_model(requested: &str, loaded: &str) -> InfernoResult<()> {
@@ -452,5 +529,42 @@ mod tests {
             validate_requested_model(GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID).unwrap_err();
         assert!(error.to_string().contains(GLM_CODEX_MODEL_ID));
         assert!(error.to_string().contains(LAGUNA_CODEX_MODEL_ID));
+    }
+
+    #[test]
+    fn completes_streamed_laguna_text_before_its_function_call() {
+        let output = parse_agent_output(
+            "reasoning</think>Creating the file.<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap();
+        let allowed_tools = HashSet::from(["exec_command".to_string()]);
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, LAGUNA_CODEX_MODEL_ID).unwrap();
+        stream.text_delta("Creating the file.").unwrap();
+
+        emit_laguna_agent_output(
+            output,
+            "Creating the file.",
+            &allowed_tools,
+            "Laguna",
+            &mut stream,
+        )
+        .unwrap();
+        drop(stream);
+
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            rendered
+                .matches("event: response.output_text.delta")
+                .count(),
+            1
+        );
+        let message_done = rendered
+            .find("\"type\":\"message\"")
+            .expect("expected completed text message");
+        let function_done = rendered
+            .find("\"type\":\"function_call\"")
+            .expect("expected completed function call");
+        assert!(message_done < function_done);
     }
 }

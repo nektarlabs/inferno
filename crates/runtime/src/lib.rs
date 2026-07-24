@@ -15,7 +15,8 @@ pub use cache_budget::{
     DEFAULT_TARGET_HEADROOM_BYTES,
 };
 pub use laguna::{
-    run_laguna_generate_streaming, LagunaGenerationOptions, LagunaGenerationReport, LagunaRuntime,
+    run_laguna_generate_streaming, GenerationControl, LagunaGenerationOptions,
+    LagunaGenerationReport, LagunaRuntime,
 };
 
 use std::{

@@ -10,11 +10,15 @@ use std::{
 };
 
 use common::{Error, Result};
-use tokenizers::Tokenizer as HfTokenizer;
+use tokenizers::{
+    DecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper, PostProcessorWrapper,
+    PreTokenizerWrapper, Tokenizer as HfTokenizer,
+};
 
 pub use agent::{
-    is_supported_codex_function, parse_agent_output, render_codex_prompt,
-    render_laguna_codex_prompt, AgentFunctionCall, AgentOutput, AgentOutputItem,
+    is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
+    render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentFunctionCall,
+    AgentOutput, AgentOutputItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +82,27 @@ pub struct ChatTurn {
 pub struct Tokenizer {
     tokenizer: HfTokenizer,
     source_path: PathBuf,
+}
+
+pub struct TokenDecoder<'a> {
+    stream: DecodeStream<
+        'a,
+        ModelWrapper,
+        NormalizerWrapper,
+        PreTokenizerWrapper,
+        PostProcessorWrapper,
+        DecoderWrapper,
+    >,
+}
+
+impl TokenDecoder<'_> {
+    pub fn push(&mut self, token_id: u32) -> Result<Option<String>> {
+        self.stream.step(token_id).map_err(|error| {
+            Error::tokenizer(format!(
+                "failed to decode streaming token {token_id}: {error}"
+            ))
+        })
+    }
 }
 
 impl Tokenizer {
@@ -147,6 +172,12 @@ impl Tokenizer {
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|error| Error::tokenizer(format!("failed to decode token ids: {error}")))
+    }
+
+    pub fn decoder(&self, skip_special_tokens: bool) -> TokenDecoder<'_> {
+        TokenDecoder {
+            stream: self.tokenizer.decode_stream(skip_special_tokens),
+        }
     }
 
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
@@ -353,6 +384,20 @@ mod tests {
 
         assert_eq!(encoded.token_ids, vec![0]);
         assert_eq!(tokenizer.decode(&encoded.token_ids, true).unwrap(), "<unk>");
+    }
+
+    #[test]
+    fn streaming_decoder_matches_complete_decode() {
+        let tokenizer_path = write_tiny_tokenizer();
+        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+        let token_ids = tokenizer.encode("Hello GLM", false).unwrap().token_ids;
+        let mut decoder = tokenizer.decoder(true);
+        let streamed = token_ids
+            .iter()
+            .filter_map(|token_id| decoder.push(*token_id).unwrap())
+            .collect::<String>();
+
+        assert_eq!(streamed, tokenizer.decode(&token_ids, true).unwrap());
     }
 
     #[test]

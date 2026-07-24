@@ -5,6 +5,13 @@ use common::{Error, Result};
 use model::{LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
 
 const LAGUNA_PREFILL_CHUNK_TOKENS: usize = 4_096;
+const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationControl {
+    Continue,
+    Stop,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LagunaGenerationOptions {
@@ -72,6 +79,34 @@ impl LagunaRuntime {
         B: Backend,
         F: FnMut(u32) -> Result<()>,
     {
+        self.generate_streaming_controlled(
+            model,
+            backend,
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            |token_id| {
+                on_token(token_id)?;
+                Ok(GenerationControl::Continue)
+            },
+        )
+    }
+
+    /// Generates tokens until EOS, the configured limit, or the callback
+    /// reports that a complete higher-level response is ready.
+    pub fn generate_streaming_controlled<B, F>(
+        &mut self,
+        model: &LagunaModel,
+        backend: &B,
+        prompt_token_ids: &[u32],
+        max_new_tokens: Option<usize>,
+        stop_token_ids: &[u32],
+        mut on_token: F,
+    ) -> Result<LagunaGenerationReport>
+    where
+        B: Backend,
+        F: FnMut(u32) -> Result<GenerationControl>,
+    {
         if prompt_token_ids.is_empty() {
             return Err(Error::runtime(
                 "Laguna generation requires at least one prompt token",
@@ -102,12 +137,11 @@ impl LagunaRuntime {
             });
         }
 
-        // The last emitted token is not fed back into the model, so the cache
-        // holds the prompt plus at most generated_limit - 1 decode inputs.
-        let required_context_capacity = prompt_token_ids
-            .len()
-            .checked_add(generated_limit.saturating_sub(1))
-            .ok_or_else(|| Error::runtime("Laguna generation context capacity overflow"))?;
+        let required_context_capacity = initial_context_capacity(
+            prompt_token_ids.len(),
+            generated_limit,
+            config.max_position_embeddings,
+        )?;
         self.prepare_session(model, backend, required_context_capacity)?;
         let session = self
             .session
@@ -124,23 +158,41 @@ impl LagunaRuntime {
         {
             model.prefill_chunk(session, chunk, backend)?;
         }
-        let mut input = &prompt_token_ids[final_prompt_chunk_start..];
         let mut decode_token = [0_u32; 1];
 
         while generated_tokens < generated_limit {
+            let input: &[u32] = if generated_tokens == 0 {
+                &prompt_token_ids[final_prompt_chunk_start..]
+            } else {
+                &decode_token
+            };
+            let required_end = session
+                .position()?
+                .checked_add(input.len())
+                .ok_or_else(|| Error::runtime("Laguna sequence capacity overflow"))?;
+            if required_end > session.context_capacity() {
+                let next_capacity = next_context_capacity(
+                    session.context_capacity(),
+                    required_end,
+                    config.max_position_embeddings,
+                )?;
+                model.grow_session_capacity(session, next_capacity, backend)?;
+            }
             let output = model.forward_next_token(session, input, backend)?;
             if time_to_first_token.is_none() {
                 time_to_first_token = Some(started_at.elapsed());
             }
-            on_token(output.token_id)?;
+            let control = on_token(output.token_id)?;
             generated_tokens = generated_tokens
                 .checked_add(1)
                 .ok_or_else(|| Error::runtime("Laguna generated-token count overflow"))?;
-            if stop_token_ids.contains(&output.token_id) || generated_tokens == generated_limit {
+            if control == GenerationControl::Stop
+                || stop_token_ids.contains(&output.token_id)
+                || generated_tokens == generated_limit
+            {
                 break;
             }
             decode_token[0] = output.token_id;
-            input = &decode_token;
         }
 
         let expert_cache = session.expert_cache_metrics();
@@ -183,6 +235,42 @@ impl LagunaRuntime {
     }
 }
 
+fn initial_context_capacity(
+    prompt_tokens: usize,
+    generated_limit: usize,
+    max_context_tokens: usize,
+) -> Result<usize> {
+    let reserved_outputs = generated_limit.min(LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS);
+    let capacity = prompt_tokens
+        .checked_add(reserved_outputs.saturating_sub(1))
+        .ok_or_else(|| Error::runtime("Laguna initial context capacity overflow"))?;
+    if capacity == 0 || capacity > max_context_tokens {
+        return Err(Error::runtime(format!(
+            "Laguna initial context capacity must be within 1..={max_context_tokens}, got {capacity}"
+        )));
+    }
+    Ok(capacity)
+}
+
+fn next_context_capacity(
+    current_capacity: usize,
+    required_capacity: usize,
+    max_context_tokens: usize,
+) -> Result<usize> {
+    if required_capacity <= current_capacity {
+        return Ok(current_capacity);
+    }
+    if required_capacity > max_context_tokens {
+        return Err(Error::runtime(format!(
+            "Laguna sequence requires {required_capacity} context tokens, maximum is {max_context_tokens}"
+        )));
+    }
+    Ok(current_capacity
+        .saturating_mul(2)
+        .max(required_capacity)
+        .min(max_context_tokens))
+}
+
 /// Runs batch-1 greedy generation with Laguna's native FP8 full/sliding KV
 /// caches and indexed on-demand INT4 expert cache.
 pub fn run_laguna_generate_streaming<B, F>(
@@ -220,7 +308,9 @@ fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        final_chunk_start, LagunaGenerationOptions, LagunaRuntime, LAGUNA_PREFILL_CHUNK_TOKENS,
+        final_chunk_start, initial_context_capacity, next_context_capacity,
+        LagunaGenerationOptions, LagunaRuntime, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
+        LAGUNA_PREFILL_CHUNK_TOKENS,
     };
 
     #[test]
@@ -258,5 +348,24 @@ mod tests {
                 .unwrap(),
             LAGUNA_PREFILL_CHUNK_TOKENS
         );
+    }
+
+    #[test]
+    fn unlimited_generation_reserves_a_small_initial_decode_window() {
+        let capacity =
+            initial_context_capacity(1_000, 200_000, 262_144).expect("valid context capacity");
+        assert_eq!(capacity, 1_000 + LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS - 1);
+
+        assert_eq!(initial_context_capacity(1_000, 8, 262_144).unwrap(), 1_007);
+    }
+
+    #[test]
+    fn context_growth_doubles_without_exceeding_the_model_limit() {
+        assert_eq!(next_context_capacity(1_511, 1_512, 262_144).unwrap(), 3_022);
+        assert_eq!(
+            next_context_capacity(200_000, 200_001, 262_144).unwrap(),
+            262_144
+        );
+        assert!(next_context_capacity(262_144, 262_145, 262_144).is_err());
     }
 }

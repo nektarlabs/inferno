@@ -125,6 +125,51 @@ pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
     })
 }
 
+/// Returns a parsed agent turn as soon as one complete function call exists.
+///
+/// An incomplete reasoning boundary or function-call closing tag means the
+/// model is still generating. Once the closing tag exists, malformed output is
+/// reported immediately instead of being mistaken for a usable tool call.
+pub fn parse_complete_agent_tool_call(output: &str) -> Result<Option<AgentOutput>> {
+    let Some((_, visible)) = output.split_once(THINK_END) else {
+        return Ok(None);
+    };
+    if !visible.contains(TOOL_CALL_CLOSE) {
+        return Ok(None);
+    }
+
+    let parsed = parse_agent_output(output)?;
+    if parsed
+        .items
+        .iter()
+        .any(|item| matches!(item, AgentOutputItem::FunctionCall(_)))
+    {
+        Ok(Some(parsed))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Returns the stable visible-text prefix that can be streamed before the
+/// first function call. A partial `<tool_call>` marker is withheld until the
+/// next token resolves whether it is text or protocol syntax.
+pub fn streamable_agent_text(output: &str) -> Option<&str> {
+    let (_, visible) = output.split_once(THINK_END)?;
+    let end = visible
+        .find(TOOL_CALL_OPEN)
+        .unwrap_or_else(|| stable_text_end(visible, TOOL_CALL_OPEN));
+    Some(visible[..end].trim_start())
+}
+
+fn stable_text_end(text: &str, marker: &str) -> usize {
+    for prefix_len in (1..marker.len()).rev() {
+        if text.ends_with(&marker[..prefix_len]) {
+            return text.len() - prefix_len;
+        }
+    }
+    text.len()
+}
+
 fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
     let normalized = normalize_tools(tools)?;
     if normalized.is_empty() {
@@ -635,6 +680,67 @@ mod tests {
             serde_json::from_str::<Value>(&call.arguments).unwrap(),
             json!({"cmd": "cargo test", "yield_time_ms": 30000})
         );
+    }
+
+    #[test]
+    fn detects_only_complete_valid_agent_tool_calls() {
+        assert_eq!(
+            parse_complete_agent_tool_call("still thinking").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_complete_agent_tool_call(
+                "done</think><tool_call>exec_command<arg_key>cmd</arg_key>"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_complete_agent_tool_call("done</think>Visible text only.").unwrap(),
+            None
+        );
+
+        let parsed = parse_complete_agent_tool_call(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap()
+        .expect("expected a complete function call");
+        assert!(matches!(
+            parsed.items.as_slice(),
+            [AgentOutputItem::FunctionCall(_)]
+        ));
+    }
+
+    #[test]
+    fn streams_visible_text_without_exposing_protocol_prefixes() {
+        assert_eq!(streamable_agent_text("still thinking"), None);
+        assert_eq!(
+            streamable_agent_text("done</think>Creating the file."),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text("done</think>\n\nCreating the file."),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text("done</think>Creating the file.<tool"),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text(
+                "done</think>Creating the file.<tool_call>exec_command<arg_key>cmd"
+            ),
+            Some("Creating the file.")
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_completed_agent_tool_call() {
+        let error = parse_complete_agent_tool_call(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key></tool_call>",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("<arg_value>"));
     }
 
     #[test]

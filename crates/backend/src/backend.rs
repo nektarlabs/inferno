@@ -1123,6 +1123,16 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    /// Grows one full-attention Laguna FP8 K/V cache on the device while
+    /// preserving every stored K/V row. Sliding caches never need growth.
+    fn grow_laguna_fp8_kv_cache(
+        &self,
+        _cache: &mut LagunaFp8KvCache,
+        _capacity_tokens: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Runs causal grouped-query attention directly against Laguna's FP8 KV
     /// cache and appends the current K/V rows before returning.
     ///
@@ -4496,6 +4506,27 @@ impl Backend for MetalBackend {
         {
             let _ = (batch, capacity_tokens, retention, key_scale, value_scale);
             Ok(None)
+        }
+    }
+
+    fn grow_laguna_fp8_kv_cache(
+        &self,
+        cache: &mut LagunaFp8KvCache,
+        capacity_tokens: usize,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            native_metal.grow_laguna_fp8_kv_cache(cache, capacity_tokens)?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, capacity_tokens);
+            Ok(false)
         }
     }
 

@@ -1683,6 +1683,17 @@ impl Metal {
         )
     }
 
+    pub(crate) fn grow_laguna_fp8_kv_cache(
+        &self,
+        cache: &mut LagunaFp8KvCache,
+        capacity_tokens: usize,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.fp8_attention
+                .grow_cache(&self.device, command_buffer, cache, capacity_tokens)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_laguna_gated_gqa_attention(
         &self,

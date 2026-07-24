@@ -68,6 +68,22 @@ impl LagunaAttentionCache {
     pub fn reset(&mut self) {
         self.inner.reset();
     }
+
+    pub(super) fn grow_full_capacity<B: Backend>(
+        &mut self,
+        capacity_tokens: usize,
+        backend: &B,
+    ) -> Result<()> {
+        if self.inner.retention() == LagunaKvRetention::Sliding
+            || capacity_tokens <= self.inner.capacity_tokens()
+        {
+            return Ok(());
+        }
+        if !backend.grow_laguna_fp8_kv_cache(&mut self.inner, capacity_tokens)? {
+            return Err(Error::backend("Laguna FP8 KV growth requires native Metal"));
+        }
+        Ok(())
+    }
 }
 
 /// Executes one complete Laguna attention stage without leaving the shared

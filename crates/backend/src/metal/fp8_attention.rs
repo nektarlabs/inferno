@@ -7,7 +7,7 @@ use crate::{LagunaFp8KvCache, LagunaKvRetention};
 use super::{
     arena::MetalArena,
     buffers::{empty_u8_buffer, require_byte_capacity, require_f32_capacity},
-    command::{encode_1d, encode_1d_threadgroups},
+    command::{encode_1d, encode_1d_threadgroups, encode_element_copy},
     library::MetalLibrary,
     pipeline::compute_pipeline,
 };
@@ -71,6 +71,68 @@ impl MetalFp8Attention {
             key: empty_u8_buffer(device, values)?,
             value: empty_u8_buffer(device, values)?,
         })
+    }
+
+    pub(crate) fn grow_cache(
+        &self,
+        device: &Device,
+        command_buffer: &CommandBufferRef,
+        cache: &mut LagunaFp8KvCache,
+        capacity_tokens: usize,
+    ) -> Result<()> {
+        if cache.retention != LagunaKvRetention::Full {
+            return Err(Error::cache(
+                "Laguna sliding FP8 KV caches have fixed capacity and cannot grow",
+            ));
+        }
+        if capacity_tokens <= cache.capacity_tokens {
+            return Err(Error::cache(format!(
+                "Laguna FP8 KV growth requires capacity above {}, got {capacity_tokens}",
+                cache.capacity_tokens
+            )));
+        }
+
+        let mut grown = self.prepare_cache(
+            device,
+            cache.batch,
+            capacity_tokens,
+            cache.retention,
+            cache.key_scale,
+            cache.value_scale,
+        )?;
+        let stored_values = cache_value_count(cache.batch, cache.stored_tokens)?;
+        if stored_values > 0 {
+            encode_element_copy(
+                command_buffer,
+                &cache.key,
+                0,
+                &grown.key,
+                0,
+                stored_values,
+                std::mem::size_of::<u8>(),
+            )?;
+            encode_element_copy(
+                command_buffer,
+                &cache.value,
+                0,
+                &grown.value,
+                0,
+                stored_values,
+                std::mem::size_of::<u8>(),
+            )?;
+        }
+        grown.stored_tokens = cache.stored_tokens;
+        grown.total_tokens = cache.total_tokens;
+
+        trace!(
+            target: "inferno::metal",
+            previous_capacity = cache.capacity_tokens,
+            capacity_tokens,
+            stored_tokens = cache.stored_tokens,
+            "growing Laguna full-attention FP8 KV cache"
+        );
+        *cache = grown;
+        Ok(())
     }
 
     /// Encodes attention first and cache append second into the same command
@@ -463,6 +525,11 @@ mod tests {
         assert_eq!(cache.total_tokens(), 2);
         assert_eq!(cache.stored_tokens(), 2);
 
+        backend.grow_laguna_fp8_kv_cache(&mut cache, 8).unwrap();
+        assert_eq!(cache.capacity_tokens(), 8);
+        assert_eq!(cache.total_tokens(), 2);
+        assert_eq!(cache.stored_tokens(), 2);
+
         // Zero queries make all three decode keys equally likely. The two
         // historical values must come from the byte-sized FP8 cache, while
         // the current value is consumed directly as F32. E4M3FN rounds 1.1
@@ -486,7 +553,7 @@ mod tests {
         }
         assert_eq!(cache.total_tokens(), 3);
         assert_eq!(cache.stored_tokens(), 3);
-        assert_eq!(cache.storage_bytes().unwrap(), 2 * 4 * KV_HEADS * HEAD_DIM);
+        assert_eq!(cache.storage_bytes().unwrap(), 2 * 8 * KV_HEADS * HEAD_DIM);
 
         cache.reset();
         assert_eq!(cache.total_tokens(), 0);
