@@ -1,6 +1,187 @@
 constant uint Q3_K_BLOCK_BYTES = 110u;
 constant uint LAGUNA_SIMDGROUPS_PER_THREADGROUP = 2u;
-constant uint LAGUNA_Q3_ROWS_PER_SIMDGROUP = 2u;
+constant uint LAGUNA_Q3_ROWS_PER_SIMDGROUP = 4u;
+constant uint LAGUNA_Q2_ROWS_PER_SIMDGROUP = 4u;
+
+// Decodes one 256-value Q2_K block of one row against a lane's activation
+// window.
+//
+// The four 2-bit fields of a quant byte are left in place rather than shifted
+// down one at a time: each field keeps its 1x/4x/16x/64x magnitude and the
+// shift is folded into the group scale at the end. `value_sums` carries the
+// plain activation sums that the block minimum needs, so the minimum costs one
+// multiply per group instead of one per value.
+//
+// Every offset here is even (blocks are 84 bytes and GGUF aligns tensor data
+// to at least 8), so the quant pair and the two f16 block constants can be
+// read with 2-byte-aligned vector loads instead of byte at a time.
+static inline float laguna_q2_k_block_dot(
+    const device uchar* weights,
+    uint block_offset,
+    uint lane_scale_offset,
+    uint lane_quant_offset,
+    thread const float* values,
+    float4 value_sums
+) {
+    ushort4 packed = ushort4(*reinterpret_cast<const device packed_ushort4*>(
+        weights + block_offset + lane_quant_offset));
+    float4 low = float4(0.0f);
+    float4 high = float4(0.0f);
+    for (uint pair = 0u; pair < 4u; pair++) {
+        uint index = pair * 2u;
+        ushort bits = packed[pair];
+        low[0] += values[index] * float(bits & 0x0003);
+        high[0] += values[index + 1] * float(bits & 0x0300);
+        low[1] += values[index + 8] * float(bits & 0x000c);
+        high[1] += values[index + 9] * float(bits & 0x0c00);
+        low[2] += values[index + 16] * float(bits & 0x0030);
+        high[2] += values[index + 17] * float(bits & 0x3000);
+        low[3] += values[index + 24] * float(bits & 0x00c0);
+        high[3] += values[index + 25] * float(bits & 0xc000);
+    }
+
+    // The scale nibbles this lane needs sit at +0, +2, +4 and +6, so two
+    // 4-byte reads cover them.
+    const device packed_uchar4* scale_bytes =
+        reinterpret_cast<const device packed_uchar4*>(
+            weights + block_offset + lane_scale_offset);
+    uchar4 first = uchar4(scale_bytes[0]);
+    uchar4 second = uchar4(scale_bytes[1]);
+    uchar4 scales = uchar4(first[0], first[2], second[0], second[2]);
+
+    half2 constants = half2(*reinterpret_cast<const device packed_half2*>(
+        weights + block_offset + Q2_K_SCALE_BYTES + Q2_K_QUANT_BYTES));
+    float d = float(constants[0]);
+    float dmin = float(constants[1]) / 16.0f;
+    float4 scaled = low + (high / 256.0f);
+
+    return d * (
+        scaled[0] * float(scales[0] & 0x0f)
+        + scaled[1] * float(scales[1] & 0x0f) * (1.0f / 4.0f)
+        + scaled[2] * float(scales[2] & 0x0f) * (1.0f / 16.0f)
+        + scaled[3] * float(scales[3] & 0x0f) * (1.0f / 64.0f)
+    ) - dmin * (
+        value_sums[0] * float(scales[0] & 0xf0)
+        + value_sums[1] * float(scales[1] & 0xf0)
+        + value_sums[2] * float(scales[2] & 0xf0)
+        + value_sums[3] * float(scales[3] & 0xf0)
+    );
+}
+
+// Splits a simdgroup eight ways across a Q2_K block and four ways across the
+// blocks of a row, which is the partition `laguna_q2_k_block_dot` expects.
+struct LagunaQ2LanePartition {
+    ushort block_lane;
+    uint scale_offset;
+    uint quant_offset;
+    uint input_offset;
+};
+
+static inline LagunaQ2LanePartition laguna_q2_k_lane_partition(ushort simd_lane) {
+    ushort lane_in_block = simd_lane % 8u;
+    ushort quant_half = lane_in_block / 4u;
+    ushort quant_quarter = lane_in_block % 4u;
+    return LagunaQ2LanePartition{
+        ushort(simd_lane / 8u),
+        8u * uint(quant_half) + uint(quant_quarter / 2u),
+        Q2_K_SCALE_BYTES + 32u * uint(quant_half) + 8u * uint(quant_quarter),
+        128u * uint(quant_half) + 8u * uint(quant_quarter),
+    };
+}
+
+// Four consecutive Q2_K rows of two matrices against one activation window.
+//
+// Laguna's routed gate and up projections address the same expert rows, so a
+// single activation load drives eight dot products instead of the one the
+// untiled kernel managed.
+static inline void laguna_q2_k_dot4x2(
+    const device uchar* rows_a,
+    const device uchar* rows_b,
+    uint row_bytes,
+    uint valid_rows,
+    uint blocks_per_row,
+    const device float* input,
+    ushort simd_lane,
+    thread float4& sums_a,
+    thread float4& sums_b
+) {
+    sums_a = float4(0.0f);
+    sums_b = float4(0.0f);
+    LagunaQ2LanePartition lane = laguna_q2_k_lane_partition(simd_lane);
+
+    for (uint block = lane.block_lane; block < blocks_per_row; block += 4u) {
+        const device float* block_input =
+            input + block * Q2_K_BLOCK_VALUES + lane.input_offset;
+        float values[32];
+        float4 value_sums = float4(0.0f);
+        for (uint index = 0u; index < 8u; index++) {
+            values[index] = block_input[index];
+            values[index + 8] = block_input[index + 32];
+            values[index + 16] = block_input[index + 64];
+            values[index + 24] = block_input[index + 96];
+            value_sums[0] += values[index];
+            value_sums[1] += values[index + 8];
+            value_sums[2] += values[index + 16];
+            value_sums[3] += values[index + 24];
+        }
+
+        uint block_offset = block * Q2_K_BLOCK_BYTES;
+        for (uint row = 0u; row < LAGUNA_Q2_ROWS_PER_SIMDGROUP; row++) {
+            if (row >= valid_rows) {
+                break;
+            }
+            uint row_offset = block_offset + row * row_bytes;
+            sums_a[row] += laguna_q2_k_block_dot(
+                rows_a, row_offset, lane.scale_offset, lane.quant_offset,
+                values, value_sums);
+            sums_b[row] += laguna_q2_k_block_dot(
+                rows_b, row_offset, lane.scale_offset, lane.quant_offset,
+                values, value_sums);
+        }
+    }
+}
+
+// Four consecutive Q2_K rows of a single matrix. The routed down projection
+// has no second matrix to pair with.
+static inline float4 laguna_q2_k_dot4(
+    const device uchar* rows,
+    uint row_bytes,
+    uint valid_rows,
+    uint blocks_per_row,
+    const device float* input,
+    ushort simd_lane
+) {
+    float4 sums = float4(0.0f);
+    LagunaQ2LanePartition lane = laguna_q2_k_lane_partition(simd_lane);
+
+    for (uint block = lane.block_lane; block < blocks_per_row; block += 4u) {
+        const device float* block_input =
+            input + block * Q2_K_BLOCK_VALUES + lane.input_offset;
+        float values[32];
+        float4 value_sums = float4(0.0f);
+        for (uint index = 0u; index < 8u; index++) {
+            values[index] = block_input[index];
+            values[index + 8] = block_input[index + 32];
+            values[index + 16] = block_input[index + 64];
+            values[index + 24] = block_input[index + 96];
+            value_sums[0] += values[index];
+            value_sums[1] += values[index + 8];
+            value_sums[2] += values[index + 16];
+            value_sums[3] += values[index + 24];
+        }
+
+        uint block_offset = block * Q2_K_BLOCK_BYTES;
+        for (uint row = 0u; row < LAGUNA_Q2_ROWS_PER_SIMDGROUP; row++) {
+            if (row >= valid_rows) {
+                break;
+            }
+            sums[row] += laguna_q2_k_block_dot(
+                rows, block_offset + row * row_bytes,
+                lane.scale_offset, lane.quant_offset, values, value_sums);
+        }
+    }
+    return sums;
+}
 
 struct LagunaQ3KBlock {
     uchar high_mask[32];
@@ -11,9 +192,10 @@ struct LagunaQ3KBlock {
 
 // Two adjacent Q3_K rows reuse each activation load. This layout-specific
 // implementation follows the GGML block organization used by Laguna.
-static inline float2 laguna_q3_k_dot2(
+static inline float4 laguna_q3_k_dot2(
     const device uchar* rows,
     uint row_bytes,
+    uint valid_rows,
     uint in_features,
     const device float* input,
     ushort simd_lane
@@ -47,8 +229,8 @@ static inline float2 laguna_q3_k_dot2(
 
     const device float* input_part_values =
         input + block_lane * Q2_K_BLOCK_VALUES + input_offset;
-    float2 sum_1 = float2(0.0f);
-    float2 sum_2 = float2(0.0f);
+    float4 sum_1 = float4(0.0f);
+    float4 sum_2 = float4(0.0f);
 
     for (int block = block_lane; block < block_count; block += 4) {
         float values[32];
@@ -60,15 +242,28 @@ static inline float2 laguna_q3_k_dot2(
         }
 
         for (short row = 0; row < short(LAGUNA_Q3_ROWS_PER_SIMDGROUP); row++) {
+            if (uint(row) >= valid_rows) {
+                break;
+            }
             const device LagunaQ3KBlock* row_blocks =
                 reinterpret_cast<const device LagunaQ3KBlock*>(
                     rows + uint(row) * row_bytes);
-            const device ushort* quants =
-                reinterpret_cast<const device ushort*>(
-                    row_blocks[block].quants + quant_offset);
-            const device ushort* high =
-                reinterpret_cast<const device ushort*>(
-                    row_blocks[block].high_mask + lane_offset);
+            // Each of these spans is eight contiguous bytes that the loop below
+            // walks two bytes at a time. Block starts are only 2-byte aligned,
+            // so `packed_ushort4` is the widest legal load; it replaces four
+            // scalar loads per span.
+            ushort4 quants = ushort4(
+                *reinterpret_cast<const device packed_ushort4*>(
+                    row_blocks[block].quants + quant_offset));
+            ushort4 quants_upper = ushort4(
+                *reinterpret_cast<const device packed_ushort4*>(
+                    row_blocks[block].quants + quant_offset + 16));
+            ushort4 high = ushort4(
+                *reinterpret_cast<const device packed_ushort4*>(
+                    row_blocks[block].high_mask + lane_offset));
+            ushort4 high_upper = ushort4(
+                *reinterpret_cast<const device packed_ushort4*>(
+                    row_blocks[block].high_mask + lane_offset + 16));
             const device ushort* packed_scales =
                 reinterpret_cast<const device ushort*>(
                     row_blocks[block].scales);
@@ -94,14 +289,15 @@ static inline float2 laguna_q3_k_dot2(
             float s6 = 0.0f;
             for (short index = 0; index < 8; index += 2) {
                 int quant = quants[index / 2];
+                ushort high_bits = high[index / 2];
                 s1 += values[index + 0] * float(quant & low_masks[quant_part / 2][0]);
                 s2 += values[index + 1] * float(quant & low_masks[quant_part / 2][1]);
-                s3 += ((high[index / 2] & high_mask[0]) ? 0.0f : values[index + 0])
-                    + ((high[index / 2] & high_mask[1]) ? 0.0f : values[index + 1]);
+                s3 += ((high_bits & high_mask[0]) ? 0.0f : values[index + 0])
+                    + ((high_bits & high_mask[1]) ? 0.0f : values[index + 1]);
                 s4 += values[index + 16] * float(quant & low_masks[quant_part / 2][2]);
                 s5 += values[index + 17] * float(quant & low_masks[quant_part / 2][3]);
-                s6 += ((high[index / 2] & high_mask[2]) ? 0.0f : values[index + 16])
-                    + ((high[index / 2] & high_mask[3]) ? 0.0f : values[index + 17]);
+                s6 += ((high_bits & high_mask[2]) ? 0.0f : values[index + 16])
+                    + ((high_bits & high_mask[3]) ? 0.0f : values[index + 17]);
             }
 
             float d = float(row_blocks[block].d);
@@ -117,15 +313,16 @@ static inline float2 laguna_q3_k_dot2(
             s5 = 0.0f;
             s6 = 0.0f;
             for (short index = 0; index < 8; index += 2) {
-                int quant = quants[index / 2 + 8];
+                int quant = quants_upper[index / 2];
+                ushort high_bits = high_upper[index / 2];
                 s1 += values[index + 8] * float(quant & low_masks[quant_part / 2][0]);
                 s2 += values[index + 9] * float(quant & low_masks[quant_part / 2][1]);
-                s3 += ((high[index / 2 + 8] & high_mask[0]) ? 0.0f : values[index + 8])
-                    + ((high[index / 2 + 8] & high_mask[1]) ? 0.0f : values[index + 9]);
+                s3 += ((high_bits & high_mask[0]) ? 0.0f : values[index + 8])
+                    + ((high_bits & high_mask[1]) ? 0.0f : values[index + 9]);
                 s4 += values[index + 24] * float(quant & low_masks[quant_part / 2][2]);
                 s5 += values[index + 25] * float(quant & low_masks[quant_part / 2][3]);
-                s6 += ((high[index / 2 + 8] & high_mask[2]) ? 0.0f : values[index + 24])
-                    + ((high[index / 2 + 8] & high_mask[3]) ? 0.0f : values[index + 25]);
+                s6 += ((high_bits & high_mask[2]) ? 0.0f : values[index + 24])
+                    + ((high_bits & high_mask[3]) ? 0.0f : values[index + 25]);
             }
 
             float e1 = d * (s1 + (1.0f / 256.0f) * s2 - s3 * high_base_1);
@@ -153,33 +350,52 @@ kernel void laguna_q2_expert_gate_up_f32_kernel(
     constant uint& intermediate_features [[buffer(9)]],
     constant uint& blocks_per_row [[buffer(10)]],
     constant uint& expert_stride_bytes [[buffer(11)]],
-    uint gid [[thread_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]]
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
 ) {
-    uint output_index = gid / 32u;
-    if (output_index >= assignment_count * intermediate_features) {
+    uint simdgroup = threadgroup_position.x
+        * LAGUNA_SIMDGROUPS_PER_THREADGROUP
+        + uint(simdgroup_index);
+    uint row_groups_per_assignment =
+        (intermediate_features + LAGUNA_Q2_ROWS_PER_SIMDGROUP - 1u)
+        / LAGUNA_Q2_ROWS_PER_SIMDGROUP;
+    uint assignment = simdgroup / row_groups_per_assignment;
+    if (assignment >= assignment_count) {
         return;
     }
-    uint assignment = output_index / intermediate_features;
-    uint row = output_index - assignment * intermediate_features;
-    uint input_offset = token_indices[assignment] * in_features;
-    uint expert_offset = expert_ids[assignment] * expert_stride_bytes;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint block = 0u; block < blocks_per_row; block++) {
-        uint weight_offset = expert_offset
-            + (row * blocks_per_row + block) * Q2_K_BLOCK_BYTES;
-        uint input_block = input_offset + block * Q2_K_BLOCK_VALUES;
-        gate += q2_k_block_dot_partial(
-            gate_weights, input, input_block, weight_offset, simd_lane);
-        up += q2_k_block_dot_partial(
-            up_weights, input, input_block, weight_offset, simd_lane);
-    }
-    gate = simd_sum(gate);
-    up = simd_sum(up);
-    if (simd_lane == 0u) {
-        float silu = gate / (1.0f + exp(-gate));
-        intermediate[output_index] = silu * up * expert_weights[assignment];
+    uint row_group = simdgroup - assignment * row_groups_per_assignment;
+    uint row = row_group * LAGUNA_Q2_ROWS_PER_SIMDGROUP;
+    uint row_bytes = blocks_per_row * Q2_K_BLOCK_BYTES;
+    uint expert_offset = expert_ids[assignment] * expert_stride_bytes
+        + row * row_bytes;
+    const device float* token_input =
+        input + token_indices[assignment] * in_features;
+    uint valid_rows = min(
+        LAGUNA_Q2_ROWS_PER_SIMDGROUP, intermediate_features - row);
+
+    float4 gate;
+    float4 up;
+    laguna_q2_k_dot4x2(
+        gate_weights + expert_offset,
+        up_weights + expert_offset,
+        row_bytes,
+        valid_rows,
+        blocks_per_row,
+        token_input,
+        simd_lane,
+        gate,
+        up);
+
+    float routing_weight = expert_weights[assignment];
+    for (uint local_row = 0u; local_row < valid_rows; local_row++) {
+        float gate_sum = simd_sum(gate[local_row]);
+        float up_sum = simd_sum(up[local_row]);
+        if (simd_lane == 0u) {
+            float silu = gate_sum / (1.0f + exp(-gate_sum));
+            intermediate[assignment * intermediate_features + row + local_row] =
+                silu * up_sum * routing_weight;
+        }
     }
 }
 
@@ -217,29 +433,23 @@ kernel void laguna_q3_expert_gate_up_f32_kernel(
         + row * row_bytes;
     const device float* token_input =
         input + token_indices[assignment] * in_features;
-    float2 gate = laguna_q3_k_dot2(
-        gate_weights + expert_offset,
-        row_bytes,
-        in_features,
-        token_input,
-        simd_lane);
-    float2 up = laguna_q3_k_dot2(
-        up_weights + expert_offset,
-        row_bytes,
-        in_features,
-        token_input,
-        simd_lane);
+    uint valid_rows = min(
+        LAGUNA_Q3_ROWS_PER_SIMDGROUP, intermediate_features - row);
+    float4 gate = laguna_q3_k_dot2(
+        gate_weights + expert_offset, row_bytes, valid_rows, in_features,
+        token_input, simd_lane);
+    float4 up = laguna_q3_k_dot2(
+        up_weights + expert_offset, row_bytes, valid_rows, in_features,
+        token_input, simd_lane);
 
-    for (uint local_row = 0u;
-         local_row < LAGUNA_Q3_ROWS_PER_SIMDGROUP
-             && row + local_row < intermediate_features;
-         local_row++) {
+    float routing_weight = expert_weights[assignment];
+    for (uint local_row = 0u; local_row < valid_rows; local_row++) {
         float gate_sum = simd_sum(gate[local_row]);
         float up_sum = simd_sum(up[local_row]);
         if (simd_lane == 0u) {
             float silu = gate_sum / (1.0f + exp(-gate_sum));
             intermediate[assignment * intermediate_features + row + local_row] =
-                silu * up_sum * expert_weights[assignment];
+                silu * up_sum * routing_weight;
         }
     }
 }
@@ -255,36 +465,47 @@ kernel void laguna_q2_expert_down_sum_f32_kernel(
     constant uint& out_features [[buffer(7)]],
     constant uint& blocks_per_row [[buffer(8)]],
     constant uint& expert_stride_bytes [[buffer(9)]],
-    uint gid [[thread_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]]
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
 ) {
-    uint output_index = gid / 32u;
-    if (output_index >= token_count * out_features) {
+    uint simdgroup = threadgroup_position.x
+        * LAGUNA_SIMDGROUPS_PER_THREADGROUP
+        + uint(simdgroup_index);
+    uint row_groups_per_token =
+        (out_features + LAGUNA_Q2_ROWS_PER_SIMDGROUP - 1u)
+        / LAGUNA_Q2_ROWS_PER_SIMDGROUP;
+    uint token = simdgroup / row_groups_per_token;
+    if (token >= token_count) {
         return;
     }
-    uint token = output_index / out_features;
-    uint row = output_index - token * out_features;
-    float total = 0.0f;
+    uint row_group = simdgroup - token * row_groups_per_token;
+    uint row = row_group * LAGUNA_Q2_ROWS_PER_SIMDGROUP;
+    uint row_bytes = blocks_per_row * Q2_K_BLOCK_BYTES;
+    uint valid_rows = min(LAGUNA_Q2_ROWS_PER_SIMDGROUP, out_features - row);
+
+    // Every selected expert contributes to the same output rows with the same
+    // lane partition, so the partial sums add up before the reduction and one
+    // simdgroup reduction covers all of top-k.
+    float4 total = float4(0.0f);
     for (uint slot = 0u; slot < top_k; slot++) {
         uint assignment = token * top_k + slot;
-        uint expert_offset = expert_ids[assignment] * expert_stride_bytes;
-        uint input_offset = assignment * intermediate_features;
-        float partial = 0.0f;
-        for (uint block = 0u; block < blocks_per_row; block++) {
-            uint weight_offset = expert_offset
-                + (row * blocks_per_row + block) * Q2_K_BLOCK_BYTES;
-            partial += q2_k_block_dot_partial(
-                down_weights,
-                intermediate,
-                input_offset + block * Q2_K_BLOCK_VALUES,
-                weight_offset,
-                simd_lane
-            );
-        }
-        total += simd_sum(partial);
+        uint expert_offset = expert_ids[assignment] * expert_stride_bytes
+            + row * row_bytes;
+        total += laguna_q2_k_dot4(
+            down_weights + expert_offset,
+            row_bytes,
+            valid_rows,
+            blocks_per_row,
+            intermediate + assignment * intermediate_features,
+            simd_lane);
     }
-    if (simd_lane == 0u) {
-        output[output_index] = total;
+
+    for (uint local_row = 0u; local_row < valid_rows; local_row++) {
+        float value = simd_sum(total[local_row]);
+        if (simd_lane == 0u) {
+            output[token * out_features + row + local_row] = value;
+        }
     }
 }
 
@@ -316,7 +537,8 @@ kernel void laguna_q3_expert_down_sum_f32_kernel(
     uint row_group = simdgroup - token * row_groups_per_token;
     uint row = row_group * LAGUNA_Q3_ROWS_PER_SIMDGROUP;
     uint row_bytes = blocks_per_row * Q3_K_BLOCK_BYTES;
-    float2 total = float2(0.0f);
+    uint valid_rows = min(LAGUNA_Q3_ROWS_PER_SIMDGROUP, out_features - row);
+    float4 total = float4(0.0f);
     for (uint slot = 0u; slot < top_k; slot++) {
         uint assignment = token * top_k + slot;
         uint expert_offset = expert_ids[assignment] * expert_stride_bytes
@@ -324,15 +546,13 @@ kernel void laguna_q3_expert_down_sum_f32_kernel(
         total += laguna_q3_k_dot2(
             down_weights + expert_offset,
             row_bytes,
+            valid_rows,
             intermediate_features,
             intermediate + assignment * intermediate_features,
             simd_lane);
     }
 
-    for (uint local_row = 0u;
-         local_row < LAGUNA_Q3_ROWS_PER_SIMDGROUP
-             && row + local_row < out_features;
-         local_row++) {
+    for (uint local_row = 0u; local_row < valid_rows; local_row++) {
         float value = simd_sum(total[local_row]);
         if (simd_lane == 0u) {
             output[token * out_features + row + local_row] = value;

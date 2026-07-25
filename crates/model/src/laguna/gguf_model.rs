@@ -12,7 +12,14 @@ use super::{
     LagunaTokenOutput,
 };
 
-const LAYER_SUBMISSION_CHUNK: usize = 2;
+/// Layers per command-buffer submission.
+///
+/// Submitting each layer as it is encoded lets the GPU start on it while the CPU
+/// encodes the next one. Measured on an M4 Max at decode, throughput falls off
+/// monotonically as this grows — 24 layers per submission costs about 16% — so
+/// the extra submissions pay for themselves. Submitting more often than once per
+/// layer measured flat.
+const LAYER_SUBMISSION_CHUNK: usize = 1;
 
 #[derive(Debug)]
 pub struct LagunaGgufModel {
@@ -792,6 +799,11 @@ mod tests {
             .filter(|layer_index| should_submit_after_layer(*layer_index, 48))
             .collect::<Vec<_>>();
 
-        assert_eq!(submission_layers, (1..47).step_by(2).collect::<Vec<_>>());
+        // The final layer is left for the caller to submit alongside the output
+        // head, so it must not appear here.
+        assert_eq!(
+            submission_layers,
+            (0..47).step_by(super::LAYER_SUBMISSION_CHUNK).collect::<Vec<_>>()
+        );
     }
 }

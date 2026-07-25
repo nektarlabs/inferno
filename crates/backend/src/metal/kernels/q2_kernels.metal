@@ -102,6 +102,59 @@ static inline float q8_0_block_value(const device uchar* weights, uint block_off
     return d * float(quant);
 }
 
+// A Q8_0 block is an f16 scale followed by 32 signed quants, so block starts
+// sit on 34-byte boundaries. That keeps the scale 2-byte aligned and readable
+// as a `half`, which costs one load instead of two byte loads plus a shift.
+static inline float q8_0_block_scale(const device uchar* weights, uint block_offset) {
+    return float(*reinterpret_cast<const device half*>(weights + block_offset));
+}
+
+// The quant payload starts at an odd offset inside the block, so its alignment
+// alternates between 2 and 4 bytes from block to block. `packed_char4` is
+// 1-byte aligned, which makes it the widest vector load that is always legal
+// here, and it turns Laguna's eight-quant lane stride into two loads instead
+// of eight.
+static inline float q8_0_lane_dot8(
+    const device uchar* weights,
+    uint quant_offset,
+    thread const float* values
+) {
+    const device packed_char4* quants =
+        reinterpret_cast<const device packed_char4*>(weights + quant_offset);
+    char4 low = char4(quants[0]);
+    char4 high = char4(quants[1]);
+    return values[0] * float(low.x)
+        + values[1] * float(low.y)
+        + values[2] * float(low.z)
+        + values[3] * float(low.w)
+        + values[4] * float(high.x)
+        + values[5] * float(high.y)
+        + values[6] * float(high.z)
+        + values[7] * float(high.w);
+}
+
+// Laguna reads eight consecutive activations per lane per block, and every
+// such offset is a multiple of eight floats, so the 16-byte alignment `float4`
+// needs always holds.
+static inline void q8_0_lane_load8(
+    const device float* input,
+    uint value_offset,
+    thread float* values
+) {
+    const device float4* packed =
+        reinterpret_cast<const device float4*>(input + value_offset);
+    float4 low = packed[0];
+    float4 high = packed[1];
+    values[0] = low.x;
+    values[1] = low.y;
+    values[2] = low.z;
+    values[3] = low.w;
+    values[4] = high.x;
+    values[5] = high.y;
+    values[6] = high.z;
+    values[7] = high.w;
+}
+
 kernel void q8_0_embedding_f32_kernel(
     const device uchar* weights [[buffer(0)]],
     const device uint* token_ids [[buffer(1)]],
@@ -1346,9 +1399,9 @@ kernel void laguna_q8_0_matvec_output4_f32_kernel(
             + block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_OUTPUT_FEATURE_TILE; row++) {
             uint feature = output_row + row;
@@ -1357,18 +1410,9 @@ kernel void laguna_q8_0_matvec_output4_f32_kernel(
             }
             uint block_offset =
                 (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-            float dot = 0.0f;
-            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                uchar raw = weights[
-                    block_offset + 2u
-                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                    + index
-                ];
-                int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                dot += values[index] * float(quant);
-            }
-            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
-            sums[row] += dot * scale;
+            sums[row] +=
+                q8_0_lane_dot8(weights, block_offset + lane_quant_offset, values)
+                * q8_0_block_scale(weights, block_offset);
         }
     }
 
@@ -1434,9 +1478,9 @@ kernel void laguna_q8_0_matvec_argmax_candidates_f32_kernel(
             block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_LAGUNA_ARGMAX_ROWS; row++) {
             uint feature = output_row + row;
@@ -1445,18 +1489,9 @@ kernel void laguna_q8_0_matvec_argmax_candidates_f32_kernel(
             }
             uint block_offset =
                 (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-            float dot = 0.0f;
-            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                uchar raw = weights[
-                    block_offset + 2u
-                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                    + index
-                ];
-                int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                dot += values[index] * float(quant);
-            }
-            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
-            sums[row] += dot * scale;
+            sums[row] +=
+                q8_0_lane_dot8(weights, block_offset + lane_quant_offset, values)
+                * q8_0_block_scale(weights, block_offset);
         }
     }
 
@@ -1620,43 +1655,24 @@ kernel void laguna_q8_0_matvec_pair_rows2_f32_kernel(
             + block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
             uint feature = output_row + row;
+            uint block_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            uint quant_offset = block_offset + lane_quant_offset;
             if (feature < out_features_a) {
-                uint block_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = weights_a[
-                        block_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                float scale = f16_bits_to_f32(read_le_u16(weights_a, block_offset));
-                sums_a[row] += dot * scale;
+                sums_a[row] +=
+                    q8_0_lane_dot8(weights_a, quant_offset, values)
+                    * q8_0_block_scale(weights_a, block_offset);
             }
             if (feature < out_features_b) {
-                uint block_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = weights_b[
-                        block_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                float scale = f16_bits_to_f32(read_le_u16(weights_b, block_offset));
-                sums_b[row] += dot * scale;
+                sums_b[row] +=
+                    q8_0_lane_dot8(weights_b, quant_offset, values)
+                    * q8_0_block_scale(weights_b, block_offset);
             }
         }
     }
@@ -1759,75 +1775,34 @@ kernel void laguna_q8_0_attention_projections_rows2_f32_kernel(
             + block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
             uint feature = output_row + row;
+            uint weight_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            uint quant_offset = weight_offset + lane_quant_offset;
             if (feature < query_features) {
-                uint weight_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = query_weights[
-                        weight_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                query_sums[row] += dot
-                    * f16_bits_to_f32(read_le_u16(query_weights, weight_offset));
+                query_sums[row] +=
+                    q8_0_lane_dot8(query_weights, quant_offset, values)
+                    * q8_0_block_scale(query_weights, weight_offset);
             }
             if (feature < key_features) {
-                uint weight_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = key_weights[
-                        weight_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                key_sums[row] += dot
-                    * f16_bits_to_f32(read_le_u16(key_weights, weight_offset));
+                key_sums[row] +=
+                    q8_0_lane_dot8(key_weights, quant_offset, values)
+                    * q8_0_block_scale(key_weights, weight_offset);
             }
             if (feature < value_features) {
-                uint weight_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = value_weights[
-                        weight_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                value_sums[row] += dot
-                    * f16_bits_to_f32(read_le_u16(value_weights, weight_offset));
+                value_sums[row] +=
+                    q8_0_lane_dot8(value_weights, quant_offset, values)
+                    * q8_0_block_scale(value_weights, weight_offset);
             }
             if (feature < gate_features) {
-                uint weight_offset =
-                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-                float dot = 0.0f;
-                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                    uchar raw = gate_weights[
-                        weight_offset + 2u
-                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                        + index
-                    ];
-                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                    dot += values[index] * float(quant);
-                }
-                gate_sums[row] += dot
-                    * f16_bits_to_f32(read_le_u16(gate_weights, weight_offset));
+                gate_sums[row] +=
+                    q8_0_lane_dot8(gate_weights, quant_offset, values)
+                    * q8_0_block_scale(gate_weights, weight_offset);
             }
         }
     }
@@ -1844,18 +1819,38 @@ kernel void laguna_q8_0_attention_projections_rows2_f32_kernel(
     threadgroup float gate_partials[
         Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
     ];
+    // Laguna's key, value and gate projections are far narrower than the query
+    // projection, so most threadgroups own query rows only. Reducing the three
+    // idle projections there would cost three simdgroup reductions per row to
+    // produce values nothing reads. `output_row` is threadgroup-uniform, so
+    // these guards never diverge within a simdgroup.
     for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        uint feature = output_row + row;
         uint partial_index =
             row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index);
-        float query_partial = simd_sum(query_sums[row]);
-        float key_partial = simd_sum(key_sums[row]);
-        float value_partial = simd_sum(value_sums[row]);
-        float gate_partial = simd_sum(gate_sums[row]);
-        if (simd_lane == 0u) {
-            query_partials[partial_index] = query_partial;
-            key_partials[partial_index] = key_partial;
-            value_partials[partial_index] = value_partial;
-            gate_partials[partial_index] = gate_partial;
+        if (feature < query_features) {
+            float partial = simd_sum(query_sums[row]);
+            if (simd_lane == 0u) {
+                query_partials[partial_index] = partial;
+            }
+        }
+        if (feature < key_features) {
+            float partial = simd_sum(key_sums[row]);
+            if (simd_lane == 0u) {
+                key_partials[partial_index] = partial;
+            }
+        }
+        if (feature < value_features) {
+            float partial = simd_sum(value_sums[row]);
+            if (simd_lane == 0u) {
+                value_partials[partial_index] = partial;
+            }
+        }
+        if (feature < gate_features) {
+            float partial = simd_sum(gate_sums[row]);
+            if (simd_lane == 0u) {
+                gate_partials[partial_index] = partial;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1864,37 +1859,33 @@ kernel void laguna_q8_0_attention_projections_rows2_f32_kernel(
         for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
             uint feature = output_row + row;
             uint partial_base = row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT;
-            float query_value = simd_sum(
-                simd_lane < simdgroups_per_output
-                    ? query_partials[partial_base + simd_lane]
-                    : 0.0f);
-            float key_value = simd_sum(
-                simd_lane < simdgroups_per_output
-                    ? key_partials[partial_base + simd_lane]
-                    : 0.0f);
-            float value_value = simd_sum(
-                simd_lane < simdgroups_per_output
-                    ? value_partials[partial_base + simd_lane]
-                    : 0.0f);
-            float gate_value = simd_sum(
-                simd_lane < simdgroups_per_output
-                    ? gate_partials[partial_base + simd_lane]
-                    : 0.0f);
-            if (simd_lane == 0u) {
-                if (feature < query_features) {
-                    query_output[input_row * query_features + feature] =
-                        query_value;
+            bool contributes = simd_lane < simdgroups_per_output;
+            if (feature < query_features) {
+                float value = simd_sum(
+                    contributes ? query_partials[partial_base + simd_lane] : 0.0f);
+                if (simd_lane == 0u) {
+                    query_output[input_row * query_features + feature] = value;
                 }
-                if (feature < key_features) {
-                    key_output[input_row * key_features + feature] = key_value;
+            }
+            if (feature < key_features) {
+                float value = simd_sum(
+                    contributes ? key_partials[partial_base + simd_lane] : 0.0f);
+                if (simd_lane == 0u) {
+                    key_output[input_row * key_features + feature] = value;
                 }
-                if (feature < value_features) {
-                    value_output[input_row * value_features + feature] =
-                        value_value;
+            }
+            if (feature < value_features) {
+                float value = simd_sum(
+                    contributes ? value_partials[partial_base + simd_lane] : 0.0f);
+                if (simd_lane == 0u) {
+                    value_output[input_row * value_features + feature] = value;
                 }
-                if (feature < gate_features) {
-                    gate_output[input_row * gate_features + feature] =
-                        gate_value;
+            }
+            if (feature < gate_features) {
+                float value = simd_sum(
+                    contributes ? gate_partials[partial_base + simd_lane] : 0.0f);
+                if (simd_lane == 0u) {
+                    gate_output[input_row * gate_features + feature] = value;
                 }
             }
         }
@@ -1925,9 +1916,9 @@ static inline float2 laguna_q8_0_rows2_partial(
             + block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
             uint feature = output_row + row;
@@ -1936,18 +1927,9 @@ static inline float2 laguna_q8_0_rows2_partial(
             }
             uint block_offset =
                 (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-            float dot = 0.0f;
-            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                uchar raw = weights[
-                    block_offset + 2u
-                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                    + index
-                ];
-                int quant = raw < 128u ? int(raw) : int(raw) - 256;
-                dot += values[index] * float(quant);
-            }
-            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
-            sums[row] += dot * scale;
+            sums[row] +=
+                q8_0_lane_dot8(weights, block_offset + lane_quant_offset, values)
+                * q8_0_block_scale(weights, block_offset);
         }
     }
     return sums;
@@ -2190,9 +2172,9 @@ kernel void laguna_q8_0_gate_up_swiglu_rows2_f32_kernel(
             + block * Q8_0_BLOCK_VALUES
             + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
         float values[Q8_0_LAGUNA_VALUES_PER_LANE];
-        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-            values[index] = input[input_offset + index];
-        }
+        q8_0_lane_load8(input, input_offset, values);
+        uint lane_quant_offset =
+            2u + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
 
         for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
             uint feature = output_row + row;
@@ -2201,27 +2183,13 @@ kernel void laguna_q8_0_gate_up_swiglu_rows2_f32_kernel(
             }
             uint block_offset =
                 (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
-            float gate_dot = 0.0f;
-            float up_dot = 0.0f;
-            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
-                uint quant_offset = block_offset + 2u
-                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
-                    + index;
-                uchar gate_raw = gate_weights[quant_offset];
-                uchar up_raw = up_weights[quant_offset];
-                int gate_quant =
-                    gate_raw < 128u ? int(gate_raw) : int(gate_raw) - 256;
-                int up_quant =
-                    up_raw < 128u ? int(up_raw) : int(up_raw) - 256;
-                gate_dot += values[index] * float(gate_quant);
-                up_dot += values[index] * float(up_quant);
-            }
-            float gate_scale =
-                f16_bits_to_f32(read_le_u16(gate_weights, block_offset));
-            float up_scale =
-                f16_bits_to_f32(read_le_u16(up_weights, block_offset));
-            gate_sums[row] += gate_dot * gate_scale;
-            up_sums[row] += up_dot * up_scale;
+            uint quant_offset = block_offset + lane_quant_offset;
+            gate_sums[row] +=
+                q8_0_lane_dot8(gate_weights, quant_offset, values)
+                * q8_0_block_scale(gate_weights, block_offset);
+            up_sums[row] +=
+                q8_0_lane_dot8(up_weights, quant_offset, values)
+                * q8_0_block_scale(up_weights, block_offset);
         }
     }
 

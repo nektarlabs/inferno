@@ -244,6 +244,128 @@ pub(crate) fn encode_element_copy(
     Ok(())
 }
 
+/// One argument of a compute kernel.
+///
+/// Scalars are bound with `setBytes`, which copies the value straight into the
+/// command buffer. Passing them as arena buffers instead costs a real
+/// `MTLBuffer` allocation plus hazard-tracking registration — measured at about
+/// 3.9µs each on an M4 Max. Laguna decode binds roughly fifty scalars per layer
+/// across forty-eight layers, so that allocation alone accounted for most of the
+/// CPU time spent encoding a token.
+#[derive(Clone, Copy)]
+pub(crate) enum KernelArg<'a> {
+    Buffer(&'a Buffer),
+    BufferOffset(&'a Buffer, usize),
+    U32(u32),
+    F32(f32),
+}
+
+fn bind_args(
+    encoder: &::metal::ComputeCommandEncoderRef,
+    args: &[KernelArg<'_>],
+) -> Result<()> {
+    for (index, arg) in args.iter().enumerate() {
+        let slot = index as NSUInteger;
+        match arg {
+            KernelArg::Buffer(buffer) => encoder.set_buffer(slot, Some(buffer), 0),
+            KernelArg::BufferOffset(buffer, offset) => {
+                if *offset > buffer.length() as usize {
+                    return Err(Error::backend(format!(
+                        "Metal buffer {index} offset {offset} exceeds buffer length {}",
+                        buffer.length()
+                    )));
+                }
+                encoder.set_buffer(slot, Some(buffer), *offset as NSUInteger);
+            }
+            // `setBytes` copies before returning, so pointing at the slice
+            // element is sound for the duration of this call.
+            KernelArg::U32(value) => encoder.set_bytes(
+                slot,
+                std::mem::size_of::<u32>() as NSUInteger,
+                value as *const u32 as *const std::ffi::c_void,
+            ),
+            KernelArg::F32(value) => encoder.set_bytes(
+                slot,
+                std::mem::size_of::<f32>() as NSUInteger,
+                value as *const f32 as *const std::ffi::c_void,
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_threadgroup_shape(
+    pipeline: &ComputePipelineState,
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    if threadgroup_count == 0 || threads_per_group == 0 {
+        return Err(Error::backend(
+            "Metal threadgroup dispatch dimensions must be positive",
+        ));
+    }
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1) as usize;
+    if threads_per_group > max_threads {
+        return Err(Error::backend(format!(
+            "Metal threadgroup requires {threads_per_group} threads but pipeline allows {max_threads}"
+        )));
+    }
+    let execution_width = pipeline.thread_execution_width().max(1) as usize;
+    if !threads_per_group.is_multiple_of(execution_width) {
+        return Err(Error::backend(format!(
+            "Metal threadgroup size {threads_per_group} must be divisible by SIMD width {execution_width}"
+        )));
+    }
+    Ok(())
+}
+
+/// Dispatches a 1D grid of threads with mixed buffer and scalar arguments.
+pub(crate) fn encode_1d_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threads: usize,
+) -> Result<()> {
+    if threads == 0 {
+        return Err(Error::backend(
+            "Metal dispatch requires at least one thread",
+        ));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    let threads_per_group = preferred_1d_threadgroup_size(pipeline);
+    encoder.dispatch_threads(
+        MTLSize::new(threads as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// Dispatches a fixed number of threadgroups with mixed buffer and scalar
+/// arguments.
+pub(crate) fn encode_1d_threadgroups_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    validate_threadgroup_shape(pipeline, threadgroup_count, threads_per_group)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(threadgroup_count as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
 pub(crate) fn encode_1d(
     command_buffer: &CommandBufferRef,
     pipeline: &ComputePipelineState,

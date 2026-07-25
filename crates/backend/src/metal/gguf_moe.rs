@@ -11,7 +11,7 @@ use crate::{DeviceRouterTopK, GgufExpertQuant};
 use super::{
     arena::MetalArena,
     buffers::{require_f32_capacity, u8_buffer_no_copy},
-    command::{encode_1d_threadgroups_with_offsets, encode_1d_with_offsets},
+    command::{encode_1d_threadgroups_args, KernelArg},
     laguna_views::MetalLagunaViews,
     library::MetalLibrary,
     pipeline::compute_pipeline,
@@ -22,7 +22,8 @@ const Q3_BLOCK_BYTES: usize = 110;
 const BLOCK_VALUES: usize = 256;
 const SIMD_LANES: usize = 32;
 const SIMDGROUPS_PER_THREADGROUP: usize = 2;
-const Q3_ROWS_PER_SIMDGROUP: usize = 2;
+const Q3_ROWS_PER_SIMDGROUP: usize = 4;
+const Q2_ROWS_PER_SIMDGROUP: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct WeightKey {
@@ -134,70 +135,56 @@ impl MetalGgufMoe {
         let up = self.weight_buffer(device, up_weights)?;
         let down = self.weight_buffer(device, down_weights)?;
 
-        let assignment_count_buffer = self.arena.u32(as_u32(assignment_count, "assignments")?)?;
-        let token_count_buffer = self.arena.u32(as_u32(token_count, "tokens")?)?;
-        let top_k_buffer = self.arena.u32(as_u32(top_k, "top-k")?)?;
-        let in_features_buffer = self.arena.u32(as_u32(in_features, "input width")?)?;
-        let intermediate_features_buffer = self
-            .arena
-            .u32(as_u32(intermediate_features, "intermediate width")?)?;
-        let out_features_buffer = self.arena.u32(as_u32(out_features, "output width")?)?;
-        let gate_blocks_buffer = self
-            .arena
-            .u32(as_u32(gate_blocks_per_row, "gate blocks per row")?)?;
-        let down_blocks_buffer = self
-            .arena
-            .u32(as_u32(down_blocks_per_row, "down blocks per row")?)?;
-        let gate_stride_buffer = self
-            .arena
-            .u32(as_u32(gate_expert_stride, "gate expert stride")?)?;
-        let down_stride_buffer = self
-            .arena
-            .u32(as_u32(down_expert_stride, "down expert stride")?)?;
         let gate_buffers = [
-            (&gate.storage, gate.byte_offset),
-            (&up.storage, up.byte_offset),
-            (input, 0),
-            (&routing.token_indices, 0),
-            (&routing.expert_ids, 0),
-            (&routing.expert_weights, 0),
-            (&intermediate, 0),
-            (&assignment_count_buffer, 0),
-            (&in_features_buffer, 0),
-            (&intermediate_features_buffer, 0),
-            (&gate_blocks_buffer, 0),
-            (&gate_stride_buffer, 0),
+            KernelArg::BufferOffset(&gate.storage, gate.byte_offset),
+            KernelArg::BufferOffset(&up.storage, up.byte_offset),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(&routing.token_indices),
+            KernelArg::Buffer(&routing.expert_ids),
+            KernelArg::Buffer(&routing.expert_weights),
+            KernelArg::Buffer(&intermediate),
+            KernelArg::U32(as_u32(assignment_count, "assignments")?),
+            KernelArg::U32(as_u32(in_features, "input width")?),
+            KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+            KernelArg::U32(as_u32(gate_blocks_per_row, "gate blocks per row")?),
+            KernelArg::U32(as_u32(gate_expert_stride, "gate expert stride")?),
         ];
         let down_buffers = [
-            (&down.storage, down.byte_offset),
-            (&routing.expert_ids, 0),
-            (&intermediate, 0),
-            (&output, 0),
-            (&token_count_buffer, 0),
-            (&top_k_buffer, 0),
-            (&intermediate_features_buffer, 0),
-            (&out_features_buffer, 0),
-            (&down_blocks_buffer, 0),
-            (&down_stride_buffer, 0),
+            KernelArg::BufferOffset(&down.storage, down.byte_offset),
+            KernelArg::Buffer(&routing.expert_ids),
+            KernelArg::Buffer(&intermediate),
+            KernelArg::Buffer(&output),
+            KernelArg::U32(as_u32(token_count, "tokens")?),
+            KernelArg::U32(as_u32(top_k, "top-k")?),
+            KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+            KernelArg::U32(as_u32(out_features, "output width")?),
+            KernelArg::U32(as_u32(down_blocks_per_row, "down blocks per row")?),
+            KernelArg::U32(as_u32(down_expert_stride, "down expert stride")?),
         ];
 
         match quant {
             GgufExpertQuant::Q2K => {
-                encode_1d_with_offsets(
+                encode_1d_threadgroups_args(
                     command_buffer,
                     &self.q2_gate_up,
                     &gate_buffers,
-                    cooperative_threads(intermediate_len)?,
+                    tiled_threadgroups(
+                        assignment_count,
+                        intermediate_features,
+                        Q2_ROWS_PER_SIMDGROUP,
+                    )?,
+                    SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
                 )?;
-                encode_1d_with_offsets(
+                encode_1d_threadgroups_args(
                     command_buffer,
                     &self.q2_down,
                     &down_buffers,
-                    cooperative_threads(output_len)?,
+                    tiled_threadgroups(token_count, out_features, Q2_ROWS_PER_SIMDGROUP)?,
+                    SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
                 )?;
             }
             GgufExpertQuant::Q3K => {
-                encode_1d_threadgroups_with_offsets(
+                encode_1d_threadgroups_args(
                     command_buffer,
                     &self.q3_gate_up,
                     &gate_buffers,
@@ -208,7 +195,7 @@ impl MetalGgufMoe {
                     )?,
                     SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
                 )?;
-                encode_1d_threadgroups_with_offsets(
+                encode_1d_threadgroups_args(
                     command_buffer,
                     &self.q3_down,
                     &down_buffers,
@@ -291,11 +278,6 @@ fn tiled_threadgroups(
     Ok(simdgroup_count.div_ceil(SIMDGROUPS_PER_THREADGROUP))
 }
 
-fn cooperative_threads(output_values: usize) -> Result<usize> {
-    output_values
-        .checked_mul(SIMD_LANES)
-        .ok_or_else(|| Error::backend("Laguna GGUF cooperative thread count overflow"))
-}
 
 fn as_u32(value: usize, label: &str) -> Result<u32> {
     u32::try_from(value)

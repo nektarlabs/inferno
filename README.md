@@ -45,7 +45,7 @@ or Safetensors architectures and quantization formats.
 | --- | ---: |
 | GLM-5.2 Q2 | **1.711 tokens/s** |
 | Laguna S 2.1 INT4 Safetensors | **4.680 tokens/s** |
-| Laguna S 2.1 mixed Q2_K/Q3_K GGUF | **36.077 tokens/s** |
+| Laguna S 2.1 mixed Q2_K/Q3_K GGUF | **54.53 tokens/s** |
 
 Best observed decode results on a 64 GB Apple Silicon MacBook Pro using release
 builds and exact routing. Prompt prefill is excluded. Results depend on prompt

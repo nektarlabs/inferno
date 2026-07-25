@@ -13,6 +13,7 @@ use super::{
 };
 
 const ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_attention_f32_kernel";
+const DECODE_ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_decode_attention_f32_kernel";
 const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
@@ -23,6 +24,7 @@ const ATTENTION_THREADS: usize = 256;
 
 pub(crate) struct MetalF16Attention {
     attention_pipeline: ComputePipelineState,
+    decode_attention_pipeline: ComputePipelineState,
     append_pipeline: ComputePipelineState,
     arena: MetalArena,
 }
@@ -30,17 +32,23 @@ pub(crate) struct MetalF16Attention {
 impl MetalF16Attention {
     pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         let attention_pipeline = compute_pipeline(device, library, ATTENTION_KERNEL)?;
-        let append_pipeline = compute_pipeline(device, library, APPEND_KERNEL)?;
+        let decode_attention_pipeline =
+            compute_pipeline(device, library, DECODE_ATTENTION_KERNEL)?;
         let simd_width = attention_pipeline.thread_execution_width() as usize;
         if simd_width != 32
             || (attention_pipeline.max_total_threads_per_threadgroup() as usize) < ATTENTION_THREADS
+            || decode_attention_pipeline.thread_execution_width() as usize != 32
+            || (decode_attention_pipeline.max_total_threads_per_threadgroup() as usize)
+                < ATTENTION_THREADS
         {
             return Err(Error::backend(
                 "Laguna F16 attention requires 32-lane SIMD groups and 256-thread groups",
             ));
         }
+        let append_pipeline = compute_pipeline(device, library, APPEND_KERNEL)?;
         Ok(Self {
             attention_pipeline,
+            decode_attention_pipeline,
             append_pipeline,
             arena,
         })
@@ -188,9 +196,17 @@ impl MetalF16Attention {
             "encoding fused Laguna F16 grouped-query attention"
         );
 
+        // Decode drives a single query token, where the general kernel's serial
+        // per-tile softmax has no other query rows to hide behind.
+        let pipeline = if query_tokens == 1 {
+            &self.decode_attention_pipeline
+        } else {
+            &self.attention_pipeline
+        };
+
         encode_1d_threadgroups(
             command_buffer,
-            &self.attention_pipeline,
+            pipeline,
             &[
                 query,
                 current_key,
@@ -367,7 +383,7 @@ mod tests {
     use crate::{Backend, LagunaKvRetention, MetalBackend};
     use common::F32Tensor;
 
-    use super::{HEAD_DIM, KV_HEADS};
+    use super::{GLOBAL_QUERY_HEADS, HEAD_DIM, KV_HEADS, SLIDING_QUERY_HEADS, SLIDING_WINDOW};
 
     const QUERY_HEADS: usize = 48;
 
@@ -484,6 +500,178 @@ mod tests {
                 "Laguna F16 attention mismatch at {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
             );
         }
+    }
+
+    /// The decode kernel partitions keys and merges softmaxes differently from
+    /// the prefill kernel, so it needs its own non-uniform reference check.
+    ///
+    /// The sliding case runs past the 512-token window on purpose: that is the
+    /// only configuration where the decode step both clamps the visible range
+    /// and reads a ring buffer that has wrapped.
+    #[test]
+    fn f16_decode_step_matches_nonuniform_cpu_reference() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        for (retention, query_heads, tokens) in [
+            (LagunaKvRetention::Full, GLOBAL_QUERY_HEADS, 37),
+            (LagunaKvRetention::Sliding, SLIDING_QUERY_HEADS, 600),
+        ] {
+            let query_values = patterned_values(tokens * query_heads * HEAD_DIM, 17, 8, 16.0);
+            let key_values = patterned_values(tokens * KV_HEADS * HEAD_DIM, 13, 6, 16.0);
+            let value_values = patterned_values(tokens * KV_HEADS * HEAD_DIM, 11, 5, 8.0);
+            let gate_values = patterned_values(tokens * query_heads, 7, 3, 10.0);
+            let sliding_window = match retention {
+                LagunaKvRetention::Full => 0,
+                LagunaKvRetention::Sliding => SLIDING_WINDOW,
+            };
+            let capacity = match retention {
+                LagunaKvRetention::Full => tokens,
+                LagunaKvRetention::Sliding => SLIDING_WINDOW,
+            };
+            let mut cache = backend
+                .prepare_laguna_f16_kv_cache(1, capacity, retention)
+                .unwrap()
+                .unwrap();
+
+            let prefill = tokens - 1;
+            drop(
+                backend
+                    .laguna_gated_gqa_f16_attention_device(
+                        &upload(
+                            &backend,
+                            query_values[..prefill * query_heads * HEAD_DIM].to_vec(),
+                            [1, prefill, query_heads, HEAD_DIM],
+                        ),
+                        &upload(
+                            &backend,
+                            key_values[..prefill * KV_HEADS * HEAD_DIM].to_vec(),
+                            [1, prefill, KV_HEADS, HEAD_DIM],
+                        ),
+                        &upload(
+                            &backend,
+                            value_values[..prefill * KV_HEADS * HEAD_DIM].to_vec(),
+                            [1, prefill, KV_HEADS, HEAD_DIM],
+                        ),
+                        &upload(
+                            &backend,
+                            gate_values[..prefill * query_heads].to_vec(),
+                            [1, prefill, query_heads],
+                        ),
+                        &mut cache,
+                    )
+                    .unwrap()
+                    .unwrap(),
+            );
+
+            let decode = backend
+                .laguna_gated_gqa_f16_attention_device(
+                    &upload(
+                        &backend,
+                        query_values[prefill * query_heads * HEAD_DIM..].to_vec(),
+                        [1, 1, query_heads, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        key_values[prefill * KV_HEADS * HEAD_DIM..].to_vec(),
+                        [1, 1, KV_HEADS, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        value_values[prefill * KV_HEADS * HEAD_DIM..].to_vec(),
+                        [1, 1, KV_HEADS, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        gate_values[prefill * query_heads..].to_vec(),
+                        [1, 1, query_heads],
+                    ),
+                    &mut cache,
+                )
+                .unwrap()
+                .unwrap();
+            let decode = backend.device_download_f32_tensor(&decode).unwrap();
+
+            let expected = cpu_decode_gqa(
+                &query_values,
+                &key_values,
+                &value_values,
+                &gate_values,
+                tokens,
+                query_heads,
+                sliding_window,
+            );
+            // The past keys and values came back through the f16 cache, so the
+            // decoded row carries more error than the all-f32 prefill rows.
+            for (index, (actual, expected)) in
+                decode.values().iter().zip(expected.iter()).enumerate()
+            {
+                let tolerance = 2e-3_f32.max(expected.abs() * 2e-3);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "Laguna F16 {retention:?} decode mismatch at {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
+                );
+            }
+            assert_eq!(cache.total_tokens(), tokens);
+        }
+    }
+
+    /// Reference output for the final token only. Computing every row would be
+    /// needlessly slow at the 600-token sliding shape.
+    fn cpu_decode_gqa(
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        gate: &[f32],
+        tokens: usize,
+        query_heads: usize,
+        sliding_window: usize,
+    ) -> Vec<f32> {
+        let token = tokens - 1;
+        let heads_per_kv = query_heads / KV_HEADS;
+        let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+        let first_key = if sliding_window == 0 || token + 1 <= sliding_window {
+            0
+        } else {
+            token + 1 - sliding_window
+        };
+        let mut output = vec![0.0_f32; query_heads * HEAD_DIM];
+
+        for query_head in 0..query_heads {
+            let kv_head = query_head / heads_per_kv;
+            let query_base = (token * query_heads + query_head) * HEAD_DIM;
+            let scores = (first_key..=token)
+                .map(|key_token| {
+                    let key_base = (key_token * KV_HEADS + kv_head) * HEAD_DIM;
+                    query[query_base..query_base + HEAD_DIM]
+                        .iter()
+                        .zip(&key[key_base..key_base + HEAD_DIM])
+                        .map(|(query, key)| query * key)
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights = scores
+                .iter()
+                .map(|score| (score - maximum).exp())
+                .collect::<Vec<_>>();
+            let denominator = weights.iter().sum::<f32>();
+            let gain = (1.0_f32 + gate[token * query_heads + query_head].exp()).ln();
+            for dim in 0..HEAD_DIM {
+                let weighted = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, weight)| {
+                        let value_index =
+                            ((first_key + offset) * KV_HEADS + kv_head) * HEAD_DIM + dim;
+                        weight * value[value_index]
+                    })
+                    .sum::<f32>();
+                output[query_head * HEAD_DIM + dim] = weighted / denominator * gain;
+            }
+        }
+        output
     }
 
     fn patterned_values(len: usize, period: usize, center: usize, divisor: f32) -> Vec<f32> {
