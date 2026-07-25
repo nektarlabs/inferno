@@ -93,8 +93,8 @@ pub(crate) fn empty_f16_buffer(device: &Device, len: usize) -> Result<Buffer> {
 }
 
 /// Creates a Metal view over immutable model-owned bytes without copying the
-/// GGUF mapping. Routed experts use a separate bounded cache; this helper is
-/// for always-used quantized tensors whose mmap storage outlives the backend.
+/// GGUF mapping. The caller owns the residency policy; the mmap storage must
+/// outlive every command buffer and cached `Buffer` that references it.
 pub(crate) fn u8_buffer_no_copy(device: &Device, values: &[u8]) -> Result<Buffer> {
     let bytes = byte_len::<u8>(values.len())?;
     if bytes == 0 {

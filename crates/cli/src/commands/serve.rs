@@ -15,17 +15,17 @@ use config::{
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
-    expected_expert_pack_header, validate_routing_policy, LagunaModel, Model,
+    expected_expert_pack_header, validate_routing_policy, LagunaArtifactKind, LagunaModel, Model,
     DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
     enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
-    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
+    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime,
 };
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, GLM_CODEX_MODEL_ID,
-    LAGUNA_CODEX_MODEL_ID,
+    LAGUNA_CODEX_MODEL_ID, LAGUNA_GGUF_CODEX_MODEL_ID,
 };
 use tokenizer::{
     is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
@@ -36,10 +36,9 @@ use tracing::info;
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    laguna_expert_cache_capacity, laguna_memory_controller_spec, load_q2_readiness,
-    resolve_q2_artifact, validate_generation_request, validate_laguna_prompt,
-    validate_laguna_service_options, validate_memory_controller_options, DecodedTextStream,
-    LAGUNA_TOKENIZER_CONTRACT,
+    laguna_runtime_options, load_q2_readiness, resolve_q2_artifact, validate_generation_request,
+    validate_laguna_prompt, validate_laguna_service_options, validate_laguna_tokenizer,
+    validate_memory_controller_options, DecodedTextStream,
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -217,24 +216,28 @@ fn run_laguna(
     )?;
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    validate_laguna_tokenizer(&tokenizer, &config)?;
     let backend = MetalBackend::new()?;
     let model = LagunaModel::open(model_path, config.clone(), &backend)?;
-    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
     // A server can receive any prompt size, so reserve cache headroom against
-    // Laguna's complete configured KV context.
-    let expert_cache_capacity =
-        laguna_expert_cache_capacity(&model, &config, &backend, 1, None, explicit_cache_bytes)?;
-    let memory_controller = enable_unified_memory_controller
-        .then(|| laguna_memory_controller_spec(&model, &config, expert_cache_capacity))
-        .transpose()?;
+    // Laguna's complete configured KV context for Safetensors artifacts.
+    let options = laguna_runtime_options(
+        &model,
+        &config,
+        &backend,
+        1,
+        None,
+        expert_cache_gb,
+        enable_unified_memory_controller,
+    )?;
     if let Some(path) = memory_controller_log {
         enable_laguna_memory_controller_log(path)?;
     }
-    let runtime = LagunaRuntime::new(LagunaGenerationOptions {
-        expert_cache_capacity,
-        memory_controller,
-    })?;
+    let runtime = LagunaRuntime::new(options)?;
+    let model_id = match model.artifact_kind() {
+        LagunaArtifactKind::SafetensorsInt4 => LAGUNA_CODEX_MODEL_ID,
+        LagunaArtifactKind::AntirezGguf => LAGUNA_GGUF_CODEX_MODEL_ID,
+    };
 
     let listener = TcpListener::bind(bind)?;
     let mut handler = LagunaCodexHandler {
@@ -244,9 +247,10 @@ fn run_laguna(
         tokenizer: &tokenizer,
         runtime,
         max_new_tokens,
+        model_id,
     };
-    info!(%bind, model = LAGUNA_CODEX_MODEL_ID, "Inferno model loaded for Codex");
-    server::serve(listener, &mut handler, LAGUNA_CODEX_MODEL_ID)?;
+    info!(%bind, model = model_id, "Inferno model loaded for Codex");
+    server::serve(listener, &mut handler, model_id)?;
     Ok(())
 }
 
@@ -330,6 +334,7 @@ struct LagunaCodexHandler<'runtime> {
     tokenizer: &'runtime Tokenizer,
     runtime: LagunaRuntime,
     max_new_tokens: Option<usize>,
+    model_id: &'static str,
 }
 
 impl ResponsesHandler for LagunaCodexHandler<'_> {
@@ -338,7 +343,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
         request: ResponsesRequest,
         stream: &mut ResponsesStream<'_>,
     ) -> InfernoResult<ResponseUsage> {
-        validate_requested_model(&request.model, LAGUNA_CODEX_MODEL_ID)?;
+        validate_requested_model(&request.model, self.model_id)?;
         let allowed_tools = tool_names(&request.tools)?;
         let prompt =
             render_laguna_codex_prompt(&request.instructions, &request.input, &request.tools)?;

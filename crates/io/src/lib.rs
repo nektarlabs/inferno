@@ -19,6 +19,7 @@ use std::{
     fs::File,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
 };
 
@@ -40,7 +41,38 @@ pub enum MappedFileAdvice {
 pub struct MappedFile {
     path: PathBuf,
     file: File,
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
+}
+
+/// Shared ownership of immutable memory-mapped bytes.
+///
+/// Native backends keep this owner beside no-copy device views so the mapping
+/// cannot disappear while a GPU command still references it.
+#[derive(Debug, Clone)]
+pub struct MappedBytes {
+    mmap: Arc<Mmap>,
+}
+
+impl MappedBytes {
+    pub fn len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    pub fn cache_identity(&self) -> usize {
+        self.as_ptr() as usize
+    }
 }
 
 impl MappedFile {
@@ -75,7 +107,7 @@ impl MappedFile {
         Ok(Self {
             path: path.to_path_buf(),
             file,
-            mmap,
+            mmap: Arc::new(mmap),
         })
     }
 
@@ -85,6 +117,12 @@ impl MappedFile {
 
     pub fn cache_identity(&self) -> usize {
         self.mmap.as_ptr() as usize
+    }
+
+    pub fn shared_bytes(&self) -> MappedBytes {
+        MappedBytes {
+            mmap: Arc::clone(&self.mmap),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -405,6 +443,20 @@ mod tests {
 
         assert_eq!(mapped.len(), 6);
         assert_eq!(mapped.slice(2, 3).unwrap(), b"cde");
+    }
+
+    #[test]
+    fn shared_mapped_bytes_keep_mapping_alive() {
+        let path = unique_temp_file("shared");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let shared = {
+            let mapped = MappedFile::open(&path).unwrap();
+            mapped.shared_bytes()
+        };
+
+        assert_eq!(shared.len(), 6);
+        assert_eq!(shared.as_slice(), b"abcdef");
     }
 
     #[test]

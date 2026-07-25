@@ -77,6 +77,45 @@
       "input_modalities": ["text"],
       "supports_search_tool": false,
       "use_responses_lite": false
+    },
+    {
+      "slug": "laguna-s-2.1-gguf",
+      "display_name": "Inferno Laguna S 2.1 GGUF",
+      "description": "Local Laguna S 2.1 mixed Q2_K/Q3_K GGUF inference through Inferno on Apple Metal",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Use Laguna S 2.1's native reasoning path"
+        }
+      ],
+      "shell_type": "unified_exec",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 3,
+      "upgrade": null,
+      "base_instructions": "You are a coding agent operating in the user's repository. Follow developer and user instructions exactly. Inspect the workspace before editing. Use the provided shell tools for filesystem and command work; never invent tool results. Codex enforces workspace permissions and approvals outside the model prompt. Continue through implementation and validation when the user asks for changes. Keep progress updates short and make the final response concise and factual.",
+      "supports_reasoning_summary_parameter": false,
+      "supports_reasoning_summaries": false,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": null,
+      "web_search_tool_type": "text",
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": false,
+      "context_window": 32768,
+      "max_context_window": 32768,
+      "auto_compact_token_limit": 28000,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text"],
+      "supports_search_tool": false,
+      "use_responses_lite": false
     }
   ]
 }

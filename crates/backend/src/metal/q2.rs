@@ -31,9 +31,11 @@ use super::{
         write_f32_buffer, write_u32_buffer,
     },
     command::{
-        dispatch_1d, dispatch_1d_many, encode_1d, encode_1d_threadgroups,
-        encode_1d_with_indirect_reads, Dispatch1d,
+        dispatch_1d_many_with_offsets, dispatch_1d_with_offsets, encode_1d,
+        encode_1d_threadgroups_with_offsets, encode_1d_with_indirect_reads, encode_1d_with_offsets,
+        Dispatch1d, Dispatch1dWithOffsets,
     },
+    laguna_views::MetalLagunaViews,
     library::MetalLibrary,
     pipeline::compute_pipeline,
     validation::{
@@ -69,28 +71,43 @@ const Q2_K_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
 const Q8_0_MATVEC_KERNEL: &str = "q8_0_matvec_f32_kernel";
 const Q8_0_MATVEC_TILED_KERNEL: &str = "q8_0_matvec_tiled_f32_kernel";
 const Q8_0_MATVEC_OUTPUT4_TILED_KERNEL: &str = "q8_0_matvec_output4_tiled_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_OUTPUT4_KERNEL: &str = "laguna_q8_0_matvec_output4_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_ARGMAX_CANDIDATES_KERNEL: &str =
+    "laguna_q8_0_matvec_argmax_candidates_f32_kernel";
 const Q8_0_MATVEC_PAIR_TILED_KERNEL: &str = "q8_0_matvec_pair_tiled_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_PAIR_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_pair_rows2_f32_kernel";
+const LAGUNA_Q8_0_ATTENTION_PROJECTIONS_ROWS2_KERNEL: &str =
+    "laguna_q8_0_attention_projections_rows2_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_rows2_f32_kernel";
 const Q8_0_GATE_UP_SWIGLU_TILED_KERNEL: &str = "q8_0_gate_up_swiglu_tiled_f32_kernel";
+const LAGUNA_Q8_0_GATE_UP_SWIGLU_ROWS2_KERNEL: &str = "laguna_q8_0_gate_up_swiglu_rows2_f32_kernel";
 const Q8_0_BATCHED_MATVEC_TILED_KERNEL: &str = "q8_0_batched_matvec_tiled_f32_kernel";
 const Q8_0_PREFILL_MMA_KERNEL: &str = "q8_0_prefill_mma_f32_kernel";
 const Q8_0_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_matvec_add_tiled_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_ADD_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_add_rows2_f32_kernel";
+const LAGUNA_Q8_0_MATVEC_ADD2_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_add2_rows2_f32_kernel";
 const Q8_0_BATCHED_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_batched_matvec_add_tiled_f32_kernel";
 const Q8_0_TRANSPOSED_MATVEC_KERNEL: &str = "q8_0_transposed_matvec_f32_kernel";
 const Q8_0_PACKED_HEADS_TRANSPOSED_MATVEC_KERNEL: &str =
     "q8_0_packed_heads_transposed_matvec_f32_kernel";
 const Q8_0_PACKED_HEADS_MATVEC_KERNEL: &str = "q8_0_packed_heads_matvec_f32_kernel";
+const Q8_0_EMBEDDING_KERNEL: &str = "q8_0_embedding_f32_kernel";
 const ARGMAX_F32_KERNEL: &str = "argmax_f32_kernel";
 const ARGMAX_ROWS_F32_KERNEL: &str = "argmax_rows_f32_kernel";
+const ARGMAX_CANDIDATES_F32_KERNEL: &str = "argmax_candidates_f32_kernel";
 const Q2_K_SIMD_LANES: usize = 32;
 const READY_EXPERT_ASSIGNMENTS_PER_KERNEL_GROUP: usize = 8;
 const READY_EXPERT_OUTPUT_ROWS_PER_SIMDGROUP: usize = 4;
 const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_OUTPUT_FEATURE_TILE: usize = 4;
 const Q8_0_OUTPUT_FEATURE_TILE_MIN_FEATURES: usize = 65_536;
+const LAGUNA_Q8_0_ARGMAX_ROWS: usize = 4;
 const Q8_0_MMA_TOKEN_TILE: usize = 32;
 const Q8_0_MMA_OUTPUT_TILE: usize = 32;
 const Q8_0_MMA_THREAD_COUNT: usize = 128;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
+const LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT: usize = 4;
+const LAGUNA_Q8_0_OUTPUT_ROWS: usize = 2;
 const ARGMAX_THREADS_PER_VECTOR: usize = 256;
 const ROUTED_EXPERT_COUNT: usize = 256;
 // Thirty Q2 expert triplets per routed layer allocate about 27.9 GB on the
@@ -127,17 +144,27 @@ pub(crate) struct MetalQ2Matvec {
     q8_0_pipeline: ComputePipelineState,
     q8_0_tiled_pipeline: ComputePipelineState,
     q8_0_output4_tiled_pipeline: ComputePipelineState,
+    laguna_q8_0_output4_pipeline: ComputePipelineState,
+    laguna_q8_0_argmax_candidates_pipeline: ComputePipelineState,
     q8_0_pair_tiled_pipeline: ComputePipelineState,
+    laguna_q8_0_pair_rows2_pipeline: ComputePipelineState,
+    laguna_q8_0_attention_projections_rows2_pipeline: ComputePipelineState,
+    laguna_q8_0_rows2_pipeline: ComputePipelineState,
     q8_0_gate_up_swiglu_tiled_pipeline: ComputePipelineState,
+    laguna_q8_0_gate_up_rows2_pipeline: ComputePipelineState,
     q8_0_batched_tiled_pipeline: ComputePipelineState,
     q8_0_prefill_mma_pipeline: ComputePipelineState,
     q8_0_tiled_add_pipeline: ComputePipelineState,
+    laguna_q8_0_add_rows2_pipeline: ComputePipelineState,
+    laguna_q8_0_add2_rows2_pipeline: ComputePipelineState,
     q8_0_batched_tiled_add_pipeline: ComputePipelineState,
     q8_0_transposed_pipeline: ComputePipelineState,
     q8_0_packed_heads_transposed_pipeline: ComputePipelineState,
     q8_0_packed_heads_pipeline: ComputePipelineState,
+    q8_0_embedding_pipeline: ComputePipelineState,
     argmax_pipeline: ComputePipelineState,
     argmax_rows_pipeline: ComputePipelineState,
+    argmax_candidates_pipeline: ComputePipelineState,
     scratch: Mutex<Q2ScratchBuffers>,
     ready_expert_cache: Mutex<Q2PerLayerExpertCache>,
     transient_expert_pool: Mutex<Q2TransientExpertPool>,
@@ -147,6 +174,7 @@ pub(crate) struct MetalQ2Matvec {
     next_expert_completion_value: AtomicU64,
     pending_expert_submissions: Mutex<Vec<PendingExpertSubmission>>,
     weight_buffers: Mutex<HashMap<WeightBufferKey, Buffer>>,
+    laguna_views: Arc<MetalLagunaViews>,
 }
 
 #[derive(Debug, Default)]
@@ -222,7 +250,9 @@ pub struct MetalQ2GateUpSwiGluReport {
 
 #[derive(Debug)]
 struct WeightBuffer {
-    buffer: Buffer,
+    storage: Buffer,
+    byte_offset: usize,
+    laguna_view: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -454,7 +484,12 @@ struct ScratchBufferRef {
 }
 
 impl MetalQ2Matvec {
-    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
+    pub(crate) fn new(
+        device: &Device,
+        library: &MetalLibrary,
+        arena: MetalArena,
+        laguna_views: Arc<MetalLagunaViews>,
+    ) -> Result<Self> {
         Ok(Self {
             arena,
             pipeline: compute_pipeline(device, library, Q2_K_MATVEC_KERNEL)?,
@@ -499,15 +534,45 @@ impl MetalQ2Matvec {
                 library,
                 Q8_0_MATVEC_OUTPUT4_TILED_KERNEL,
             )?,
+            laguna_q8_0_output4_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_OUTPUT4_KERNEL,
+            )?,
+            laguna_q8_0_argmax_candidates_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_ARGMAX_CANDIDATES_KERNEL,
+            )?,
             q8_0_pair_tiled_pipeline: compute_pipeline(
                 device,
                 library,
                 Q8_0_MATVEC_PAIR_TILED_KERNEL,
             )?,
+            laguna_q8_0_pair_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_PAIR_ROWS2_KERNEL,
+            )?,
+            laguna_q8_0_attention_projections_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_ATTENTION_PROJECTIONS_ROWS2_KERNEL,
+            )?,
+            laguna_q8_0_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_ROWS2_KERNEL,
+            )?,
             q8_0_gate_up_swiglu_tiled_pipeline: compute_pipeline(
                 device,
                 library,
                 Q8_0_GATE_UP_SWIGLU_TILED_KERNEL,
+            )?,
+            laguna_q8_0_gate_up_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_GATE_UP_SWIGLU_ROWS2_KERNEL,
             )?,
             q8_0_batched_tiled_pipeline: compute_pipeline(
                 device,
@@ -519,6 +584,16 @@ impl MetalQ2Matvec {
                 device,
                 library,
                 Q8_0_MATVEC_ADD_TILED_KERNEL,
+            )?,
+            laguna_q8_0_add_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_ADD_ROWS2_KERNEL,
+            )?,
+            laguna_q8_0_add2_rows2_pipeline: compute_pipeline(
+                device,
+                library,
+                LAGUNA_Q8_0_MATVEC_ADD2_ROWS2_KERNEL,
             )?,
             q8_0_batched_tiled_add_pipeline: compute_pipeline(
                 device,
@@ -540,8 +615,14 @@ impl MetalQ2Matvec {
                 library,
                 Q8_0_PACKED_HEADS_MATVEC_KERNEL,
             )?,
+            q8_0_embedding_pipeline: compute_pipeline(device, library, Q8_0_EMBEDDING_KERNEL)?,
             argmax_pipeline: compute_pipeline(device, library, ARGMAX_F32_KERNEL)?,
             argmax_rows_pipeline: compute_pipeline(device, library, ARGMAX_ROWS_F32_KERNEL)?,
+            argmax_candidates_pipeline: compute_pipeline(
+                device,
+                library,
+                ARGMAX_CANDIDATES_F32_KERNEL,
+            )?,
             scratch: Mutex::new(Q2ScratchBuffers::default()),
             ready_expert_cache: Mutex::new(Q2PerLayerExpertCache::default()),
             transient_expert_pool: Mutex::new(Q2TransientExpertPool::default()),
@@ -551,6 +632,7 @@ impl MetalQ2Matvec {
             next_expert_completion_value: AtomicU64::new(0),
             pending_expert_submissions: Mutex::new(Vec::new()),
             weight_buffers: Mutex::new(HashMap::new()),
+            laguna_views,
         })
     }
 
@@ -834,17 +916,17 @@ impl MetalQ2Matvec {
             "running native Metal Q2_K matvec"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.pipeline,
             &[
-                &weight_buffer.buffer,
-                &input_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_row_buffer.buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -927,18 +1009,18 @@ impl MetalQ2Matvec {
             "running native Metal Q2_K matvec plus residual"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.add_pipeline,
             &[
-                &weight_buffer.buffer,
-                &input_buffer.buffer,
-                &residual_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_row_buffer.buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&residual_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -1026,18 +1108,18 @@ impl MetalQ2Matvec {
             "running native Metal Q2_K gate/up SwiGLU"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.gate_up_swiglu_pipeline,
             &[
-                &gate_weight_buffer.buffer,
-                &up_weight_buffer.buffer,
-                &input_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_row_buffer.buffer,
+                (&gate_weight_buffer.storage, gate_weight_buffer.byte_offset),
+                (&up_weight_buffer.storage, up_weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -1130,29 +1212,29 @@ impl MetalQ2Matvec {
         );
 
         let matvec_buffers = [
-            &weight_buffer.buffer,
-            &input_buffer.buffer,
-            &logits_buffer.buffer,
-            &row_count_buffer.buffer,
-            &in_features_buffer.buffer,
-            &out_features_buffer.buffer,
-            &blocks_per_row_buffer.buffer,
+            (&weight_buffer.storage, weight_buffer.byte_offset),
+            (&input_buffer.buffer, 0),
+            (&logits_buffer.buffer, 0),
+            (&row_count_buffer.buffer, 0),
+            (&in_features_buffer.buffer, 0),
+            (&out_features_buffer.buffer, 0),
+            (&blocks_per_row_buffer.buffer, 0),
         ];
         let argmax_buffers = [
-            &logits_buffer.buffer,
-            &token_id_buffer.buffer,
-            &token_score_buffer.buffer,
-            &output_len_buffer.buffer,
+            (&logits_buffer.buffer, 0),
+            (&token_id_buffer.buffer, 0),
+            (&token_score_buffer.buffer, 0),
+            (&output_len_buffer.buffer, 0),
         ];
-        dispatch_1d_many(
+        dispatch_1d_many_with_offsets(
             queue,
             &[
-                Dispatch1d {
+                Dispatch1dWithOffsets {
                     pipeline: &self.pipeline,
                     buffers: &matvec_buffers,
                     threads: matvec_threads,
                 },
-                Dispatch1d {
+                Dispatch1dWithOffsets {
                     pipeline: &self.argmax_pipeline,
                     buffers: &argmax_buffers,
                     threads: argmax_threads,
@@ -1248,30 +1330,39 @@ impl MetalQ2Matvec {
         let output_len_buffer = scratch.output_len_buffer(device, output_len_u32)?;
 
         let matvec_buffers = [
-            &weight_buffer.buffer,
-            input_buffer,
-            &logits_buffer.buffer,
-            &row_count_buffer.buffer,
-            &in_features_buffer.buffer,
-            &out_features_buffer.buffer,
-            &blocks_per_row_buffer.buffer,
+            (&weight_buffer.storage, weight_buffer.byte_offset),
+            (input_buffer, 0),
+            (&logits_buffer.buffer, 0),
+            (&row_count_buffer.buffer, 0),
+            (&in_features_buffer.buffer, 0),
+            (&out_features_buffer.buffer, 0),
+            (&blocks_per_row_buffer.buffer, 0),
         ];
         let argmax_buffers = [
-            &logits_buffer.buffer,
-            &token_id_buffer.buffer,
-            &token_score_buffer.buffer,
-            &output_len_buffer.buffer,
+            (&logits_buffer.buffer, 0),
+            (&token_id_buffer.buffer, 0),
+            (&token_score_buffer.buffer, 0),
+            (&output_len_buffer.buffer, 0),
         ];
-        dispatch_1d_many(
+        let prefix_buffers = prefix
+            .buffers
+            .iter()
+            .map(|buffer| (*buffer, 0_usize))
+            .collect::<Vec<_>>();
+        dispatch_1d_many_with_offsets(
             queue,
             &[
-                prefix,
-                Dispatch1d {
+                Dispatch1dWithOffsets {
+                    pipeline: prefix.pipeline,
+                    buffers: &prefix_buffers,
+                    threads: prefix.threads,
+                },
+                Dispatch1dWithOffsets {
                     pipeline: &self.pipeline,
                     buffers: &matvec_buffers,
                     threads: matvec_threads,
                 },
-                Dispatch1d {
+                Dispatch1dWithOffsets {
                     pipeline: &self.argmax_pipeline,
                     buffers: &argmax_buffers,
                     threads: argmax_threads,
@@ -1354,17 +1445,17 @@ impl MetalQ2Matvec {
             "running native Metal Q8_0 matvec"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.q8_0_pipeline,
             &[
-                &weight_buffer.buffer,
-                &input_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_row_buffer.buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -1449,17 +1540,17 @@ impl MetalQ2Matvec {
             "running native Metal transposed Q8_0 matvec"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.q8_0_transposed_pipeline,
             &[
-                &weight_buffer.buffer,
-                &input_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_input_row_buffer.buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_input_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -1544,17 +1635,17 @@ impl MetalQ2Matvec {
             "running native Metal transposed Q2_K matvec"
         );
 
-        dispatch_1d(
+        dispatch_1d_with_offsets(
             queue,
             &self.transposed_pipeline,
             &[
-                &weight_buffer.buffer,
-                &input_buffer.buffer,
-                &output_buffer.buffer,
-                &row_count_buffer.buffer,
-                &in_features_buffer.buffer,
-                &out_features_buffer.buffer,
-                &blocks_per_input_row_buffer.buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&input_buffer.buffer, 0),
+                (&output_buffer.buffer, 0),
+                (&row_count_buffer.buffer, 0),
+                (&in_features_buffer.buffer, 0),
+                (&out_features_buffer.buffer, 0),
+                (&blocks_per_input_row_buffer.buffer, 0),
             ],
             physical_threads,
         )?;
@@ -1646,6 +1737,21 @@ impl MetalQ2Matvec {
             QuantMatvecKind::Q80Transposed => &self.q8_0_transposed_pipeline,
         };
         let weight_buffer = self.weight_buffer(device, weights)?;
+        let use_laguna_rows2 = kind == QuantMatvecKind::Q80
+            && row_count == 1
+            && !use_q8_output_tile
+            && weight_buffer.laguna_view;
+        let use_laguna_output4 = kind == QuantMatvecKind::Q80
+            && row_count == 1
+            && use_q8_output_tile
+            && weight_buffer.laguna_view;
+        let pipeline = if use_laguna_output4 {
+            &self.laguna_q8_0_output4_pipeline
+        } else if use_laguna_rows2 {
+            &self.laguna_q8_0_rows2_pipeline
+        } else {
+            pipeline
+        };
         let output_buffer = self.arena.empty_f32(output_len)?;
         let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
         let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
@@ -1665,17 +1771,17 @@ impl MetalQ2Matvec {
         );
 
         let buffers = [
-            &weight_buffer.buffer,
-            input,
-            &output_buffer,
-            &row_count_buffer,
-            &in_features_buffer,
-            &out_features_buffer,
-            &blocks_per_row_buffer,
+            (&weight_buffer.storage, weight_buffer.byte_offset),
+            (input, 0),
+            (&output_buffer, 0),
+            (&row_count_buffer, 0),
+            (&in_features_buffer, 0),
+            (&out_features_buffer, 0),
+            (&blocks_per_row_buffer, 0),
         ];
         if kind == QuantMatvecKind::Q80 {
             if use_q8_mma {
-                encode_1d_threadgroups(
+                encode_1d_threadgroups_with_offsets(
                     command_buffer,
                     pipeline,
                     &buffers,
@@ -1684,11 +1790,15 @@ impl MetalQ2Matvec {
                 )?;
                 return Ok(output_buffer);
             }
-            let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
+            let simdgroups_per_output = if use_laguna_rows2 {
+                LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row)
+            } else {
+                q8_0_simdgroups_per_output(blocks_per_row)
+            };
             let simdgroups_per_output_buffer = self
                 .arena
                 .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
-            encode_1d_threadgroups(
+            encode_1d_threadgroups_with_offsets(
                 command_buffer,
                 pipeline,
                 &[
@@ -1699,12 +1809,14 @@ impl MetalQ2Matvec {
                     buffers[4],
                     buffers[5],
                     buffers[6],
-                    &simdgroups_per_output_buffer,
+                    (&simdgroups_per_output_buffer, 0),
                 ],
                 if use_q8_batch {
                     row_count.div_ceil(Q8_0_BATCH_ROW_TILE) * out_features
                 } else if use_q8_output_tile {
                     row_count * out_features.div_ceil(Q8_0_OUTPUT_FEATURE_TILE)
+                } else if use_laguna_rows2 {
+                    row_count * out_features.div_ceil(LAGUNA_Q8_0_OUTPUT_ROWS)
                 } else {
                     output_len
                 },
@@ -1716,9 +1828,87 @@ impl MetalQ2Matvec {
                 output_len,
                 "batched cooperative quantized matvec",
             )?;
-            encode_1d(command_buffer, pipeline, &buffers, dispatch_threads)?;
+            encode_1d_with_offsets(command_buffer, pipeline, &buffers, dispatch_threads)?;
         }
         Ok(output_buffer)
+    }
+
+    pub(crate) fn encode_q8_0_embedding(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        if token_ids.is_empty() {
+            return Err(Error::backend(
+                "Q8_0 embedding requires at least one token ID",
+            ));
+        }
+        if hidden_size == 0 || !hidden_size.is_multiple_of(Q8_0_BLOCK_VALUES) {
+            return Err(Error::backend(format!(
+                "Q8_0 embedding hidden size {hidden_size} must be divisible by {Q8_0_BLOCK_VALUES}"
+            )));
+        }
+        if let Some(token_id) = token_ids
+            .iter()
+            .copied()
+            .find(|token_id| *token_id as usize >= vocab_size)
+        {
+            return Err(Error::backend(format!(
+                "Q8_0 embedding token ID {token_id} exceeds vocabulary {vocab_size}"
+            )));
+        }
+        let blocks_per_row = hidden_size / Q8_0_BLOCK_VALUES;
+        let row_bytes = blocks_per_row
+            .checked_mul(Q8_0_BLOCK_BYTES)
+            .ok_or_else(|| Error::backend("Q8_0 embedding row byte count overflow"))?;
+        let expected_bytes = vocab_size
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::backend("Q8_0 embedding payload byte count overflow"))?;
+        if weights.len() != expected_bytes {
+            return Err(Error::backend(format!(
+                "Q8_0 embedding expected {expected_bytes} weight bytes, got {}",
+                weights.len()
+            )));
+        }
+
+        let output_len = token_ids
+            .len()
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("Q8_0 embedding output length overflow"))?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        let token_buffer = u32_buffer(device, token_ids)?;
+        let output = self.arena.empty_f32(output_len)?;
+        let token_count = self
+            .arena
+            .u32(matvec_u32(token_ids.len(), "embedding token count")?)?;
+        let vocab_size = self
+            .arena
+            .u32(matvec_u32(vocab_size, "embedding vocabulary")?)?;
+        let hidden_size = self
+            .arena
+            .u32(matvec_u32(hidden_size, "embedding hidden size")?)?;
+        let blocks_per_row = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "embedding blocks per row")?)?;
+        encode_1d_with_offsets(
+            command_buffer,
+            &self.q8_0_embedding_pipeline,
+            &[
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (&token_buffer, 0),
+                (&output, 0),
+                (&token_count, 0),
+                (&vocab_size, 0),
+                (&hidden_size, 0),
+                (&blocks_per_row, 0),
+            ],
+            output_len,
+        )?;
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1763,13 +1953,24 @@ impl MetalQ2Matvec {
             .checked_mul(out_features_b)
             .ok_or_else(|| Error::backend("paired Q8_0 output B length overflow"))?;
         let max_out_features = out_features_a.max(out_features_b);
-        let threadgroup_count = row_count
-            .checked_mul(max_out_features)
-            .ok_or_else(|| Error::backend("paired Q8_0 threadgroup count overflow"))?;
-        let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row_a);
 
         let weight_buffer_a = self.weight_buffer(device, weights_a)?;
         let weight_buffer_b = self.weight_buffer(device, weights_b)?;
+        let use_laguna_rows2 =
+            row_count == 1 && weight_buffer_a.laguna_view && weight_buffer_b.laguna_view;
+        let simdgroups_per_output = if use_laguna_rows2 {
+            LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row_a)
+        } else {
+            q8_0_simdgroups_per_output(blocks_per_row_a)
+        };
+        let output_rows_per_group = if use_laguna_rows2 {
+            LAGUNA_Q8_0_OUTPUT_ROWS
+        } else {
+            1
+        };
+        let threadgroup_count = row_count
+            .checked_mul(max_out_features.div_ceil(output_rows_per_group))
+            .ok_or_else(|| Error::backend("paired Q8_0 threadgroup count overflow"))?;
         let output_a = self.arena.empty_f32(output_len_a)?;
         let output_b = self.arena.empty_f32(output_len_b)?;
         let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
@@ -1794,29 +1995,177 @@ impl MetalQ2Matvec {
             out_features_a,
             out_features_b,
             blocks_per_row = blocks_per_row_a,
+            laguna_rows2 = use_laguna_rows2,
             "encoding paired native Metal Q8_0 matvec"
         );
 
-        encode_1d_threadgroups(
+        encode_1d_threadgroups_with_offsets(
             command_buffer,
-            &self.q8_0_pair_tiled_pipeline,
+            if use_laguna_rows2 {
+                &self.laguna_q8_0_pair_rows2_pipeline
+            } else {
+                &self.q8_0_pair_tiled_pipeline
+            },
             &[
-                &weight_buffer_a.buffer,
-                &weight_buffer_b.buffer,
-                input,
-                &output_a,
-                &output_b,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_a_buffer,
-                &out_features_b_buffer,
-                &blocks_per_row_buffer,
-                &simdgroups_per_output_buffer,
+                (&weight_buffer_a.storage, weight_buffer_a.byte_offset),
+                (&weight_buffer_b.storage, weight_buffer_b.byte_offset),
+                (input, 0),
+                (&output_a, 0),
+                (&output_b, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_a_buffer, 0),
+                (&out_features_b_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
             ],
             threadgroup_count,
             simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
         Ok((output_a, output_b))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_laguna_q8_0_attention_projections(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        query_weights: &[u8],
+        key_weights: &[u8],
+        value_weights: &[u8],
+        gate_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        query_features: usize,
+        key_features: usize,
+        value_features: usize,
+        gate_features: usize,
+    ) -> Result<[Buffer; 4]> {
+        if row_count != 1 {
+            return Err(Error::backend(format!(
+                "fused Laguna attention projections require one decode row, got {row_count}"
+            )));
+        }
+        let query_blocks = validate_q8_0_matvec_buffer(
+            query_weights,
+            input_len,
+            row_count,
+            in_features,
+            query_features,
+        )?;
+        let key_blocks = validate_q8_0_matvec_buffer(
+            key_weights,
+            input_len,
+            row_count,
+            in_features,
+            key_features,
+        )?;
+        let value_blocks = validate_q8_0_matvec_buffer(
+            value_weights,
+            input_len,
+            row_count,
+            in_features,
+            value_features,
+        )?;
+        let gate_blocks = validate_q8_0_matvec_buffer(
+            gate_weights,
+            input_len,
+            row_count,
+            in_features,
+            gate_features,
+        )?;
+        if [key_blocks, value_blocks, gate_blocks]
+            .into_iter()
+            .any(|blocks| blocks != query_blocks)
+        {
+            return Err(Error::backend(format!(
+                "fused Laguna attention projections require equal blocks per row, got query={query_blocks}, key={key_blocks}, value={value_blocks}, gate={gate_blocks}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "fused Laguna attention input")?;
+
+        let query_binding = self.weight_buffer(device, query_weights)?;
+        let key_binding = self.weight_buffer(device, key_weights)?;
+        let value_binding = self.weight_buffer(device, value_weights)?;
+        let gate_binding = self.weight_buffer(device, gate_weights)?;
+        if !query_binding.laguna_view
+            || !key_binding.laguna_view
+            || !value_binding.laguna_view
+            || !gate_binding.laguna_view
+        {
+            return Err(Error::backend(
+                "fused Laguna attention projections require registered GGUF Metal views",
+            ));
+        }
+
+        let query_output = self.arena.empty_f32(query_features)?;
+        let key_output = self.arena.empty_f32(key_features)?;
+        let value_output = self.arena.empty_f32(value_features)?;
+        let gate_output = self.arena.empty_f32(gate_features)?;
+        let max_out_features = query_features
+            .max(key_features)
+            .max(value_features)
+            .max(gate_features);
+        let simdgroups_per_output = LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(query_blocks);
+        let threadgroup_count = max_out_features.div_ceil(LAGUNA_Q8_0_OUTPUT_ROWS);
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let query_features_buffer = self
+            .arena
+            .u32(matvec_u32(query_features, "query_features")?)?;
+        let key_features_buffer = self.arena.u32(matvec_u32(key_features, "key_features")?)?;
+        let value_features_buffer = self
+            .arena
+            .u32(matvec_u32(value_features, "value_features")?)?;
+        let gate_features_buffer = self
+            .arena
+            .u32(matvec_u32(gate_features, "gate_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(query_blocks, "blocks_per_row")?)?;
+        let simdgroups_per_output_buffer = self
+            .arena
+            .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
+
+        trace!(
+            target: "inferno::metal",
+            in_features,
+            query_features,
+            key_features,
+            value_features,
+            gate_features,
+            blocks_per_row = query_blocks,
+            "encoding fused Laguna Q8_0 attention projections"
+        );
+
+        encode_1d_threadgroups_with_offsets(
+            command_buffer,
+            &self.laguna_q8_0_attention_projections_rows2_pipeline,
+            &[
+                (&query_binding.storage, query_binding.byte_offset),
+                (&key_binding.storage, key_binding.byte_offset),
+                (&value_binding.storage, value_binding.byte_offset),
+                (&gate_binding.storage, gate_binding.byte_offset),
+                (input, 0),
+                (&query_output, 0),
+                (&key_output, 0),
+                (&value_output, 0),
+                (&gate_output, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&query_features_buffer, 0),
+                (&key_features_buffer, 0),
+                (&value_features_buffer, 0),
+                (&gate_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
+            ],
+            threadgroup_count,
+            simdgroups_per_output * Q2_K_SIMD_LANES,
+        )?;
+        Ok([query_output, key_output, value_output, gate_output])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1855,9 +2204,14 @@ impl MetalQ2Matvec {
         let output_len = row_count
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("fused Q8_0 gate/up output length overflow"))?;
-        let simdgroups_per_output = q8_0_simdgroups_per_output(gate_blocks);
         let gate_buffer = self.weight_buffer(device, gate_weights)?;
         let up_buffer = self.weight_buffer(device, up_weights)?;
+        let use_laguna_rows2 = row_count == 1 && gate_buffer.laguna_view && up_buffer.laguna_view;
+        let simdgroups_per_output = if use_laguna_rows2 {
+            LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(gate_blocks)
+        } else {
+            q8_0_simdgroups_per_output(gate_blocks)
+        };
         let output = self.arena.empty_f32(output_len)?;
         let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
         let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
@@ -1873,24 +2227,33 @@ impl MetalQ2Matvec {
             in_features,
             out_features,
             blocks_per_row = gate_blocks,
+            laguna_rows2 = use_laguna_rows2,
             "encoding fused native Metal Q8_0 gate/up SwiGLU"
         );
 
-        encode_1d_threadgroups(
+        encode_1d_threadgroups_with_offsets(
             command_buffer,
-            &self.q8_0_gate_up_swiglu_tiled_pipeline,
+            if use_laguna_rows2 {
+                &self.laguna_q8_0_gate_up_rows2_pipeline
+            } else {
+                &self.q8_0_gate_up_swiglu_tiled_pipeline
+            },
             &[
-                &gate_buffer.buffer,
-                &up_buffer.buffer,
-                input,
-                &output,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &simdgroups_per_output_buffer,
+                (&gate_buffer.storage, gate_buffer.byte_offset),
+                (&up_buffer.storage, up_buffer.byte_offset),
+                (input, 0),
+                (&output, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
             ],
-            output_len,
+            if use_laguna_rows2 {
+                row_count * out_features.div_ceil(LAGUNA_Q8_0_OUTPUT_ROWS)
+            } else {
+                output_len
+            },
             simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
         Ok(output)
@@ -1996,19 +2359,19 @@ impl MetalQ2Matvec {
             "encoding packed-head transposed quantized matvec"
         );
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             pipeline,
             &[
-                &weight_buffer.buffer,
-                input,
-                &output_buffer,
-                &row_count_buffer,
-                &head_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_input_row_buffer,
-                &blocks_per_head_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (&output_buffer, 0),
+                (&row_count_buffer, 0),
+                (&head_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_input_row_buffer, 0),
+                (&blocks_per_head_buffer, 0),
             ],
             physical_threads,
         )?;
@@ -2087,19 +2450,19 @@ impl MetalQ2Matvec {
             .arena
             .u32(matvec_u32(blocks_per_head, "blocks_per_head")?)?;
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             &self.q8_0_packed_heads_pipeline,
             &[
-                &weight_buffer.buffer,
-                input,
-                &output_buffer,
-                &row_count_buffer,
-                &head_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &blocks_per_head_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (&output_buffer, 0),
+                (&row_count_buffer, 0),
+                (&head_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&blocks_per_head_buffer, 0),
             ],
             physical_threads,
         )?;
@@ -2155,18 +2518,18 @@ impl MetalQ2Matvec {
             "encoding batched Q2_K matvec plus residual"
         );
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             &self.add_pipeline,
             &[
-                &weight_buffer.buffer,
-                input,
-                residual,
-                &output_buffer,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (residual, 0),
+                (&output_buffer, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
             ],
             physical_threads,
         )?;
@@ -2200,8 +2563,13 @@ impl MetalQ2Matvec {
         }
         require_f32_capacity(residual, residual_len, "Q8_0 matvec add residual")?;
 
-        let simdgroups_per_output = q8_0_simdgroups_per_output(blocks_per_row);
         let weight_buffer = self.weight_buffer(device, weights)?;
+        let use_laguna_rows2 = row_count == 1 && weight_buffer.laguna_view;
+        let simdgroups_per_output = if use_laguna_rows2 {
+            LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row)
+        } else {
+            q8_0_simdgroups_per_output(blocks_per_row)
+        };
         let output_buffer = self.arena.empty_f32(output_len)?;
         let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
         let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
@@ -2214,32 +2582,105 @@ impl MetalQ2Matvec {
             .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
 
         let use_q8_batch = row_count >= 2;
-        encode_1d_threadgroups(
+        encode_1d_threadgroups_with_offsets(
             command_buffer,
             if use_q8_batch {
                 &self.q8_0_batched_tiled_add_pipeline
+            } else if use_laguna_rows2 {
+                &self.laguna_q8_0_add_rows2_pipeline
             } else {
                 &self.q8_0_tiled_add_pipeline
             },
             &[
-                &weight_buffer.buffer,
-                input,
-                residual,
-                &output_buffer,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &simdgroups_per_output_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (residual, 0),
+                (&output_buffer, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
             ],
             if use_q8_batch {
                 row_count.div_ceil(Q8_0_BATCH_ROW_TILE) * out_features
+            } else if use_laguna_rows2 {
+                row_count * out_features.div_ceil(LAGUNA_Q8_0_OUTPUT_ROWS)
             } else {
                 output_len
             },
             simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
         Ok(output_buffer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_laguna_q8_0_matvec_add2(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual_a: &Buffer,
+        residual_a_len: usize,
+        residual_b: &Buffer,
+        residual_b_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        let blocks_per_row =
+            validate_q8_0_matvec_buffer(weights, input_len, row_count, in_features, out_features)?;
+        require_f32_capacity(input, input_len, "Laguna Q8_0 add2 input")?;
+        let output_len = row_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("Laguna Q8_0 add2 output length overflow"))?;
+        if residual_a_len != output_len || residual_b_len != output_len {
+            return Err(Error::backend(format!(
+                "Laguna Q8_0 add2 residual lengths must both be {output_len}, got {residual_a_len} and {residual_b_len}"
+            )));
+        }
+        require_f32_capacity(residual_a, residual_a_len, "Laguna Q8_0 add2 residual A")?;
+        require_f32_capacity(residual_b, residual_b_len, "Laguna Q8_0 add2 residual B")?;
+
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        if !weight_buffer.laguna_view {
+            return Err(Error::backend(
+                "Laguna Q8_0 add2 requires a registered Laguna GGUF model view",
+            ));
+        }
+        let simdgroups_per_output = LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row);
+        let output = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let simdgroups_per_output_buffer = self
+            .arena
+            .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
+
+        encode_1d_threadgroups_with_offsets(
+            command_buffer,
+            &self.laguna_q8_0_add2_rows2_pipeline,
+            &[
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (residual_a, 0),
+                (residual_b, 0),
+                (&output, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
+            ],
+            row_count * out_features.div_ceil(LAGUNA_Q8_0_OUTPUT_ROWS),
+            simdgroups_per_output * Q2_K_SIMD_LANES,
+        )?;
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2332,22 +2773,22 @@ impl MetalQ2Matvec {
             "encoding batched Q2_K multi-expert gate/up SwiGLU"
         );
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             &self.multi_expert_gate_up_swiglu_pipeline,
             &[
-                &gate_weight_buffer.buffer,
-                &up_weight_buffer.buffer,
-                input,
-                &token_indices_buffer,
-                &expert_ids_buffer,
-                &output_buffer,
-                &token_count_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &expert_stride_buffer,
+                (&gate_weight_buffer.storage, gate_weight_buffer.byte_offset),
+                (&up_weight_buffer.storage, up_weight_buffer.byte_offset),
+                (input, 0),
+                (&token_indices_buffer, 0),
+                (&expert_ids_buffer, 0),
+                (&output_buffer, 0),
+                (&token_count_buffer, 0),
+                (&assignment_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&expert_stride_buffer, 0),
             ],
             physical_threads,
         )?;
@@ -2422,23 +2863,99 @@ impl MetalQ2Matvec {
             "encoding batched Q2_K multi-expert matvec"
         );
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             &self.multi_expert_matvec_pipeline,
             &[
-                &weight_buffer.buffer,
-                input,
-                &expert_ids_buffer,
-                &output_buffer,
-                &assignment_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
-                &expert_stride_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (&expert_ids_buffer, 0),
+                (&output_buffer, 0),
+                (&assignment_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&expert_stride_buffer, 0),
             ],
             physical_threads,
         )?;
         Ok(output_buffer)
+    }
+
+    /// Encodes the Laguna Q8_0 output head without materializing the full
+    /// logits vector. Each four-row matvec tile emits one candidate, then a
+    /// final reduction selects the globally best token.
+    pub(crate) fn encode_laguna_q8_0_matvec_argmax(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        let blocks_per_row =
+            validate_q8_0_matvec_buffer(weights, input_len, 1, in_features, out_features)?;
+        require_f32_capacity(input, input_len, "Laguna Q8_0 output-head input")?;
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        if !weight_buffer.laguna_view {
+            return Err(Error::backend(
+                "Laguna Q8_0 output-head argmax requires a registered Laguna GGUF model view",
+            ));
+        }
+
+        let candidate_count = out_features.div_ceil(LAGUNA_Q8_0_ARGMAX_ROWS);
+        let simdgroups_per_output = LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row);
+        let argmax_threads = argmax_threads(
+            &self.argmax_candidates_pipeline,
+            "Laguna Q8_0 output-head candidate argmax",
+        )?;
+        let candidate_ids = self.arena.empty_u32(candidate_count)?;
+        let candidate_scores = self.arena.empty_f32(candidate_count)?;
+        let token_id = self.arena.empty_u32(1)?;
+        let token_score = self.arena.empty_f32(1)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+        let simdgroups_per_output_buffer = self
+            .arena
+            .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
+        let candidate_count_buffer = self
+            .arena
+            .u32(matvec_u32(candidate_count, "candidate_count")?)?;
+
+        encode_1d_threadgroups_with_offsets(
+            command_buffer,
+            &self.laguna_q8_0_argmax_candidates_pipeline,
+            &[
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (&candidate_ids, 0),
+                (&candidate_scores, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+                (&simdgroups_per_output_buffer, 0),
+            ],
+            candidate_count,
+            simdgroups_per_output * Q2_K_SIMD_LANES,
+        )?;
+        encode_1d(
+            command_buffer,
+            &self.argmax_candidates_pipeline,
+            &[
+                &candidate_ids,
+                &candidate_scores,
+                &token_id,
+                &token_score,
+                &candidate_count_buffer,
+            ],
+            argmax_threads,
+        )?;
+        Ok((token_id, token_score))
     }
 
     /// Encodes the Q2_K output-head matvec plus greedy argmax into an open
@@ -2491,17 +3008,17 @@ impl MetalQ2Matvec {
             "encoding batched Q2_K matvec plus greedy argmax"
         );
 
-        encode_1d(
+        encode_1d_with_offsets(
             command_buffer,
             &self.pipeline,
             &[
-                &weight_buffer.buffer,
-                input,
-                &logits_buffer,
-                &row_count_buffer,
-                &in_features_buffer,
-                &out_features_buffer,
-                &blocks_per_row_buffer,
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (&logits_buffer, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
             ],
             matvec_threads,
         )?;
@@ -4018,6 +4535,14 @@ impl MetalQ2Matvec {
     }
 
     fn weight_buffer(&self, device: &Device, weights: &[u8]) -> Result<WeightBuffer> {
+        if let Some(binding) = self.laguna_views.binding(weights)? {
+            return Ok(WeightBuffer {
+                storage: binding.buffer,
+                byte_offset: binding.byte_offset,
+                laguna_view: true,
+            });
+        }
+
         let key = WeightBufferKey {
             address: weights.as_ptr() as usize,
             byte_len: weights.len(),
@@ -4028,13 +4553,19 @@ impl MetalQ2Matvec {
             .map_err(|_| Error::backend("Metal weight buffer cache lock poisoned"))?;
         if let Some(buffer) = buffers.get(&key) {
             return Ok(WeightBuffer {
-                buffer: buffer.clone(),
+                storage: buffer.clone(),
+                byte_offset: 0,
+                laguna_view: false,
             });
         }
 
         let buffer = u8_buffer_no_copy(device, weights)?;
         buffers.insert(key, buffer.clone());
-        Ok(WeightBuffer { buffer })
+        Ok(WeightBuffer {
+            storage: buffer,
+            byte_offset: 0,
+            laguna_view: false,
+        })
     }
 }
 
@@ -6012,6 +6543,24 @@ mod tests {
             *value += residual;
         }
 
+        assert_close(&actual, &expected, 1e-4);
+    }
+
+    #[test]
+    fn q8_0_embedding_gathers_only_selected_rows() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let weights = [q8_0_block(0x3c00, 1), q8_0_block(0x3800, -4)].concat();
+        let output = metal
+            .batched_q8_0_embedding(&weights, &[1, 0], 2, Q8_0_BLOCK_VALUES)
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, 2 * Q8_0_BLOCK_VALUES)
+            .unwrap();
+        let expected = std::iter::repeat_n(-2.0_f32, Q8_0_BLOCK_VALUES)
+            .chain(std::iter::repeat_n(1.0_f32, Q8_0_BLOCK_VALUES))
+            .collect::<Vec<_>>();
         assert_close(&actual, &expected, 1e-4);
     }
 

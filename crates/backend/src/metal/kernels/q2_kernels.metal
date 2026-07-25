@@ -15,6 +15,9 @@ constant uint Q8_0_BLOCK_BYTES = 34;
 constant uint Q8_0_MAX_SIMDGROUPS_PER_OUTPUT = 8;
 constant uint Q8_0_BATCH_ROW_TILE = 4;
 constant uint Q8_0_OUTPUT_FEATURE_TILE = 4;
+constant uint Q8_0_LAGUNA_ARGMAX_ROWS = 4;
+constant uint Q8_0_LAGUNA_OUTPUT_ROWS = 2;
+constant uint Q8_0_LAGUNA_VALUES_PER_LANE = 8;
 constant uint Q8_0_MMA_TOKEN_TILE = 32;
 constant uint Q8_0_MMA_TOKEN_GROUPS = 4;
 constant uint Q8_0_MMA_OUTPUT_TILE = 32;
@@ -97,6 +100,33 @@ static inline float q8_0_block_value(const device uchar* weights, uint block_off
     uchar raw = weights[block_offset + 2 + value_index];
     int quant = raw < 128 ? int(raw) : int(raw) - 256;
     return d * float(quant);
+}
+
+kernel void q8_0_embedding_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device uint* token_ids [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& vocab_size [[buffer(4)]],
+    constant uint& hidden_size [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint output_count = token_count * hidden_size;
+    if (gid >= output_count) {
+        return;
+    }
+    uint token = gid / hidden_size;
+    uint hidden = gid - token * hidden_size;
+    uint token_id = token_ids[token];
+    if (token_id >= vocab_size) {
+        output[gid] = 0.0f;
+        return;
+    }
+    uint block = hidden / Q8_0_BLOCK_VALUES;
+    uint value = hidden - block * Q8_0_BLOCK_VALUES;
+    uint block_offset = (token_id * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+    output[gid] = q8_0_block_value(weights, block_offset, value);
 }
 
 kernel void q2_k_matvec_f32_kernel(
@@ -1276,6 +1306,197 @@ kernel void q8_0_matvec_output4_tiled_f32_kernel(
     }
 }
 
+kernel void laguna_q8_0_matvec_output4_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    constant uint& simdgroups_per_output [[buffer(7)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_groups_per_input =
+        (out_features + Q8_0_OUTPUT_FEATURE_TILE - 1u)
+        / Q8_0_OUTPUT_FEATURE_TILE;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_OUTPUT_FEATURE_TILE;
+    if (input_row >= row_count
+        || output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step =
+        simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    uint input_row_offset = input_row * in_features;
+    float4 sums = float4(0.0f);
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset = input_row_offset
+            + block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_OUTPUT_FEATURE_TILE; row++) {
+            uint feature = output_row + row;
+            if (feature >= out_features) {
+                continue;
+            }
+            uint block_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            float dot = 0.0f;
+            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                uchar raw = weights[
+                    block_offset + 2u
+                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                    + index
+                ];
+                int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                dot += values[index] * float(quant);
+            }
+            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
+            sums[row] += dot * scale;
+        }
+    }
+
+    threadgroup float partial[
+        Q8_0_OUTPUT_FEATURE_TILE * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_OUTPUT_FEATURE_TILE; row++) {
+        float value = simd_sum(sums[row]);
+        if (simd_lane == 0u) {
+            partial[
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index)
+            ] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_OUTPUT_FEATURE_TILE; row++) {
+            uint feature = output_row + row;
+            float lane = simd_lane < simdgroups_per_output
+                ? partial[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value = simd_sum(lane);
+            if (simd_lane == 0u && feature < out_features) {
+                output[input_row * out_features + feature] = value;
+            }
+        }
+    }
+}
+
+kernel void laguna_q8_0_matvec_argmax_candidates_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device uint* candidate_ids [[buffer(2)]],
+    device float* candidate_scores [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    constant uint& simdgroups_per_output [[buffer(7)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint output_row = threadgroup_position.x * Q8_0_LAGUNA_ARGMAX_ROWS;
+    if (output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step =
+        simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    float sums[Q8_0_LAGUNA_ARGMAX_ROWS];
+    for (uint row = 0u; row < Q8_0_LAGUNA_ARGMAX_ROWS; row++) {
+        sums[row] = 0.0f;
+    }
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset =
+            block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_LAGUNA_ARGMAX_ROWS; row++) {
+            uint feature = output_row + row;
+            if (feature >= out_features) {
+                continue;
+            }
+            uint block_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            float dot = 0.0f;
+            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                uchar raw = weights[
+                    block_offset + 2u
+                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                    + index
+                ];
+                int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                dot += values[index] * float(quant);
+            }
+            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
+            sums[row] += dot * scale;
+        }
+    }
+
+    threadgroup float partial[
+        Q8_0_LAGUNA_ARGMAX_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_ARGMAX_ROWS; row++) {
+        float value = simd_sum(sums[row]);
+        if (simd_lane == 0u) {
+            partial[
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index)
+            ] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        float best_score = -3.402823466e+38F;
+        uint best_id = 0xffffffffu;
+        for (uint row = 0u; row < Q8_0_LAGUNA_ARGMAX_ROWS; row++) {
+            uint feature = output_row + row;
+            float lane = simd_lane < simdgroups_per_output
+                ? partial[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value = simd_sum(lane);
+            if (simd_lane == 0u
+                && feature < out_features
+                && (value > best_score
+                    || (value == best_score && feature < best_id))) {
+                best_score = value;
+                best_id = feature;
+            }
+        }
+        if (simd_lane == 0u) {
+            candidate_ids[threadgroup_position.x] = best_id;
+            candidate_scores[threadgroup_position.x] = best_score;
+        }
+    }
+}
+
 // Decode Q-A and KV-A together. Both matrices consume the same activation
 // row, so each lane loads one input value and applies it to both independent
 // Q8_0 weight streams while both output rows are active.
@@ -1347,6 +1568,699 @@ kernel void q8_0_matvec_pair_tiled_f32_kernel(
             }
             if (output_feature < out_features_b) {
                 output_b[(input_row * out_features_b) + output_feature] = reduced_b;
+            }
+        }
+    }
+}
+
+// Laguna decode uses four SIMD groups to compute two adjacent Q8_0 rows.
+// Each lane loads eight consecutive activation values and reuses them for
+// both projections and both rows.
+kernel void laguna_q8_0_matvec_pair_rows2_f32_kernel(
+    const device uchar* weights_a [[buffer(0)]],
+    const device uchar* weights_b [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    device float* output_a [[buffer(3)]],
+    device float* output_b [[buffer(4)]],
+    constant uint& row_count [[buffer(5)]],
+    constant uint& in_features [[buffer(6)]],
+    constant uint& out_features_a [[buffer(7)]],
+    constant uint& out_features_b [[buffer(8)]],
+    constant uint& blocks_per_row [[buffer(9)]],
+    constant uint& simdgroups_per_output [[buffer(10)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint max_out_features = max(out_features_a, out_features_b);
+    uint row_groups_per_input =
+        (max_out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= max_out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step = simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    uint input_row_offset = input_row * in_features;
+    float sums_a[Q8_0_LAGUNA_OUTPUT_ROWS] = {0.0f};
+    float sums_b[Q8_0_LAGUNA_OUTPUT_ROWS] = {0.0f};
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset = input_row_offset
+            + block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            if (feature < out_features_a) {
+                uint block_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = weights_a[
+                        block_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                float scale = f16_bits_to_f32(read_le_u16(weights_a, block_offset));
+                sums_a[row] += dot * scale;
+            }
+            if (feature < out_features_b) {
+                uint block_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = weights_b[
+                        block_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                float scale = f16_bits_to_f32(read_le_u16(weights_b, block_offset));
+                sums_b[row] += dot * scale;
+            }
+        }
+    }
+
+    threadgroup float partial_a[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    threadgroup float partial_b[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        float sum_a = simd_sum(sums_a[row]);
+        float sum_b = simd_sum(sums_b[row]);
+        if (simd_lane == 0u) {
+            uint partial_index =
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index);
+            partial_a[partial_index] = sum_a;
+            partial_b[partial_index] = sum_b;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            float lane_a = simd_lane < simdgroups_per_output
+                ? partial_a[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float lane_b = simd_lane < simdgroups_per_output
+                ? partial_b[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value_a = simd_sum(lane_a);
+            float value_b = simd_sum(lane_b);
+            if (simd_lane == 0u) {
+                if (feature < out_features_a) {
+                    output_a[input_row * out_features_a + feature] = value_a;
+                }
+                if (feature < out_features_b) {
+                    output_b[input_row * out_features_b + feature] = value_b;
+                }
+            }
+        }
+    }
+}
+
+// Laguna decode projects Q, K, V, and the attention gate from the same
+// normalized hidden row. Loading that row once avoids a second full activation
+// traversal for the V/gate pair.
+kernel void laguna_q8_0_attention_projections_rows2_f32_kernel(
+    const device uchar* query_weights [[buffer(0)]],
+    const device uchar* key_weights [[buffer(1)]],
+    const device uchar* value_weights [[buffer(2)]],
+    const device uchar* gate_weights [[buffer(3)]],
+    const device float* input [[buffer(4)]],
+    device float* query_output [[buffer(5)]],
+    device float* key_output [[buffer(6)]],
+    device float* value_output [[buffer(7)]],
+    device float* gate_output [[buffer(8)]],
+    constant uint& row_count [[buffer(9)]],
+    constant uint& in_features [[buffer(10)]],
+    constant uint& query_features [[buffer(11)]],
+    constant uint& key_features [[buffer(12)]],
+    constant uint& value_features [[buffer(13)]],
+    constant uint& gate_features [[buffer(14)]],
+    constant uint& blocks_per_row [[buffer(15)]],
+    constant uint& simdgroups_per_output [[buffer(16)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint max_out_features = max(
+        max(query_features, key_features),
+        max(value_features, gate_features));
+    uint row_groups_per_input =
+        (max_out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= max_out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step = simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    uint input_row_offset = input_row * in_features;
+    float2 query_sums = float2(0.0f);
+    float2 key_sums = float2(0.0f);
+    float2 value_sums = float2(0.0f);
+    float2 gate_sums = float2(0.0f);
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset = input_row_offset
+            + block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            if (feature < query_features) {
+                uint weight_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = query_weights[
+                        weight_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                query_sums[row] += dot
+                    * f16_bits_to_f32(read_le_u16(query_weights, weight_offset));
+            }
+            if (feature < key_features) {
+                uint weight_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = key_weights[
+                        weight_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                key_sums[row] += dot
+                    * f16_bits_to_f32(read_le_u16(key_weights, weight_offset));
+            }
+            if (feature < value_features) {
+                uint weight_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = value_weights[
+                        weight_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                value_sums[row] += dot
+                    * f16_bits_to_f32(read_le_u16(value_weights, weight_offset));
+            }
+            if (feature < gate_features) {
+                uint weight_offset =
+                    (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                float dot = 0.0f;
+                for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                    uchar raw = gate_weights[
+                        weight_offset + 2u
+                        + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                        + index
+                    ];
+                    int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                    dot += values[index] * float(quant);
+                }
+                gate_sums[row] += dot
+                    * f16_bits_to_f32(read_le_u16(gate_weights, weight_offset));
+            }
+        }
+    }
+
+    threadgroup float query_partials[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    threadgroup float key_partials[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    threadgroup float value_partials[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    threadgroup float gate_partials[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        uint partial_index =
+            row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index);
+        float query_partial = simd_sum(query_sums[row]);
+        float key_partial = simd_sum(key_sums[row]);
+        float value_partial = simd_sum(value_sums[row]);
+        float gate_partial = simd_sum(gate_sums[row]);
+        if (simd_lane == 0u) {
+            query_partials[partial_index] = query_partial;
+            key_partials[partial_index] = key_partial;
+            value_partials[partial_index] = value_partial;
+            gate_partials[partial_index] = gate_partial;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            uint partial_base = row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT;
+            float query_value = simd_sum(
+                simd_lane < simdgroups_per_output
+                    ? query_partials[partial_base + simd_lane]
+                    : 0.0f);
+            float key_value = simd_sum(
+                simd_lane < simdgroups_per_output
+                    ? key_partials[partial_base + simd_lane]
+                    : 0.0f);
+            float value_value = simd_sum(
+                simd_lane < simdgroups_per_output
+                    ? value_partials[partial_base + simd_lane]
+                    : 0.0f);
+            float gate_value = simd_sum(
+                simd_lane < simdgroups_per_output
+                    ? gate_partials[partial_base + simd_lane]
+                    : 0.0f);
+            if (simd_lane == 0u) {
+                if (feature < query_features) {
+                    query_output[input_row * query_features + feature] =
+                        query_value;
+                }
+                if (feature < key_features) {
+                    key_output[input_row * key_features + feature] = key_value;
+                }
+                if (feature < value_features) {
+                    value_output[input_row * value_features + feature] =
+                        value_value;
+                }
+                if (feature < gate_features) {
+                    gate_output[input_row * gate_features + feature] =
+                        gate_value;
+                }
+            }
+        }
+    }
+}
+
+static inline float2 laguna_q8_0_rows2_partial(
+    const device uchar* weights,
+    const device float* input,
+    uint input_row_offset,
+    uint output_row,
+    uint out_features,
+    uint blocks_per_row,
+    uint simdgroups_per_output,
+    ushort simd_lane,
+    ushort simdgroup_index
+) {
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step =
+        simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    float2 sums = float2(0.0f);
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset = input_row_offset
+            + block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            if (feature >= out_features) {
+                continue;
+            }
+            uint block_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            float dot = 0.0f;
+            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                uchar raw = weights[
+                    block_offset + 2u
+                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                    + index
+                ];
+                int quant = raw < 128u ? int(raw) : int(raw) - 256;
+                dot += values[index] * float(quant);
+            }
+            float scale = f16_bits_to_f32(read_le_u16(weights, block_offset));
+            sums[row] += dot * scale;
+        }
+    }
+    return sums;
+}
+
+kernel void laguna_q8_0_matvec_rows2_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& blocks_per_row [[buffer(6)]],
+    constant uint& simdgroups_per_output [[buffer(7)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_groups_per_input =
+        (out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    float2 sums = laguna_q8_0_rows2_partial(
+        weights,
+        input,
+        input_row * in_features,
+        output_row,
+        out_features,
+        blocks_per_row,
+        simdgroups_per_output,
+        simd_lane,
+        simdgroup_index);
+    threadgroup float partial[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        float value = simd_sum(sums[row]);
+        if (simd_lane == 0u) {
+            partial[
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index)
+            ] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            float lane = simd_lane < simdgroups_per_output
+                ? partial[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value = simd_sum(lane);
+            if (simd_lane == 0u && feature < out_features) {
+                output[input_row * out_features + feature] = value;
+            }
+        }
+    }
+}
+
+kernel void laguna_q8_0_matvec_add_rows2_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    const device float* residual [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& row_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    constant uint& simdgroups_per_output [[buffer(8)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_groups_per_input =
+        (out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    float2 sums = laguna_q8_0_rows2_partial(
+        weights,
+        input,
+        input_row * in_features,
+        output_row,
+        out_features,
+        blocks_per_row,
+        simdgroups_per_output,
+        simd_lane,
+        simdgroup_index);
+    threadgroup float partial[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        float value = simd_sum(sums[row]);
+        if (simd_lane == 0u) {
+            partial[
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index)
+            ] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            float lane = simd_lane < simdgroups_per_output
+                ? partial[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value = simd_sum(lane);
+            if (simd_lane == 0u && feature < out_features) {
+                uint output_index = input_row * out_features + feature;
+                output[output_index] = residual[output_index] + value;
+            }
+        }
+    }
+}
+
+kernel void laguna_q8_0_matvec_add2_rows2_f32_kernel(
+    const device uchar* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    const device float* residual_a [[buffer(2)]],
+    const device float* residual_b [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& row_count [[buffer(5)]],
+    constant uint& in_features [[buffer(6)]],
+    constant uint& out_features [[buffer(7)]],
+    constant uint& blocks_per_row [[buffer(8)]],
+    constant uint& simdgroups_per_output [[buffer(9)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_groups_per_input =
+        (out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    float2 sums = laguna_q8_0_rows2_partial(
+        weights,
+        input,
+        input_row * in_features,
+        output_row,
+        out_features,
+        blocks_per_row,
+        simdgroups_per_output,
+        simd_lane,
+        simdgroup_index);
+    threadgroup float partial[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        float value = simd_sum(sums[row]);
+        if (simd_lane == 0u) {
+            partial[
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index)
+            ] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            float lane = simd_lane < simdgroups_per_output
+                ? partial[row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane]
+                : 0.0f;
+            float value = simd_sum(lane);
+            if (simd_lane == 0u && feature < out_features) {
+                uint output_index = input_row * out_features + feature;
+                output[output_index] =
+                    residual_a[output_index] + residual_b[output_index] + value;
+            }
+        }
+    }
+}
+
+kernel void laguna_q8_0_gate_up_swiglu_rows2_f32_kernel(
+    const device uchar* gate_weights [[buffer(0)]],
+    const device uchar* up_weights [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& row_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    constant uint& simdgroups_per_output [[buffer(8)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_groups_per_input =
+        (out_features + Q8_0_LAGUNA_OUTPUT_ROWS - 1u)
+        / Q8_0_LAGUNA_OUTPUT_ROWS;
+    uint input_row = threadgroup_position.x / row_groups_per_input;
+    uint row_group = threadgroup_position.x
+        - input_row * row_groups_per_input;
+    uint output_row = row_group * Q8_0_LAGUNA_OUTPUT_ROWS;
+    if (input_row >= row_count
+        || output_row >= out_features
+        || simdgroup_index >= simdgroups_per_output) {
+        return;
+    }
+
+    ushort block_lane = simd_lane / 4u;
+    ushort value_lane = simd_lane % 4u;
+    uint first_block = uint(simdgroup_index) * Q8_0_LAGUNA_VALUES_PER_LANE
+        + uint(block_lane);
+    uint block_step =
+        simdgroups_per_output * Q8_0_LAGUNA_VALUES_PER_LANE;
+    uint input_row_offset = input_row * in_features;
+    float2 gate_sums = float2(0.0f);
+    float2 up_sums = float2(0.0f);
+
+    for (uint block = first_block; block < blocks_per_row; block += block_step) {
+        uint input_offset = input_row_offset
+            + block * Q8_0_BLOCK_VALUES
+            + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE;
+        float values[Q8_0_LAGUNA_VALUES_PER_LANE];
+        for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+            values[index] = input[input_offset + index];
+        }
+
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            if (feature >= out_features) {
+                continue;
+            }
+            uint block_offset =
+                (feature * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+            float gate_dot = 0.0f;
+            float up_dot = 0.0f;
+            for (uint index = 0u; index < Q8_0_LAGUNA_VALUES_PER_LANE; index++) {
+                uint quant_offset = block_offset + 2u
+                    + uint(value_lane) * Q8_0_LAGUNA_VALUES_PER_LANE
+                    + index;
+                uchar gate_raw = gate_weights[quant_offset];
+                uchar up_raw = up_weights[quant_offset];
+                int gate_quant =
+                    gate_raw < 128u ? int(gate_raw) : int(gate_raw) - 256;
+                int up_quant =
+                    up_raw < 128u ? int(up_raw) : int(up_raw) - 256;
+                gate_dot += values[index] * float(gate_quant);
+                up_dot += values[index] * float(up_quant);
+            }
+            float gate_scale =
+                f16_bits_to_f32(read_le_u16(gate_weights, block_offset));
+            float up_scale =
+                f16_bits_to_f32(read_le_u16(up_weights, block_offset));
+            gate_sums[row] += gate_dot * gate_scale;
+            up_sums[row] += up_dot * up_scale;
+        }
+    }
+
+    threadgroup float partial_gate[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    threadgroup float partial_up[
+        Q8_0_LAGUNA_OUTPUT_ROWS * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT
+    ];
+    for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+        float gate_value = simd_sum(gate_sums[row]);
+        float up_value = simd_sum(up_sums[row]);
+        if (simd_lane == 0u) {
+            uint partial_index =
+                row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + uint(simdgroup_index);
+            partial_gate[partial_index] = gate_value;
+            partial_up[partial_index] = up_value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        for (uint row = 0u; row < Q8_0_LAGUNA_OUTPUT_ROWS; row++) {
+            uint feature = output_row + row;
+            float gate_lane = simd_lane < simdgroups_per_output
+                ? partial_gate[
+                    row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane
+                ]
+                : 0.0f;
+            float up_lane = simd_lane < simdgroups_per_output
+                ? partial_up[
+                    row * Q8_0_MAX_SIMDGROUPS_PER_OUTPUT + simd_lane
+                ]
+                : 0.0f;
+            float gate = simd_sum(gate_lane);
+            float up = simd_sum(up_lane);
+            if (simd_lane == 0u && feature < out_features) {
+                output[input_row * out_features + feature] =
+                    (gate / (1.0f + exp(-gate))) * up;
             }
         }
     }
@@ -2041,5 +2955,51 @@ kernel void argmax_rows_f32_kernel(
         }
         token_ids[row] = group_best_id;
         token_scores[row] = group_best_score;
+    }
+}
+
+kernel void argmax_candidates_f32_kernel(
+    const device uint* candidate_ids [[buffer(0)]],
+    const device float* candidate_scores [[buffer(1)]],
+    device uint* token_id [[buffer(2)]],
+    device float* token_score [[buffer(3)]],
+    constant uint& candidate_count [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (candidate_count == 0u) {
+        return;
+    }
+
+    float best_score = -3.402823466e+38F;
+    uint best_id = 0xffffffffu;
+    for (uint index = tid; index < candidate_count; index += ARGMAX_THREADS) {
+        float score = candidate_scores[index];
+        uint id = candidate_ids[index];
+        if (score > best_score || (score == best_score && id < best_id)) {
+            best_score = score;
+            best_id = id;
+        }
+    }
+
+    threadgroup float partial_scores[ARGMAX_THREADS];
+    threadgroup uint partial_ids[ARGMAX_THREADS];
+    partial_scores[tid] = best_score;
+    partial_ids[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float group_best_score = partial_scores[0];
+        uint group_best_id = partial_ids[0];
+        for (uint index = 1u; index < ARGMAX_THREADS; index++) {
+            float score = partial_scores[index];
+            uint id = partial_ids[index];
+            if (score > group_best_score
+                || (score == group_best_score && id < group_best_id)) {
+                group_best_score = score;
+                group_best_id = id;
+            }
+        }
+        token_id[0] = group_best_id;
+        token_score[0] = group_best_score;
     }
 }

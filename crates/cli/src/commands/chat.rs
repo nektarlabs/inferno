@@ -20,7 +20,7 @@ use model::{
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
     enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
-    CacheBudgetSpec, GenerationOptions, LagunaGenerationOptions, LagunaRuntime,
+    CacheBudgetSpec, GenerationOptions, LagunaRuntime,
 };
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, LocalModes, OptionalActions, QueueSelector, Termios,
@@ -29,10 +29,9 @@ use tokenizer::{render_chat_prompt, render_laguna_chat_prompt, ChatTurn, Tokeniz
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    laguna_expert_cache_capacity, laguna_memory_controller_spec, load_q2_readiness,
-    resolve_q2_artifact, validate_generation_request, validate_laguna_prompt,
-    validate_laguna_service_options, validate_memory_controller_options, DecodedTextStream,
-    LAGUNA_TOKENIZER_CONTRACT,
+    laguna_runtime_options, load_q2_readiness, resolve_q2_artifact, validate_generation_request,
+    validate_laguna_prompt, validate_laguna_service_options, validate_laguna_tokenizer,
+    validate_memory_controller_options, DecodedTextStream,
 };
 
 const THINK_END: &str = "</think>";
@@ -174,24 +173,24 @@ fn run_laguna(
     )?;
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    validate_laguna_tokenizer(&tokenizer, &config)?;
     let backend = MetalBackend::new()?;
     let model = LagunaModel::open(model_path, config.clone(), &backend)?;
-    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
     // Reserve against Laguna's full configured context because chat history can
-    // grow across turns while the expert cache remains persistent.
-    let expert_cache_capacity =
-        laguna_expert_cache_capacity(&model, &config, &backend, 1, None, explicit_cache_bytes)?;
-    let memory_controller = enable_unified_memory_controller
-        .then(|| laguna_memory_controller_spec(&model, &config, expert_cache_capacity))
-        .transpose()?;
+    // grow across turns while a Safetensors expert cache remains persistent.
+    let options = laguna_runtime_options(
+        &model,
+        &config,
+        &backend,
+        1,
+        None,
+        expert_cache_gb,
+        enable_unified_memory_controller,
+    )?;
     if let Some(path) = memory_controller_log {
         enable_laguna_memory_controller_log(path)?;
     }
-    let mut runtime = LagunaRuntime::new(LagunaGenerationOptions {
-        expert_cache_capacity,
-        memory_controller,
-    })?;
+    let mut runtime = LagunaRuntime::new(options)?;
 
     run_laguna_interactive_loop(
         &model,

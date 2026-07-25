@@ -24,6 +24,7 @@ use http::{read_request, write_json_error, write_json_response};
 
 pub const GLM_CODEX_MODEL_ID: &str = "glm-5.2-q2";
 pub const LAGUNA_CODEX_MODEL_ID: &str = "laguna-s-2.1-int4";
+pub const LAGUNA_GGUF_CODEX_MODEL_ID: &str = "laguna-s-2.1-gguf";
 const CODEX_MODEL_CATALOG: &str = include_str!("../../../examples/inferno.models.json");
 
 /// Executes one Responses request using an already-loaded model runtime.
@@ -265,7 +266,11 @@ mod tests {
 
     #[test]
     fn model_catalog_describes_only_the_loaded_model() {
-        for model_id in [GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID] {
+        for model_id in [
+            GLM_CODEX_MODEL_ID,
+            LAGUNA_CODEX_MODEL_ID,
+            LAGUNA_GGUF_CODEX_MODEL_ID,
+        ] {
             let catalog = codex_model_catalog(model_id).unwrap();
             let models = catalog["models"].as_array().unwrap();
 

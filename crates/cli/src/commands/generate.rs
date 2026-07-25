@@ -17,7 +17,7 @@ use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
 use model::{
     antirez_q2_artifact, enable_layer_profile, expected_expert_pack_header,
-    validate_routing_policy, FfnIndex, Index, IndexSummary, LagunaModel, Model,
+    validate_routing_policy, FfnIndex, Index, IndexSummary, LagunaArtifactKind, LagunaModel, Model,
     DEFAULT_GGUF_OUTPUT_CHUNK_ROWS,
 };
 use runtime::{
@@ -43,6 +43,12 @@ pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 6] = [
     ("<think>", 18),
     ("<assistant>", 23),
     ("</assistant>", 24),
+];
+const LAGUNA_TOKENIZER_REFERENCE_PROMPT: &str = "Tell me the capital of Italy.";
+const LAGUNA_TOKENIZER_REFERENCE_IDS: [u32; 49] = [
+    2, 97, 6453, 55620, 515, 330, 6408, 81, 12123, 1009, 8286, 10167, 18263, 2637, 565, 30810, 638,
+    83, 1239, 515, 1973, 367, 445, 6408, 367, 1667, 1388, 5882, 2930, 22746, 4187, 6453, 99, 268,
+    97, 1437, 22021, 753, 756, 340, 9626, 377, 22532, 4187, 1437, 99, 268, 23, 18,
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -267,25 +273,22 @@ fn run_laguna(
     )?;
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    validate_laguna_tokenizer(&tokenizer, &config)?;
     let rendered_prompt = render_laguna_user_prompt(prompt);
     let encoded = tokenizer.encode(&rendered_prompt.rendered, add_special_tokens)?;
     validate_laguna_prompt(&config, &encoded.token_ids, max_new_tokens)?;
 
     let backend = MetalBackend::new()?;
     let model = LagunaModel::open(model_path, config.clone(), &backend)?;
-    let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
-    let expert_cache_capacity = laguna_expert_cache_capacity(
+    let options = laguna_runtime_options(
         &model,
         &config,
         &backend,
         encoded.token_ids.len(),
         max_new_tokens,
-        explicit_cache_bytes,
+        expert_cache_gb,
+        enable_unified_memory_controller,
     )?;
-    let memory_controller = enable_unified_memory_controller
-        .then(|| laguna_memory_controller_spec(&model, &config, expert_cache_capacity))
-        .transpose()?;
     if let Some(path) = memory_controller_log {
         enable_laguna_memory_controller_log(path)?;
     }
@@ -299,10 +302,7 @@ fn run_laguna(
         &encoded.token_ids,
         max_new_tokens,
         &config.eos_token_id,
-        LagunaGenerationOptions {
-            expert_cache_capacity,
-            memory_controller,
-        },
+        options,
         |token_id| {
             throughput.record_token();
             if let Some(text) = stream.push(token_id)? {
@@ -327,6 +327,23 @@ fn run_laguna(
     }
     if let Some(path) = throughput_file {
         append_laguna_tokens_per_second_report(path, &throughput_report, &generation_report)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_laguna_tokenizer(
+    tokenizer: &Tokenizer,
+    config: &LagunaConfig,
+) -> InfernoResult<()> {
+    tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
+    let rendered = render_laguna_user_prompt(LAGUNA_TOKENIZER_REFERENCE_PROMPT);
+    let actual = tokenizer.encode(&rendered.rendered, false)?.token_ids;
+    if actual != LAGUNA_TOKENIZER_REFERENCE_IDS {
+        return Err(Error::tokenizer(format!(
+            "Laguna tokenizer does not match the published checkpoint: reference prompt produced {} token IDs instead of the required {}",
+            actual.len(),
+            LAGUNA_TOKENIZER_REFERENCE_IDS.len()
+        )));
     }
     Ok(())
 }
@@ -468,6 +485,67 @@ fn validate_laguna_prompt_boundary(prompt_token_ids: &[u32]) -> InfernoResult<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn laguna_runtime_options<B: Backend>(
+    model: &LagunaModel,
+    config: &LagunaConfig,
+    backend: &B,
+    prompt_tokens: usize,
+    max_new_tokens: Option<usize>,
+    expert_cache_gb: Option<f64>,
+    enable_unified_memory_controller: bool,
+) -> InfernoResult<LagunaGenerationOptions> {
+    validate_laguna_artifact_cache_options(
+        model.artifact_kind(),
+        expert_cache_gb,
+        enable_unified_memory_controller,
+    )?;
+    match model.artifact_kind() {
+        LagunaArtifactKind::AntirezGguf => Ok(LagunaGenerationOptions {
+            expert_cache_capacity: None,
+            memory_controller: None,
+        }),
+        LagunaArtifactKind::SafetensorsInt4 => {
+            let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
+            let expert_cache_capacity = laguna_expert_cache_capacity(
+                model,
+                config,
+                backend,
+                prompt_tokens,
+                max_new_tokens,
+                explicit_cache_bytes,
+            )?;
+            let memory_controller = enable_unified_memory_controller
+                .then(|| laguna_memory_controller_spec(model, config, expert_cache_capacity))
+                .transpose()?;
+            Ok(LagunaGenerationOptions {
+                expert_cache_capacity: Some(expert_cache_capacity),
+                memory_controller,
+            })
+        }
+    }
+}
+
+fn validate_laguna_artifact_cache_options(
+    artifact: LagunaArtifactKind,
+    expert_cache_gb: Option<f64>,
+    enable_unified_memory_controller: bool,
+) -> InfernoResult<()> {
+    if artifact == LagunaArtifactKind::AntirezGguf {
+        if expert_cache_gb.is_some() {
+            return Err(Error::runtime(
+                "--expert-cache-gb does not apply to Antirez Laguna GGUF; routed Q2/Q3 experts are mmap-backed",
+            ));
+        }
+        if enable_unified_memory_controller {
+            return Err(Error::runtime(
+                "--enable-unified-memory-controller does not apply to Antirez Laguna GGUF because it has no configurable expert cache",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn laguna_expert_cache_capacity<B: Backend>(
     model: &LagunaModel,
     config: &LagunaConfig,
@@ -493,13 +571,22 @@ pub(super) fn laguna_expert_cache_capacity<B: Backend>(
                         "Metal did not report a recommended working-set limit; pass --expert-cache-gb explicitly",
                     )
                 })?
-                .saturating_sub(model.prepared_matrix_bytes())
+                .saturating_sub(model.prepared_matrix_bytes().ok_or_else(|| {
+                    Error::runtime(
+                        "Antirez Laguna GGUF does not use the Safetensors expert-cache budget",
+                    )
+                })?)
                 .saturating_sub(kv_bytes)
                 .saturating_sub(LAGUNA_AUTO_CACHE_HEADROOM_BYTES);
             laguna_default_expert_cache_bytes(available_bytes)
         }
     };
-    let bytes_per_expert = model.weight_summary().bytes_per_expert;
+    let bytes_per_expert = model
+        .weight_summary()
+        .ok_or_else(|| {
+            Error::runtime("Antirez Laguna GGUF does not expose Safetensors expert-cache weights")
+        })?
+        .bytes_per_expert;
     let capacity = budget_bytes / bytes_per_expert;
     let capacity = usize::try_from(capacity)
         .map_err(|_| Error::runtime("Laguna expert-cache capacity does not fit usize"))?;
@@ -525,7 +612,12 @@ pub(super) fn laguna_memory_controller_spec(
     config: &LagunaConfig,
     initial_expert_capacity: usize,
 ) -> InfernoResult<LagunaMemoryControllerSpec> {
-    let bytes_per_expert = model.weight_summary().bytes_per_expert;
+    let bytes_per_expert = model
+        .weight_summary()
+        .ok_or_else(|| {
+            Error::runtime("Antirez Laguna GGUF does not expose Safetensors expert-cache weights")
+        })?
+        .bytes_per_expert;
     let total_experts = config
         .num_hidden_layers
         .saturating_sub(1)
@@ -1383,6 +1475,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn laguna_gguf_rejects_safetensors_cache_controls() {
+        validate_laguna_artifact_cache_options(LagunaArtifactKind::AntirezGguf, None, false)
+            .unwrap();
+
+        let fixed_cache = validate_laguna_artifact_cache_options(
+            LagunaArtifactKind::AntirezGguf,
+            Some(24.0),
+            false,
+        )
+        .unwrap_err();
+        assert!(fixed_cache.to_string().contains("mmap-backed"));
+
+        let controller =
+            validate_laguna_artifact_cache_options(LagunaArtifactKind::AntirezGguf, None, true)
+                .unwrap_err();
+        assert!(controller
+            .to_string()
+            .contains("no configurable expert cache"));
     }
 
     #[test]

@@ -21,14 +21,14 @@ pub struct LagunaTokenOutput {
 /// remain indexed Safetensors ranges and become direct Metal views only after
 /// the router selects them.
 #[derive(Debug)]
-pub struct LagunaModel {
+pub struct LagunaSafetensorsModel {
     config: LagunaConfig,
     index: LagunaWeightIndex,
     weights: LagunaDeviceWeights,
     expert_prefetch_pool: LagunaExpertPrefetchPool,
 }
 
-impl LagunaModel {
+impl LagunaSafetensorsModel {
     pub fn open<B: Backend>(
         model_dir: impl AsRef<Path>,
         config: LagunaConfig,
@@ -68,10 +68,10 @@ impl LagunaModel {
         context_capacity: usize,
         expert_cache_capacity: usize,
         backend: &B,
-    ) -> Result<LagunaSession> {
+    ) -> Result<LagunaSafetensorsSession> {
         self.validate_session_shape(batch, context_capacity)?;
         let attention_caches = self.prepare_attention_caches(batch, context_capacity, backend)?;
-        Ok(LagunaSession {
+        Ok(LagunaSafetensorsSession {
             batch,
             context_capacity,
             attention_caches,
@@ -90,7 +90,7 @@ impl LagunaModel {
     /// later request needs a larger context.
     pub fn prepare_session<B: Backend>(
         &self,
-        session: &mut LagunaSession,
+        session: &mut LagunaSafetensorsSession,
         batch: usize,
         context_capacity: usize,
         backend: &B,
@@ -117,7 +117,7 @@ impl LagunaModel {
     /// discarding already cached tokens. Sliding-window buffers stay fixed.
     pub fn grow_session_capacity<B: Backend>(
         &self,
-        session: &mut LagunaSession,
+        session: &mut LagunaSafetensorsSession,
         context_capacity: usize,
         backend: &B,
     ) -> Result<()> {
@@ -139,7 +139,7 @@ impl LagunaModel {
     /// The argmax sink is the only synchronization after the layer stack.
     pub fn forward_next_token<B: Backend>(
         &self,
-        session: &mut LagunaSession,
+        session: &mut LagunaSafetensorsSession,
         token_ids: &[u32],
         backend: &B,
     ) -> Result<LagunaTokenOutput> {
@@ -184,7 +184,7 @@ impl LagunaModel {
     /// next chunk can be encoded behind them on the same Metal queue.
     pub fn prefill_chunk<B: Backend>(
         &self,
-        session: &mut LagunaSession,
+        session: &mut LagunaSafetensorsSession,
         token_ids: &[u32],
         backend: &B,
     ) -> Result<()> {
@@ -196,7 +196,7 @@ impl LagunaModel {
 
     fn forward_hidden_states<B: Backend>(
         &self,
-        session: &mut LagunaSession,
+        session: &mut LagunaSafetensorsSession,
         token_ids: &[u32],
         backend: &B,
     ) -> Result<DeviceValue> {
@@ -281,14 +281,14 @@ impl LagunaModel {
 /// Mutable per-sequence state. It can be reset without discarding reusable
 /// expert weights, so repeated turns avoid cold expert loads where possible.
 #[derive(Debug)]
-pub struct LagunaSession {
+pub struct LagunaSafetensorsSession {
     batch: usize,
     context_capacity: usize,
     attention_caches: Vec<LagunaAttentionCache>,
     expert_cache: LagunaExpertCache,
 }
 
-impl LagunaSession {
+impl LagunaSafetensorsSession {
     pub fn position(&self) -> Result<usize> {
         let Some(first) = self.attention_caches.first() else {
             return Err(Error::cache("Laguna session has no attention caches"));

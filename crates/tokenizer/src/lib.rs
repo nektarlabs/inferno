@@ -244,8 +244,11 @@ pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
 /// Renders one user turn with Laguna S 2.1's published chat template.
 ///
 /// This is intentionally the exact no-tools, thinking-enabled case used by
-/// Inferno's generate command. General Jinja interpretation does not belong in
-/// the inference hot path.
+/// Inferno's generate command. It matches both the template published beside
+/// the source GGUF revision and DwarfStar's Laguna runtime contract. The
+/// GGUF's embedded template metadata differs from that tested runtime
+/// contract, so Inferno does not interpret it dynamically. General Jinja
+/// interpretation does not belong in the inference hot path.
 pub fn render_laguna_user_prompt(prompt: &str) -> ChatPrompt {
     render_laguna_chat_prompt(&[], prompt)
 }
@@ -417,6 +420,30 @@ mod tests {
         assert_eq!(
             rendered.rendered,
             "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>Hello Laguna</user>\n<assistant><think>"
+        );
+    }
+
+    #[test]
+    fn laguna_prompt_tokens_match_dwarfstar_reference() {
+        let tokenizer_path = Path::new("../../models/laguna-s-2.1-int4/tokenizer.json");
+        if !tokenizer_path.is_file() {
+            return;
+        }
+
+        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+        let rendered = render_laguna_user_prompt("Tell me the capital of Italy.");
+        let encoded = tokenizer.encode(&rendered.rendered, false).unwrap();
+
+        // Produced by DwarfStar's --dump-tokens at the Laguna GGUF reference
+        // revision. This covers BPE merges across tag/content boundaries too.
+        assert_eq!(
+            encoded.token_ids,
+            vec![
+                2, 97, 6453, 55620, 515, 330, 6408, 81, 12123, 1009, 8286, 10167, 18263, 2637, 565,
+                30810, 638, 83, 1239, 515, 1973, 367, 445, 6408, 367, 1667, 1388, 5882, 2930,
+                22746, 4187, 6453, 99, 268, 97, 1437, 22021, 753, 756, 340, 9626, 377, 22532, 4187,
+                1437, 99, 268, 23, 18,
+            ]
         );
     }
 

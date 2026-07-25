@@ -2,12 +2,12 @@ use std::{path::Path, sync::Arc};
 
 use crate::{
     BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView, DeviceRopeTable, DeviceRouterTopK,
-    DeviceW4Weight, ExpertCacheMetrics, LagunaFp8KvCache, LagunaKvRetention, Q2ExpertSource,
-    W4ExpertGroup, W4WeightSource,
+    DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant, LagunaF16KvCache, LagunaFp8KvCache,
+    LagunaKvRetention, LagunaModelViewReport, Q2ExpertSource, W4ExpertGroup, W4WeightSource,
 };
 use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, Error, PagedKvView, Result};
-use inferno_io::ExpertPackHeader;
+use inferno_io::{ExpertPackHeader, MappedBytes};
 
 use super::activation::MetalActivation;
 use super::arena::MetalArena;
@@ -20,7 +20,10 @@ use super::buffers::{empty_f16_buffer, f32_buffer, read_f32_buffer, read_u32_buf
 use super::cast::MetalCast;
 use super::command::{encode_element_copy, encode_f32_copy, Dispatch1d};
 use super::dsa::MetalDsa;
+use super::f16_attention::MetalF16Attention;
 use super::fp8_attention::MetalFp8Attention;
+use super::gguf_moe::MetalGgufMoe;
+use super::laguna_views::MetalLagunaViews;
 use super::layout::MetalLayout;
 use super::library::MetalLibrary;
 use super::matmul::MetalMatmul;
@@ -48,7 +51,10 @@ pub struct Metal {
     rope: MetalRope,
     moe: MetalMoe,
     dsa: MetalDsa,
+    f16_attention: MetalF16Attention,
     fp8_attention: MetalFp8Attention,
+    gguf_moe: MetalGgufMoe,
+    laguna_views: Arc<MetalLagunaViews>,
     batch: BatchSlot,
 }
 
@@ -58,6 +64,7 @@ impl Metal {
         let queue = device.new_command_queue();
         let library = MetalLibrary::compile(&device)?;
         let arena = MetalArena::new(&device)?;
+        let laguna_views = Arc::new(MetalLagunaViews::new(&device, &library)?);
         let attention_scores = MetalAttentionScores::new(&device, &library, arena.clone())?;
         let attention_values = MetalAttentionValues::new(&device, &library, arena.clone())?;
         let attention_causal_softmax =
@@ -68,13 +75,16 @@ impl Metal {
         let cast = MetalCast::new(&device, &library, arena.clone())?;
         let layout = MetalLayout::new(&device, &library, arena.clone())?;
         let matmul = MetalMatmul::new(&device, &library, arena.clone())?;
-        let q2_matvec = MetalQ2Matvec::new(&device, &library, arena.clone())?;
+        let q2_matvec =
+            MetalQ2Matvec::new(&device, &library, arena.clone(), Arc::clone(&laguna_views))?;
         let w4 = MetalW4::new(&device, &library, arena.clone())?;
         let rms_norm = MetalRmsNorm::new(&device, &library, arena.clone())?;
         let rope = MetalRope::new(&device, &library, arena.clone())?;
         let moe = MetalMoe::new(&device, &library, arena.clone())?;
         let dsa = MetalDsa::new(&device, &library, arena.clone())?;
-        let fp8_attention = MetalFp8Attention::new(&device, &library, arena)?;
+        let f16_attention = MetalF16Attention::new(&device, &library, arena.clone())?;
+        let fp8_attention = MetalFp8Attention::new(&device, &library, arena.clone())?;
+        let gguf_moe = MetalGgufMoe::new(&device, &library, arena, Arc::clone(&laguna_views))?;
 
         Ok(Self {
             device,
@@ -94,7 +104,10 @@ impl Metal {
             rope,
             moe,
             dsa,
+            f16_attention,
             fp8_attention,
+            gguf_moe,
+            laguna_views,
             batch: BatchSlot::new(),
         })
     }
@@ -135,6 +148,21 @@ impl Metal {
 
     pub fn configure_expert_pack(&self, path: &Path, header: ExpertPackHeader) -> Result<()> {
         self.q2_matvec.configure_expert_pack(path, header)
+    }
+
+    pub(crate) fn prepare_laguna_gguf_views(
+        &self,
+        mapping: MappedBytes,
+        tensor_data_offset: usize,
+        max_tensor_bytes: usize,
+    ) -> Result<LagunaModelViewReport> {
+        self.laguna_views.prepare(
+            &self.device,
+            &self.queue,
+            mapping,
+            tensor_data_offset,
+            max_tensor_bytes,
+        )
     }
 
     pub(crate) fn device(&self) -> &Device {
@@ -1429,6 +1457,25 @@ impl Metal {
         })
     }
 
+    pub(crate) fn batched_q8_0_embedding(
+        &self,
+        weights: &[u8],
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_q8_0_embedding(
+                command_buffer,
+                &self.device,
+                weights,
+                token_ids,
+                vocab_size,
+                hidden_size,
+            )
+        })
+    }
+
     pub(crate) fn prepare_w4_groupwise_weight(
         &self,
         packed: &[u8],
@@ -1507,6 +1554,38 @@ impl Metal {
                 top_k,
                 destination,
                 destination_len,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_gguf_moe(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        quant: GgufExpertQuant,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.gguf_moe.encode(
+                command_buffer,
+                &self.device,
+                gate_weights,
+                up_weights,
+                down_weights,
+                quant,
+                input,
+                input_len,
+                routing,
+                in_features,
+                intermediate_features,
+                out_features,
             )
         })
     }
@@ -1729,6 +1808,62 @@ impl Metal {
         })
     }
 
+    pub(crate) fn prepare_laguna_f16_kv_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+        retention: LagunaKvRetention,
+    ) -> Result<LagunaF16KvCache> {
+        self.f16_attention
+            .prepare_cache(&self.device, batch, capacity_tokens, retention)
+    }
+
+    pub(crate) fn grow_laguna_f16_kv_cache(
+        &self,
+        cache: &mut LagunaF16KvCache,
+        capacity_tokens: usize,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.f16_attention
+                .grow_cache(&self.device, command_buffer, cache, capacity_tokens)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_gated_gqa_f16_attention(
+        &self,
+        query: &Buffer,
+        query_len: usize,
+        current_key: &Buffer,
+        current_key_len: usize,
+        current_value: &Buffer,
+        current_value_len: usize,
+        gate: &Buffer,
+        gate_len: usize,
+        batch: usize,
+        query_tokens: usize,
+        query_heads: usize,
+        cache: &LagunaF16KvCache,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.f16_attention.encode_attention_and_append(
+                command_buffer,
+                query,
+                query_len,
+                current_key,
+                current_key_len,
+                current_value,
+                current_value_len,
+                gate,
+                gate_len,
+                batch,
+                query_tokens,
+                query_heads,
+                cache,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_q8_0_matvec_pair(
         &self,
@@ -1753,6 +1888,42 @@ impl Metal {
                 in_features,
                 out_features_a,
                 out_features_b,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_q8_0_attention_projections(
+        &self,
+        query_weights: &[u8],
+        key_weights: &[u8],
+        value_weights: &[u8],
+        gate_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        query_features: usize,
+        key_features: usize,
+        value_features: usize,
+        gate_features: usize,
+    ) -> Result<[Buffer; 4]> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_laguna_q8_0_attention_projections(
+                command_buffer,
+                &self.device,
+                query_weights,
+                key_weights,
+                value_weights,
+                gate_weights,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                query_features,
+                key_features,
+                value_features,
+                gate_features,
             )
         })
     }
@@ -1860,6 +2031,38 @@ impl Metal {
                 input_len,
                 residual,
                 residual_len,
+                row_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_q8_0_matvec_add2(
+        &self,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual_a: &Buffer,
+        residual_a_len: usize,
+        residual_b: &Buffer,
+        residual_b_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.q2_matvec.encode_laguna_q8_0_matvec_add2(
+                command_buffer,
+                &self.device,
+                weights,
+                input,
+                input_len,
+                residual_a,
+                residual_a_len,
+                residual_b,
+                residual_b_len,
                 row_count,
                 in_features,
                 out_features,
@@ -2018,6 +2221,38 @@ impl Metal {
             .into_iter()
             .next()
             .ok_or_else(|| Error::backend("Q2_K argmax produced no token score"))?;
+        Ok((token_id, token_score))
+    }
+
+    pub(crate) fn batched_laguna_q8_0_matvec_argmax(
+        &self,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(u32, f32)> {
+        let (token_id_buffer, token_score_buffer) =
+            self.batch.encode(&self.queue, |command_buffer| {
+                self.q2_matvec.encode_laguna_q8_0_matvec_argmax(
+                    command_buffer,
+                    &self.device,
+                    weights,
+                    input,
+                    input_len,
+                    in_features,
+                    out_features,
+                )
+            })?;
+        self.batch_flush()?;
+        let token_id = read_u32_buffer(&token_id_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("Laguna Q8_0 argmax produced no token id"))?;
+        let token_score = read_f32_buffer(&token_score_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("Laguna Q8_0 argmax produced no token score"))?;
         Ok((token_id, token_score))
     }
 

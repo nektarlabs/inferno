@@ -10,7 +10,8 @@ mod metal;
 pub use backend::{
     Backend, BackendCapabilities, BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView,
     DeviceRopeTable, DeviceRoutedExperts, DeviceRouterTopK, DeviceSelectedKvView, DeviceW4Weight,
-    ExpertCacheMetrics, LagunaAttentionProjections, LagunaFp8KvCache, LagunaKvRetention,
-    MetalBackend, Q2ExpertSource, RouterTopK, W4ExpertGroup, W4WeightSource,
+    ExpertCacheMetrics, GgufExpertQuant, LagunaAttentionProjections, LagunaF16KvCache,
+    LagunaFp8KvCache, LagunaKvRetention, LagunaModelViewReport, MetalBackend, Q2ExpertSource,
+    RouterTopK, W4ExpertGroup, W4WeightSource,
 };
 pub use device_value::DeviceValue;

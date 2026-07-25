@@ -12,7 +12,7 @@ use common::{
     PagedKvView, Result,
 };
 use common::{Device, Tensor};
-use inferno_io::ExpertPackHeader;
+use inferno_io::{ExpertPackHeader, MappedBytes};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendCapabilities {
@@ -40,6 +40,16 @@ pub struct BackendMemoryReport {
     pub swap_used_bytes: Option<u64>,
     pub metal_current_allocated_bytes: Option<u64>,
     pub metal_recommended_max_working_set_bytes: Option<u64>,
+}
+
+/// Stable Metal view layout for one exact Laguna Q2/Q3 GGUF mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagunaModelViewReport {
+    pub view_count: usize,
+    pub model_bytes: usize,
+    pub view_bytes: usize,
+    pub max_view_bytes: usize,
+    pub warmup_samples: usize,
 }
 
 /// Cumulative production-path metrics for the routed-expert cache.
@@ -113,6 +123,12 @@ pub struct DeviceRouterTopK {
     pub(crate) expert_ids: ::metal::Buffer,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) expert_weights: ::metal::Buffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufExpertQuant {
+    Q2K,
+    Q3K,
 }
 
 /// One row-major BF16 matrix prepared for native device execution.
@@ -253,6 +269,76 @@ pub struct LagunaFp8KvCache {
     pub(crate) key: ::metal::Buffer,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) value: ::metal::Buffer,
+}
+
+/// Device-resident F16 K/V cache used by the Antirez Laguna GGUF path.
+///
+/// Layout and retention match `LagunaFp8KvCache`, but each cached value uses
+/// IEEE F16 and therefore needs no checkpoint-specific quantization scale.
+#[derive(Debug)]
+pub struct LagunaF16KvCache {
+    pub(crate) batch: usize,
+    pub(crate) capacity_tokens: usize,
+    pub(crate) stored_tokens: usize,
+    pub(crate) total_tokens: usize,
+    pub(crate) retention: LagunaKvRetention,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) key: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) value: ::metal::Buffer,
+}
+
+impl LagunaF16KvCache {
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    pub fn capacity_tokens(&self) -> usize {
+        self.capacity_tokens
+    }
+
+    pub fn stored_tokens(&self) -> usize {
+        self.stored_tokens
+    }
+
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens
+    }
+
+    pub fn retention(&self) -> LagunaKvRetention {
+        self.retention
+    }
+
+    pub fn storage_bytes(&self) -> Result<usize> {
+        self.batch
+            .checked_mul(self.capacity_tokens)
+            .and_then(|values| values.checked_mul(8))
+            .and_then(|values| values.checked_mul(128))
+            .and_then(|values| values.checked_mul(2))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| Error::cache("Laguna F16 KV storage byte count overflow"))
+    }
+
+    pub fn reset(&mut self) {
+        self.stored_tokens = 0;
+        self.total_tokens = 0;
+    }
+
+    fn commit_append(&mut self, token_count: usize) -> Result<()> {
+        let total_tokens = self
+            .total_tokens
+            .checked_add(token_count)
+            .ok_or_else(|| Error::cache("Laguna F16 KV token count overflow"))?;
+        if self.retention == LagunaKvRetention::Full && total_tokens > self.capacity_tokens {
+            return Err(Error::cache(format!(
+                "Laguna full-attention F16 KV capacity {} is smaller than sequence length {total_tokens}",
+                self.capacity_tokens
+            )));
+        }
+        self.total_tokens = total_tokens;
+        self.stored_tokens = total_tokens.min(self.capacity_tokens);
+        Ok(())
+    }
 }
 
 impl LagunaFp8KvCache {
@@ -613,6 +699,14 @@ pub trait Backend: Sync {
         Err(Error::backend(
             "Q2 expert packs require the native Metal backend",
         ))
+    }
+    fn prepare_laguna_gguf_views(
+        &self,
+        _mapping: MappedBytes,
+        _tensor_data_offset: usize,
+        _max_tensor_bytes: usize,
+    ) -> Result<Option<LagunaModelViewReport>> {
+        Ok(None)
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor>;
@@ -1151,6 +1245,34 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    fn prepare_laguna_f16_kv_cache(
+        &self,
+        _batch: usize,
+        _capacity_tokens: usize,
+        _retention: LagunaKvRetention,
+    ) -> Result<Option<LagunaF16KvCache>> {
+        Ok(None)
+    }
+
+    fn grow_laguna_f16_kv_cache(
+        &self,
+        _cache: &mut LagunaF16KvCache,
+        _capacity_tokens: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn laguna_gated_gqa_f16_attention_device(
+        &self,
+        _query: &DeviceValue,
+        _current_key: &DeviceValue,
+        _current_value: &DeviceValue,
+        _gate: &DeviceValue,
+        _cache: &mut LagunaF16KvCache,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Copies one immutable packed INT4 matrix and its BF16 group scales into
     /// persistent device buffers. The returned object is reused by subsequent
     /// projections; inference must not upload the same weight for every token.
@@ -1243,6 +1365,17 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    fn q8_0_embedding_device(
+        &self,
+        _weights: &[u8],
+        _token_ids: &[u32],
+        _token_shape: &[usize],
+        _vocab_size: usize,
+        _hidden_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn q8_0_matvec_pair_device(
         &self,
@@ -1254,6 +1387,24 @@ pub trait Backend: Sync {
         _out_features_a: usize,
         _out_features_b: usize,
     ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_q8_0_attention_projections_device(
+        &self,
+        _query_weights: &[u8],
+        _key_weights: &[u8],
+        _value_weights: &[u8],
+        _gate_weights: &[u8],
+        _input: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _query_features: usize,
+        _key_features: usize,
+        _value_features: usize,
+        _gate_features: usize,
+    ) -> Result<Option<[DeviceValue; 4]>> {
         Ok(None)
     }
 
@@ -1335,6 +1486,22 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    /// Laguna Q8_0 matvec fused with two residual adds. This is intentionally
+    /// model-specific because it binds weights through the Laguna GGUF view.
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_q8_0_matvec_add2_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _residual_a: &DeviceValue,
+        _residual_b: &DeviceValue,
+        _row_count: usize,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
@@ -1356,6 +1523,22 @@ pub trait Backend: Sync {
         _input: &DeviceValue,
         _expert_ids: &[u32],
         _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_gguf_moe_device(
+        &self,
+        _gate_weights: &[u8],
+        _up_weights: &[u8],
+        _down_weights: &[u8],
+        _quant: GgufExpertQuant,
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _in_features: usize,
+        _intermediate_features: usize,
         _out_features: usize,
     ) -> Result<Option<DeviceValue>> {
         Ok(None)
@@ -1404,6 +1587,18 @@ pub trait Backend: Sync {
     /// Flushes the batch (this is the end-of-token sink) and returns the
     /// winning token id and score.
     fn q2_k_matvec_argmax_device(
+        &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+
+    /// Laguna Q8_0 output projection plus greedy argmax. The native path keeps
+    /// only one candidate per four vocabulary rows instead of full logits.
+    fn laguna_q8_0_matvec_argmax_device(
         &self,
         _weights: &[u8],
         _input: &DeviceValue,
@@ -1913,6 +2108,29 @@ impl Backend for MetalBackend {
         Err(Error::backend(
             "Q2 expert packs require the native Metal backend",
         ))
+    }
+
+    fn prepare_laguna_gguf_views(
+        &self,
+        mapping: MappedBytes,
+        tensor_data_offset: usize,
+        max_tensor_bytes: usize,
+    ) -> Result<Option<LagunaModelViewReport>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_laguna_gguf_views(mapping, tensor_data_offset, max_tensor_bytes)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (mapping, tensor_data_offset, max_tensor_bytes);
+            Ok(None)
+        }
     }
 
     fn matmul(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
@@ -4610,6 +4828,130 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn prepare_laguna_f16_kv_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+        retention: LagunaKvRetention,
+    ) -> Result<Option<LagunaF16KvCache>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_laguna_f16_kv_cache(batch, capacity_tokens, retention)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (batch, capacity_tokens, retention);
+            Ok(None)
+        }
+    }
+
+    fn grow_laguna_f16_kv_cache(
+        &self,
+        cache: &mut LagunaF16KvCache,
+        capacity_tokens: usize,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            native_metal.grow_laguna_f16_kv_cache(cache, capacity_tokens)?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, capacity_tokens);
+            Ok(false)
+        }
+    }
+
+    fn laguna_gated_gqa_f16_attention_device(
+        &self,
+        query: &DeviceValue,
+        current_key: &DeviceValue,
+        current_value: &DeviceValue,
+        gate: &DeviceValue,
+        cache: &mut LagunaF16KvCache,
+    ) -> Result<Option<DeviceValue>> {
+        for (label, value) in [
+            ("query", query),
+            ("current key", current_key),
+            ("current value", current_value),
+            ("gate", gate),
+        ] {
+            if value.dtype() != DType::F32 {
+                return Err(Error::backend(format!(
+                    "Laguna F16 {label} must be F32, got {:?}",
+                    value.dtype()
+                )));
+            }
+        }
+        let query_dims = require_device_rank("Laguna F16 query", query, 4)?;
+        let key_dims = require_device_rank("Laguna F16 current key", current_key, 4)?;
+        let value_dims = require_device_rank("Laguna F16 current value", current_value, 4)?;
+        let gate_dims = require_device_rank("Laguna F16 attention gate", gate, 3)?;
+        let batch = query_dims[0];
+        let query_tokens = query_dims[1];
+        let query_heads = query_dims[2];
+        let head_dim = query_dims[3];
+        validate_exact_shape(
+            "Laguna F16 current key shape",
+            key_dims,
+            &[batch, query_tokens, 8, 128],
+        )?;
+        validate_exact_shape(
+            "Laguna F16 current value shape",
+            value_dims,
+            &[batch, query_tokens, 8, 128],
+        )?;
+        validate_exact_shape(
+            "Laguna F16 attention gate shape",
+            gate_dims,
+            &[batch, query_tokens, query_heads],
+        )?;
+        if head_dim != 128 || !matches!(query_heads, 48 | 72) {
+            return Err(Error::backend(format!(
+                "Laguna F16 query shape must end in [48|72,128], got {query_dims:?}"
+            )));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_laguna_gated_gqa_f16_attention(
+                &query.buffer,
+                query.element_count()?,
+                &current_key.buffer,
+                current_key.element_count()?,
+                &current_value.buffer,
+                current_value.element_count()?,
+                &gate.buffer,
+                gate.element_count()?,
+                batch,
+                query_tokens,
+                query_heads,
+                cache,
+            )?;
+            cache.commit_append(query_tokens)?;
+            return Ok(Some(DeviceValue::new(query_dims.to_vec(), output)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = cache;
+            Ok(None)
+        }
+    }
+
     fn prepare_w4_groupwise_weight(
         &self,
         packed: &[u8],
@@ -4875,6 +5217,45 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn q8_0_embedding_device(
+        &self,
+        weights: &[u8],
+        token_ids: &[u32],
+        token_shape: &[usize],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let expected_tokens = token_shape.iter().try_fold(1_usize, |count, dim| {
+            count
+                .checked_mul(*dim)
+                .ok_or_else(|| Error::backend("Q8_0 embedding token shape overflow"))
+        })?;
+        if expected_tokens != token_ids.len() {
+            return Err(Error::backend(format!(
+                "Q8_0 embedding token shape {token_shape:?} contains {expected_tokens} IDs, got {}",
+                token_ids.len()
+            )));
+        }
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(hidden_size);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output =
+                native_metal.batched_q8_0_embedding(weights, token_ids, vocab_size, hidden_size)?;
+            return Ok(Some(DeviceValue::new(output_shape, output)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, token_ids, vocab_size);
+            Ok(None)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn q8_0_matvec_pair_device(
         &self,
@@ -4931,6 +5312,90 @@ impl Backend for MetalBackend {
                 in_features,
                 out_features_a,
                 out_features_b,
+            );
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_q8_0_attention_projections_device(
+        &self,
+        query_weights: &[u8],
+        key_weights: &[u8],
+        value_weights: &[u8],
+        gate_weights: &[u8],
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        query_features: usize,
+        key_features: usize,
+        value_features: usize,
+        gate_features: usize,
+    ) -> Result<Option<[DeviceValue; 4]>> {
+        if row_count != 1 {
+            return Ok(None);
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (query_rows, query_shape) =
+                matvec_dims_shape(input.dims(), in_features, query_features)?;
+            let (key_rows, key_shape) = matvec_dims_shape(input.dims(), in_features, key_features)?;
+            let (value_rows, value_shape) =
+                matvec_dims_shape(input.dims(), in_features, value_features)?;
+            let (gate_rows, gate_shape) =
+                matvec_dims_shape(input.dims(), in_features, gate_features)?;
+            for (component, actual_rows) in [
+                ("query", query_rows),
+                ("key", key_rows),
+                ("value", value_rows),
+                ("gate", gate_rows),
+            ] {
+                validate_exact_shape(
+                    &format!("device_laguna_{component}_projection_rows"),
+                    &[actual_rows],
+                    &[row_count],
+                )?;
+            }
+            let [query, key, value, gate] = native_metal
+                .batched_laguna_q8_0_attention_projections(
+                    query_weights,
+                    key_weights,
+                    value_weights,
+                    gate_weights,
+                    &input.buffer,
+                    input.element_count()?,
+                    row_count,
+                    in_features,
+                    query_features,
+                    key_features,
+                    value_features,
+                    gate_features,
+                )?;
+            Ok(Some([
+                DeviceValue::new(query_shape, query),
+                DeviceValue::new(key_shape, key),
+                DeviceValue::new(value_shape, value),
+                DeviceValue::new(gate_shape, gate),
+            ]))
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                query_weights,
+                key_weights,
+                value_weights,
+                gate_weights,
+                input,
+                in_features,
+                query_features,
+                key_features,
+                value_features,
+                gate_features,
             );
             Ok(None)
         }
@@ -5166,6 +5631,58 @@ impl Backend for MetalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn laguna_q8_0_matvec_add2_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        residual_a: &DeviceValue,
+        residual_b: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape(
+                "device_laguna_q8_0_matvec_add2_rows",
+                &[actual_rows],
+                &[row_count],
+            )?;
+            let buffer = native_metal.batched_laguna_q8_0_matvec_add2(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                &residual_a.buffer,
+                residual_a.element_count()?,
+                &residual_b.buffer,
+                residual_b.element_count()?,
+                row_count,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(residual_b.dims().to_vec(), buffer)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                weights,
+                input,
+                residual_a,
+                residual_b,
+                row_count,
+                in_features,
+                out_features,
+            );
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn q2_k_multi_expert_gate_up_swiglu_device(
         &self,
         gate_weights: &[u8],
@@ -5266,6 +5783,65 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (weights, input, expert_ids, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn laguna_gguf_moe_device(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        quant: GgufExpertQuant,
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::F32 {
+            return Err(Error::backend(format!(
+                "Laguna GGUF MoE input must be F32, got {:?}",
+                input.dtype()
+            )));
+        }
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+        validate_exact_shape(
+            "Laguna GGUF MoE routing token count",
+            &[routing.token_count],
+            &[row_count],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_laguna_gguf_moe(
+                gate_weights,
+                up_weights,
+                down_weights,
+                quant,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                in_features,
+                intermediate_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(output_shape, output)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                gate_weights,
+                up_weights,
+                down_weights,
+                quant,
+                routing,
+                intermediate_features,
+            );
             Ok(None)
         }
     }
@@ -5412,6 +5988,41 @@ impl Backend for MetalBackend {
                 out_features,
             )?;
             return Ok(Some((token_id, token_score)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weights, input, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn laguna_q8_0_matvec_argmax_device(
+        &self,
+        weights: &[u8],
+        input: &DeviceValue,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape(
+                "device_laguna_q8_0_matvec_argmax_rows",
+                &[actual_rows],
+                &[1],
+            )?;
+            let result = native_metal.batched_laguna_q8_0_matvec_argmax(
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(result));
         }
 
         #[cfg(not(all(target_os = "macos", feature = "metal")))]

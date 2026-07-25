@@ -1,0 +1,553 @@
+use ::metal::{Buffer, CommandBufferRef, ComputePipelineState, Device};
+use common::{Error, Result};
+use tracing::trace;
+
+use crate::{LagunaF16KvCache, LagunaKvRetention};
+
+use super::{
+    arena::MetalArena,
+    buffers::{empty_f16_buffer, require_f16_capacity, require_f32_capacity},
+    command::{encode_1d, encode_1d_threadgroups, encode_element_copy},
+    library::MetalLibrary,
+    pipeline::compute_pipeline,
+};
+
+const ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_attention_f32_kernel";
+const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
+const KV_HEADS: usize = 8;
+const HEAD_DIM: usize = 128;
+const GLOBAL_QUERY_HEADS: usize = 48;
+const SLIDING_QUERY_HEADS: usize = 72;
+const SLIDING_WINDOW: usize = 512;
+const ATTENTION_THREADS: usize = 256;
+
+pub(crate) struct MetalF16Attention {
+    attention_pipeline: ComputePipelineState,
+    append_pipeline: ComputePipelineState,
+    arena: MetalArena,
+}
+
+impl MetalF16Attention {
+    pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
+        let attention_pipeline = compute_pipeline(device, library, ATTENTION_KERNEL)?;
+        let append_pipeline = compute_pipeline(device, library, APPEND_KERNEL)?;
+        let simd_width = attention_pipeline.thread_execution_width() as usize;
+        if simd_width != 32
+            || (attention_pipeline.max_total_threads_per_threadgroup() as usize) < ATTENTION_THREADS
+        {
+            return Err(Error::backend(
+                "Laguna F16 attention requires 32-lane SIMD groups and 256-thread groups",
+            ));
+        }
+        Ok(Self {
+            attention_pipeline,
+            append_pipeline,
+            arena,
+        })
+    }
+
+    pub(crate) fn prepare_cache(
+        &self,
+        device: &Device,
+        batch: usize,
+        capacity_tokens: usize,
+        retention: LagunaKvRetention,
+    ) -> Result<LagunaF16KvCache> {
+        validate_cache_configuration(batch, capacity_tokens, retention)?;
+        let values = cache_value_count(batch, capacity_tokens)?;
+        Ok(LagunaF16KvCache {
+            batch,
+            capacity_tokens,
+            stored_tokens: 0,
+            total_tokens: 0,
+            retention,
+            key: empty_f16_buffer(device, values)?,
+            value: empty_f16_buffer(device, values)?,
+        })
+    }
+
+    pub(crate) fn grow_cache(
+        &self,
+        device: &Device,
+        command_buffer: &CommandBufferRef,
+        cache: &mut LagunaF16KvCache,
+        capacity_tokens: usize,
+    ) -> Result<()> {
+        if cache.retention != LagunaKvRetention::Full {
+            return Err(Error::cache(
+                "Laguna sliding F16 KV caches have fixed capacity and cannot grow",
+            ));
+        }
+        if capacity_tokens <= cache.capacity_tokens {
+            return Err(Error::cache(format!(
+                "Laguna F16 KV growth requires capacity above {}, got {capacity_tokens}",
+                cache.capacity_tokens
+            )));
+        }
+
+        let mut grown =
+            self.prepare_cache(device, cache.batch, capacity_tokens, cache.retention)?;
+        let stored_values = cache_value_count(cache.batch, cache.stored_tokens)?;
+        if stored_values > 0 {
+            encode_element_copy(
+                command_buffer,
+                &cache.key,
+                0,
+                &grown.key,
+                0,
+                stored_values,
+                std::mem::size_of::<u16>(),
+            )?;
+            encode_element_copy(
+                command_buffer,
+                &cache.value,
+                0,
+                &grown.value,
+                0,
+                stored_values,
+                std::mem::size_of::<u16>(),
+            )?;
+        }
+        grown.stored_tokens = cache.stored_tokens;
+        grown.total_tokens = cache.total_tokens;
+        *cache = grown;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_attention_and_append(
+        &self,
+        command_buffer: &CommandBufferRef,
+        query: &Buffer,
+        query_len: usize,
+        current_key: &Buffer,
+        current_key_len: usize,
+        current_value: &Buffer,
+        current_value_len: usize,
+        gate: &Buffer,
+        gate_len: usize,
+        batch: usize,
+        query_tokens: usize,
+        query_heads: usize,
+        cache: &LagunaF16KvCache,
+    ) -> Result<Buffer> {
+        validate_execution(
+            query,
+            query_len,
+            current_key,
+            current_key_len,
+            current_value,
+            current_value_len,
+            gate,
+            gate_len,
+            batch,
+            query_tokens,
+            query_heads,
+            cache,
+        )?;
+
+        let output = self.arena.empty_f32(query_len)?;
+        let batch_buffer = self.arena.u32(as_u32(batch, "batch")?)?;
+        let query_heads_buffer = self.arena.u32(as_u32(query_heads, "query head count")?)?;
+        let query_tokens_buffer = self.arena.u32(as_u32(query_tokens, "query token count")?)?;
+        let past_tokens_buffer = self
+            .arena
+            .u32(as_u32(cache.total_tokens, "past token count")?)?;
+        let stored_tokens_buffer = self
+            .arena
+            .u32(as_u32(cache.stored_tokens, "stored token count")?)?;
+        let capacity_buffer = self
+            .arena
+            .u32(as_u32(cache.capacity_tokens, "cache capacity")?)?;
+        let sliding_window = match cache.retention {
+            LagunaKvRetention::Full => 0,
+            LagunaKvRetention::Sliding => SLIDING_WINDOW,
+        };
+        let sliding_window_buffer = self.arena.u32(sliding_window as u32)?;
+        let fuse_append = cache.stored_tokens == cache.total_tokens
+            && cache
+                .total_tokens
+                .checked_add(query_tokens)
+                .is_some_and(|total| total <= cache.capacity_tokens);
+        let fuse_append_buffer = self.arena.u32(u32::from(fuse_append))?;
+        let row_count = batch
+            .checked_mul(query_tokens)
+            .and_then(|rows| rows.checked_mul(query_heads))
+            .ok_or_else(|| Error::backend("Laguna F16 attention row count overflow"))?;
+
+        trace!(
+            target: "inferno::metal",
+            batch,
+            query_tokens,
+            query_heads,
+            past_tokens = cache.total_tokens,
+            stored_tokens = cache.stored_tokens,
+            cache_capacity = cache.capacity_tokens,
+            fuse_append,
+            ?cache.retention,
+            "encoding fused Laguna F16 grouped-query attention"
+        );
+
+        encode_1d_threadgroups(
+            command_buffer,
+            &self.attention_pipeline,
+            &[
+                query,
+                current_key,
+                current_value,
+                gate,
+                &cache.key,
+                &cache.value,
+                &output,
+                &batch_buffer,
+                &query_heads_buffer,
+                &query_tokens_buffer,
+                &past_tokens_buffer,
+                &stored_tokens_buffer,
+                &capacity_buffer,
+                &sliding_window_buffer,
+                &fuse_append_buffer,
+            ],
+            row_count,
+            ATTENTION_THREADS,
+        )?;
+
+        if !fuse_append {
+            let retained_current_tokens = query_tokens.min(cache.capacity_tokens);
+            let retained_current_buffer = self.arena.u32(as_u32(
+                retained_current_tokens,
+                "retained current token count",
+            )?)?;
+            let append_threads = batch
+                .checked_mul(retained_current_tokens)
+                .and_then(|values| values.checked_mul(KV_HEADS))
+                .and_then(|values| values.checked_mul(HEAD_DIM))
+                .ok_or_else(|| Error::backend("Laguna F16 KV append thread count overflow"))?;
+            encode_1d(
+                command_buffer,
+                &self.append_pipeline,
+                &[
+                    current_key,
+                    current_value,
+                    &cache.key,
+                    &cache.value,
+                    &batch_buffer,
+                    &query_tokens_buffer,
+                    &past_tokens_buffer,
+                    &capacity_buffer,
+                    &retained_current_buffer,
+                ],
+                append_threads,
+            )?;
+        }
+        Ok(output)
+    }
+}
+
+fn validate_cache_configuration(
+    batch: usize,
+    capacity_tokens: usize,
+    retention: LagunaKvRetention,
+) -> Result<()> {
+    if batch == 0 || capacity_tokens == 0 {
+        return Err(Error::cache(
+            "Laguna F16 KV batch and capacity must be positive",
+        ));
+    }
+    if retention == LagunaKvRetention::Sliding && capacity_tokens != SLIDING_WINDOW {
+        return Err(Error::cache(format!(
+            "Laguna sliding F16 KV capacity must be {SLIDING_WINDOW}, got {capacity_tokens}"
+        )));
+    }
+    cache_value_count(batch, capacity_tokens)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_execution(
+    query: &Buffer,
+    query_len: usize,
+    current_key: &Buffer,
+    current_key_len: usize,
+    current_value: &Buffer,
+    current_value_len: usize,
+    gate: &Buffer,
+    gate_len: usize,
+    batch: usize,
+    query_tokens: usize,
+    query_heads: usize,
+    cache: &LagunaF16KvCache,
+) -> Result<()> {
+    validate_cache_configuration(cache.batch, cache.capacity_tokens, cache.retention)?;
+    if batch != cache.batch || query_tokens == 0 {
+        return Err(Error::cache(format!(
+            "Laguna F16 attention/cache batch mismatch or empty query: attention batch={batch}, cache batch={}, tokens={query_tokens}",
+            cache.batch
+        )));
+    }
+    let expected_query_heads = match cache.retention {
+        LagunaKvRetention::Full => GLOBAL_QUERY_HEADS,
+        LagunaKvRetention::Sliding => SLIDING_QUERY_HEADS,
+    };
+    if query_heads != expected_query_heads {
+        return Err(Error::backend(format!(
+            "Laguna {:?} F16 attention requires {expected_query_heads} query heads, got {query_heads}",
+            cache.retention
+        )));
+    }
+    if cache.stored_tokens > cache.capacity_tokens || cache.stored_tokens > cache.total_tokens {
+        return Err(Error::cache("Laguna F16 KV cache metadata is inconsistent"));
+    }
+    if cache.retention == LagunaKvRetention::Full {
+        if cache.stored_tokens != cache.total_tokens {
+            return Err(Error::cache(
+                "Laguna full-attention F16 KV must retain every past token",
+            ));
+        }
+        cache
+            .total_tokens
+            .checked_add(query_tokens)
+            .filter(|total| *total <= cache.capacity_tokens)
+            .ok_or_else(|| {
+                Error::cache(format!(
+                    "Laguna full-attention F16 KV capacity {} cannot append {} tokens after {}",
+                    cache.capacity_tokens, query_tokens, cache.total_tokens
+                ))
+            })?;
+    }
+
+    let expected_query_len = batch
+        .checked_mul(query_tokens)
+        .and_then(|values| values.checked_mul(query_heads))
+        .and_then(|values| values.checked_mul(HEAD_DIM))
+        .ok_or_else(|| Error::backend("Laguna F16 query element count overflow"))?;
+    let expected_kv_len = batch
+        .checked_mul(query_tokens)
+        .and_then(|values| values.checked_mul(KV_HEADS))
+        .and_then(|values| values.checked_mul(HEAD_DIM))
+        .ok_or_else(|| Error::backend("Laguna F16 K/V element count overflow"))?;
+    let expected_gate_len = batch
+        .checked_mul(query_tokens)
+        .and_then(|values| values.checked_mul(query_heads))
+        .ok_or_else(|| Error::backend("Laguna F16 gate element count overflow"))?;
+    if query_len != expected_query_len
+        || current_key_len != expected_kv_len
+        || current_value_len != expected_kv_len
+        || gate_len != expected_gate_len
+    {
+        return Err(Error::backend(format!(
+            "Laguna F16 attention buffer lengths mismatch: expected q={expected_query_len}, k/v={expected_kv_len}, gate={expected_gate_len}; got q={query_len}, k={current_key_len}, v={current_value_len}, gate={gate_len}"
+        )));
+    }
+    require_f32_capacity(query, query_len, "Laguna F16 query")?;
+    require_f32_capacity(current_key, current_key_len, "Laguna F16 current key")?;
+    require_f32_capacity(current_value, current_value_len, "Laguna F16 current value")?;
+    require_f32_capacity(gate, gate_len, "Laguna F16 attention gate")?;
+    let cache_values = cache_value_count(cache.batch, cache.capacity_tokens)?;
+    require_f16_capacity(&cache.key, cache_values, "Laguna F16 key cache")?;
+    require_f16_capacity(&cache.value, cache_values, "Laguna F16 value cache")?;
+    Ok(())
+}
+
+fn cache_value_count(batch: usize, capacity_tokens: usize) -> Result<usize> {
+    batch
+        .checked_mul(capacity_tokens)
+        .and_then(|values| values.checked_mul(KV_HEADS))
+        .and_then(|values| values.checked_mul(HEAD_DIM))
+        .ok_or_else(|| Error::cache("Laguna F16 KV value count overflow"))
+}
+
+fn as_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| Error::backend(format!("Laguna F16 attention {label} exceeds u32")))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Backend, LagunaKvRetention, MetalBackend};
+    use common::F32Tensor;
+
+    use super::{HEAD_DIM, KV_HEADS};
+
+    const QUERY_HEADS: usize = 48;
+
+    #[test]
+    fn f16_cache_preserves_prefill_values_for_decode() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let mut cache = backend
+            .prepare_laguna_f16_kv_cache(1, 4, LagunaKvRetention::Full)
+            .unwrap()
+            .unwrap();
+
+        let query = upload(
+            &backend,
+            vec![0.0; 2 * QUERY_HEADS * HEAD_DIM],
+            [1, 2, QUERY_HEADS, HEAD_DIM],
+        );
+        let key = upload(
+            &backend,
+            vec![0.0; 2 * KV_HEADS * HEAD_DIM],
+            [1, 2, KV_HEADS, HEAD_DIM],
+        );
+        let mut values = vec![1.0; 2 * KV_HEADS * HEAD_DIM];
+        values[KV_HEADS * HEAD_DIM..].fill(3.0);
+        let value = upload(&backend, values, [1, 2, KV_HEADS, HEAD_DIM]);
+        let gate = upload(&backend, vec![0.0; 2 * QUERY_HEADS], [1, 2, QUERY_HEADS]);
+        let output = backend
+            .laguna_gated_gqa_f16_attention_device(&query, &key, &value, &gate, &mut cache)
+            .unwrap()
+            .unwrap();
+        let output = backend.device_download_f32_tensor(&output).unwrap();
+        let softplus_zero = 2.0_f32.ln();
+        assert!((output.values()[0] - softplus_zero).abs() <= 1e-4);
+        assert!((output.values()[QUERY_HEADS * HEAD_DIM] - 2.0 * softplus_zero).abs() <= 1e-4);
+
+        let query = upload(
+            &backend,
+            vec![0.0; QUERY_HEADS * HEAD_DIM],
+            [1, 1, QUERY_HEADS, HEAD_DIM],
+        );
+        let key = upload(
+            &backend,
+            vec![0.0; KV_HEADS * HEAD_DIM],
+            [1, 1, KV_HEADS, HEAD_DIM],
+        );
+        let value = upload(
+            &backend,
+            vec![5.0; KV_HEADS * HEAD_DIM],
+            [1, 1, KV_HEADS, HEAD_DIM],
+        );
+        let gate = upload(&backend, vec![0.0; QUERY_HEADS], [1, 1, QUERY_HEADS]);
+        let output = backend
+            .laguna_gated_gqa_f16_attention_device(&query, &key, &value, &gate, &mut cache)
+            .unwrap()
+            .unwrap();
+        let output = backend.device_download_f32_tensor(&output).unwrap();
+        assert!((output.values()[0] - 3.0 * softplus_zero).abs() <= 1e-4);
+        assert_eq!(cache.total_tokens(), 3);
+        assert_eq!(
+            cache.storage_bytes().unwrap(),
+            2 * 4 * KV_HEADS * HEAD_DIM * 2
+        );
+    }
+
+    #[test]
+    fn f16_prefill_matches_nonuniform_cpu_reference() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        const TOKENS: usize = 3;
+        let query_values = patterned_values(TOKENS * QUERY_HEADS * HEAD_DIM, 17, 8, 16.0);
+        let key_values = patterned_values(TOKENS * KV_HEADS * HEAD_DIM, 13, 6, 16.0);
+        let value_values = patterned_values(TOKENS * KV_HEADS * HEAD_DIM, 11, 5, 8.0);
+        let gate_values = patterned_values(TOKENS * QUERY_HEADS, 7, 3, 10.0);
+        let query = upload(
+            &backend,
+            query_values.clone(),
+            [1, TOKENS, QUERY_HEADS, HEAD_DIM],
+        );
+        let key = upload(
+            &backend,
+            key_values.clone(),
+            [1, TOKENS, KV_HEADS, HEAD_DIM],
+        );
+        let value = upload(
+            &backend,
+            value_values.clone(),
+            [1, TOKENS, KV_HEADS, HEAD_DIM],
+        );
+        let gate = upload(&backend, gate_values.clone(), [1, TOKENS, QUERY_HEADS]);
+        let mut cache = backend
+            .prepare_laguna_f16_kv_cache(1, TOKENS, LagunaKvRetention::Full)
+            .unwrap()
+            .unwrap();
+
+        let actual = backend
+            .laguna_gated_gqa_f16_attention_device(&query, &key, &value, &gate, &mut cache)
+            .unwrap()
+            .unwrap();
+        let actual = backend.device_download_f32_tensor(&actual).unwrap();
+        let expected = cpu_causal_gqa(
+            &query_values,
+            &key_values,
+            &value_values,
+            &gate_values,
+            TOKENS,
+        );
+
+        for (index, (actual, expected)) in actual.values().iter().zip(expected.iter()).enumerate() {
+            let tolerance = 5e-4_f32.max(expected.abs() * 5e-4);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "Laguna F16 attention mismatch at {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    fn patterned_values(len: usize, period: usize, center: usize, divisor: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index % period) as f32 - center as f32) / divisor)
+            .collect()
+    }
+
+    fn cpu_causal_gqa(
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        gate: &[f32],
+        tokens: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0_f32; query.len()];
+        let heads_per_kv = QUERY_HEADS / KV_HEADS;
+        let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+        for token in 0..tokens {
+            for query_head in 0..QUERY_HEADS {
+                let kv_head = query_head / heads_per_kv;
+                let query_base = (token * QUERY_HEADS + query_head) * HEAD_DIM;
+                let scores = (0..=token)
+                    .map(|key_token| {
+                        let key_base = (key_token * KV_HEADS + kv_head) * HEAD_DIM;
+                        query[query_base..query_base + HEAD_DIM]
+                            .iter()
+                            .zip(&key[key_base..key_base + HEAD_DIM])
+                            .map(|(query, key)| query * key)
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores
+                    .iter()
+                    .map(|score| (score - maximum).exp())
+                    .collect::<Vec<_>>();
+                let denominator = weights.iter().sum::<f32>();
+                let gate = (1.0_f32 + gate[token * QUERY_HEADS + query_head].exp()).ln();
+                for dim in 0..HEAD_DIM {
+                    let weighted = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(key_token, weight)| {
+                            let value_index = (key_token * KV_HEADS + kv_head) * HEAD_DIM + dim;
+                            weight * value[value_index]
+                        })
+                        .sum::<f32>();
+                    output[query_base + dim] = weighted / denominator * gate;
+                }
+            }
+        }
+        output
+    }
+
+    fn upload<const N: usize>(
+        backend: &MetalBackend,
+        values: Vec<f32>,
+        dims: [usize; N],
+    ) -> crate::DeviceValue {
+        backend
+            .device_upload_f32_tensor(&F32Tensor::new(values, dims).unwrap())
+            .unwrap()
+            .unwrap()
+    }
+}

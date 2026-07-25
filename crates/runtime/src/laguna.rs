@@ -21,7 +21,7 @@ pub enum GenerationControl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LagunaGenerationOptions {
-    pub expert_cache_capacity: usize,
+    pub expert_cache_capacity: Option<usize>,
     pub memory_controller: Option<LagunaMemoryControllerSpec>,
 }
 
@@ -53,24 +53,29 @@ impl LagunaGenerationReport {
 /// every chat turn into a cold expert-cache start.
 #[derive(Debug)]
 pub struct LagunaRuntime {
-    expert_cache_capacity: usize,
+    expert_cache_capacity: Option<usize>,
     memory_controller: Option<LagunaMemoryController>,
     session: Option<LagunaSession>,
 }
 
 impl LagunaRuntime {
     pub fn new(options: LagunaGenerationOptions) -> Result<Self> {
-        if options.expert_cache_capacity == 0 {
+        if options.expert_cache_capacity == Some(0) {
             return Err(Error::cache(
                 "Laguna runtime expert-cache capacity must be positive",
+            ));
+        }
+        if options.memory_controller.is_some() && options.expert_cache_capacity.is_none() {
+            return Err(Error::runtime(
+                "Laguna memory controller requires a configurable expert cache",
             ));
         }
         let memory_controller = options
             .memory_controller
             .map(|spec| {
-                if spec.initial_expert_capacity != options.expert_cache_capacity {
+                if Some(spec.initial_expert_capacity) != options.expert_cache_capacity {
                     return Err(Error::runtime(format!(
-                        "Laguna memory controller initial capacity {} does not match runtime capacity {}",
+                        "Laguna memory controller initial capacity {} does not match runtime capacity {:?}",
                         spec.initial_expert_capacity, options.expert_cache_capacity
                     )));
                 }
@@ -84,7 +89,7 @@ impl LagunaRuntime {
         })
     }
 
-    pub fn expert_cache_capacity(&self) -> usize {
+    pub fn expert_cache_capacity(&self) -> Option<usize> {
         self.expert_cache_capacity
     }
 
@@ -129,6 +134,14 @@ impl LagunaRuntime {
         B: Backend,
         F: FnMut(u32) -> Result<GenerationControl>,
     {
+        let uses_expert_cache = model.artifact_kind().uses_expert_cache();
+        if uses_expert_cache != self.expert_cache_capacity.is_some() {
+            return Err(Error::runtime(format!(
+                "Laguna {:?} model requires expert-cache capacity presence={uses_expert_cache}, runtime has {:?}",
+                model.artifact_kind(),
+                self.expert_cache_capacity
+            )));
+        }
         if prompt_token_ids.is_empty() {
             return Err(Error::runtime(
                 "Laguna generation requires at least one prompt token",
@@ -233,7 +246,7 @@ impl LagunaRuntime {
                             if decision.changes_capacity() {
                                 session
                                     .resize_expert_cache_capacity(decision.next_expert_capacity)?;
-                                self.expert_cache_capacity = decision.next_expert_capacity;
+                                self.expert_cache_capacity = Some(decision.next_expert_capacity);
                             }
                             controller.record_decision(decision, memory)?;
                         }
@@ -386,24 +399,31 @@ mod tests {
     #[test]
     fn persistent_runtime_requires_a_real_expert_cache() {
         let error = LagunaRuntime::new(LagunaGenerationOptions {
-            expert_cache_capacity: 0,
+            expert_cache_capacity: Some(0),
             memory_controller: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("must be positive"));
 
         let runtime = LagunaRuntime::new(LagunaGenerationOptions {
-            expert_cache_capacity: 10,
+            expert_cache_capacity: Some(10),
             memory_controller: None,
         })
         .unwrap();
-        assert_eq!(runtime.expert_cache_capacity(), 10);
+        assert_eq!(runtime.expert_cache_capacity(), Some(10));
+
+        let mapped_runtime = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: None,
+            memory_controller: None,
+        })
+        .unwrap();
+        assert_eq!(mapped_runtime.expert_cache_capacity(), None);
     }
 
     #[test]
     fn controller_and_runtime_must_start_with_the_same_capacity() {
         let error = LagunaRuntime::new(LagunaGenerationOptions {
-            expert_cache_capacity: 10,
+            expert_cache_capacity: Some(10),
             memory_controller: Some(LagunaMemoryControllerSpec {
                 initial_expert_capacity: 11,
                 minimum_expert_capacity: 10,

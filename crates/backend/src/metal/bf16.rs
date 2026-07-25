@@ -107,13 +107,13 @@ impl MetalBf16 {
         let output_len = row_count
             .checked_mul(matrix.rows)
             .ok_or_else(|| Error::backend("BF16 linear output element count overflow"))?;
+        let thread_count = output_len
+            .checked_mul(SIMD_LANES)
+            .ok_or_else(|| Error::backend("BF16 linear thread count overflow"))?;
         let output = self.arena.empty_f32(output_len)?;
         let row_count = self.arena.u32(as_u32(row_count, "row_count")?)?;
         let in_features = self.arena.u32(as_u32(matrix.columns, "in_features")?)?;
         let out_features = self.arena.u32(as_u32(matrix.rows, "out_features")?)?;
-        let thread_count = output_len
-            .checked_mul(SIMD_LANES)
-            .ok_or_else(|| Error::backend("BF16 linear thread count overflow"))?;
         encode_1d(
             command_buffer,
             &self.linear_pipeline,
