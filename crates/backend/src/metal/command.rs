@@ -257,13 +257,9 @@ pub(crate) enum KernelArg<'a> {
     Buffer(&'a Buffer),
     BufferOffset(&'a Buffer, usize),
     U32(u32),
-    F32(f32),
 }
 
-fn bind_args(
-    encoder: &::metal::ComputeCommandEncoderRef,
-    args: &[KernelArg<'_>],
-) -> Result<()> {
+fn bind_args(encoder: &::metal::ComputeCommandEncoderRef, args: &[KernelArg<'_>]) -> Result<()> {
     for (index, arg) in args.iter().enumerate() {
         let slot = index as NSUInteger;
         match arg {
@@ -283,11 +279,6 @@ fn bind_args(
                 slot,
                 std::mem::size_of::<u32>() as NSUInteger,
                 value as *const u32 as *const std::ffi::c_void,
-            ),
-            KernelArg::F32(value) => encoder.set_bytes(
-                slot,
-                std::mem::size_of::<f32>() as NSUInteger,
-                value as *const f32 as *const std::ffi::c_void,
             ),
         }
     }
@@ -316,31 +307,6 @@ fn validate_threadgroup_shape(
             "Metal threadgroup size {threads_per_group} must be divisible by SIMD width {execution_width}"
         )));
     }
-    Ok(())
-}
-
-/// Dispatches a 1D grid of threads with mixed buffer and scalar arguments.
-pub(crate) fn encode_1d_args(
-    command_buffer: &CommandBufferRef,
-    pipeline: &ComputePipelineState,
-    args: &[KernelArg<'_>],
-    threads: usize,
-) -> Result<()> {
-    if threads == 0 {
-        return Err(Error::backend(
-            "Metal dispatch requires at least one thread",
-        ));
-    }
-
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(pipeline);
-    bind_args(encoder, args)?;
-    let threads_per_group = preferred_1d_threadgroup_size(pipeline);
-    encoder.dispatch_threads(
-        MTLSize::new(threads as NSUInteger, 1, 1),
-        MTLSize::new(threads_per_group, 1, 1),
-    );
-    encoder.end_encoding();
     Ok(())
 }
 

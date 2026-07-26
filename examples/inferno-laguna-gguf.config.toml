@@ -1,7 +1,7 @@
 model = "laguna-s-2.1-gguf"
 model_provider = "inferno"
-model_context_window = 32768
-model_auto_compact_token_limit = 28000
+model_context_window = 4096
+model_auto_compact_token_limit = 3072
 model_catalog_json = "inferno.models.json"
 include_permissions_instructions = false
 include_apps_instructions = false

@@ -278,7 +278,6 @@ fn tiled_threadgroups(
     Ok(simdgroup_count.div_ceil(SIMDGROUPS_PER_THREADGROUP))
 }
 
-
 fn as_u32(value: usize, label: &str) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| Error::backend(format!("Laguna GGUF MoE {label} exceeds Metal u32")))

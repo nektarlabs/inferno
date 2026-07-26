@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use backend::Backend;
 use common::{Error, Result};
-use model::{LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
+use model::{LagunaArtifactKind, LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
 
 use crate::{
     laguna_memory::LagunaMemoryController,
@@ -10,13 +10,20 @@ use crate::{
     LagunaMemoryControllerReport, LagunaMemoryControllerSpec,
 };
 
-const LAGUNA_PREFILL_CHUNK_TOKENS: usize = 4_096;
+const LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS: usize = 4_096;
+const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 256;
 const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationControl {
     Continue,
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagunaPrefillProgress {
+    pub processed_tokens: usize,
+    pub prompt_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,10 +135,42 @@ impl LagunaRuntime {
         prompt_token_ids: &[u32],
         max_new_tokens: Option<usize>,
         stop_token_ids: &[u32],
+        on_token: F,
+    ) -> Result<LagunaGenerationReport>
+    where
+        B: Backend,
+        F: FnMut(u32) -> Result<GenerationControl>,
+    {
+        self.generate_streaming_controlled_with_prefill_progress(
+            model,
+            backend,
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            |_| Ok(()),
+            on_token,
+        )
+    }
+
+    /// Generates tokens while reporting completed prefill chunks.
+    ///
+    /// The progress callback runs only between command-buffer submissions. It
+    /// is therefore a safe place for a server to send an SSE heartbeat and
+    /// detect that its client disconnected before encoding more model work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_controlled_with_prefill_progress<B, P, F>(
+        &mut self,
+        model: &LagunaModel,
+        backend: &B,
+        prompt_token_ids: &[u32],
+        max_new_tokens: Option<usize>,
+        stop_token_ids: &[u32],
+        mut on_prefill_progress: P,
         mut on_token: F,
     ) -> Result<LagunaGenerationReport>
     where
         B: Backend,
+        P: FnMut(LagunaPrefillProgress) -> Result<()>,
         F: FnMut(u32) -> Result<GenerationControl>,
     {
         let uses_expert_cache = model.artifact_kind().uses_expert_cache();
@@ -190,13 +229,18 @@ impl LagunaRuntime {
         let started_at = Instant::now();
         let mut time_to_first_token = None;
         let mut generated_tokens = 0_usize;
-        let final_prompt_chunk_start =
-            final_chunk_start(prompt_token_ids.len(), LAGUNA_PREFILL_CHUNK_TOKENS)?;
-        for chunk in
-            prompt_token_ids[..final_prompt_chunk_start].chunks(LAGUNA_PREFILL_CHUNK_TOKENS)
-        {
-            model.prefill_chunk(session, chunk, backend)?;
-        }
+        let prefill_chunk_tokens = prefill_chunk_tokens(model.artifact_kind());
+        let final_prompt_chunk_start = for_each_prefill_prefix_chunk(
+            prompt_token_ids,
+            prefill_chunk_tokens,
+            |chunk, processed_tokens| {
+                model.prefill_chunk(session, chunk, backend)?;
+                on_prefill_progress(LagunaPrefillProgress {
+                    processed_tokens,
+                    prompt_tokens: prompt_token_ids.len(),
+                })
+            },
+        )?;
         let mut decode_token = [0_u32; 1];
 
         let generation_result = (|| -> Result<()> {
@@ -317,6 +361,32 @@ impl LagunaRuntime {
     }
 }
 
+fn prefill_chunk_tokens(artifact: LagunaArtifactKind) -> usize {
+    match artifact {
+        LagunaArtifactKind::SafetensorsInt4 => LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
+        LagunaArtifactKind::AntirezGguf => LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+    }
+}
+
+fn for_each_prefill_prefix_chunk<F>(
+    prompt_token_ids: &[u32],
+    chunk_size: usize,
+    mut process: F,
+) -> Result<usize>
+where
+    F: FnMut(&[u32], usize) -> Result<()>,
+{
+    let final_prompt_chunk_start = final_chunk_start(prompt_token_ids.len(), chunk_size)?;
+    let mut processed_tokens = 0_usize;
+    for chunk in prompt_token_ids[..final_prompt_chunk_start].chunks(chunk_size) {
+        processed_tokens = processed_tokens
+            .checked_add(chunk.len())
+            .ok_or_else(|| Error::runtime("Laguna prefill progress overflow"))?;
+        process(chunk, processed_tokens)?;
+    }
+    Ok(final_prompt_chunk_start)
+}
+
 fn initial_context_capacity(
     prompt_tokens: usize,
     generated_limit: usize,
@@ -390,11 +460,13 @@ fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        final_chunk_start, initial_context_capacity, next_context_capacity,
-        LagunaGenerationOptions, LagunaRuntime, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
-        LAGUNA_PREFILL_CHUNK_TOKENS,
+        final_chunk_start, for_each_prefill_prefix_chunk, initial_context_capacity,
+        next_context_capacity, prefill_chunk_tokens, LagunaGenerationOptions, LagunaRuntime,
+        LAGUNA_GGUF_PREFILL_CHUNK_TOKENS, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
+        LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
     };
     use crate::LagunaMemoryControllerSpec;
+    use model::LagunaArtifactKind;
 
     #[test]
     fn persistent_runtime_requires_a_real_expert_cache() {
@@ -445,23 +517,58 @@ mod tests {
     #[test]
     fn prefill_keeps_one_non_empty_final_chunk_for_next_token_projection() {
         assert_eq!(
-            final_chunk_start(1, LAGUNA_PREFILL_CHUNK_TOKENS).unwrap(),
+            final_chunk_start(1, LAGUNA_GGUF_PREFILL_CHUNK_TOKENS).unwrap(),
             0
         );
         assert_eq!(
-            final_chunk_start(LAGUNA_PREFILL_CHUNK_TOKENS, LAGUNA_PREFILL_CHUNK_TOKENS).unwrap(),
+            final_chunk_start(
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
-            final_chunk_start(LAGUNA_PREFILL_CHUNK_TOKENS + 1, LAGUNA_PREFILL_CHUNK_TOKENS)
-                .unwrap(),
-            LAGUNA_PREFILL_CHUNK_TOKENS
+            final_chunk_start(
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS + 1,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
         );
         assert_eq!(
-            final_chunk_start(2 * LAGUNA_PREFILL_CHUNK_TOKENS, LAGUNA_PREFILL_CHUNK_TOKENS)
-                .unwrap(),
-            LAGUNA_PREFILL_CHUNK_TOKENS
+            final_chunk_start(
+                2 * LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
         );
+    }
+
+    #[test]
+    fn gguf_prefill_uses_shorter_cancellable_submissions() {
+        assert_eq!(prefill_chunk_tokens(LagunaArtifactKind::AntirezGguf), 256);
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::SafetensorsInt4),
+            4_096
+        );
+        assert!(LAGUNA_GGUF_PREFILL_CHUNK_TOKENS < LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS);
+    }
+
+    #[test]
+    fn prefill_disconnect_stops_before_the_next_chunk() {
+        let prompt = vec![1_u32; 700];
+        let mut completed_chunks = Vec::new();
+
+        let error = for_each_prefill_prefix_chunk(&prompt, 256, |chunk, processed_tokens| {
+            completed_chunks.push((chunk.len(), processed_tokens));
+            Err(common::Error::runtime("Codex disconnected"))
+        })
+        .unwrap_err();
+
+        assert_eq!(completed_chunks, vec![(256, 256)]);
+        assert!(error.to_string().contains("disconnected"));
     }
 
     #[test]

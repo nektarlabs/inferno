@@ -24,15 +24,15 @@ use runtime::{
     CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime,
 };
 use server::{
-    ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, GLM_CODEX_MODEL_ID,
-    LAGUNA_CODEX_MODEL_ID, LAGUNA_GGUF_CODEX_MODEL_ID,
+    ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, ServerAdmission,
+    GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID, LAGUNA_GGUF_CODEX_MODEL_ID,
 };
 use tokenizer::{
     is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
     render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentOutput,
     AgentOutputItem, Tokenizer,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
@@ -42,6 +42,10 @@ use super::generate::{
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
+const LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS: usize = 4_096;
+const LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_048;
+const LAGUNA_GGUF_MAX_INSTRUCTION_BYTES: usize = 8 * 1_024;
+const CODEX_FALLBACK_INSTRUCTION_PREFIX: &str = "You are a coding agent running in the Codex CLI";
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -338,56 +342,97 @@ struct LagunaCodexHandler<'runtime> {
 }
 
 impl ResponsesHandler for LagunaCodexHandler<'_> {
+    fn admission(&self) -> ServerAdmission {
+        if self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID {
+            ServerAdmission::RejectWhenBusy
+        } else {
+            ServerAdmission::Queue
+        }
+    }
+
     fn generate(
         &mut self,
         request: ResponsesRequest,
         stream: &mut ResponsesStream<'_>,
     ) -> InfernoResult<ResponseUsage> {
         validate_requested_model(&request.model, self.model_id)?;
+        if self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID {
+            validate_laguna_gguf_codex_envelope(&request)?;
+        }
         let allowed_tools = tool_names(&request.tools)?;
         let prompt =
             render_laguna_codex_prompt(&request.instructions, &request.input, &request.tools)?;
         let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
-        validate_laguna_prompt(self.config, &encoded.token_ids, self.max_new_tokens)?;
+        let max_new_tokens = laguna_codex_max_new_tokens(
+            self.model_id,
+            self.max_new_tokens,
+            request.max_output_tokens,
+            encoded.token_ids.len(),
+        )?;
+        validate_laguna_prompt(self.config, &encoded.token_ids, max_new_tokens)?;
+        debug!(
+            model = self.model_id,
+            prompt_tokens = encoded.token_ids.len(),
+            max_output_tokens = max_new_tokens,
+            "accepted Laguna Codex request"
+        );
 
         let mut decoded = DecodedTextStream::new(self.tokenizer, true);
         let mut generated_text = String::new();
         let mut streamed_text = String::new();
         let mut completed_output = None;
         let mut output_tokens = 0_usize;
-        self.runtime.generate_streaming_controlled(
-            self.model,
-            self.backend,
-            &encoded.token_ids,
-            self.max_new_tokens,
-            &self.config.eos_token_id,
-            |token_id| {
-                output_tokens = output_tokens
-                    .checked_add(1)
-                    .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
-                if let Some(text) = decoded.push(token_id)? {
-                    generated_text.push_str(&text);
-                }
-                if let Some(visible_text) = streamable_agent_text(&generated_text) {
-                    let delta = visible_text.strip_prefix(&streamed_text).ok_or_else(|| {
-                        Error::tokenizer("Laguna agent visible text changed after it was streamed")
-                    })?;
-                    if !delta.is_empty() {
-                        stream.text_delta(delta)?;
-                        streamed_text.push_str(delta);
+        let heartbeat_during_prefill = self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID;
+        let stream_cell = std::cell::RefCell::new(stream);
+        self.runtime
+            .generate_streaming_controlled_with_prefill_progress(
+                self.model,
+                self.backend,
+                &encoded.token_ids,
+                max_new_tokens,
+                &self.config.eos_token_id,
+                |progress| {
+                    debug!(
+                        model = self.model_id,
+                        processed_tokens = progress.processed_tokens,
+                        prompt_tokens = progress.prompt_tokens,
+                        "Laguna Codex prefill progress"
+                    );
+                    if heartbeat_during_prefill {
+                        stream_cell.borrow_mut().heartbeat()?;
                     }
-                }
-                let control = match parse_complete_agent_tool_call(&generated_text)? {
-                    Some(output) => {
-                        completed_output = Some(output);
-                        GenerationControl::Stop
+                    Ok(())
+                },
+                |token_id| {
+                    output_tokens = output_tokens
+                        .checked_add(1)
+                        .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
+                    if let Some(text) = decoded.push(token_id)? {
+                        generated_text.push_str(&text);
                     }
-                    None => GenerationControl::Continue,
-                };
-                stream.heartbeat()?;
-                Ok(control)
-            },
-        )?;
+                    if let Some(visible_text) = streamable_agent_text(&generated_text) {
+                        let delta = visible_text.strip_prefix(&streamed_text).ok_or_else(|| {
+                            Error::tokenizer(
+                                "Laguna agent visible text changed after it was streamed",
+                            )
+                        })?;
+                        if !delta.is_empty() {
+                            stream_cell.borrow_mut().text_delta(delta)?;
+                            streamed_text.push_str(delta);
+                        }
+                    }
+                    let control = match parse_complete_agent_tool_call(&generated_text)? {
+                        Some(output) => {
+                            completed_output = Some(output);
+                            GenerationControl::Stop
+                        }
+                        None => GenerationControl::Continue,
+                    };
+                    stream_cell.borrow_mut().heartbeat()?;
+                    Ok(control)
+                },
+            )?;
+        let stream = stream_cell.into_inner();
 
         match completed_output {
             Some(output) => {
@@ -403,6 +448,45 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
             output_tokens,
         })
     }
+}
+
+fn validate_laguna_gguf_codex_envelope(request: &ResponsesRequest) -> InfernoResult<()> {
+    let instructions = request.instructions.trim_start();
+    if instructions.starts_with(CODEX_FALLBACK_INSTRUCTION_PREFIX) {
+        return Err(Error::runtime(
+            "Codex is using fallback metadata for laguna-s-2.1-gguf; install the current examples/inferno.models.json as ~/.codex/inferno.models.json and restart Codex",
+        ));
+    }
+    if request.instructions.len() > LAGUNA_GGUF_MAX_INSTRUCTION_BYTES {
+        return Err(Error::runtime(format!(
+            "Laguna GGUF Codex instructions exceed the {} KiB service limit; install the current Inferno model catalog or reduce custom instructions",
+            LAGUNA_GGUF_MAX_INSTRUCTION_BYTES / 1_024
+        )));
+    }
+    Ok(())
+}
+
+fn laguna_codex_max_new_tokens(
+    model_id: &str,
+    configured_limit: Option<usize>,
+    requested_limit: Option<usize>,
+    prompt_tokens: usize,
+) -> InfernoResult<Option<usize>> {
+    if model_id != LAGUNA_GGUF_CODEX_MODEL_ID {
+        return Ok(configured_limit);
+    }
+    let available_tokens = LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS
+        .checked_sub(prompt_tokens)
+        .filter(|available| *available > 0)
+        .ok_or_else(|| {
+            Error::runtime(format!(
+                "Laguna GGUF Codex prompt has {prompt_tokens} tokens, but the production service context is {} tokens; compact the Codex conversation and retry",
+                LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS
+            ))
+        })?;
+    let server_limit = configured_limit.unwrap_or(LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS);
+    let request_limit = requested_limit.unwrap_or(server_limit);
+    Ok(Some(server_limit.min(request_limit).min(available_tokens)))
 }
 
 fn emit_laguna_agent_output(
@@ -543,6 +627,70 @@ mod tests {
             validate_requested_model(GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID).unwrap_err();
         assert!(error.to_string().contains(GLM_CODEX_MODEL_ID));
         assert!(error.to_string().contains(LAGUNA_CODEX_MODEL_ID));
+    }
+
+    #[test]
+    fn gguf_codex_rejects_fallback_model_metadata() {
+        let request = ResponsesRequest {
+            model: LAGUNA_GGUF_CODEX_MODEL_ID.to_string(),
+            instructions:
+                "You are a coding agent running in the Codex CLI, a terminal-based assistant."
+                    .to_string(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: None,
+            stream: true,
+        };
+
+        let error = validate_laguna_gguf_codex_envelope(&request).unwrap_err();
+
+        assert!(error.to_string().contains("fallback metadata"));
+        assert!(error.to_string().contains("inferno.models.json"));
+    }
+
+    #[test]
+    fn gguf_codex_bounds_output_by_request_server_and_context() {
+        assert_eq!(
+            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, None, None, 1_000).unwrap(),
+            Some(LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, Some(512), Some(1_024), 1_000)
+                .unwrap(),
+            Some(512)
+        );
+        assert_eq!(
+            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, Some(512), Some(128), 1_000)
+                .unwrap(),
+            Some(128)
+        );
+        assert_eq!(
+            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, None, None, 4_000).unwrap(),
+            Some(96)
+        );
+    }
+
+    #[test]
+    fn gguf_codex_rejects_prompts_outside_the_service_context() {
+        let error = laguna_codex_max_new_tokens(
+            LAGUNA_GGUF_CODEX_MODEL_ID,
+            None,
+            None,
+            LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("compact"));
+        assert!(error.to_string().contains("4096"));
+    }
+
+    #[test]
+    fn safetensors_codex_keeps_its_existing_generation_limit() {
+        assert_eq!(
+            laguna_codex_max_new_tokens(LAGUNA_CODEX_MODEL_ID, Some(777), Some(12), 40_000)
+                .unwrap(),
+            Some(777)
+        );
     }
 
     #[test]

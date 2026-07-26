@@ -190,9 +190,9 @@ struct LagunaQ3KBlock {
     half d;
 };
 
-// Two adjacent Q3_K rows reuse each activation load. This layout-specific
+// Four adjacent Q3_K rows reuse each activation load. This layout-specific
 // implementation follows the GGML block organization used by Laguna.
-static inline float4 laguna_q3_k_dot2(
+static inline float4 laguna_q3_k_dot4(
     const device uchar* rows,
     uint row_bytes,
     uint valid_rows,
@@ -435,10 +435,10 @@ kernel void laguna_q3_expert_gate_up_f32_kernel(
         input + token_indices[assignment] * in_features;
     uint valid_rows = min(
         LAGUNA_Q3_ROWS_PER_SIMDGROUP, intermediate_features - row);
-    float4 gate = laguna_q3_k_dot2(
+    float4 gate = laguna_q3_k_dot4(
         gate_weights + expert_offset, row_bytes, valid_rows, in_features,
         token_input, simd_lane);
-    float4 up = laguna_q3_k_dot2(
+    float4 up = laguna_q3_k_dot4(
         up_weights + expert_offset, row_bytes, valid_rows, in_features,
         token_input, simd_lane);
 
@@ -543,7 +543,7 @@ kernel void laguna_q3_expert_down_sum_f32_kernel(
         uint assignment = token * top_k + slot;
         uint expert_offset = expert_ids[assignment] * expert_stride_bytes
             + row * row_bytes;
-        total += laguna_q3_k_dot2(
+        total += laguna_q3_k_dot4(
             down_weights + expert_offset,
             row_bytes,
             valid_rows,

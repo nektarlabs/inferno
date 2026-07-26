@@ -17,7 +17,7 @@ pub use cache_budget::{
 };
 pub use laguna::{
     run_laguna_generate_streaming, GenerationControl, LagunaGenerationOptions,
-    LagunaGenerationReport, LagunaRuntime,
+    LagunaGenerationReport, LagunaPrefillProgress, LagunaRuntime,
 };
 pub use laguna_memory::{
     enable_laguna_memory_controller_log, LagunaMemoryAction, LagunaMemoryControllerReport,

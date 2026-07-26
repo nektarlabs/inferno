@@ -27,6 +27,8 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    #[serde(default)]
     pub stream: bool,
 }
 
@@ -39,6 +41,11 @@ impl ResponsesRequest {
         if !request.stream {
             return Err(Error::runtime(
                 "Inferno requires stream=true for Codex Responses requests",
+            ));
+        }
+        if request.max_output_tokens == Some(0) {
+            return Err(Error::runtime(
+                "Responses max_output_tokens must be positive when provided",
             ));
         }
         Ok(request)
@@ -267,6 +274,7 @@ mod tests {
                 "input": [{"type": "message", "role": "user", "content": []}],
                 "tools": [{"type": "function", "name": "exec_command"}],
                 "stream": true,
+                "max_output_tokens": 64,
                 "store": false,
                 "parallel_tool_calls": false,
                 "include": []
@@ -278,6 +286,7 @@ mod tests {
         assert_eq!(request.model, "glm-5.2-q2");
         assert_eq!(request.input.len(), 1);
         assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.max_output_tokens, Some(64));
     }
 
     #[test]
@@ -288,6 +297,22 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("stream=true"));
+    }
+
+    #[test]
+    fn rejects_zero_max_output_tokens() {
+        let error = ResponsesRequest::parse(
+            &json!({
+                "model": "glm-5.2-q2",
+                "input": [],
+                "stream": true,
+                "max_output_tokens": 0
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be positive"));
     }
 
     #[test]

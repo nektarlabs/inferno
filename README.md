@@ -299,7 +299,9 @@ cp examples/inferno.models.json ~/.codex/inferno.models.json
 ```
 
 Restart Codex after replacing `inferno.models.json`; the `/models` picker reads
-the catalog when the session starts.
+the catalog when the session starts. The Laguna GGUF profile uses a 4,096-token
+service context and compacts at 3,072 tokens. Inferno rejects Codex fallback
+metadata instead of starting an unexpectedly large prefill.
 
 Start Codex with GLM:
 
@@ -326,6 +328,9 @@ The model, Metal backend, and model-specific expert cache remain alive between
 requests.
 
 Requests are processed one at a time because they share one Metal runtime.
+While Laguna GGUF is generating, additional inference requests receive HTTP
+429 instead of accumulating in memory. Its server path defaults to at most
+2,048 output tokens unless `serve --max-new-tokens` sets an explicit cap.
 The profiles expose only `exec_command` and `write_stdin` to the model. Codex
 still enforces its sandbox and approval policy, but omitting unrelated tool
 schemas keeps model prefill smaller. Plugin namespaces and hosted web search

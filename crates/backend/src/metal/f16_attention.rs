@@ -13,7 +13,6 @@ use super::{
 };
 
 const ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_attention_f32_kernel";
-const DECODE_ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_decode_attention_f32_kernel";
 const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
@@ -24,7 +23,6 @@ const ATTENTION_THREADS: usize = 256;
 
 pub(crate) struct MetalF16Attention {
     attention_pipeline: ComputePipelineState,
-    decode_attention_pipeline: ComputePipelineState,
     append_pipeline: ComputePipelineState,
     arena: MetalArena,
 }
@@ -32,14 +30,9 @@ pub(crate) struct MetalF16Attention {
 impl MetalF16Attention {
     pub(crate) fn new(device: &Device, library: &MetalLibrary, arena: MetalArena) -> Result<Self> {
         let attention_pipeline = compute_pipeline(device, library, ATTENTION_KERNEL)?;
-        let decode_attention_pipeline =
-            compute_pipeline(device, library, DECODE_ATTENTION_KERNEL)?;
         let simd_width = attention_pipeline.thread_execution_width() as usize;
         if simd_width != 32
             || (attention_pipeline.max_total_threads_per_threadgroup() as usize) < ATTENTION_THREADS
-            || decode_attention_pipeline.thread_execution_width() as usize != 32
-            || (decode_attention_pipeline.max_total_threads_per_threadgroup() as usize)
-                < ATTENTION_THREADS
         {
             return Err(Error::backend(
                 "Laguna F16 attention requires 32-lane SIMD groups and 256-thread groups",
@@ -48,7 +41,6 @@ impl MetalF16Attention {
         let append_pipeline = compute_pipeline(device, library, APPEND_KERNEL)?;
         Ok(Self {
             attention_pipeline,
-            decode_attention_pipeline,
             append_pipeline,
             arena,
         })
@@ -196,17 +188,9 @@ impl MetalF16Attention {
             "encoding fused Laguna F16 grouped-query attention"
         );
 
-        // Decode drives a single query token, where the general kernel's serial
-        // per-tile softmax has no other query rows to hide behind.
-        let pipeline = if query_tokens == 1 {
-            &self.decode_attention_pipeline
-        } else {
-            &self.attention_pipeline
-        };
-
         encode_1d_threadgroups(
             command_buffer,
-            pipeline,
+            &self.attention_pipeline,
             &[
                 query,
                 current_key,
@@ -502,12 +486,9 @@ mod tests {
         }
     }
 
-    /// The decode kernel partitions keys and merges softmaxes differently from
-    /// the prefill kernel, so it needs its own non-uniform reference check.
-    ///
     /// The sliding case runs past the 512-token window on purpose: that is the
-    /// only configuration where the decode step both clamps the visible range
-    /// and reads a ring buffer that has wrapped.
+    /// only configuration where a decode step both clamps the visible range and
+    /// reads a ring buffer that has wrapped.
     #[test]
     fn f16_decode_step_matches_nonuniform_cpu_reference() {
         let Ok(backend) = MetalBackend::new() else {

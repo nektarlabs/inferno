@@ -803,7 +803,9 @@ mod tests {
         // head, so it must not appear here.
         assert_eq!(
             submission_layers,
-            (0..47).step_by(super::LAYER_SUBMISSION_CHUNK).collect::<Vec<_>>()
+            (0..47)
+                .step_by(super::LAYER_SUBMISSION_CHUNK)
+                .collect::<Vec<_>>()
         );
     }
 }
