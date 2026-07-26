@@ -376,6 +376,7 @@ target/release/inferno generate \
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
+| `--throughput-summary` | Prints only prefill and decode throughput after `generate` or each `chat` answer. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget for cache-backed artifacts. |
 | `--hot-kv-cache-gb <GB>` | Pins the GLM hot Metal KV budget. |
 | `--enable-unified-memory-controller` | Enables the model-specific adaptive memory controller; disabled by default. |

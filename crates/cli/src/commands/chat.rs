@@ -31,7 +31,8 @@ use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
     laguna_runtime_options, load_q2_readiness, resolve_q2_artifact, validate_generation_request,
     validate_laguna_prompt, validate_laguna_service_options, validate_laguna_tokenizer,
-    validate_memory_controller_options, DecodedTextStream,
+    validate_memory_controller_options, write_throughput_summary, DecodedTextStream,
+    ThroughputRecorder,
 };
 
 const THINK_END: &str = "</think>";
@@ -46,6 +47,7 @@ pub fn run(
     tokenizer_path: Option<&Path>,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -63,6 +65,7 @@ pub fn run(
             &discovered_tokenizer,
             page_size,
             max_new_tokens,
+            throughput_summary,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -140,6 +143,7 @@ pub fn run(
         &readiness.artifact_file_name,
         page_size,
         max_new_tokens,
+        throughput_summary,
         speculative_mtp,
         hot_kv_cache_budget_bytes,
         dynamic_cache_budget,
@@ -153,6 +157,7 @@ fn run_laguna(
     tokenizer_path: &Path,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -198,6 +203,7 @@ fn run_laguna(
         &backend,
         &tokenizer,
         max_new_tokens,
+        throughput_summary,
         &mut runtime,
     )
 }
@@ -208,6 +214,7 @@ fn run_laguna_interactive_loop(
     backend: &MetalBackend,
     tokenizer: &Tokenizer,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     runtime: &mut LagunaRuntime,
 ) -> Result<()> {
     let stdin = io::stdin();
@@ -253,6 +260,7 @@ fn run_laguna_interactive_loop(
         set_thinking_color(&mut output, output_is_terminal)?;
         let mut decoded = DecodedTextStream::new(tokenizer, true);
         let mut assistant = AssistantStream::default();
+        let mut throughput = ThroughputRecorder::start();
         let generation_result = runtime.generate_streaming(
             model,
             backend,
@@ -260,6 +268,7 @@ fn run_laguna_interactive_loop(
             max_new_tokens,
             &config.eos_token_id,
             |token_id| {
+                throughput.record_token();
                 if let Some(text) = decoded.push(token_id)? {
                     write_events(&mut output, assistant.push(&text), output_is_terminal)?;
                 }
@@ -280,6 +289,11 @@ fn run_laguna_interactive_loop(
         input_result?;
         output.write_all(b"\n")?;
         output.flush()?;
+        if throughput_summary {
+            write_throughput_summary(
+                &throughput.finish(encoded.token_ids.len(), config.num_experts_per_tok),
+            )?;
+        }
 
         history.push(ChatTurn {
             user: prompt.to_string(),
@@ -298,6 +312,7 @@ fn run_interactive_loop(
     artifact_file_name: &str,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     speculative_mtp: bool,
     hot_kv_cache_budget_bytes: Option<usize>,
     dynamic_cache_budget: Option<CacheBudgetSpec>,
@@ -354,6 +369,7 @@ fn run_interactive_loop(
         set_thinking_color(&mut output, output_is_terminal)?;
         let mut decoded = DecodedTextStream::new(tokenizer, true);
         let mut assistant = AssistantStream::default();
+        let mut throughput = ThroughputRecorder::start();
         let generation_result = run_generate_streaming_with_options(
             model,
             config,
@@ -369,6 +385,7 @@ fn run_interactive_loop(
                 speculative_mtp,
             },
             |token_id| {
+                throughput.record_token();
                 if let Some(text) = decoded.push(token_id)? {
                     write_events(&mut output, assistant.push(&text), output_is_terminal)?;
                 }
@@ -389,6 +406,11 @@ fn run_interactive_loop(
         input_result?;
         output.write_all(b"\n")?;
         output.flush()?;
+        if throughput_summary {
+            write_throughput_summary(
+                &throughput.finish(encoded.token_ids.len(), config.experts_per_token),
+            )?;
+        }
 
         let response = assistant.answer().trim().to_string();
         history.push(ChatTurn {

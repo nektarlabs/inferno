@@ -64,6 +64,7 @@ pub fn run(
     profile_runtime: Option<&Path>,
     profile_layers: Option<&Path>,
     measure_tokens_per_second: bool,
+    throughput_summary: bool,
     throughput_file: Option<&Path>,
     profile_token_costs: bool,
     speculative_mtp: bool,
@@ -90,6 +91,7 @@ pub fn run(
             profile_runtime,
             profile_layers,
             measure_tokens_per_second,
+            throughput_summary,
             throughput_file,
             profile_token_costs,
             speculative_mtp,
@@ -222,10 +224,13 @@ pub fn run(
             generation_report.mtp,
         );
     stdout.write_all(b"\n")?;
-    if measure_tokens_per_second || throughput_file.is_some() {
+    if measure_tokens_per_second || throughput_summary || throughput_file.is_some() {
         validate_exact_generated_token_count(generated_token_count, &throughput_report)?;
         if measure_tokens_per_second {
             write_tokens_per_second_report(&throughput_report)?;
+        }
+        if throughput_summary {
+            write_throughput_summary(&throughput_report)?;
         }
         if let Some(path) = throughput_file {
             append_tokens_per_second_report(path, &throughput_report)?;
@@ -247,6 +252,7 @@ fn run_laguna(
     profile_runtime: Option<&Path>,
     profile_layers: Option<&Path>,
     measure_tokens_per_second: bool,
+    throughput_summary: bool,
     throughput_file: Option<&Path>,
     profile_token_costs: bool,
     speculative_mtp: bool,
@@ -324,6 +330,9 @@ fn run_laguna(
     stdout.write_all(b"\n")?;
     if measure_tokens_per_second {
         write_laguna_tokens_per_second_report(&throughput_report, &generation_report)?;
+    }
+    if throughput_summary {
+        write_throughput_summary(&throughput_report)?;
     }
     if let Some(path) = throughput_file {
         append_laguna_tokens_per_second_report(path, &throughput_report, &generation_report)?;
@@ -711,6 +720,22 @@ fn write_laguna_tokens_per_second_report(
     })
 }
 
+pub(super) fn write_throughput_summary(report: &ThroughputReport) -> InfernoResult<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "{}", throughput_summary(report)).map_err(|source| Error::Io {
+        path: PathBuf::from("<stderr>"),
+        source,
+    })
+}
+
+fn throughput_summary(report: &ThroughputReport) -> String {
+    format!(
+        "prefill_tps={:.3} decode_tps={:.3}",
+        report.prefill_tokens_per_second(),
+        report.decode_tokens_per_second
+    )
+}
+
 fn append_laguna_tokens_per_second_report(
     path: &Path,
     throughput: &ThroughputReport,
@@ -1038,24 +1063,28 @@ fn tokens_per_second(token_count: usize, elapsed: Duration) -> f64 {
     token_count as f64 / elapsed_seconds
 }
 
-struct ThroughputRecorder {
+pub(super) struct ThroughputRecorder {
     started_at: Instant,
     token_offsets: Vec<Duration>,
 }
 
 impl ThroughputRecorder {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self {
             started_at: Instant::now(),
             token_offsets: Vec::new(),
         }
     }
 
-    fn record_token(&mut self) {
+    pub(super) fn record_token(&mut self) {
         self.token_offsets.push(self.started_at.elapsed());
     }
 
-    fn finish(self, prompt_tokens: usize, routed_experts_per_token: usize) -> ThroughputReport {
+    pub(super) fn finish(
+        self,
+        prompt_tokens: usize,
+        routed_experts_per_token: usize,
+    ) -> ThroughputReport {
         ThroughputReport::from_token_offsets(
             prompt_tokens,
             routed_experts_per_token,
@@ -1066,7 +1095,7 @@ impl ThroughputRecorder {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ThroughputReport {
+pub(super) struct ThroughputReport {
     prompt_tokens: usize,
     generated_tokens: usize,
     routed_experts_per_token: usize,
@@ -1086,6 +1115,13 @@ struct ThroughputReport {
 }
 
 impl ThroughputReport {
+    fn prefill_tokens_per_second(&self) -> f64 {
+        if self.time_to_first_token_seconds <= 0.0 {
+            return 0.0;
+        }
+        self.prompt_tokens as f64 / self.time_to_first_token_seconds
+    }
+
     fn from_token_offsets(
         prompt_tokens: usize,
         routed_experts_per_token: usize,
@@ -1526,6 +1562,7 @@ mod tests {
         assert_eq!(report.total_seconds, 10.0);
         assert_eq!(report.total_tokens_per_second, 0.4);
         assert_eq!(report.time_to_first_token_seconds, 4.0);
+        assert_eq!(report.prefill_tokens_per_second(), 1.25);
         assert_eq!(report.decode_tokens, 3);
         assert_eq!(report.decode_seconds, 6.0);
         assert_eq!(report.decode_tokens_per_second, 0.5);
@@ -1550,6 +1587,26 @@ mod tests {
         assert_eq!(report.decode_token_mean_seconds, 0.0);
         assert_eq!(report.decode_token_p50_seconds, 0.0);
         assert_eq!(report.decode_token_p95_seconds, 0.0);
+    }
+
+    #[test]
+    fn compact_throughput_summary_contains_only_prefill_and_decode_rates() {
+        let report = ThroughputReport::from_token_offsets(
+            5,
+            10,
+            Duration::from_secs(10),
+            &[
+                Duration::from_secs(4),
+                Duration::from_secs(6),
+                Duration::from_secs(7),
+                Duration::from_secs(10),
+            ],
+        );
+
+        assert_eq!(
+            throughput_summary(&report),
+            "prefill_tps=1.250 decode_tps=0.500"
+        );
     }
 
     #[test]
