@@ -265,6 +265,12 @@ target/release/inferno generate \
   --prompt "Tell me the capital of Italy."
 ```
 
+Laguna returns direct answers in `generate`, `chat`, and `serve` by default.
+Add `--thinking` to the selected command to enable reasoning explicitly.
+Thinking mode closes the reasoning section automatically if an eight-token
+sequence occurs four times or reasoning reaches 512 tokens, then continues
+generation as a visible answer.
+
 Without `--max-new-tokens`, generation continues until an EOS token or the
 context limit.
 
@@ -376,6 +382,7 @@ target/release/inferno generate \
 | Option | Purpose |
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
+| `--thinking` | Enables Laguna reasoning for `generate`, `chat`, or `serve`; direct answers are the default. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
 | `--throughput-summary` | Prints only prefill and decode throughput after `generate` or each `chat` answer. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget for cache-backed artifacts. |

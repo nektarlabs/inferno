@@ -23,24 +23,29 @@ use model::{
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
     enable_memory_telemetry_file, enable_q2_runtime_profile, q2_memory_controller_spec,
-    run_generate_streaming_with_options, run_laguna_generate_streaming, GenerationOptions,
-    KvCacheMetrics, LagunaGenerationOptions, LagunaMemoryControllerSpec, MtpMetrics,
-    DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS, DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES,
-    DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS, DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
-    DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
+    run_generate_streaming_with_options, GenerationControl, GenerationOptions, KvCacheMetrics,
+    LagunaGenerationOptions, LagunaMemoryControllerSpec, LagunaRuntime, LagunaThinkingGuard,
+    MtpMetrics, DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS,
+    DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES, DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS,
+    DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES, DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
+    LAGUNA_THINKING_END_TOKEN_ID,
 };
-use tokenizer::{render_laguna_user_prompt, render_user_prompt, TokenDecoder, Tokenizer};
+use tokenizer::{
+    render_laguna_user_prompt, render_user_prompt, LagunaThinkingMode, TokenDecoder, Tokenizer,
+};
+use tracing::debug;
 
 const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
 const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
 const LAGUNA_MINIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 16_000_000_000;
 const LAGUNA_MAXIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 32_000_000_000;
 const LAGUNA_ADAPTIVE_EXPERT_CACHE_STEP_BYTES: u64 = 1_000_000_000;
-pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 6] = [
+pub(super) const LAGUNA_TOKENIZER_CONTRACT: [(&str, u32); 7] = [
     ("〈|UNK|〉", 0),
     ("〈|EOS|〉", 2),
     ("〈|PAD|〉", 9),
     ("<think>", 18),
+    ("</think>", 19),
     ("<assistant>", 23),
     ("</assistant>", 24),
 ];
@@ -59,6 +64,7 @@ pub fn run(
     page_size: usize,
     prompt: &str,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     add_special_tokens: bool,
     skip_special_tokens: bool,
     profile_runtime: Option<&Path>,
@@ -78,7 +84,8 @@ pub fn run(
     validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
-    if detect_model_architecture(&discovered_config)? == ModelArchitecture::Laguna {
+    let architecture = detect_model_architecture(&discovered_config)?;
+    if architecture == ModelArchitecture::Laguna {
         return run_laguna(
             model_path,
             &discovered_config,
@@ -86,6 +93,7 @@ pub fn run(
             page_size,
             prompt,
             max_new_tokens,
+            thinking,
             add_special_tokens,
             skip_special_tokens,
             profile_runtime,
@@ -102,6 +110,9 @@ pub fn run(
             telemetry_file,
             memory_controller_log,
         );
+    }
+    if thinking {
+        return Err(Error::runtime("--thinking currently applies only to Laguna models").into());
     }
     let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
     let config = load_config(&discovered_config)?;
@@ -247,6 +258,7 @@ fn run_laguna(
     page_size: usize,
     prompt: &str,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     add_special_tokens: bool,
     skip_special_tokens: bool,
     profile_runtime: Option<&Path>,
@@ -280,9 +292,10 @@ fn run_laguna(
     let config = load_laguna_config(config_path)?;
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
     validate_laguna_tokenizer(&tokenizer, &config)?;
-    let rendered_prompt = render_laguna_user_prompt(prompt);
+    let thinking_mode = laguna_thinking_mode(thinking);
+    let rendered_prompt = render_laguna_user_prompt(prompt, thinking_mode);
     let encoded = tokenizer.encode(&rendered_prompt.rendered, add_special_tokens)?;
-    validate_laguna_prompt(&config, &encoded.token_ids, max_new_tokens)?;
+    validate_laguna_prompt(&config, &encoded.token_ids, max_new_tokens, thinking_mode)?;
 
     let backend = MetalBackend::new()?;
     let model = LagunaModel::open(model_path, config.clone(), &backend)?;
@@ -302,13 +315,15 @@ fn run_laguna(
     let mut stdout = io::stdout().lock();
     let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
     let mut throughput = ThroughputRecorder::start();
-    let generation_report = run_laguna_generate_streaming(
+    let mut thinking_guard =
+        (thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
+    let mut runtime = LagunaRuntime::new(options)?;
+    let generation_report = runtime.generate_streaming_controlled(
         &model,
         &backend,
         &encoded.token_ids,
         max_new_tokens,
         &config.eos_token_id,
-        options,
         |token_id| {
             throughput.record_token();
             if let Some(text) = stream.push(token_id)? {
@@ -323,7 +338,29 @@ fn run_laguna(
                     source,
                 })?;
             }
-            Ok(())
+            let Some(reason) = thinking_guard
+                .as_mut()
+                .and_then(|guard| guard.observe(token_id))
+            else {
+                return Ok(GenerationControl::Continue);
+            };
+
+            debug!(?reason, "forcing Laguna reasoning boundary");
+            if let Some(text) = stream.push(LAGUNA_THINKING_END_TOKEN_ID)? {
+                stdout
+                    .write_all(text.as_bytes())
+                    .map_err(|source| Error::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    })?;
+                stdout.flush().map_err(|source| Error::Io {
+                    path: PathBuf::from("<stdout>"),
+                    source,
+                })?;
+            }
+            Ok(GenerationControl::InjectNextToken(
+                LAGUNA_THINKING_END_TOKEN_ID,
+            ))
         },
     )?;
     let throughput_report = throughput.finish(encoded.token_ids.len(), config.num_experts_per_tok);
@@ -345,7 +382,10 @@ pub(super) fn validate_laguna_tokenizer(
     config: &LagunaConfig,
 ) -> InfernoResult<()> {
     tokenizer.validate_contract(config.vocab_size, &LAGUNA_TOKENIZER_CONTRACT)?;
-    let rendered = render_laguna_user_prompt(LAGUNA_TOKENIZER_REFERENCE_PROMPT);
+    let rendered = render_laguna_user_prompt(
+        LAGUNA_TOKENIZER_REFERENCE_PROMPT,
+        LagunaThinkingMode::Enabled,
+    );
     let actual = tokenizer.encode(&rendered.rendered, false)?.token_ids;
     if actual != LAGUNA_TOKENIZER_REFERENCE_IDS {
         return Err(Error::tokenizer(format!(
@@ -440,13 +480,14 @@ pub(super) fn validate_laguna_prompt(
     config: &LagunaConfig,
     prompt_token_ids: &[u32],
     max_new_tokens: Option<usize>,
+    thinking_mode: LagunaThinkingMode,
 ) -> InfernoResult<()> {
     if prompt_token_ids.is_empty() {
         return Err(Error::runtime(
             "Laguna inference requires at least one prompt token",
         ));
     }
-    validate_laguna_prompt_boundary(prompt_token_ids)?;
+    validate_laguna_prompt_boundary(prompt_token_ids, thinking_mode)?;
     if max_new_tokens == Some(0) {
         return Err(Error::runtime(
             "max_new_tokens must be positive when provided",
@@ -477,21 +518,35 @@ pub(super) fn validate_laguna_prompt(
     Ok(())
 }
 
-fn validate_laguna_prompt_boundary(prompt_token_ids: &[u32]) -> InfernoResult<()> {
+fn validate_laguna_prompt_boundary(
+    prompt_token_ids: &[u32],
+    thinking_mode: LagunaThinkingMode,
+) -> InfernoResult<()> {
     const BOS_ID: u32 = 2;
     const ASSISTANT_ID: u32 = 23;
     const THINK_ID: u32 = 18;
+    const THINK_END_ID: u32 = 19;
 
-    if prompt_token_ids.first() != Some(&BOS_ID)
-        || !prompt_token_ids.ends_with(&[ASSISTANT_ID, THINK_ID])
-    {
+    let expected_tail: &[u32] = match thinking_mode {
+        LagunaThinkingMode::Disabled => &[ASSISTANT_ID, THINK_ID, THINK_END_ID],
+        LagunaThinkingMode::Enabled => &[ASSISTANT_ID, THINK_ID],
+    };
+    if prompt_token_ids.first() != Some(&BOS_ID) || !prompt_token_ids.ends_with(expected_tail) {
         return Err(Error::tokenizer(format!(
-            "Laguna prompt must tokenize as BOS={BOS_ID} ... assistant={ASSISTANT_ID} think={THINK_ID}; got first={:?}, tail={:?}",
+            "Laguna prompt must tokenize as BOS={BOS_ID} with {thinking_mode:?} thinking boundary {expected_tail:?}; got first={:?}, tail={:?}",
             prompt_token_ids.first(),
-            prompt_token_ids.get(prompt_token_ids.len().saturating_sub(2)..)
+            prompt_token_ids.get(prompt_token_ids.len().saturating_sub(expected_tail.len())..)
         )));
     }
     Ok(())
+}
+
+pub(super) fn laguna_thinking_mode(enabled: bool) -> LagunaThinkingMode {
+    if enabled {
+        LagunaThinkingMode::Enabled
+    } else {
+        LagunaThinkingMode::Disabled
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1535,11 +1590,18 @@ mod tests {
     }
 
     #[test]
-    fn laguna_prompt_requires_published_control_token_boundary() {
-        validate_laguna_prompt_boundary(&[2, 42, 23, 18]).unwrap();
+    fn laguna_prompt_requires_the_selected_control_token_boundary() {
+        validate_laguna_prompt_boundary(&[2, 42, 23, 18], LagunaThinkingMode::Enabled).unwrap();
+        validate_laguna_prompt_boundary(&[2, 42, 23, 18, 19], LagunaThinkingMode::Disabled)
+            .unwrap();
 
-        assert!(validate_laguna_prompt_boundary(&[42, 23, 18]).is_err());
-        assert!(validate_laguna_prompt_boundary(&[2, 42, 23]).is_err());
+        assert!(
+            validate_laguna_prompt_boundary(&[42, 23, 18], LagunaThinkingMode::Enabled,).is_err()
+        );
+        assert!(
+            validate_laguna_prompt_boundary(&[2, 42, 23, 18], LagunaThinkingMode::Disabled,)
+                .is_err()
+        );
     }
 
     #[test]

@@ -20,19 +20,23 @@ use model::{
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
     enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
-    CacheBudgetSpec, GenerationOptions, LagunaRuntime,
+    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime, LagunaThinkingGuard,
+    LAGUNA_THINKING_END_TOKEN_ID,
 };
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, LocalModes, OptionalActions, QueueSelector, Termios,
 };
-use tokenizer::{render_chat_prompt, render_laguna_chat_prompt, ChatTurn, Tokenizer};
+use tokenizer::{
+    render_chat_prompt, render_laguna_chat_prompt, ChatTurn, LagunaThinkingMode, Tokenizer,
+};
+use tracing::debug;
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    laguna_runtime_options, load_q2_readiness, resolve_q2_artifact, validate_generation_request,
-    validate_laguna_prompt, validate_laguna_service_options, validate_laguna_tokenizer,
-    validate_memory_controller_options, write_throughput_summary, DecodedTextStream,
-    ThroughputRecorder,
+    laguna_runtime_options, laguna_thinking_mode, load_q2_readiness, resolve_q2_artifact,
+    validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
+    validate_laguna_tokenizer, validate_memory_controller_options, write_throughput_summary,
+    DecodedTextStream, ThroughputRecorder,
 };
 
 const THINK_END: &str = "</think>";
@@ -47,6 +51,7 @@ pub fn run(
     tokenizer_path: Option<&Path>,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
@@ -65,6 +70,7 @@ pub fn run(
             &discovered_tokenizer,
             page_size,
             max_new_tokens,
+            thinking,
             throughput_summary,
             speculative_mtp,
             enable_unified_memory_controller,
@@ -74,6 +80,9 @@ pub fn run(
             telemetry_file,
             memory_controller_log,
         );
+    }
+    if thinking {
+        return Err(Error::runtime("--thinking currently applies only to Laguna models").into());
     }
 
     validate_memory_controller_options(enable_unified_memory_controller, memory_controller_log)?;
@@ -157,6 +166,7 @@ fn run_laguna(
     tokenizer_path: &Path,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
@@ -202,10 +212,20 @@ fn run_laguna(
         &config,
         &backend,
         &tokenizer,
-        max_new_tokens,
-        throughput_summary,
+        LagunaChatOptions {
+            max_new_tokens,
+            thinking_mode: laguna_thinking_mode(thinking),
+            throughput_summary,
+        },
         &mut runtime,
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LagunaChatOptions {
+    max_new_tokens: Option<usize>,
+    thinking_mode: LagunaThinkingMode,
+    throughput_summary: bool,
 }
 
 fn run_laguna_interactive_loop(
@@ -213,8 +233,7 @@ fn run_laguna_interactive_loop(
     config: &LagunaConfig,
     backend: &MetalBackend,
     tokenizer: &Tokenizer,
-    max_new_tokens: Option<usize>,
-    throughput_summary: bool,
+    options: LagunaChatOptions,
     runtime: &mut LagunaRuntime,
 ) -> Result<()> {
     let stdin = io::stdin();
@@ -252,27 +271,50 @@ fn run_laguna_interactive_loop(
             ChatInput::Prompt => {}
         }
 
-        let rendered = render_laguna_chat_prompt(&history, prompt);
+        let rendered = render_laguna_chat_prompt(&history, prompt, options.thinking_mode);
         let encoded = tokenizer.encode(&rendered.rendered, false)?;
-        validate_laguna_prompt(config, &encoded.token_ids, max_new_tokens)?;
+        validate_laguna_prompt(
+            config,
+            &encoded.token_ids,
+            options.max_new_tokens,
+            options.thinking_mode,
+        )?;
 
         let mut input_guard = TerminalInputGuard::suspend(&input, input_is_terminal)?;
-        set_thinking_color(&mut output, output_is_terminal)?;
+        set_initial_assistant_color(&mut output, output_is_terminal, options.thinking_mode)?;
         let mut decoded = DecodedTextStream::new(tokenizer, true);
-        let mut assistant = AssistantStream::default();
+        let mut assistant = AssistantStream::new(options.thinking_mode);
         let mut throughput = ThroughputRecorder::start();
-        let generation_result = runtime.generate_streaming(
+        let mut thinking_guard = (options.thinking_mode == LagunaThinkingMode::Enabled)
+            .then(LagunaThinkingGuard::default);
+        let generation_result = runtime.generate_streaming_controlled(
             model,
             backend,
             &encoded.token_ids,
-            max_new_tokens,
+            options.max_new_tokens,
             &config.eos_token_id,
             |token_id| {
                 throughput.record_token();
                 if let Some(text) = decoded.push(token_id)? {
                     write_events(&mut output, assistant.push(&text), output_is_terminal)?;
                 }
-                Ok(())
+                let Some(reason) = thinking_guard
+                    .as_mut()
+                    .and_then(|guard| guard.observe(token_id))
+                else {
+                    return Ok(GenerationControl::Continue);
+                };
+
+                debug!(?reason, "forcing Laguna reasoning boundary");
+                if let Some(text) = decoded.push(LAGUNA_THINKING_END_TOKEN_ID)? {
+                    write_events(&mut output, assistant.push(&text), output_is_terminal)?;
+                }
+                if assistant.phase == AssistantPhase::Thinking {
+                    write_events(&mut output, assistant.push(THINK_END), output_is_terminal)?;
+                }
+                Ok(GenerationControl::InjectNextToken(
+                    LAGUNA_THINKING_END_TOKEN_ID,
+                ))
             },
         );
         let finish_result = if generation_result.is_ok() {
@@ -289,7 +331,7 @@ fn run_laguna_interactive_loop(
         input_result?;
         output.write_all(b"\n")?;
         output.flush()?;
-        if throughput_summary {
+        if options.throughput_summary {
             write_throughput_summary(
                 &throughput.finish(encoded.token_ids.len(), config.num_experts_per_tok),
             )?;
@@ -460,6 +502,16 @@ struct AssistantStream {
 }
 
 impl AssistantStream {
+    fn new(thinking_mode: LagunaThinkingMode) -> Self {
+        Self {
+            phase: match thinking_mode {
+                LagunaThinkingMode::Disabled => AssistantPhase::Answer,
+                LagunaThinkingMode::Enabled => AssistantPhase::Thinking,
+            },
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, text: &str) -> Vec<AssistantEvent> {
         if text.is_empty() {
             return Vec::new();
@@ -533,6 +585,19 @@ fn trailing_marker_prefix_bytes(text: &str) -> usize {
 
 fn set_thinking_color(output: &mut impl Write, styled: bool) -> InfernoResult<()> {
     let bytes = if styled { THINKING_COLOR } else { &[] };
+    write_terminal_bytes(output, bytes)
+}
+
+fn set_initial_assistant_color(
+    output: &mut impl Write,
+    styled: bool,
+    thinking_mode: LagunaThinkingMode,
+) -> InfernoResult<()> {
+    let bytes = match (styled, thinking_mode) {
+        (true, LagunaThinkingMode::Disabled) => ANSWER_COLOR,
+        (true, LagunaThinkingMode::Enabled) => THINKING_COLOR,
+        (false, _) => &[],
+    };
     write_terminal_bytes(output, bytes)
 }
 
@@ -686,6 +751,19 @@ mod tests {
     }
 
     #[test]
+    fn streams_direct_laguna_answers_without_a_thinking_boundary() {
+        let mut stream = AssistantStream::new(LagunaThinkingMode::Disabled);
+
+        assert_eq!(
+            stream.push("The capital is Rome."),
+            vec![AssistantEvent::Answer("The capital is Rome.".to_string())]
+        );
+        assert_eq!(stream.finish(), Vec::<AssistantEvent>::new());
+        assert!(stream.thinking.is_empty());
+        assert_eq!(stream.answer(), "The capital is Rome.");
+    }
+
+    #[test]
     fn terminal_events_use_gray_thinking_and_an_unlabelled_white_answer() {
         let mut output = Vec::new();
 
@@ -704,6 +782,22 @@ mod tests {
 
         assert_eq!(output, b"\x1b[90mreasoning\x1b[97m\nRome\x1b[0m");
         assert!(!String::from_utf8(output).unwrap().contains('>'));
+    }
+
+    #[test]
+    fn direct_laguna_answers_start_in_white() {
+        let mut output = Vec::new();
+
+        set_initial_assistant_color(&mut output, true, LagunaThinkingMode::Disabled).unwrap();
+        write_events(
+            &mut output,
+            vec![AssistantEvent::Answer("Rome".to_string())],
+            true,
+        )
+        .unwrap();
+        reset_color(&mut output, true).unwrap();
+
+        assert_eq!(output, b"\x1b[97mRome\x1b[0m");
     }
 
     #[test]

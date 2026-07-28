@@ -78,6 +78,13 @@ pub struct ChatTurn {
     pub assistant: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LagunaThinkingMode {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     tokenizer: HfTokenizer,
@@ -242,20 +249,20 @@ pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
 }
 
 /// Renders one user turn with Laguna S 2.1's published chat template.
-///
-/// This is intentionally the exact no-tools, thinking-enabled case used by
-/// Inferno's generate command. It matches both the template published beside
-/// the source GGUF revision and DwarfStar's Laguna runtime contract. The
-/// GGUF's embedded template metadata differs from that tested runtime
-/// contract, so Inferno does not interpret it dynamically. General Jinja
-/// interpretation does not belong in the inference hot path.
-pub fn render_laguna_user_prompt(prompt: &str) -> ChatPrompt {
-    render_laguna_chat_prompt(&[], prompt)
+pub fn render_laguna_user_prompt(prompt: &str, thinking_mode: LagunaThinkingMode) -> ChatPrompt {
+    render_laguna_chat_prompt(&[], prompt, thinking_mode)
 }
 
-/// Renders a Laguna S 2.1 conversation using the checkpoint's published
-/// thinking-enabled chat contract.
-pub fn render_laguna_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatPrompt {
+/// Renders a Laguna S 2.1 conversation with an explicit reasoning mode.
+///
+/// Disabled mode closes the reasoning section in the prompt, so generation
+/// starts with the visible answer. Enabled mode leaves the section open and
+/// requires the model to emit `</think>` before its visible answer.
+pub fn render_laguna_chat_prompt(
+    history: &[ChatTurn],
+    prompt: &str,
+    thinking_mode: LagunaThinkingMode,
+) -> ChatPrompt {
     const DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
 
     let history_bytes = history.iter().fold(0_usize, |total, turn| {
@@ -282,6 +289,9 @@ pub fn render_laguna_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatProm
     rendered.push_str("<user>");
     rendered.push_str(prompt);
     rendered.push_str("</user>\n<assistant><think>");
+    if thinking_mode == LagunaThinkingMode::Disabled {
+        rendered.push_str("</think>");
+    }
     ChatPrompt { rendered }
 }
 
@@ -414,8 +424,18 @@ mod tests {
     }
 
     #[test]
-    fn renders_laguna_single_user_prompt_from_published_template() {
-        let rendered = render_laguna_user_prompt("Hello Laguna");
+    fn renders_laguna_single_user_prompt_without_reasoning_by_default() {
+        let rendered = render_laguna_user_prompt("Hello Laguna", LagunaThinkingMode::Disabled);
+
+        assert_eq!(
+            rendered.rendered,
+            "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>Hello Laguna</user>\n<assistant><think></think>"
+        );
+    }
+
+    #[test]
+    fn renders_laguna_single_user_prompt_with_reasoning_when_enabled() {
+        let rendered = render_laguna_user_prompt("Hello Laguna", LagunaThinkingMode::Enabled);
 
         assert_eq!(
             rendered.rendered,
@@ -424,14 +444,15 @@ mod tests {
     }
 
     #[test]
-    fn laguna_prompt_tokens_match_dwarfstar_reference() {
+    fn laguna_thinking_prompt_tokens_match_dwarfstar_reference() {
         let tokenizer_path = Path::new("../../models/laguna-s-2.1-int4/tokenizer.json");
         if !tokenizer_path.is_file() {
             return;
         }
 
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
-        let rendered = render_laguna_user_prompt("Tell me the capital of Italy.");
+        let rendered =
+            render_laguna_user_prompt("Tell me the capital of Italy.", LagunaThinkingMode::Enabled);
         let encoded = tokenizer.encode(&rendered.rendered, false).unwrap();
 
         // Produced by DwarfStar's --dump-tokens at the Laguna GGUF reference
@@ -453,11 +474,12 @@ mod tests {
             user: "What is the capital of Italy?".to_string(),
             assistant: "Rome.".to_string(),
         }];
-        let rendered = render_laguna_chat_prompt(&history, "And France?");
+        let rendered =
+            render_laguna_chat_prompt(&history, "And France?", LagunaThinkingMode::Disabled);
 
         assert_eq!(
             rendered.rendered,
-            "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>What is the capital of Italy?</user>\n<assistant><think></think>Rome.</assistant>\n<user>And France?</user>\n<assistant><think>"
+            "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>What is the capital of Italy?</user>\n<assistant><think></think>Rome.</assistant>\n<user>And France?</user>\n<assistant><think></think>"
         );
     }
 

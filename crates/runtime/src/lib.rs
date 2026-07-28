@@ -16,8 +16,9 @@ pub use cache_budget::{
     DEFAULT_TARGET_HEADROOM_BYTES,
 };
 pub use laguna::{
-    run_laguna_generate_streaming, GenerationControl, LagunaGenerationOptions,
-    LagunaGenerationReport, LagunaPrefillProgress, LagunaRuntime,
+    GenerationControl, LagunaGenerationOptions, LagunaGenerationReport, LagunaPrefillProgress,
+    LagunaRuntime, LagunaThinkingGuard, LagunaThinkingGuardReason, LAGUNA_THINKING_END_TOKEN_ID,
+    LAGUNA_THINKING_TOKEN_BUDGET,
 };
 pub use laguna_memory::{
     enable_laguna_memory_controller_log, LagunaMemoryAction, LagunaMemoryControllerReport,

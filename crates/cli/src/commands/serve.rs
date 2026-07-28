@@ -21,7 +21,8 @@ use model::{
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
     enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
-    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime,
+    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime, LagunaThinkingGuard,
+    LAGUNA_THINKING_END_TOKEN_ID,
 };
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, ServerAdmission,
@@ -30,15 +31,15 @@ use server::{
 use tokenizer::{
     is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
     render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentOutput,
-    AgentOutputItem, Tokenizer,
+    AgentOutputItem, LagunaThinkingMode, Tokenizer,
 };
 use tracing::{debug, info};
 
 use super::generate::{
     cache_gb_to_bytes, discover_config_path, discover_tokenizer_path, expert_cache_slots_per_layer,
-    laguna_runtime_options, load_q2_readiness, resolve_q2_artifact, validate_generation_request,
-    validate_laguna_prompt, validate_laguna_service_options, validate_laguna_tokenizer,
-    validate_memory_controller_options, DecodedTextStream,
+    laguna_runtime_options, laguna_thinking_mode, load_q2_readiness, resolve_q2_artifact,
+    validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
+    validate_laguna_tokenizer, validate_memory_controller_options, DecodedTextStream,
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -46,6 +47,7 @@ const LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS: usize = 4_096;
 const LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_048;
 const LAGUNA_GGUF_MAX_INSTRUCTION_BYTES: usize = 8 * 1_024;
 const CODEX_FALLBACK_INSTRUCTION_PREFIX: &str = "You are a coding agent running in the Codex CLI";
+const CLOSED_THINKING_BOUNDARY: &str = "</think>";
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -55,6 +57,7 @@ pub fn run(
     bind: SocketAddr,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -66,21 +69,28 @@ pub fn run(
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
     match detect_model_architecture(&discovered_config)? {
-        ModelArchitecture::GlmMoeDsa => run_glm(
-            model_path,
-            &discovered_config,
-            &discovered_tokenizer,
-            bind,
-            page_size,
-            max_new_tokens,
-            speculative_mtp,
-            enable_unified_memory_controller,
-            expert_cache_gb,
-            hot_kv_cache_gb,
-            enable_telemetry,
-            telemetry_file,
-            memory_controller_log,
-        ),
+        ModelArchitecture::GlmMoeDsa => {
+            if thinking {
+                return Err(
+                    Error::runtime("--thinking currently applies only to Laguna models").into(),
+                );
+            }
+            run_glm(
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                bind,
+                page_size,
+                max_new_tokens,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            )
+        }
         ModelArchitecture::Laguna => run_laguna(
             model_path,
             &discovered_config,
@@ -88,6 +98,7 @@ pub fn run(
             bind,
             page_size,
             max_new_tokens,
+            thinking,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -200,6 +211,7 @@ fn run_laguna(
     bind: SocketAddr,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    thinking: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -251,6 +263,7 @@ fn run_laguna(
         tokenizer: &tokenizer,
         runtime,
         max_new_tokens,
+        thinking_mode: laguna_thinking_mode(thinking),
         model_id,
     };
     info!(%bind, model = model_id, "Inferno model loaded for Codex");
@@ -338,6 +351,7 @@ struct LagunaCodexHandler<'runtime> {
     tokenizer: &'runtime Tokenizer,
     runtime: LagunaRuntime,
     max_new_tokens: Option<usize>,
+    thinking_mode: LagunaThinkingMode,
     model_id: &'static str,
 }
 
@@ -360,8 +374,12 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
             validate_laguna_gguf_codex_envelope(&request)?;
         }
         let allowed_tools = tool_names(&request.tools)?;
-        let prompt =
-            render_laguna_codex_prompt(&request.instructions, &request.input, &request.tools)?;
+        let prompt = render_laguna_codex_prompt(
+            &request.instructions,
+            &request.input,
+            &request.tools,
+            self.thinking_mode,
+        )?;
         let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
         let max_new_tokens = laguna_codex_max_new_tokens(
             self.model_id,
@@ -369,7 +387,12 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
             request.max_output_tokens,
             encoded.token_ids.len(),
         )?;
-        validate_laguna_prompt(self.config, &encoded.token_ids, max_new_tokens)?;
+        validate_laguna_prompt(
+            self.config,
+            &encoded.token_ids,
+            max_new_tokens,
+            self.thinking_mode,
+        )?;
         debug!(
             model = self.model_id,
             prompt_tokens = encoded.token_ids.len(),
@@ -378,10 +401,15 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
         );
 
         let mut decoded = DecodedTextStream::new(self.tokenizer, true);
-        let mut generated_text = String::new();
+        let mut generated_text = match self.thinking_mode {
+            LagunaThinkingMode::Disabled => String::from(CLOSED_THINKING_BOUNDARY),
+            LagunaThinkingMode::Enabled => String::new(),
+        };
         let mut streamed_text = String::new();
         let mut completed_output = None;
         let mut output_tokens = 0_usize;
+        let mut thinking_guard =
+            (self.thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
         let heartbeat_during_prefill = self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID;
         let stream_cell = std::cell::RefCell::new(stream);
         self.runtime
@@ -410,6 +438,18 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                     if let Some(text) = decoded.push(token_id)? {
                         generated_text.push_str(&text);
                     }
+                    let forced_boundary = thinking_guard
+                        .as_mut()
+                        .and_then(|guard| guard.observe(token_id));
+                    if let Some(reason) = forced_boundary {
+                        debug!(?reason, "forcing Laguna reasoning boundary");
+                        if let Some(text) = decoded.push(LAGUNA_THINKING_END_TOKEN_ID)? {
+                            generated_text.push_str(&text);
+                        }
+                        if !generated_text.contains(CLOSED_THINKING_BOUNDARY) {
+                            generated_text.push_str(CLOSED_THINKING_BOUNDARY);
+                        }
+                    }
                     if let Some(visible_text) = streamable_agent_text(&generated_text) {
                         let delta = visible_text.strip_prefix(&streamed_text).ok_or_else(|| {
                             Error::tokenizer(
@@ -425,6 +465,9 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                         Some(output) => {
                             completed_output = Some(output);
                             GenerationControl::Stop
+                        }
+                        None if forced_boundary.is_some() => {
+                            GenerationControl::InjectNextToken(LAGUNA_THINKING_END_TOKEN_ID)
                         }
                         None => GenerationControl::Continue,
                     };
@@ -728,5 +771,29 @@ mod tests {
             .find("\"type\":\"function_call\"")
             .expect("expected completed function call");
         assert!(message_done < function_done);
+    }
+
+    #[test]
+    fn direct_laguna_output_keeps_text_and_tool_parsing_available() {
+        let generated = format!(
+            "{CLOSED_THINKING_BOUNDARY}Creating the file.<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>"
+        );
+
+        assert_eq!(
+            streamable_agent_text(&generated),
+            Some("Creating the file.")
+        );
+        let output = parse_complete_agent_tool_call(&generated)
+            .unwrap()
+            .expect("expected a complete tool call");
+        assert!(output.reasoning.is_empty());
+        assert_eq!(
+            output.items.first(),
+            Some(&AgentOutputItem::Text("Creating the file.".to_string()))
+        );
+        assert!(matches!(
+            output.items.get(1),
+            Some(AgentOutputItem::FunctionCall(call)) if call.name == "exec_command"
+        ));
     }
 }

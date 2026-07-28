@@ -1,7 +1,7 @@
 use common::{Error, Result};
 use serde_json::{Map, Value};
 
-use crate::ChatPrompt;
+use crate::{ChatPrompt, LagunaThinkingMode};
 
 const PROMPT_PREFIX: &str = "[gMASK]<sop><|system|>Reasoning Effort: Max";
 const LAGUNA_PROMPT_PREFIX: &str = "〈|EOS|〉";
@@ -64,6 +64,7 @@ pub fn render_laguna_codex_prompt(
     instructions: &str,
     input: &[Value],
     tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
 ) -> Result<ChatPrompt> {
     let normalized_tools = normalize_laguna_tools(tools)?;
     let system = if instructions.trim().is_empty() {
@@ -93,6 +94,9 @@ pub fn render_laguna_codex_prompt(
         render_laguna_input_item(&mut rendered, item)?;
     }
     rendered.push_str("<assistant><think>");
+    if thinking_mode == LagunaThinkingMode::Disabled {
+        rendered.push_str(THINK_END);
+    }
     Ok(ChatPrompt { rendered })
 }
 
@@ -597,6 +601,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
                 "strict": false
             })],
+            LagunaThinkingMode::Enabled,
         )
         .unwrap();
 
@@ -618,6 +623,19 @@ mod tests {
             .rendered
             .contains("<tool_response>README.md</tool_response>"));
         assert!(prompt.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn renders_laguna_codex_prompt_without_reasoning_when_disabled() {
+        let prompt = render_laguna_codex_prompt(
+            "Answer directly.",
+            &[json!({"type": "message", "role": "user", "content": "Hello"})],
+            &[],
+            LagunaThinkingMode::Disabled,
+        )
+        .unwrap();
+
+        assert!(prompt.rendered.ends_with("<assistant><think></think>"));
     }
 
     #[test]

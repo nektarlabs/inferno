@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use backend::Backend;
 use common::{Error, Result};
@@ -13,11 +16,74 @@ use crate::{
 const LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS: usize = 4_096;
 const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
 const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
+const LAGUNA_THINKING_NGRAM_TOKENS: usize = 8;
+const LAGUNA_THINKING_NGRAM_LIMIT: u8 = 4;
+pub const LAGUNA_THINKING_END_TOKEN_ID: u32 = 19;
+pub const LAGUNA_THINKING_TOKEN_BUDGET: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationControl {
     Continue,
+    InjectNextToken(u32),
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagunaThinkingGuardReason {
+    RepeatedNgram,
+    TokenBudget,
+}
+
+#[derive(Debug)]
+pub struct LagunaThinkingGuard {
+    token_count: usize,
+    token_ids: Vec<u32>,
+    ngram_counts: HashMap<[u32; LAGUNA_THINKING_NGRAM_TOKENS], u8>,
+    complete: bool,
+}
+
+impl Default for LagunaThinkingGuard {
+    fn default() -> Self {
+        Self {
+            token_count: 0,
+            token_ids: Vec::with_capacity(LAGUNA_THINKING_TOKEN_BUDGET),
+            ngram_counts: HashMap::new(),
+            complete: false,
+        }
+    }
+}
+
+impl LagunaThinkingGuard {
+    pub fn observe(&mut self, token_id: u32) -> Option<LagunaThinkingGuardReason> {
+        if self.complete {
+            return None;
+        }
+        if token_id == LAGUNA_THINKING_END_TOKEN_ID {
+            self.complete = true;
+            return None;
+        }
+
+        self.token_count = self.token_count.saturating_add(1);
+        self.token_ids.push(token_id);
+
+        if self.token_ids.len() >= LAGUNA_THINKING_NGRAM_TOKENS {
+            let start = self.token_ids.len() - LAGUNA_THINKING_NGRAM_TOKENS;
+            let mut ngram = [0_u32; LAGUNA_THINKING_NGRAM_TOKENS];
+            ngram.copy_from_slice(&self.token_ids[start..]);
+            let count = self.ngram_counts.entry(ngram).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= LAGUNA_THINKING_NGRAM_LIMIT {
+                self.complete = true;
+                return Some(LagunaThinkingGuardReason::RepeatedNgram);
+            }
+        }
+
+        if self.token_count >= LAGUNA_THINKING_TOKEN_BUDGET {
+            self.complete = true;
+            return Some(LagunaThinkingGuardReason::TokenBudget);
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,32 +164,6 @@ impl LagunaRuntime {
 
     pub fn expert_cache_capacity(&self) -> Option<usize> {
         self.expert_cache_capacity
-    }
-
-    pub fn generate_streaming<B, F>(
-        &mut self,
-        model: &LagunaModel,
-        backend: &B,
-        prompt_token_ids: &[u32],
-        max_new_tokens: Option<usize>,
-        stop_token_ids: &[u32],
-        mut on_token: F,
-    ) -> Result<LagunaGenerationReport>
-    where
-        B: Backend,
-        F: FnMut(u32) -> Result<()>,
-    {
-        self.generate_streaming_controlled(
-            model,
-            backend,
-            prompt_token_ids,
-            max_new_tokens,
-            stop_token_ids,
-            |token_id| {
-                on_token(token_id)?;
-                Ok(GenerationControl::Continue)
-            },
-        )
     }
 
     /// Generates tokens until EOS, the configured limit, or the callback
@@ -301,13 +341,27 @@ impl LagunaRuntime {
                 generated_tokens = generated_tokens
                     .checked_add(1)
                     .ok_or_else(|| Error::runtime("Laguna generated-token count overflow"))?;
-                if control == GenerationControl::Stop
-                    || stop_token_ids.contains(&output.token_id)
-                    || generated_tokens == generated_limit
+                let next_token_id = match control {
+                    GenerationControl::Continue => Some(output.token_id),
+                    GenerationControl::InjectNextToken(token_id) => {
+                        if token_id as usize >= config.vocab_size {
+                            return Err(Error::runtime(format!(
+                                "Laguna injected token ID {token_id} is outside vocabulary size {}",
+                                config.vocab_size
+                            )));
+                        }
+                        Some(token_id)
+                    }
+                    GenerationControl::Stop => None,
+                };
+                if stop_token_ids.contains(&output.token_id) || generated_tokens == generated_limit
                 {
                     break;
                 }
-                decode_token[0] = output.token_id;
+                let Some(next_token_id) = next_token_id else {
+                    break;
+                };
+                decode_token[0] = next_token_id;
             }
             Ok(())
         })();
@@ -423,31 +477,6 @@ fn next_context_capacity(
         .min(max_context_tokens))
 }
 
-/// Runs batch-1 greedy generation with Laguna's native FP8 full/sliding KV
-/// caches and indexed on-demand INT4 expert cache.
-pub fn run_laguna_generate_streaming<B, F>(
-    model: &LagunaModel,
-    backend: &B,
-    prompt_token_ids: &[u32],
-    max_new_tokens: Option<usize>,
-    stop_token_ids: &[u32],
-    options: LagunaGenerationOptions,
-    on_token: F,
-) -> Result<LagunaGenerationReport>
-where
-    B: Backend,
-    F: FnMut(u32) -> Result<()>,
-{
-    LagunaRuntime::new(options)?.generate_streaming(
-        model,
-        backend,
-        prompt_token_ids,
-        max_new_tokens,
-        stop_token_ids,
-        on_token,
-    )
-}
-
 fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
     if token_count == 0 || chunk_size == 0 {
         return Err(Error::runtime(
@@ -462,11 +491,52 @@ mod tests {
     use super::{
         final_chunk_start, for_each_prefill_prefix_chunk, initial_context_capacity,
         next_context_capacity, prefill_chunk_tokens, LagunaGenerationOptions, LagunaRuntime,
-        LAGUNA_GGUF_PREFILL_CHUNK_TOKENS, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
-        LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
+        LagunaThinkingGuard, LagunaThinkingGuardReason, LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+        LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS, LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
+        LAGUNA_THINKING_END_TOKEN_ID, LAGUNA_THINKING_TOKEN_BUDGET,
     };
     use crate::LagunaMemoryControllerSpec;
     use model::LagunaArtifactKind;
+
+    #[test]
+    fn thinking_guard_closes_after_a_repeated_ngram() {
+        let mut guard = LagunaThinkingGuard::default();
+        let pattern = [10_u32, 11, 12, 13, 14, 15, 16, 17];
+        let mut reason = None;
+
+        for token_id in pattern.into_iter().cycle().take(pattern.len() * 4) {
+            reason = guard.observe(token_id).or(reason);
+        }
+
+        assert_eq!(reason, Some(LagunaThinkingGuardReason::RepeatedNgram));
+    }
+
+    #[test]
+    fn thinking_guard_closes_at_the_reasoning_budget() {
+        let mut guard = LagunaThinkingGuard::default();
+        let mut reason = None;
+
+        for token_id in 1_000..1_000 + LAGUNA_THINKING_TOKEN_BUDGET as u32 {
+            reason = guard.observe(token_id).or(reason);
+        }
+
+        assert_eq!(reason, Some(LagunaThinkingGuardReason::TokenBudget));
+    }
+
+    #[test]
+    fn thinking_guard_disables_itself_after_the_natural_boundary() {
+        let mut guard = LagunaThinkingGuard::default();
+
+        assert_eq!(guard.observe(42), None);
+        assert_eq!(guard.observe(LAGUNA_THINKING_END_TOKEN_ID), None);
+        for token_id in [10_u32, 11, 12, 13, 14, 15, 16, 17]
+            .into_iter()
+            .cycle()
+            .take(64)
+        {
+            assert_eq!(guard.observe(token_id), None);
+        }
+    }
 
     #[test]
     fn persistent_runtime_requires_a_real_expert_cache() {
