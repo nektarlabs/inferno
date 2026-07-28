@@ -23,12 +23,16 @@ use super::dsa::MetalDsa;
 use super::f16_attention::MetalF16Attention;
 use super::fp8_attention::MetalFp8Attention;
 use super::gguf_moe::MetalGgufMoe;
+use super::gguf_moe_prefill::MetalGgufMoePrefill;
 use super::laguna_views::MetalLagunaViews;
 use super::layout::MetalLayout;
 use super::library::MetalLibrary;
 use super::matmul::MetalMatmul;
 use super::moe::MetalMoe;
-use super::q2::{MetalQ2Matvec, QuantMatvecKind, ReadyRoutedExperts};
+use super::q2::{
+    MetalQ2Matvec, QuantMatvecKind, ReadyRoutedExperts, Q8_0_MMA_MIN_PREFILL_ROWS,
+    Q8_0_MMA_OUTPUT_TILE,
+};
 use super::rms_norm::MetalRmsNorm;
 use super::rope::MetalRope;
 use super::w4::MetalW4;
@@ -54,6 +58,7 @@ pub struct Metal {
     f16_attention: MetalF16Attention,
     fp8_attention: MetalFp8Attention,
     gguf_moe: MetalGgufMoe,
+    gguf_moe_prefill: MetalGgufMoePrefill,
     laguna_views: Arc<MetalLagunaViews>,
     batch: BatchSlot,
 }
@@ -84,6 +89,8 @@ impl Metal {
         let dsa = MetalDsa::new(&device, &library, arena.clone())?;
         let f16_attention = MetalF16Attention::new(&device, &library, arena.clone())?;
         let fp8_attention = MetalFp8Attention::new(&device, &library, arena.clone())?;
+        let gguf_moe_prefill =
+            MetalGgufMoePrefill::new(&device, &library, arena.clone(), Arc::clone(&laguna_views))?;
         let gguf_moe = MetalGgufMoe::new(&device, &library, arena, Arc::clone(&laguna_views))?;
 
         Ok(Self {
@@ -107,6 +114,7 @@ impl Metal {
             f16_attention,
             fp8_attention,
             gguf_moe,
+            gguf_moe_prefill,
             laguna_views,
             batch: BatchSlot::new(),
         })
@@ -1280,6 +1288,10 @@ impl Metal {
         self.batch.submit()
     }
 
+    pub fn batch_submit_profile_segment(&self, label: &str) -> Result<()> {
+        self.batch.submit_profile_segment(label)
+    }
+
     /// Commits the open batch, if any, and waits for the GPU to finish it.
     /// Routed-expert submissions are validated after the main queue reaches
     /// the same synchronization point.
@@ -1573,6 +1585,22 @@ impl Metal {
         out_features: usize,
     ) -> Result<Buffer> {
         self.batch.encode(&self.queue, |command_buffer| {
+            if routing.token_count > 1 && routing.top_k == 10 && routing.expert_count == 256 {
+                return self.gguf_moe_prefill.encode(
+                    command_buffer,
+                    &self.device,
+                    gate_weights,
+                    up_weights,
+                    down_weights,
+                    quant,
+                    input,
+                    input_len,
+                    routing,
+                    in_features,
+                    intermediate_features,
+                    out_features,
+                );
+            }
             self.gguf_moe.encode(
                 command_buffer,
                 &self.device,
@@ -1940,6 +1968,22 @@ impl Metal {
         out_features: usize,
     ) -> Result<Buffer> {
         self.batch.encode(&self.queue, |command_buffer| {
+            if row_count >= Q8_0_MMA_MIN_PREFILL_ROWS
+                && out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE)
+            {
+                return self.q2_matvec.encode_q8_0_prefill_mma_gate_up_swiglu(
+                    command_buffer,
+                    &self.device,
+                    gate_weights,
+                    up_weights,
+                    input,
+                    input_len,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+
             self.q2_matvec.encode_q8_0_gate_up_swiglu(
                 command_buffer,
                 &self.device,
@@ -2023,6 +2067,23 @@ impl Metal {
         out_features: usize,
     ) -> Result<Buffer> {
         self.batch.encode(&self.queue, |command_buffer| {
+            if row_count >= Q8_0_MMA_MIN_PREFILL_ROWS
+                && out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE)
+            {
+                return self.q2_matvec.encode_q8_0_prefill_mma_add(
+                    command_buffer,
+                    &self.device,
+                    weights,
+                    input,
+                    input_len,
+                    residual,
+                    residual_len,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+
             self.q2_matvec.encode_q8_0_matvec_add(
                 command_buffer,
                 &self.device,
@@ -2053,6 +2114,25 @@ impl Metal {
         out_features: usize,
     ) -> Result<Buffer> {
         self.batch.encode(&self.queue, |command_buffer| {
+            if row_count >= Q8_0_MMA_MIN_PREFILL_ROWS
+                && out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE)
+            {
+                return self.q2_matvec.encode_q8_0_prefill_mma_add2(
+                    command_buffer,
+                    &self.device,
+                    weights,
+                    input,
+                    input_len,
+                    residual_a,
+                    residual_a_len,
+                    residual_b,
+                    residual_b_len,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+
             self.q2_matvec.encode_laguna_q8_0_matvec_add2(
                 command_buffer,
                 &self.device,

@@ -2366,6 +2366,7 @@ kernel void q8_0_batched_matvec_tiled_f32_kernel(
     }
 }
 
+template <bool TailSafe>
 static inline void q8_0_stage_prefill_mma_tile(
     const device uchar* weights,
     const device float* input,
@@ -2374,37 +2375,72 @@ static inline void q8_0_stage_prefill_mma_tile(
     uint token_start,
     uint output_start,
     uint active_tokens,
+    uint active_outputs,
     uint in_features,
     uint blocks_per_row,
     uint block_in_row,
     uint thread_index
 ) {
-    for (uint index = thread_index;
-         index < Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE;
-         index += Q8_0_MMA_THREAD_COUNT) {
-        uint token = index / Q8_0_MMA_K_TILE;
-        uint input_column = index - (token * Q8_0_MMA_K_TILE);
-        input_tile[index] = token < active_tokens
-            ? half(input[
-                ((token_start + token) * in_features)
-                + (block_in_row * Q8_0_MMA_K_TILE)
-                + input_column
-            ])
-            : half(0.0f);
+    constexpr uint input_vectors_per_token = Q8_0_MMA_K_TILE / 4u;
+    for (uint vector_index = thread_index;
+         vector_index < Q8_0_MMA_TOKEN_TILE * input_vectors_per_token;
+         vector_index += Q8_0_MMA_THREAD_COUNT) {
+        uint token = vector_index / input_vectors_per_token;
+        uint input_vector =
+            vector_index - (token * input_vectors_per_token);
+        uint input_column = input_vector * 4u;
+        threadgroup half4* destination =
+            reinterpret_cast<threadgroup half4*>(
+                input_tile
+                    + token * Q8_0_MMA_K_TILE
+                    + input_column);
+        if (token < active_tokens) {
+            const device float4* source =
+                reinterpret_cast<const device float4*>(
+                    input
+                        + (token_start + token) * in_features
+                        + block_in_row * Q8_0_MMA_K_TILE
+                        + input_column);
+            *destination = half4(*source);
+        } else {
+            *destination = half4(0.0h);
+        }
     }
-    for (uint index = thread_index;
-         index < Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE;
-         index += Q8_0_MMA_THREAD_COUNT) {
-        uint output_feature = index / Q8_0_MMA_K_TILE;
-        uint input_column = index - (output_feature * Q8_0_MMA_K_TILE);
+
+    constexpr uint quant_groups_per_block = Q8_0_MMA_K_TILE / 8u;
+    for (uint quant_group_index = thread_index;
+         quant_group_index
+            < Q8_0_MMA_OUTPUT_TILE * quant_groups_per_block;
+         quant_group_index += Q8_0_MMA_THREAD_COUNT) {
+        uint output_feature =
+            quant_group_index / quant_groups_per_block;
+        uint quant_group =
+            quant_group_index
+            - output_feature * quant_groups_per_block;
+        threadgroup half4* destination =
+            reinterpret_cast<threadgroup half4*>(
+                weight_tile
+                    + output_feature * Q8_0_MMA_K_TILE
+                    + quant_group * 8u);
+        if (TailSafe && output_feature >= active_outputs) {
+            destination[0] = half4(0.0h);
+            destination[1] = half4(0.0h);
+            continue;
+        }
         uint block_index = ((output_start + output_feature) * blocks_per_row)
             + block_in_row;
         uint block_offset = block_index * Q8_0_BLOCK_BYTES;
-        weight_tile[index] = half(q8_0_block_value(
-            weights,
-            block_offset,
-            input_column
-        ));
+        float scale = q8_0_block_scale(weights, block_offset);
+        const device packed_char4* quants =
+            reinterpret_cast<const device packed_char4*>(
+                weights
+                    + block_offset
+                    + 2u
+                    + quant_group * 8u);
+        char4 low = char4(quants[0]);
+        char4 high = char4(quants[1]);
+        destination[0] = half4(float4(low) * scale);
+        destination[1] = half4(float4(high) * scale);
     }
 }
 
@@ -2413,24 +2449,33 @@ static inline void q8_0_stage_prefill_mma_tile(
 // adjacent output features for all four 8-token subtiles. Alternating the K
 // tile storage removes the overwrite barrier between tiles, reducing weight
 // decoding and synchronization without materializing F16 tensors.
-kernel void q8_0_prefill_mma_f32_kernel(
+template <bool TailSafe, ushort ResidualCount>
+kernel void q8_0_prefill_mma_impl(
     const device uchar* weights [[buffer(0)]],
     const device float* input [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& row_count [[buffer(3)]],
-    constant uint& in_features [[buffer(4)]],
-    constant uint& out_features [[buffer(5)]],
-    constant uint& blocks_per_row [[buffer(6)]],
+    const device float* residual_a [[buffer(2)]],
+    const device float* residual_b [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& row_count [[buffer(5)]],
+    constant uint& in_features [[buffer(6)]],
+    constant uint& out_features [[buffer(7)]],
+    constant uint& blocks_per_row [[buffer(8)]],
     uint3 threadgroup_position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup_index [[simdgroup_index_in_threadgroup]]
 ) {
-    uint output_tiles = out_features / Q8_0_MMA_OUTPUT_TILE;
+    uint output_tiles = TailSafe
+        ? (out_features + Q8_0_MMA_OUTPUT_TILE - 1u)
+            / Q8_0_MMA_OUTPUT_TILE
+        : out_features / Q8_0_MMA_OUTPUT_TILE;
     uint token_tile = threadgroup_position.x / output_tiles;
     uint output_tile = threadgroup_position.x - (token_tile * output_tiles);
     uint token_start = token_tile * Q8_0_MMA_TOKEN_TILE;
     uint output_start = output_tile * Q8_0_MMA_OUTPUT_TILE;
     uint active_tokens = min(Q8_0_MMA_TOKEN_TILE, row_count - token_start);
+    uint active_outputs = TailSafe
+        ? min(Q8_0_MMA_OUTPUT_TILE, out_features - output_start)
+        : Q8_0_MMA_OUTPUT_TILE;
 
     threadgroup half input_tiles[2 * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE];
     threadgroup half weight_tiles[2 * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE];
@@ -2442,7 +2487,7 @@ kernel void q8_0_prefill_mma_f32_kernel(
         accumulators[group] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
-    q8_0_stage_prefill_mma_tile(
+    q8_0_stage_prefill_mma_tile<TailSafe>(
         weights,
         input,
         input_tiles,
@@ -2450,6 +2495,7 @@ kernel void q8_0_prefill_mma_f32_kernel(
         token_start,
         output_start,
         active_tokens,
+        active_outputs,
         in_features,
         blocks_per_row,
         0,
@@ -2498,7 +2544,7 @@ kernel void q8_0_prefill_mma_f32_kernel(
         uint next_block = block_in_row + 1u;
         if (next_block < blocks_per_row) {
             tile_index ^= 1u;
-            q8_0_stage_prefill_mma_tile(
+            q8_0_stage_prefill_mma_tile<TailSafe>(
                 weights,
                 input,
                 input_tiles
@@ -2508,6 +2554,7 @@ kernel void q8_0_prefill_mma_f32_kernel(
                 token_start,
                 output_start,
                 active_tokens,
+                active_outputs,
                 in_features,
                 blocks_per_row,
                 next_block,
@@ -2535,8 +2582,311 @@ kernel void q8_0_prefill_mma_f32_kernel(
          index += Q8_0_MMA_OUTPUT_TILE * 4u) {
         uint token = index / Q8_0_MMA_OUTPUT_TILE;
         uint output_feature = index - (token * Q8_0_MMA_OUTPUT_TILE);
-        output[((token_start + token) * out_features) + output_start + output_feature]
-            = output_tile_values[index];
+        if (!TailSafe || output_feature < active_outputs) {
+            uint output_index =
+                ((token_start + token) * out_features)
+                + output_start
+                + output_feature;
+            float value = output_tile_values[index];
+            if (ResidualCount >= 1) {
+                value += residual_a[output_index];
+            }
+            if (ResidualCount >= 2) {
+                value += residual_b[output_index];
+            }
+            output[output_index] = value;
+        }
+    }
+}
+
+typedef decltype(q8_0_prefill_mma_impl<false, 0>)
+    Q8_0PrefillMmaAligned;
+typedef decltype(q8_0_prefill_mma_impl<true, 0>)
+    Q8_0PrefillMmaTail;
+typedef decltype(q8_0_prefill_mma_impl<false, 1>)
+    Q8_0PrefillMmaAdd;
+typedef decltype(q8_0_prefill_mma_impl<false, 2>)
+    Q8_0PrefillMmaAdd2;
+
+template [[host_name("q8_0_prefill_mma_f32_kernel")]]
+kernel Q8_0PrefillMmaAligned
+q8_0_prefill_mma_impl<false, 0>;
+
+template [[host_name("q8_0_prefill_mma_tail_f32_kernel")]]
+kernel Q8_0PrefillMmaTail
+q8_0_prefill_mma_impl<true, 0>;
+
+template [[host_name("q8_0_prefill_mma_add_f32_kernel")]]
+kernel Q8_0PrefillMmaAdd
+q8_0_prefill_mma_impl<false, 1>;
+
+template [[host_name("q8_0_prefill_mma_add2_f32_kernel")]]
+kernel Q8_0PrefillMmaAdd2
+q8_0_prefill_mma_impl<false, 2>;
+
+static inline void q8_0_stage_prefill_mma_gate_up_tile(
+    const device uchar* gate_weights,
+    const device uchar* up_weights,
+    const device float* input,
+    threadgroup half* input_tile,
+    threadgroup half* gate_tile,
+    threadgroup half* up_tile,
+    uint token_start,
+    uint output_start,
+    uint active_tokens,
+    uint in_features,
+    uint blocks_per_row,
+    uint block_in_row,
+    uint thread_index
+) {
+    constexpr uint input_vectors_per_token = Q8_0_MMA_K_TILE / 4u;
+    for (uint vector_index = thread_index;
+         vector_index < Q8_0_MMA_TOKEN_TILE * input_vectors_per_token;
+         vector_index += Q8_0_MMA_THREAD_COUNT) {
+        uint token = vector_index / input_vectors_per_token;
+        uint input_vector = vector_index - token * input_vectors_per_token;
+        uint input_column = input_vector * 4u;
+        threadgroup half4* destination =
+            reinterpret_cast<threadgroup half4*>(
+                input_tile + token * Q8_0_MMA_K_TILE + input_column);
+        if (token < active_tokens) {
+            const device float4* source =
+                reinterpret_cast<const device float4*>(
+                    input
+                        + (token_start + token) * in_features
+                        + block_in_row * Q8_0_MMA_K_TILE
+                        + input_column);
+            *destination = half4(*source);
+        } else {
+            *destination = half4(0.0h);
+        }
+    }
+
+    constexpr uint quant_groups_per_block = Q8_0_MMA_K_TILE / 8u;
+    for (uint quant_group_index = thread_index;
+         quant_group_index
+            < Q8_0_MMA_OUTPUT_TILE * quant_groups_per_block;
+         quant_group_index += Q8_0_MMA_THREAD_COUNT) {
+        uint output_feature = quant_group_index / quant_groups_per_block;
+        uint quant_group =
+            quant_group_index - output_feature * quant_groups_per_block;
+        uint block_index =
+            (output_start + output_feature) * blocks_per_row + block_in_row;
+        uint block_offset = block_index * Q8_0_BLOCK_BYTES;
+        uint quant_offset = block_offset + 2u + quant_group * 8u;
+
+        float gate_scale = q8_0_block_scale(gate_weights, block_offset);
+        const device packed_char4* gate_quants =
+            reinterpret_cast<const device packed_char4*>(
+                gate_weights + quant_offset);
+        threadgroup half4* gate_destination =
+            reinterpret_cast<threadgroup half4*>(
+                gate_tile
+                    + output_feature * Q8_0_MMA_K_TILE
+                    + quant_group * 8u);
+        gate_destination[0] =
+            half4(float4(char4(gate_quants[0])) * gate_scale);
+        gate_destination[1] =
+            half4(float4(char4(gate_quants[1])) * gate_scale);
+
+        float up_scale = q8_0_block_scale(up_weights, block_offset);
+        const device packed_char4* up_quants =
+            reinterpret_cast<const device packed_char4*>(
+                up_weights + quant_offset);
+        threadgroup half4* up_destination =
+            reinterpret_cast<threadgroup half4*>(
+                up_tile
+                    + output_feature * Q8_0_MMA_K_TILE
+                    + quant_group * 8u);
+        up_destination[0] =
+            half4(float4(char4(up_quants[0])) * up_scale);
+        up_destination[1] =
+            half4(float4(char4(up_quants[1])) * up_scale);
+    }
+}
+
+// Multi-token gate/up projection. One threadgroup reuses each staged
+// activation tile for both matrices and writes only the final SwiGLU result.
+kernel void q8_0_prefill_mma_gate_up_swiglu_f32_kernel(
+    const device uchar* gate_weights [[buffer(0)]],
+    const device uchar* up_weights [[buffer(1)]],
+    const device float* input [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& row_count [[buffer(4)]],
+    constant uint& in_features [[buffer(5)]],
+    constant uint& out_features [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint output_tiles = out_features / Q8_0_MMA_OUTPUT_TILE;
+    uint token_tile = threadgroup_position.x / output_tiles;
+    uint output_tile = threadgroup_position.x - token_tile * output_tiles;
+    uint token_start = token_tile * Q8_0_MMA_TOKEN_TILE;
+    uint output_start = output_tile * Q8_0_MMA_OUTPUT_TILE;
+    uint active_tokens = min(Q8_0_MMA_TOKEN_TILE, row_count - token_start);
+
+    threadgroup half input_tiles[
+        2 * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE
+    ];
+    threadgroup half gate_tiles[
+        2 * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE
+    ];
+    threadgroup half up_tiles[
+        2 * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE
+    ];
+    threadgroup float gate_output[
+        Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_OUTPUT_TILE
+    ];
+    threadgroup float up_output[
+        Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_OUTPUT_TILE
+    ];
+    simdgroup_float8x8 gate_accumulators[Q8_0_MMA_TOKEN_GROUPS];
+    simdgroup_float8x8 up_accumulators[Q8_0_MMA_TOKEN_GROUPS];
+    for (uint group = 0; group < Q8_0_MMA_TOKEN_GROUPS; group++) {
+        gate_accumulators[group] =
+            make_filled_simdgroup_matrix<float, 8>(0.0f);
+        up_accumulators[group] =
+            make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    q8_0_stage_prefill_mma_gate_up_tile(
+        gate_weights,
+        up_weights,
+        input,
+        input_tiles,
+        gate_tiles,
+        up_tiles,
+        token_start,
+        output_start,
+        active_tokens,
+        in_features,
+        blocks_per_row,
+        0u,
+        thread_index
+    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint tile_index = 0u;
+    for (uint block_in_row = 0u;
+         block_in_row < blocks_per_row;
+         block_in_row++) {
+        threadgroup half* input_tile = input_tiles
+            + tile_index * Q8_0_MMA_TOKEN_TILE * Q8_0_MMA_K_TILE;
+        threadgroup half* gate_tile = gate_tiles
+            + tile_index * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE;
+        threadgroup half* up_tile = up_tiles
+            + tile_index * Q8_0_MMA_OUTPUT_TILE * Q8_0_MMA_K_TILE;
+
+        for (uint k_offset = 0u;
+             k_offset < Q8_0_MMA_K_TILE;
+             k_offset += 8u) {
+            simdgroup_half8x8 gate_matrix;
+            simdgroup_half8x8 up_matrix;
+            simdgroup_load(
+                gate_matrix,
+                gate_tile
+                    + simdgroup_index * 8u * Q8_0_MMA_K_TILE
+                    + k_offset,
+                Q8_0_MMA_K_TILE,
+                0,
+                true);
+            simdgroup_load(
+                up_matrix,
+                up_tile
+                    + simdgroup_index * 8u * Q8_0_MMA_K_TILE
+                    + k_offset,
+                Q8_0_MMA_K_TILE,
+                0,
+                true);
+            for (uint group = 0u;
+                 group < Q8_0_MMA_TOKEN_GROUPS;
+                 group++) {
+                simdgroup_half8x8 input_matrix;
+                simdgroup_load(
+                    input_matrix,
+                    input_tile
+                        + group * 8u * Q8_0_MMA_K_TILE
+                        + k_offset,
+                    Q8_0_MMA_K_TILE,
+                    0,
+                    false);
+                simdgroup_multiply_accumulate(
+                    gate_accumulators[group],
+                    input_matrix,
+                    gate_matrix,
+                    gate_accumulators[group]);
+                simdgroup_multiply_accumulate(
+                    up_accumulators[group],
+                    input_matrix,
+                    up_matrix,
+                    up_accumulators[group]);
+            }
+        }
+
+        uint next_block = block_in_row + 1u;
+        if (next_block < blocks_per_row) {
+            tile_index ^= 1u;
+            q8_0_stage_prefill_mma_gate_up_tile(
+                gate_weights,
+                up_weights,
+                input,
+                input_tiles
+                    + tile_index
+                        * Q8_0_MMA_TOKEN_TILE
+                        * Q8_0_MMA_K_TILE,
+                gate_tiles
+                    + tile_index
+                        * Q8_0_MMA_OUTPUT_TILE
+                        * Q8_0_MMA_K_TILE,
+                up_tiles
+                    + tile_index
+                        * Q8_0_MMA_OUTPUT_TILE
+                        * Q8_0_MMA_K_TILE,
+                token_start,
+                output_start,
+                active_tokens,
+                in_features,
+                blocks_per_row,
+                next_block,
+                thread_index
+            );
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint group = 0u; group < Q8_0_MMA_TOKEN_GROUPS; group++) {
+        uint store_offset =
+            group * 8u * Q8_0_MMA_OUTPUT_TILE
+            + simdgroup_index * 8u;
+        simdgroup_store(
+            gate_accumulators[group],
+            gate_output + store_offset,
+            Q8_0_MMA_OUTPUT_TILE,
+            0,
+            false);
+        simdgroup_store(
+            up_accumulators[group],
+            up_output + store_offset,
+            Q8_0_MMA_OUTPUT_TILE,
+            0,
+            false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint index = thread_index;
+         index < active_tokens * Q8_0_MMA_OUTPUT_TILE;
+         index += Q8_0_MMA_THREAD_COUNT) {
+        uint token = index / Q8_0_MMA_OUTPUT_TILE;
+        uint output_feature = index - token * Q8_0_MMA_OUTPUT_TILE;
+        float gate = gate_output[index];
+        float up = up_output[index];
+        uint output_index =
+            (token_start + token) * out_features
+            + output_start
+            + output_feature;
+        output[output_index] = (gate / (1.0f + exp(-gate))) * up;
     }
 }
 

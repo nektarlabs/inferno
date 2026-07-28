@@ -332,6 +332,85 @@ pub(crate) fn encode_1d_threadgroups_args(
     Ok(())
 }
 
+/// Dispatches a fixed 3D grid for prompt-time tiled kernels.
+///
+/// This is intentionally separate from the one-dimensional decode helpers:
+/// prefill tiles the routed assignment, output-row, and expert dimensions.
+pub(crate) fn encode_3d_threadgroups_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threadgroups: [usize; 3],
+    threads_per_group: usize,
+    threadgroup_memory_bytes: usize,
+) -> Result<()> {
+    if threadgroups.contains(&0) {
+        return Err(Error::backend(format!(
+            "Metal 3D threadgroup dimensions must be positive, got {threadgroups:?}"
+        )));
+    }
+    validate_threadgroup_shape(pipeline, 1, threads_per_group)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    if threadgroup_memory_bytes > 0 {
+        encoder.set_threadgroup_memory_length(0, threadgroup_memory_bytes as NSUInteger);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            threadgroups[0] as NSUInteger,
+            threadgroups[1] as NSUInteger,
+            threadgroups[2] as NSUInteger,
+        ),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// Dispatches a GPU-sized threadgroup grid with mixed buffer and scalar
+/// arguments.
+///
+/// The indirect buffer contains three consecutive `u32` values:
+/// `[threadgroups_x, threadgroups_y, threadgroups_z]`. A prior kernel in the
+/// same command buffer may write those values, which lets prefill compact its
+/// routed expert work without synchronizing with the CPU.
+pub(crate) fn encode_threadgroups_indirect_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    indirect_buffer: &Buffer,
+    indirect_offset: usize,
+    threads_per_group: usize,
+    threadgroup_memory_bytes: usize,
+) -> Result<()> {
+    validate_threadgroup_shape(pipeline, 1, threads_per_group)?;
+    let required_bytes = indirect_offset
+        .checked_add(3 * std::mem::size_of::<u32>())
+        .ok_or_else(|| Error::backend("Metal indirect dispatch offset overflow"))?;
+    if required_bytes > indirect_buffer.length() as usize {
+        return Err(Error::backend(format!(
+            "Metal indirect dispatch needs {required_bytes} bytes but buffer contains {}",
+            indirect_buffer.length()
+        )));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    if threadgroup_memory_bytes > 0 {
+        encoder.set_threadgroup_memory_length(0, threadgroup_memory_bytes as NSUInteger);
+    }
+    encoder.dispatch_thread_groups_indirect(
+        indirect_buffer,
+        indirect_offset as NSUInteger,
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
 pub(crate) fn encode_1d(
     command_buffer: &CommandBufferRef,
     pipeline: &ComputePipelineState,

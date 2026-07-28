@@ -7,12 +7,16 @@ use crate::{LagunaF16KvCache, LagunaKvRetention};
 use super::{
     arena::MetalArena,
     buffers::{empty_f16_buffer, require_f16_capacity, require_f32_capacity},
-    command::{encode_1d, encode_1d_threadgroups, encode_element_copy},
+    command::{
+        encode_1d, encode_1d_threadgroups, encode_1d_threadgroups_args, encode_element_copy,
+        KernelArg,
+    },
     library::MetalLibrary,
     pipeline::compute_pipeline,
 };
 
 const ATTENTION_KERNEL: &str = "laguna_gated_gqa_f16_attention_f32_kernel";
+const PREFILL_ATTENTION_KERNEL: &str = "laguna_prefill_gated_gqa_f16_attention_f32_kernel";
 const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
@@ -20,9 +24,11 @@ const GLOBAL_QUERY_HEADS: usize = 48;
 const SLIDING_QUERY_HEADS: usize = 72;
 const SLIDING_WINDOW: usize = 512;
 const ATTENTION_THREADS: usize = 256;
+const PREFILL_MIN_TOKENS: usize = 8;
 
 pub(crate) struct MetalF16Attention {
     attention_pipeline: ComputePipelineState,
+    prefill_attention_pipeline: ComputePipelineState,
     append_pipeline: ComputePipelineState,
     arena: MetalArena,
 }
@@ -38,9 +44,21 @@ impl MetalF16Attention {
                 "Laguna F16 attention requires 32-lane SIMD groups and 256-thread groups",
             ));
         }
+        let prefill_attention_pipeline =
+            compute_pipeline(device, library, PREFILL_ATTENTION_KERNEL)?;
+        let prefill_max_threads =
+            prefill_attention_pipeline.max_total_threads_per_threadgroup() as usize;
+        if prefill_attention_pipeline.thread_execution_width() as usize != 32
+            || prefill_max_threads < SLIDING_QUERY_HEADS / KV_HEADS * 32
+        {
+            return Err(Error::backend(
+                "Laguna F16 prefill attention requires 32-lane SIMD groups and at least 288 threads per group",
+            ));
+        }
         let append_pipeline = compute_pipeline(device, library, APPEND_KERNEL)?;
         Ok(Self {
             attention_pipeline,
+            prefill_attention_pipeline,
             append_pipeline,
             arena,
         })
@@ -188,29 +206,61 @@ impl MetalF16Attention {
             "encoding fused Laguna F16 grouped-query attention"
         );
 
-        encode_1d_threadgroups(
-            command_buffer,
-            &self.attention_pipeline,
-            &[
-                query,
-                current_key,
-                current_value,
-                gate,
-                &cache.key,
-                &cache.value,
-                &output,
-                &batch_buffer,
-                &query_heads_buffer,
-                &query_tokens_buffer,
-                &past_tokens_buffer,
-                &stored_tokens_buffer,
-                &capacity_buffer,
-                &sliding_window_buffer,
-                &fuse_append_buffer,
-            ],
-            row_count,
-            ATTENTION_THREADS,
-        )?;
+        if query_tokens >= PREFILL_MIN_TOKENS {
+            let prefill_rows = batch
+                .checked_mul(query_tokens)
+                .and_then(|rows| rows.checked_mul(KV_HEADS))
+                .ok_or_else(|| Error::backend("Laguna F16 prefill row count overflow"))?;
+            let prefill_threads = query_heads / KV_HEADS * 32;
+            let args = [
+                KernelArg::Buffer(query),
+                KernelArg::Buffer(current_key),
+                KernelArg::Buffer(current_value),
+                KernelArg::Buffer(gate),
+                KernelArg::Buffer(&cache.key),
+                KernelArg::Buffer(&cache.value),
+                KernelArg::Buffer(&output),
+                KernelArg::U32(as_u32(batch, "batch")?),
+                KernelArg::U32(as_u32(query_heads, "query head count")?),
+                KernelArg::U32(as_u32(query_tokens, "query token count")?),
+                KernelArg::U32(as_u32(cache.total_tokens, "past token count")?),
+                KernelArg::U32(as_u32(cache.stored_tokens, "stored token count")?),
+                KernelArg::U32(as_u32(cache.capacity_tokens, "cache capacity")?),
+                KernelArg::U32(sliding_window as u32),
+                KernelArg::U32(u32::from(fuse_append)),
+            ];
+            encode_1d_threadgroups_args(
+                command_buffer,
+                &self.prefill_attention_pipeline,
+                &args,
+                prefill_rows,
+                prefill_threads,
+            )?;
+        } else {
+            encode_1d_threadgroups(
+                command_buffer,
+                &self.attention_pipeline,
+                &[
+                    query,
+                    current_key,
+                    current_value,
+                    gate,
+                    &cache.key,
+                    &cache.value,
+                    &output,
+                    &batch_buffer,
+                    &query_heads_buffer,
+                    &query_tokens_buffer,
+                    &past_tokens_buffer,
+                    &stored_tokens_buffer,
+                    &capacity_buffer,
+                    &sliding_window_buffer,
+                    &fuse_append_buffer,
+                ],
+                row_count,
+                ATTENTION_THREADS,
+            )?;
+        }
 
         if !fuse_append {
             let retained_current_tokens = query_tokens.min(cache.capacity_tokens);
@@ -438,7 +488,7 @@ mod tests {
         let Ok(backend) = MetalBackend::new() else {
             return;
         };
-        const TOKENS: usize = 3;
+        const TOKENS: usize = 8;
         let query_values = patterned_values(TOKENS * QUERY_HEADS * HEAD_DIM, 17, 8, 16.0);
         let key_values = patterned_values(TOKENS * KV_HEADS * HEAD_DIM, 13, 6, 16.0);
         let value_values = patterned_values(TOKENS * KV_HEADS * HEAD_DIM, 11, 5, 8.0);

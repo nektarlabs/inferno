@@ -11,6 +11,7 @@ mod dsa;
 mod f16_attention;
 mod fp8_attention;
 mod gguf_moe;
+mod gguf_moe_prefill;
 mod laguna_views;
 mod layout;
 mod library;

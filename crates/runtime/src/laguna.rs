@@ -11,7 +11,7 @@ use crate::{
 };
 
 const LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS: usize = 4_096;
-const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 256;
+const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
 const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,8 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn gguf_prefill_uses_shorter_cancellable_submissions() {
-        assert_eq!(prefill_chunk_tokens(LagunaArtifactKind::AntirezGguf), 256);
+    fn gguf_prefill_uses_bounded_cancellable_submissions() {
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::AntirezGguf),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+        );
         assert_eq!(
             prefill_chunk_tokens(LagunaArtifactKind::SafetensorsInt4),
             4_096

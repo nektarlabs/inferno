@@ -300,6 +300,116 @@ mod tests {
         assert_q2_case(3072, 1024, 3072);
     }
 
+    #[test]
+    fn q2_prefill_matches_laguna_top10_cpu_reference() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let token_count = 4;
+        let expert_count = 256;
+        let active_experts = 10;
+        let in_features = BLOCK_VALUES;
+        let intermediate_features = BLOCK_VALUES;
+        let out_features = BLOCK_VALUES;
+        let input_values = (0..token_count * in_features)
+            .map(|index| {
+                let token = index / in_features;
+                let column = index - token * in_features;
+                ((column % 17) as f32 - 8.0 + token as f32) / 32.0
+            })
+            .collect::<Vec<_>>();
+        let input = F32Tensor::new(input_values.clone(), [token_count, in_features]).unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+        let logits = F32Tensor::new(
+            (0..token_count)
+                .flat_map(|_| {
+                    (0..expert_count).map(|expert| {
+                        if expert < active_experts {
+                            10.0_f32 - expert as f32 * 0.1
+                        } else {
+                            -10.0
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+            [token_count, expert_count],
+        )
+        .unwrap();
+        let logits = backend.device_upload_f32_tensor(&logits).unwrap().unwrap();
+        let routing = backend
+            .moe_router_topk_resident_device(
+                &logits,
+                &vec![0.0; expert_count],
+                active_experts,
+                true,
+                1.0,
+            )
+            .unwrap()
+            .unwrap();
+
+        let gate_pair = patterned_q2_expert_matrix(11, intermediate_features, in_features);
+        let up_pair = patterned_q2_expert_matrix(37, intermediate_features, in_features);
+        let down_pair = patterned_q2_expert_matrix(83, out_features, intermediate_features);
+        let gate_stride = intermediate_features * Q2_BLOCK_BYTES;
+        let down_stride = out_features * Q2_BLOCK_BYTES;
+        let gate = repeat_first_expert(
+            &gate_pair[..gate_stride],
+            gate_stride,
+            expert_count,
+            active_experts,
+        );
+        let up = repeat_first_expert(
+            &up_pair[..gate_stride],
+            gate_stride,
+            expert_count,
+            active_experts,
+        );
+        let down = repeat_first_expert(
+            &down_pair[..down_stride],
+            down_stride,
+            expert_count,
+            active_experts,
+        );
+        let output = backend
+            .laguna_gguf_moe_device(
+                &gate,
+                &up,
+                &down,
+                GgufExpertQuant::Q2K,
+                &input,
+                &routing,
+                in_features,
+                intermediate_features,
+                out_features,
+            )
+            .unwrap()
+            .unwrap();
+        let output = backend.device_download_f32_tensor(&output).unwrap();
+
+        for token in 0..token_count {
+            let input_row = &input_values[token * in_features..(token + 1) * in_features];
+            let gate_values =
+                cpu_q2_matrix_vector(&gate[..gate_stride], input_row, intermediate_features);
+            let up_values =
+                cpu_q2_matrix_vector(&up[..gate_stride], input_row, intermediate_features);
+            let intermediate = gate_values
+                .iter()
+                .copied()
+                .zip(up_values)
+                .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+                .collect::<Vec<_>>();
+            let expected = cpu_q2_matrix_vector(&down[..down_stride], &intermediate, out_features);
+            let actual = &output.values()[token * out_features..(token + 1) * out_features];
+            for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let tolerance = 2e-2_f32.max(expected.abs() * 2e-2);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "Q2 prefill GEMM mismatch at token {token}, row {row}: actual={actual}, expected={expected}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
     fn assert_q2_case(in_features: usize, intermediate_features: usize, out_features: usize) {
         let Ok(backend) = MetalBackend::new() else {
             return;
@@ -457,6 +567,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn q3_prefill_matches_laguna_top10_cpu_reference() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let token_count = 4;
+        let expert_count = 256;
+        let active_experts = 10;
+        let input_values = (0..token_count * BLOCK_VALUES)
+            .map(|index| {
+                let token = index / BLOCK_VALUES;
+                let column = index - token * BLOCK_VALUES;
+                ((column % 13) as f32 - 6.0 + token as f32) / 32.0
+            })
+            .collect::<Vec<_>>();
+        let input = F32Tensor::new(input_values.clone(), [token_count, BLOCK_VALUES]).unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+        let logits = F32Tensor::new(
+            (0..token_count)
+                .flat_map(|_| {
+                    (0..expert_count).map(|expert| {
+                        if expert < active_experts {
+                            10.0_f32 - expert as f32 * 0.1
+                        } else {
+                            -10.0
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+            [token_count, expert_count],
+        )
+        .unwrap();
+        let logits = backend.device_upload_f32_tensor(&logits).unwrap().unwrap();
+        let routing = backend
+            .moe_router_topk_resident_device(
+                &logits,
+                &vec![0.0; expert_count],
+                active_experts,
+                true,
+                1.0,
+            )
+            .unwrap()
+            .unwrap();
+
+        let expert_stride = BLOCK_VALUES * Q3_BLOCK_BYTES;
+        let gate_pair = patterned_q3_expert_matrix(11);
+        let up_pair = patterned_q3_expert_matrix(37);
+        let down_pair = patterned_q3_expert_matrix(83);
+        let gate = repeat_first_expert(
+            &gate_pair[..expert_stride],
+            expert_stride,
+            expert_count,
+            active_experts,
+        );
+        let up = repeat_first_expert(
+            &up_pair[..expert_stride],
+            expert_stride,
+            expert_count,
+            active_experts,
+        );
+        let down = repeat_first_expert(
+            &down_pair[..expert_stride],
+            expert_stride,
+            expert_count,
+            active_experts,
+        );
+        let output = backend
+            .laguna_gguf_moe_device(
+                &gate,
+                &up,
+                &down,
+                GgufExpertQuant::Q3K,
+                &input,
+                &routing,
+                BLOCK_VALUES,
+                BLOCK_VALUES,
+                BLOCK_VALUES,
+            )
+            .unwrap()
+            .unwrap();
+        let output = backend.device_download_f32_tensor(&output).unwrap();
+
+        for token in 0..token_count {
+            let input_row = &input_values[token * BLOCK_VALUES..(token + 1) * BLOCK_VALUES];
+            let gate_values = cpu_q3_matrix_vector(&gate[..expert_stride], input_row);
+            let up_values = cpu_q3_matrix_vector(&up[..expert_stride], input_row);
+            let intermediate = gate_values
+                .iter()
+                .copied()
+                .zip(up_values)
+                .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+                .collect::<Vec<_>>();
+            let expected = cpu_q3_matrix_vector(&down[..expert_stride], &intermediate);
+            let actual = &output.values()[token * BLOCK_VALUES..(token + 1) * BLOCK_VALUES];
+            for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let tolerance = 2e-2_f32.max(expected.abs() * 2e-2);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "Q3 prefill GEMM mismatch at token {token}, row {row}: actual={actual}, expected={expected}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
     fn patterned_q3_expert_matrix(seed: u8) -> Vec<u8> {
         let mut weights = Vec::with_capacity(2 * BLOCK_VALUES * Q3_BLOCK_BYTES);
         for expert in 0..2 {
@@ -498,6 +712,24 @@ mod tests {
                         block_seed,
                     ));
                 }
+            }
+        }
+        weights
+    }
+
+    fn repeat_first_expert(
+        active_payload: &[u8],
+        expert_stride: usize,
+        expert_count: usize,
+        active_experts: usize,
+    ) -> Vec<u8> {
+        assert_eq!(active_payload.len(), expert_stride);
+        let mut weights = Vec::with_capacity(expert_count * expert_stride);
+        for expert in 0..expert_count {
+            if expert < active_experts {
+                weights.extend_from_slice(active_payload);
+            } else {
+                weights.resize(weights.len() + expert_stride, 0);
             }
         }
         weights

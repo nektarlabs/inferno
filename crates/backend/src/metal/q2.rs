@@ -83,6 +83,10 @@ const Q8_0_GATE_UP_SWIGLU_TILED_KERNEL: &str = "q8_0_gate_up_swiglu_tiled_f32_ke
 const LAGUNA_Q8_0_GATE_UP_SWIGLU_ROWS2_KERNEL: &str = "laguna_q8_0_gate_up_swiglu_rows2_f32_kernel";
 const Q8_0_BATCHED_MATVEC_TILED_KERNEL: &str = "q8_0_batched_matvec_tiled_f32_kernel";
 const Q8_0_PREFILL_MMA_KERNEL: &str = "q8_0_prefill_mma_f32_kernel";
+const Q8_0_PREFILL_MMA_TAIL_KERNEL: &str = "q8_0_prefill_mma_tail_f32_kernel";
+const Q8_0_PREFILL_MMA_ADD_KERNEL: &str = "q8_0_prefill_mma_add_f32_kernel";
+const Q8_0_PREFILL_MMA_ADD2_KERNEL: &str = "q8_0_prefill_mma_add2_f32_kernel";
+const Q8_0_PREFILL_MMA_GATE_UP_SWIGLU_KERNEL: &str = "q8_0_prefill_mma_gate_up_swiglu_f32_kernel";
 const Q8_0_MATVEC_ADD_TILED_KERNEL: &str = "q8_0_matvec_add_tiled_f32_kernel";
 const LAGUNA_Q8_0_MATVEC_ADD_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_add_rows2_f32_kernel";
 const LAGUNA_Q8_0_MATVEC_ADD2_ROWS2_KERNEL: &str = "laguna_q8_0_matvec_add2_rows2_f32_kernel";
@@ -102,8 +106,9 @@ const Q8_0_BATCH_ROW_TILE: usize = 4;
 const Q8_0_OUTPUT_FEATURE_TILE: usize = 4;
 const Q8_0_OUTPUT_FEATURE_TILE_MIN_FEATURES: usize = 65_536;
 const LAGUNA_Q8_0_ARGMAX_ROWS: usize = 4;
-const Q8_0_MMA_TOKEN_TILE: usize = 32;
-const Q8_0_MMA_OUTPUT_TILE: usize = 32;
+pub(super) const Q8_0_MMA_TOKEN_TILE: usize = 32;
+pub(super) const Q8_0_MMA_OUTPUT_TILE: usize = 32;
+pub(super) const Q8_0_MMA_MIN_PREFILL_ROWS: usize = 4;
 const Q8_0_MMA_THREAD_COUNT: usize = 128;
 const Q8_0_MAX_SIMDGROUPS_PER_OUTPUT: usize = 8;
 const LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT: usize = 4;
@@ -154,6 +159,10 @@ pub(crate) struct MetalQ2Matvec {
     laguna_q8_0_gate_up_rows2_pipeline: ComputePipelineState,
     q8_0_batched_tiled_pipeline: ComputePipelineState,
     q8_0_prefill_mma_pipeline: ComputePipelineState,
+    q8_0_prefill_mma_tail_pipeline: ComputePipelineState,
+    q8_0_prefill_mma_add_pipeline: ComputePipelineState,
+    q8_0_prefill_mma_add2_pipeline: ComputePipelineState,
+    q8_0_prefill_mma_gate_up_swiglu_pipeline: ComputePipelineState,
     q8_0_tiled_add_pipeline: ComputePipelineState,
     laguna_q8_0_add_rows2_pipeline: ComputePipelineState,
     laguna_q8_0_add2_rows2_pipeline: ComputePipelineState,
@@ -580,6 +589,26 @@ impl MetalQ2Matvec {
                 Q8_0_BATCHED_MATVEC_TILED_KERNEL,
             )?,
             q8_0_prefill_mma_pipeline: compute_pipeline(device, library, Q8_0_PREFILL_MMA_KERNEL)?,
+            q8_0_prefill_mma_tail_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_PREFILL_MMA_TAIL_KERNEL,
+            )?,
+            q8_0_prefill_mma_add_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_PREFILL_MMA_ADD_KERNEL,
+            )?,
+            q8_0_prefill_mma_add2_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_PREFILL_MMA_ADD2_KERNEL,
+            )?,
+            q8_0_prefill_mma_gate_up_swiglu_pipeline: compute_pipeline(
+                device,
+                library,
+                Q8_0_PREFILL_MMA_GATE_UP_SWIGLU_KERNEL,
+            )?,
             q8_0_tiled_add_pipeline: compute_pipeline(
                 device,
                 library,
@@ -1720,9 +1749,8 @@ impl MetalQ2Matvec {
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("quantized matvec output length overflow"))?;
 
-        let use_q8_mma = kind == QuantMatvecKind::Q80
-            && row_count >= Q8_0_MMA_TOKEN_TILE
-            && out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE);
+        let use_q8_mma = kind == QuantMatvecKind::Q80 && row_count >= Q8_0_MMA_MIN_PREFILL_ROWS;
+        let use_q8_mma_tail = use_q8_mma && !out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE);
         let use_q8_batch = kind == QuantMatvecKind::Q80 && row_count >= 2 && !use_q8_mma;
         let use_q8_output_tile = kind == QuantMatvecKind::Q80
             && row_count == 1
@@ -1730,6 +1758,7 @@ impl MetalQ2Matvec {
         let pipeline = match kind {
             QuantMatvecKind::Q2K => &self.pipeline,
             QuantMatvecKind::Q2KTransposed => &self.transposed_pipeline,
+            QuantMatvecKind::Q80 if use_q8_mma_tail => &self.q8_0_prefill_mma_tail_pipeline,
             QuantMatvecKind::Q80 if use_q8_mma => &self.q8_0_prefill_mma_pipeline,
             QuantMatvecKind::Q80 if use_q8_batch => &self.q8_0_batched_tiled_pipeline,
             QuantMatvecKind::Q80 if use_q8_output_tile => &self.q8_0_output4_tiled_pipeline,
@@ -1781,11 +1810,16 @@ impl MetalQ2Matvec {
         ];
         if kind == QuantMatvecKind::Q80 {
             if use_q8_mma {
+                let prefill_buffers = [
+                    buffers[0], buffers[1], buffers[1], buffers[1], buffers[2], buffers[3],
+                    buffers[4], buffers[5], buffers[6],
+                ];
                 encode_1d_threadgroups_with_offsets(
                     command_buffer,
                     pipeline,
-                    &buffers,
-                    row_count.div_ceil(Q8_0_MMA_TOKEN_TILE) * (out_features / Q8_0_MMA_OUTPUT_TILE),
+                    &prefill_buffers,
+                    row_count.div_ceil(Q8_0_MMA_TOKEN_TILE)
+                        * out_features.div_ceil(Q8_0_MMA_OUTPUT_TILE),
                     Q8_0_MMA_THREAD_COUNT,
                 )?;
                 return Ok(output_buffer);
@@ -1831,6 +1865,211 @@ impl MetalQ2Matvec {
             encode_1d_with_offsets(command_buffer, pipeline, &buffers, dispatch_threads)?;
         }
         Ok(output_buffer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_q8_0_prefill_mma_add(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual: &Buffer,
+        residual_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.encode_q8_0_prefill_mma_residuals(
+            command_buffer,
+            device,
+            weights,
+            input,
+            input_len,
+            residual,
+            residual_len,
+            residual,
+            residual_len,
+            row_count,
+            in_features,
+            out_features,
+            &self.q8_0_prefill_mma_add_pipeline,
+            "Q8_0 prefill MMA add",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_q8_0_prefill_mma_add2(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual_a: &Buffer,
+        residual_a_len: usize,
+        residual_b: &Buffer,
+        residual_b_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.encode_q8_0_prefill_mma_residuals(
+            command_buffer,
+            device,
+            weights,
+            input,
+            input_len,
+            residual_a,
+            residual_a_len,
+            residual_b,
+            residual_b_len,
+            row_count,
+            in_features,
+            out_features,
+            &self.q8_0_prefill_mma_add2_pipeline,
+            "Q8_0 prefill MMA add2",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q8_0_prefill_mma_residuals(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual_a: &Buffer,
+        residual_a_len: usize,
+        residual_b: &Buffer,
+        residual_b_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+        pipeline: &ComputePipelineState,
+        operation: &str,
+    ) -> Result<Buffer> {
+        if row_count < Q8_0_MMA_MIN_PREFILL_ROWS
+            || !out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE)
+        {
+            return Err(Error::backend(format!(
+                "{operation} requires at least {Q8_0_MMA_MIN_PREFILL_ROWS} rows and an output width divisible by {Q8_0_MMA_OUTPUT_TILE}, got rows={row_count}, outputs={out_features}"
+            )));
+        }
+        let blocks_per_row =
+            validate_q8_0_matvec_buffer(weights, input_len, row_count, in_features, out_features)?;
+        require_f32_capacity(input, input_len, operation)?;
+        let output_len = row_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend(format!("{operation} output length overflow")))?;
+        if residual_a_len != output_len || residual_b_len != output_len {
+            return Err(Error::backend(format!(
+                "{operation} residual lengths must both be {output_len}, got {residual_a_len} and {residual_b_len}"
+            )));
+        }
+        require_f32_capacity(residual_a, residual_a_len, operation)?;
+        require_f32_capacity(residual_b, residual_b_len, operation)?;
+
+        let weight_buffer = self.weight_buffer(device, weights)?;
+        let output = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self
+            .arena
+            .u32(matvec_u32(blocks_per_row, "blocks_per_row")?)?;
+
+        encode_1d_threadgroups_with_offsets(
+            command_buffer,
+            pipeline,
+            &[
+                (&weight_buffer.storage, weight_buffer.byte_offset),
+                (input, 0),
+                (residual_a, 0),
+                (residual_b, 0),
+                (&output, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+            ],
+            row_count.div_ceil(Q8_0_MMA_TOKEN_TILE) * (out_features / Q8_0_MMA_OUTPUT_TILE),
+            Q8_0_MMA_THREAD_COUNT,
+        )?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_q8_0_prefill_mma_gate_up_swiglu(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        if row_count < Q8_0_MMA_MIN_PREFILL_ROWS
+            || !out_features.is_multiple_of(Q8_0_MMA_OUTPUT_TILE)
+        {
+            return Err(Error::backend(format!(
+                "Q8_0 prefill MMA gate/up requires at least {Q8_0_MMA_MIN_PREFILL_ROWS} rows and an output width divisible by {Q8_0_MMA_OUTPUT_TILE}, got rows={row_count}, outputs={out_features}"
+            )));
+        }
+        let gate_blocks = validate_q8_0_matvec_buffer(
+            gate_weights,
+            input_len,
+            row_count,
+            in_features,
+            out_features,
+        )?;
+        let up_blocks = validate_q8_0_matvec_buffer(
+            up_weights,
+            input_len,
+            row_count,
+            in_features,
+            out_features,
+        )?;
+        if gate_blocks != up_blocks {
+            return Err(Error::backend(format!(
+                "Q8_0 prefill MMA gate/up block counts differ: gate={gate_blocks}, up={up_blocks}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Q8_0 prefill MMA gate/up input")?;
+        let output_len = row_count
+            .checked_mul(out_features)
+            .ok_or_else(|| Error::backend("Q8_0 prefill MMA gate/up output length overflow"))?;
+
+        let gate = self.weight_buffer(device, gate_weights)?;
+        let up = self.weight_buffer(device, up_weights)?;
+        let output = self.arena.empty_f32(output_len)?;
+        let row_count_buffer = self.arena.u32(matvec_u32(row_count, "row_count")?)?;
+        let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
+        let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
+        let blocks_per_row_buffer = self.arena.u32(matvec_u32(gate_blocks, "blocks_per_row")?)?;
+
+        encode_1d_threadgroups_with_offsets(
+            command_buffer,
+            &self.q8_0_prefill_mma_gate_up_swiglu_pipeline,
+            &[
+                (&gate.storage, gate.byte_offset),
+                (&up.storage, up.byte_offset),
+                (input, 0),
+                (&output, 0),
+                (&row_count_buffer, 0),
+                (&in_features_buffer, 0),
+                (&out_features_buffer, 0),
+                (&blocks_per_row_buffer, 0),
+            ],
+            row_count.div_ceil(Q8_0_MMA_TOKEN_TILE) * (out_features / Q8_0_MMA_OUTPUT_TILE),
+            Q8_0_MMA_THREAD_COUNT,
+        )?;
+        Ok(output)
     }
 
     pub(crate) fn encode_q8_0_embedding(
@@ -1925,6 +2164,36 @@ impl MetalQ2Matvec {
         out_features_a: usize,
         out_features_b: usize,
     ) -> Result<(Buffer, Buffer)> {
+        if row_count >= Q8_0_MMA_MIN_PREFILL_ROWS {
+            // Prefill chooses the best kernel independently for each
+            // projection. Laguna's V width is MMA-aligned while its small
+            // per-head gate width is not; coupling their dispatch would force
+            // the large V matrix through the slower generic batch kernel.
+            let output_a = self.encode_matvec(
+                command_buffer,
+                device,
+                QuantMatvecKind::Q80,
+                weights_a,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features_a,
+            )?;
+            let output_b = self.encode_matvec(
+                command_buffer,
+                device,
+                QuantMatvecKind::Q80,
+                weights_b,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features_b,
+            )?;
+            return Ok((output_a, output_b));
+        }
+
         let blocks_per_row_a = validate_q8_0_matvec_buffer(
             weights_a,
             input_len,
@@ -6045,9 +6314,10 @@ mod tests {
         },
         expert_protected_capacity, prioritize_ready_expert_seeds, ExpertQueueKind,
         LayerSlotResolution, Q2ExpertLayerCache, Q2PerLayerExpertCache, Q2TransientExpertPool,
-        QuantMatvecKind, ReadyExpertSeed, Q8_0_MMA_OUTPUT_TILE, Q8_0_MMA_TOKEN_TILE,
-        Q8_0_OUTPUT_FEATURE_TILE_MIN_FEATURES, ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER,
-        ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER, ROUTED_EXPERT_COUNT, ROUTED_EXPERT_WAVE_MIN_GROUPS,
+        QuantMatvecKind, ReadyExpertSeed, Q8_0_MMA_MIN_PREFILL_ROWS, Q8_0_MMA_OUTPUT_TILE,
+        Q8_0_MMA_TOKEN_TILE, Q8_0_OUTPUT_FEATURE_TILE_MIN_FEATURES,
+        ROUTED_EXPERT_BASE_SLAB_SLOTS_PER_LAYER, ROUTED_EXPERT_CACHE_SLOTS_PER_LAYER,
+        ROUTED_EXPERT_COUNT, ROUTED_EXPERT_WAVE_MIN_GROUPS,
     };
 
     fn resolve_one(cache: &mut Q2ExpertLayerCache, expert_id: u32) -> LayerSlotResolution {
@@ -6688,6 +6958,106 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_paired_prefill_mma_matches_independent_projections() {
+        const F16_STAGING_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = Q8_0_MMA_MIN_PREFILL_ROWS;
+        let in_features = Q8_0_BLOCK_VALUES * 2;
+        let out_features_a = Q8_0_MMA_OUTPUT_TILE;
+        let out_features_b = Q8_0_MMA_OUTPUT_TILE * 2;
+        let weights_a = q8_0_test_matrix(in_features, out_features_a, 3);
+        let weights_b = q8_0_test_matrix(in_features, out_features_b, 7);
+        let input = (0..row_count * in_features)
+            .map(|index| {
+                let phase = index as f32 * 0.113;
+                phase.sin() * 0.31 + phase.cos() * 0.17
+            })
+            .collect::<Vec<_>>();
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+
+        let (paired_a, paired_b) = metal
+            .batched_q8_0_matvec_pair(
+                &weights_a,
+                &weights_b,
+                &input_buffer,
+                input.len(),
+                row_count,
+                in_features,
+                out_features_a,
+                out_features_b,
+            )
+            .unwrap();
+        let actual_a = metal
+            .batch_read_f32(&paired_a, row_count * out_features_a)
+            .unwrap();
+        let actual_b = metal
+            .batch_read_f32(&paired_b, row_count * out_features_b)
+            .unwrap();
+        let expected_a =
+            cpu_q8_0_matvec(&weights_a, &input, row_count, in_features, out_features_a);
+        let expected_b =
+            cpu_q8_0_matvec(&weights_b, &input, row_count, in_features, out_features_b);
+
+        assert_close_relative(&actual_a, &expected_a, F16_STAGING_RELATIVE_TOLERANCE);
+        assert_close_relative(&actual_b, &expected_b, F16_STAGING_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
+    fn q8_0_paired_prefill_uses_mixed_aligned_and_tail_safe_paths() {
+        const F16_STAGING_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = Q8_0_MMA_MIN_PREFILL_ROWS + 1;
+        let in_features = Q8_0_BLOCK_VALUES * 2;
+        let aligned_features = Q8_0_MMA_OUTPUT_TILE * 2;
+        let tail_features = Q8_0_MMA_OUTPUT_TILE + 16;
+        let aligned_weights = q8_0_test_matrix(in_features, aligned_features, 5);
+        let tail_weights = q8_0_test_matrix(in_features, tail_features, 11);
+        let input = q8_0_test_input(row_count * in_features);
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+
+        let (aligned, tail) = metal
+            .batched_q8_0_matvec_pair(
+                &aligned_weights,
+                &tail_weights,
+                &input_buffer,
+                input.len(),
+                row_count,
+                in_features,
+                aligned_features,
+                tail_features,
+            )
+            .unwrap();
+        let actual_aligned = metal
+            .batch_read_f32(&aligned, row_count * aligned_features)
+            .unwrap();
+        let actual_tail = metal
+            .batch_read_f32(&tail, row_count * tail_features)
+            .unwrap();
+        let expected_aligned = cpu_q8_0_matvec(
+            &aligned_weights,
+            &input,
+            row_count,
+            in_features,
+            aligned_features,
+        );
+        let expected_tail =
+            cpu_q8_0_matvec(&tail_weights, &input, row_count, in_features, tail_features);
+
+        assert_close_relative(
+            &actual_aligned,
+            &expected_aligned,
+            F16_STAGING_RELATIVE_TOLERANCE,
+        );
+        assert_close_relative(&actual_tail, &expected_tail, F16_STAGING_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
     fn q8_0_fused_gate_up_swiglu_matches_independent_chain() {
         let Some(metal) = native_metal_or_skip() else {
             return;
@@ -6884,6 +7254,138 @@ mod tests {
 
         // The MMA path rounds both activations and dequantized weights to F16
         // before accumulating in F32, so this comparison is intentionally not exact.
+        assert_close_relative(&actual, &expected, F16_STAGING_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
+    fn q8_0_prefill_mma_add_matches_cpu_reference() {
+        const F16_STAGING_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = Q8_0_MMA_TOKEN_TILE + 1;
+        let in_features = Q8_0_BLOCK_VALUES * 2;
+        let out_features = Q8_0_MMA_OUTPUT_TILE;
+        let weights = q8_0_test_matrix(in_features, out_features, 5);
+        let input = q8_0_test_input(row_count * in_features);
+        let residual = q8_0_test_input(row_count * out_features)
+            .into_iter()
+            .map(|value| value * 0.25)
+            .collect::<Vec<_>>();
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let residual_buffer = metal.batch_upload_f32(&residual).unwrap();
+
+        let output = metal
+            .batched_q8_0_matvec_add(
+                &weights,
+                &input_buffer,
+                input.len(),
+                &residual_buffer,
+                residual.len(),
+                row_count,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, row_count * out_features)
+            .unwrap();
+        let mut expected = cpu_q8_0_matvec(&weights, &input, row_count, in_features, out_features);
+        for (value, residual) in expected.iter_mut().zip(residual) {
+            *value += residual;
+        }
+
+        assert_close_relative(&actual, &expected, F16_STAGING_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
+    fn q8_0_prefill_mma_gate_up_swiglu_matches_cpu_reference() {
+        const F16_STAGING_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = Q8_0_MMA_TOKEN_TILE + 1;
+        let in_features = Q8_0_BLOCK_VALUES * 2;
+        let out_features = Q8_0_MMA_OUTPUT_TILE;
+        let gate_weights = q8_0_test_matrix(in_features, out_features, 2);
+        let up_weights = q8_0_test_matrix(in_features, out_features, 9);
+        let input = q8_0_test_input(row_count * in_features);
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+
+        let output = metal
+            .batched_q8_0_gate_up_swiglu(
+                &gate_weights,
+                &up_weights,
+                &input_buffer,
+                input.len(),
+                row_count,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, row_count * out_features)
+            .unwrap();
+        let gate = cpu_q8_0_matvec(&gate_weights, &input, row_count, in_features, out_features);
+        let up = cpu_q8_0_matvec(&up_weights, &input, row_count, in_features, out_features);
+        let expected = gate
+            .into_iter()
+            .zip(up)
+            .map(|(gate, up)| (gate / (1.0 + (-gate).exp())) * up)
+            .collect::<Vec<_>>();
+
+        assert_close_relative(&actual, &expected, F16_STAGING_RELATIVE_TOLERANCE);
+    }
+
+    #[test]
+    fn q8_0_prefill_mma_add2_matches_cpu_reference() {
+        const F16_STAGING_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let row_count = Q8_0_MMA_TOKEN_TILE + 1;
+        let in_features = Q8_0_BLOCK_VALUES * 2;
+        let out_features = Q8_0_MMA_OUTPUT_TILE;
+        let weights = q8_0_test_matrix(in_features, out_features, 4);
+        let input = q8_0_test_input(row_count * in_features);
+        let residual_a = q8_0_test_input(row_count * out_features)
+            .into_iter()
+            .map(|value| value * 0.25)
+            .collect::<Vec<_>>();
+        let residual_b = q8_0_test_input(row_count * out_features)
+            .into_iter()
+            .map(|value| value * -0.125)
+            .collect::<Vec<_>>();
+        let input_buffer = metal.batch_upload_f32(&input).unwrap();
+        let residual_a_buffer = metal.batch_upload_f32(&residual_a).unwrap();
+        let residual_b_buffer = metal.batch_upload_f32(&residual_b).unwrap();
+
+        let output = metal
+            .batched_laguna_q8_0_matvec_add2(
+                &weights,
+                &input_buffer,
+                input.len(),
+                &residual_a_buffer,
+                residual_a.len(),
+                &residual_b_buffer,
+                residual_b.len(),
+                row_count,
+                in_features,
+                out_features,
+            )
+            .unwrap();
+        let actual = metal
+            .batch_read_f32(&output, row_count * out_features)
+            .unwrap();
+        let mut expected = cpu_q8_0_matvec(&weights, &input, row_count, in_features, out_features);
+        for ((value, residual_a), residual_b) in expected.iter_mut().zip(residual_a).zip(residual_b)
+        {
+            *value += residual_a + residual_b;
+        }
+
         assert_close_relative(&actual, &expected, F16_STAGING_RELATIVE_TOLERANCE);
     }
 
@@ -7920,6 +8422,31 @@ mod tests {
         block.extend(d.to_le_bytes());
         block.extend(std::iter::repeat_n(quant as u8, 32));
         block
+    }
+
+    fn q8_0_test_matrix(in_features: usize, out_features: usize, phase_offset: usize) -> Vec<u8> {
+        let scale_bits = [0x3555_u16, 0x3266, 0x39a0, 0x2e00];
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        let mut weights = Vec::with_capacity(out_features * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for output_feature in 0..out_features {
+            for block in 0..blocks_per_row {
+                let quant = ((output_feature * 3 + block * 5 + phase_offset) % 15) as i8 - 7;
+                weights.extend(q8_0_block(
+                    scale_bits[(output_feature + block + phase_offset) % scale_bits.len()],
+                    quant,
+                ));
+            }
+        }
+        weights
+    }
+
+    fn q8_0_test_input(value_count: usize) -> Vec<f32> {
+        (0..value_count)
+            .map(|index| {
+                let phase = index as f32 * 0.113;
+                phase.sin() * 0.31 + phase.cos() * 0.17
+            })
+            .collect()
     }
 
     fn cpu_q2_k_matvec(

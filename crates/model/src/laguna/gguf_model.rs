@@ -247,7 +247,14 @@ impl LagunaGgufModel {
                 .get_mut(layer_index)
                 .ok_or_else(|| Error::cache(format!("missing Laguna GGUF cache {layer_index}")))?;
             hidden = self.forward_layer(&hidden, layer, prepared, cache, backend)?;
-            if should_submit_after_layer(layer_index, self.config.num_hidden_layers) {
+            if row_is_prefill(&hidden)?
+                && tracing::enabled!(
+                    target: "inferno::metal::profile",
+                    tracing::Level::TRACE
+                )
+            {
+                backend.device_profile_boundary("laguna.prefill.mlp_tail")?;
+            } else if should_submit_after_layer(layer_index, self.config.num_hidden_layers) {
                 backend.device_submit()?;
             }
         }
@@ -360,6 +367,11 @@ impl LagunaGgufModel {
                 rope,
             )?,
         )?;
+        profile_prefill_boundary(
+            backend,
+            row_count,
+            "laguna.prefill.attention_projection_and_rope",
+        )?;
         let context = required(
             "Laguna GGUF F16 attention",
             backend.laguna_gated_gqa_f16_attention_device(
@@ -371,6 +383,7 @@ impl LagunaGgufModel {
             )?,
         )?
         .reshape(vec![*batch, *tokens, query_width])?;
+        profile_prefill_boundary(backend, row_count, "laguna.prefill.attention_core")?;
         let post_attention = required(
             "Laguna GGUF attention output and residual",
             backend.q8_0_matvec_add_device(
@@ -382,6 +395,7 @@ impl LagunaGgufModel {
                 self.config.hidden_size,
             )?,
         )?;
+        profile_prefill_boundary(backend, row_count, "laguna.prefill.attention_output")?;
         let mlp_input = required(
             "Laguna GGUF MLP RMSNorm",
             backend.rms_norm_device(
@@ -464,6 +478,7 @@ impl LagunaGgufModel {
                 self.config.moe_routed_scaling_factor as f32,
             )?
             .ok_or_else(|| Error::backend("Laguna GGUF routing requires native Metal"))?;
+        profile_prefill_boundary(backend, row_count, "laguna.prefill.router")?;
         let routed_gate = self.index.quantized_storage(&moe.routed_gate)?;
         let routed_up = self.index.quantized_storage(&moe.routed_up)?;
         let routed_down = self.index.quantized_storage(&moe.routed_down)?;
@@ -495,6 +510,7 @@ impl LagunaGgufModel {
                 self.config.hidden_size,
             )?,
         )?;
+        profile_prefill_boundary(backend, row_count, "laguna.prefill.routed_experts")?;
         let shared_activated = required(
             "Laguna GGUF shared expert gate/up",
             backend.q8_0_gate_up_swiglu_device(
@@ -782,6 +798,23 @@ fn required_pair(
     value: Option<(DeviceValue, DeviceValue)>,
 ) -> Result<(DeviceValue, DeviceValue)> {
     value.ok_or_else(|| Error::backend(format!("{label} requires native Metal")))
+}
+
+fn row_is_prefill(hidden: &DeviceValue) -> Result<bool> {
+    let row_count = hidden.element_count()? / hidden.dims().last().copied().unwrap_or(1);
+    Ok(row_count > 1)
+}
+
+fn profile_prefill_boundary<B: Backend>(backend: &B, row_count: usize, label: &str) -> Result<()> {
+    if row_count > 1
+        && tracing::enabled!(
+            target: "inferno::metal::profile",
+            tracing::Level::TRACE
+        )
+    {
+        backend.device_profile_boundary(label)?;
+    }
+    Ok(())
 }
 
 fn should_submit_after_layer(layer_index: usize, layer_count: usize) -> bool {

@@ -1042,6 +1042,14 @@ pub trait Backend: Sync {
         self.device_flush()
     }
 
+    /// Ends a named GPU profiling segment without waiting for completion.
+    ///
+    /// Production callers should invoke this only behind a tracing check.
+    /// Backends without native asynchronous execution keep it as a no-op.
+    fn device_profile_boundary(&self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Copies a host tensor into GPU memory, returning a handle usable with
     /// the other `*_device` ops.
     fn device_upload_f32_tensor(&self, _tensor: &F32Tensor) -> Result<Option<DeviceValue>> {
@@ -4045,6 +4053,18 @@ impl Backend for MetalBackend {
                 return native_metal.batch_submit();
             }
         }
+        Ok(())
+    }
+
+    fn device_profile_boundary(&self, label: &str) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Some(native_metal) = self.native_metal() {
+                return native_metal.batch_submit_profile_segment(label);
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = label;
         Ok(())
     }
 
