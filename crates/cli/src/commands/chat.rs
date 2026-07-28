@@ -298,10 +298,9 @@ fn run_laguna_interactive_loop(
                 if let Some(text) = decoded.push(token_id)? {
                     write_events(&mut output, assistant.push(&text), output_is_terminal)?;
                 }
-                let Some(reason) = thinking_guard
-                    .as_mut()
-                    .and_then(|guard| guard.observe(token_id))
-                else {
+                let Some(reason) = thinking_guard.as_mut().and_then(|guard| {
+                    guard.observe(token_id, config.eos_token_id.contains(&token_id))
+                }) else {
                     return Ok(GenerationControl::Continue);
                 };
 

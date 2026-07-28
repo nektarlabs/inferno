@@ -30,6 +30,7 @@ pub enum GenerationControl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LagunaThinkingGuardReason {
+    PrematureStopToken,
     RepeatedNgram,
     TokenBudget,
 }
@@ -54,13 +55,21 @@ impl Default for LagunaThinkingGuard {
 }
 
 impl LagunaThinkingGuard {
-    pub fn observe(&mut self, token_id: u32) -> Option<LagunaThinkingGuardReason> {
+    pub fn observe(
+        &mut self,
+        token_id: u32,
+        is_stop_token: bool,
+    ) -> Option<LagunaThinkingGuardReason> {
         if self.complete {
             return None;
         }
         if token_id == LAGUNA_THINKING_END_TOKEN_ID {
             self.complete = true;
             return None;
+        }
+        if is_stop_token {
+            self.complete = true;
+            return Some(LagunaThinkingGuardReason::PrematureStopToken);
         }
 
         self.token_count = self.token_count.saturating_add(1);
@@ -354,8 +363,11 @@ impl LagunaRuntime {
                     }
                     GenerationControl::Stop => None,
                 };
-                if stop_token_ids.contains(&output.token_id) || generated_tokens == generated_limit
-                {
+                if generation_should_stop(
+                    control,
+                    stop_token_ids.contains(&output.token_id),
+                    generated_tokens == generated_limit,
+                ) {
                     break;
                 }
                 let Some(next_token_id) = next_token_id else {
@@ -477,6 +489,16 @@ fn next_context_capacity(
         .min(max_context_tokens))
 }
 
+fn generation_should_stop(
+    control: GenerationControl,
+    emitted_stop_token: bool,
+    reached_generation_limit: bool,
+) -> bool {
+    reached_generation_limit
+        || control == GenerationControl::Stop
+        || (emitted_stop_token && !matches!(control, GenerationControl::InjectNextToken(_)))
+}
+
 fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
     if token_count == 0 || chunk_size == 0 {
         return Err(Error::runtime(
@@ -505,7 +527,7 @@ mod tests {
         let mut reason = None;
 
         for token_id in pattern.into_iter().cycle().take(pattern.len() * 4) {
-            reason = guard.observe(token_id).or(reason);
+            reason = guard.observe(token_id, false).or(reason);
         }
 
         assert_eq!(reason, Some(LagunaThinkingGuardReason::RepeatedNgram));
@@ -517,7 +539,7 @@ mod tests {
         let mut reason = None;
 
         for token_id in 1_000..1_000 + LAGUNA_THINKING_TOKEN_BUDGET as u32 {
-            reason = guard.observe(token_id).or(reason);
+            reason = guard.observe(token_id, false).or(reason);
         }
 
         assert_eq!(reason, Some(LagunaThinkingGuardReason::TokenBudget));
@@ -527,15 +549,46 @@ mod tests {
     fn thinking_guard_disables_itself_after_the_natural_boundary() {
         let mut guard = LagunaThinkingGuard::default();
 
-        assert_eq!(guard.observe(42), None);
-        assert_eq!(guard.observe(LAGUNA_THINKING_END_TOKEN_ID), None);
+        assert_eq!(guard.observe(42, false), None);
+        assert_eq!(guard.observe(LAGUNA_THINKING_END_TOKEN_ID, false), None);
         for token_id in [10_u32, 11, 12, 13, 14, 15, 16, 17]
             .into_iter()
             .cycle()
             .take(64)
         {
-            assert_eq!(guard.observe(token_id), None);
+            assert_eq!(guard.observe(token_id, false), None);
         }
+    }
+
+    #[test]
+    fn thinking_guard_replaces_a_stop_token_before_the_reasoning_boundary() {
+        let mut guard = LagunaThinkingGuard::default();
+
+        assert_eq!(guard.observe(42, false), None);
+        assert_eq!(
+            guard.observe(24, true),
+            Some(LagunaThinkingGuardReason::PrematureStopToken)
+        );
+        assert_eq!(guard.observe(24, true), None);
+    }
+
+    #[test]
+    fn injected_token_overrides_model_stop_but_not_the_generation_limit() {
+        assert!(!super::generation_should_stop(
+            super::GenerationControl::InjectNextToken(LAGUNA_THINKING_END_TOKEN_ID),
+            true,
+            false,
+        ));
+        assert!(super::generation_should_stop(
+            super::GenerationControl::Continue,
+            true,
+            false,
+        ));
+        assert!(super::generation_should_stop(
+            super::GenerationControl::InjectNextToken(LAGUNA_THINKING_END_TOKEN_ID),
+            true,
+            true,
+        ));
     }
 
     #[test]

@@ -340,7 +340,7 @@ fn run_laguna(
             }
             let Some(reason) = thinking_guard
                 .as_mut()
-                .and_then(|guard| guard.observe(token_id))
+                .and_then(|guard| guard.observe(token_id, config.eos_token_id.contains(&token_id)))
             else {
                 return Ok(GenerationControl::Continue);
             };

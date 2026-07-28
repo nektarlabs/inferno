@@ -438,9 +438,9 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                     if let Some(text) = decoded.push(token_id)? {
                         generated_text.push_str(&text);
                     }
-                    let forced_boundary = thinking_guard
-                        .as_mut()
-                        .and_then(|guard| guard.observe(token_id));
+                    let forced_boundary = thinking_guard.as_mut().and_then(|guard| {
+                        guard.observe(token_id, self.config.eos_token_id.contains(&token_id))
+                    });
                     if let Some(reason) = forced_boundary {
                         debug!(?reason, "forcing Laguna reasoning boundary");
                         if let Some(text) = decoded.push(LAGUNA_THINKING_END_TOKEN_ID)? {
