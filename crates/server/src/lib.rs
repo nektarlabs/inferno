@@ -476,12 +476,7 @@ mod tests {
             assert_eq!(models[0]["shell_type"], "unified_exec");
             assert_eq!(models[0]["supports_parallel_tool_calls"], false);
             assert_eq!(models[0]["supports_reasoning_summaries"], false);
-            let expected_context = if model_id == LAGUNA_GGUF_CODEX_MODEL_ID {
-                4096
-            } else {
-                32768
-            };
-            assert_eq!(models[0]["context_window"], expected_context);
+            assert_eq!(models[0]["context_window"], 32768);
         }
     }
 

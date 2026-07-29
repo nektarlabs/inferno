@@ -27,6 +27,8 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(default)]
     pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
@@ -180,6 +182,33 @@ impl<'a> ResponsesStream<'a> {
         Ok(())
     }
 
+    pub fn custom_tool_call_done(&mut self, call_id: &str, name: &str, input: &str) -> Result<()> {
+        if call_id.is_empty() || name.is_empty() {
+            return Err(Error::runtime(
+                "Responses custom tool call requires non-empty call_id and name",
+            ));
+        }
+        let item_id = format!("ctc_{}_{}", self.response_id, self.output_index);
+        self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input
+                }
+            }),
+        )?;
+        self.output_index += 1;
+        Ok(())
+    }
+
     pub fn completed(&mut self, usage: ResponseUsage) -> Result<()> {
         let total_tokens = usage
             .input_tokens
@@ -273,6 +302,7 @@ mod tests {
                 "instructions": "Use tools.",
                 "input": [{"type": "message", "role": "user", "content": []}],
                 "tools": [{"type": "function", "name": "exec_command"}],
+                "reasoning": {"effort": "high"},
                 "stream": true,
                 "max_output_tokens": 64,
                 "store": false,
@@ -286,6 +316,7 @@ mod tests {
         assert_eq!(request.model, "glm-5.2-q2");
         assert_eq!(request.input.len(), 1);
         assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.reasoning, Some(json!({"effort": "high"})));
         assert_eq!(request.max_output_tokens, Some(64));
     }
 
@@ -325,6 +356,9 @@ mod tests {
             .function_call_done("call_1", "exec_command", r#"{"cmd":"pwd"}"#)
             .unwrap();
         stream
+            .custom_tool_call_done("call_2", "apply_patch", "*** Begin Patch\n*** End Patch\n")
+            .unwrap();
+        stream
             .completed(ResponseUsage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -337,6 +371,8 @@ mod tests {
         assert!(rendered.contains("response.output_item.added"));
         assert!(rendered.contains("\"type\":\"message\""));
         assert!(rendered.contains("\"type\":\"function_call\""));
+        assert!(rendered.contains("\"type\":\"custom_tool_call\""));
+        assert!(rendered.contains("\"name\":\"apply_patch\""));
         assert!(rendered.contains("\\\"cmd\\\":\\\"pwd\\\""));
         assert!(rendered.contains("\"total_tokens\":12"));
     }

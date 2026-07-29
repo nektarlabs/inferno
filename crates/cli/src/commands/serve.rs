@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{SocketAddr, TcpListener},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
@@ -29,9 +29,9 @@ use server::{
     GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID, LAGUNA_GGUF_CODEX_MODEL_ID,
 };
 use tokenizer::{
-    is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
-    render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentOutput,
-    AgentOutputItem, LagunaThinkingMode, Tokenizer,
+    is_supported_codex_function, map_laguna_function_call_to_codex, parse_agent_output,
+    parse_complete_agent_tool_call, render_codex_prompt, render_laguna_codex_prompt,
+    AgentFunctionCall, AgentOutput, AgentOutputItem, LagunaThinkingMode, Tokenizer,
 };
 use tracing::{debug, info};
 
@@ -43,9 +43,12 @@ use super::generate::{
 };
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
-const LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS: usize = 4_096;
-const LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS: usize = 2_048;
+const LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS: usize = 32_768;
+const LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS: usize = 8_192;
 const LAGUNA_GGUF_MAX_INSTRUCTION_BYTES: usize = 8 * 1_024;
+const LAGUNA_CODEX_DUPLICATE_RETRIES: usize = 2;
+const LAGUNA_CODEX_MAX_INSPECTIONS_BEFORE_EDIT: usize = 3;
+const LAGUNA_CODEX_MAX_IDENTICAL_TOOL_EXECUTIONS: usize = 2;
 const CODEX_FALLBACK_INSTRUCTION_PREFIX: &str = "You are a coding agent running in the Codex CLI";
 const CLOSED_THINKING_BOUNDARY: &str = "</think>";
 
@@ -374,24 +377,155 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
             validate_laguna_gguf_codex_envelope(&request)?;
         }
         let allowed_tools = tool_names(&request.tools)?;
-        let prompt = render_laguna_codex_prompt(
-            &request.instructions,
-            &request.input,
-            &request.tools,
-            self.thinking_mode,
-        )?;
+        let tool_phase = laguna_tool_phase(&request.input);
+        let prompt_tools = laguna_prompt_tools(tool_phase, &request.tools);
+        let prompt_allowed_tools = tool_names(&prompt_tools)?;
+        let mut logged_tools = allowed_tools.iter().cloned().collect::<Vec<_>>();
+        logged_tools.sort_unstable();
+        let mut logged_prompt_tools = prompt_allowed_tools.iter().cloned().collect::<Vec<_>>();
+        logged_prompt_tools.sort_unstable();
+        debug!(
+            model = self.model_id,
+            tools = ?logged_tools,
+            prompt_tools = ?logged_prompt_tools,
+            "accepted Codex tool contract"
+        );
+        let completed_calls = historical_tool_call_fingerprints(&request.input)?;
+        let inspection_limit_reached = tool_phase == LagunaToolPhase::Edit
+            && historical_read_only_shell_calls_since_last_mutation(&request.input)
+                >= LAGUNA_CODEX_MAX_INSPECTIONS_BEFORE_EDIT;
+        let thinking_mode = self.thinking_mode;
+        let mut input = request.input.clone();
+        let mut total_input_tokens = 0_usize;
+        let mut total_output_tokens = 0_usize;
+        let mut require_new_tool_call = false;
+
+        for attempt in 0..=LAGUNA_CODEX_DUPLICATE_RETRIES {
+            let suppress_exec_replay = inspection_limit_reached
+                || require_new_tool_call
+                || tool_phase == LagunaToolPhase::Complete;
+            let prompt_input = laguna_prompt_input(
+                &input,
+                &prompt_allowed_tools,
+                tool_phase,
+                suppress_exec_replay,
+            );
+            let turn = self.generate_agent_turn(
+                &request.instructions,
+                &prompt_input,
+                &prompt_tools,
+                request.max_output_tokens,
+                thinking_mode,
+                stream,
+            )?;
+            total_input_tokens = total_input_tokens
+                .checked_add(turn.input_tokens)
+                .ok_or_else(|| Error::runtime("Codex input token count overflow"))?;
+            total_output_tokens = total_output_tokens
+                .checked_add(turn.output_tokens)
+                .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
+
+            if let Some(duplicate) = duplicate_tool_call(&turn.output, &completed_calls)? {
+                if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
+                    return Err(Error::runtime(format!(
+                        "Laguna repeated completed Codex tool {:?} after {} internal retries",
+                        duplicate.name, LAGUNA_CODEX_DUPLICATE_RETRIES
+                    )));
+                }
+                debug!(
+                    tool = duplicate.name,
+                    attempt = attempt + 1,
+                    "retrying Laguna Codex turn after duplicate tool call"
+                );
+                input.push(duplicate_tool_retry_message(&duplicate));
+                require_new_tool_call = true;
+                stream.heartbeat()?;
+                continue;
+            }
+            if inspection_limit_reached {
+                if let Some(inspection) = first_read_only_shell_call(&turn.output)? {
+                    if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
+                        return Err(Error::runtime(format!(
+                            "Laguna repeated workspace inspection with {:?} after {} internal retries",
+                            inspection.name, LAGUNA_CODEX_DUPLICATE_RETRIES
+                        )));
+                    }
+                    input.push(repeated_inspection_retry_message());
+                    require_new_tool_call = true;
+                    stream.heartbeat()?;
+                    continue;
+                }
+            }
+            if let Some(disallowed) =
+                first_tool_outside_contract(&turn.output, &prompt_allowed_tools)
+            {
+                if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
+                    return Err(Error::runtime(format!(
+                        "Laguna requested unavailable Codex tool {:?} after {} internal retries",
+                        disallowed.name, LAGUNA_CODEX_DUPLICATE_RETRIES
+                    )));
+                }
+                input.push(unavailable_tool_retry_message(&disallowed));
+                require_new_tool_call = tool_phase != LagunaToolPhase::Complete;
+                stream.heartbeat()?;
+                continue;
+            }
+            if turn.hit_output_limit
+                || (require_new_tool_call && !agent_output_has_tool(&turn.output))
+            {
+                if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
+                    return Err(Error::runtime(
+                        "Laguna did not produce the required new Codex tool call before the internal retry limit",
+                    ));
+                }
+                input.push(required_tool_retry_message(turn.hit_output_limit));
+                require_new_tool_call = true;
+                stream.heartbeat()?;
+                continue;
+            }
+
+            emit_laguna_agent_output(turn.output, "", &prompt_allowed_tools, "Laguna", stream)?;
+            return Ok(ResponseUsage {
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+            });
+        }
+        Err(Error::runtime(
+            "Laguna Codex duplicate retry loop exhausted",
+        ))
+    }
+}
+
+struct LagunaAgentTurn {
+    output: AgentOutput,
+    input_tokens: usize,
+    output_tokens: usize,
+    hit_output_limit: bool,
+}
+
+impl LagunaCodexHandler<'_> {
+    fn generate_agent_turn(
+        &mut self,
+        instructions: &str,
+        input: &[serde_json::Value],
+        tools: &[serde_json::Value],
+        requested_max_output_tokens: Option<usize>,
+        thinking_mode: LagunaThinkingMode,
+        stream: &mut ResponsesStream<'_>,
+    ) -> InfernoResult<LagunaAgentTurn> {
+        let prompt = render_laguna_codex_prompt(instructions, input, tools, thinking_mode)?;
         let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
         let max_new_tokens = laguna_codex_max_new_tokens(
             self.model_id,
             self.max_new_tokens,
-            request.max_output_tokens,
+            requested_max_output_tokens,
             encoded.token_ids.len(),
         )?;
         validate_laguna_prompt(
             self.config,
             &encoded.token_ids,
             max_new_tokens,
-            self.thinking_mode,
+            thinking_mode,
         )?;
         debug!(
             model = self.model_id,
@@ -401,18 +535,18 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
         );
 
         let mut decoded = DecodedTextStream::new(self.tokenizer, true);
-        let mut generated_text = match self.thinking_mode {
+        let mut generated_text = match thinking_mode {
             LagunaThinkingMode::Disabled => String::from(CLOSED_THINKING_BOUNDARY),
             LagunaThinkingMode::Enabled => String::new(),
         };
-        let mut streamed_text = String::new();
         let mut completed_output = None;
         let mut output_tokens = 0_usize;
         let mut thinking_guard =
-            (self.thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
+            (thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
         let heartbeat_during_prefill = self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID;
         let stream_cell = std::cell::RefCell::new(stream);
-        self.runtime
+        let generation = self
+            .runtime
             .generate_streaming_controlled_with_prefill_progress(
                 self.model,
                 self.backend,
@@ -450,17 +584,6 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                             generated_text.push_str(CLOSED_THINKING_BOUNDARY);
                         }
                     }
-                    if let Some(visible_text) = streamable_agent_text(&generated_text) {
-                        let delta = visible_text.strip_prefix(&streamed_text).ok_or_else(|| {
-                            Error::tokenizer(
-                                "Laguna agent visible text changed after it was streamed",
-                            )
-                        })?;
-                        if !delta.is_empty() {
-                            stream_cell.borrow_mut().text_delta(delta)?;
-                            streamed_text.push_str(delta);
-                        }
-                    }
                     let control = match parse_complete_agent_tool_call(&generated_text)? {
                         Some(output) => {
                             completed_output = Some(output);
@@ -475,22 +598,423 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                     Ok(control)
                 },
             )?;
-        let stream = stream_cell.into_inner();
-
-        match completed_output {
-            Some(output) => {
-                emit_laguna_agent_output(output, &streamed_text, &allowed_tools, "Laguna", stream)?
-            }
-            None => {
-                let output = parse_agent_output(&generated_text)?;
-                emit_laguna_agent_output(output, &streamed_text, &allowed_tools, "Laguna", stream)?;
-            }
-        }
-        Ok(ResponseUsage {
+        let output = completed_output.unwrap_or(parse_agent_output(&generated_text)?);
+        Ok(LagunaAgentTurn {
+            output,
             input_tokens: encoded.token_ids.len(),
             output_tokens,
+            hit_output_limit: max_new_tokens
+                .is_some_and(|limit| generation.generated_tokens >= limit),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LagunaToolPhase {
+    Initial,
+    Edit,
+    Validate,
+    Complete,
+}
+
+fn laguna_prompt_tools(
+    phase: LagunaToolPhase,
+    tools: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let has_apply_patch = tools.iter().any(|tool| {
+        tool.get("type").and_then(serde_json::Value::as_str) == Some("custom")
+            && tool.get("name").and_then(serde_json::Value::as_str) == Some("apply_patch")
+    });
+    if !has_apply_patch
+        || matches!(
+            phase,
+            LagunaToolPhase::Initial | LagunaToolPhase::Edit | LagunaToolPhase::Validate
+        )
+    {
+        return tools.to_vec();
+    }
+    if phase == LagunaToolPhase::Complete {
+        return Vec::new();
+    }
+
+    tools
+        .iter()
+        .filter(|tool| tool.get("name").and_then(serde_json::Value::as_str) != Some("exec_command"))
+        .cloned()
+        .collect()
+}
+
+fn laguna_prompt_input(
+    input: &[serde_json::Value],
+    allowed_tools: &HashSet<String>,
+    phase: LagunaToolPhase,
+    suppress_exec_replay: bool,
+) -> Vec<serde_json::Value> {
+    if !suppress_exec_replay {
+        return input.to_vec();
+    }
+    if phase != LagunaToolPhase::Edit
+        && phase != LagunaToolPhase::Complete
+        && !allowed_tools.contains("exec_command")
+    {
+        return input.to_vec();
+    }
+
+    let mut prompt_input = input
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| {
+            if is_historical_exec_command(item) {
+                return false;
+            }
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            {
+                return !next_non_reasoning_item_is_exec_command(input, index + 1);
+            }
+            true
+        })
+        .map(|(_, item)| item.clone())
+        .collect::<Vec<_>>();
+    let instruction = match phase {
+        LagunaToolPhase::Edit => {
+            "Workspace inspection has completed. Do not run another read-only inspection and do not describe the plan. Create or update the requested files now. You may call apply_patch, or emit a mutating shell call in exactly this shape: <tool_call>shell<arg_key>cmd</arg_key><arg_value>mkdir -p src</arg_value></tool_call>. Adapt the command to the task and keep each call small. If the requested work is already complete, return the final answer."
+        }
+        LagunaToolPhase::Complete => {
+            "The requested file change and its validation both succeeded. Do not call another tool. Return a concise final answer now."
+        }
+        LagunaToolPhase::Initial | LagunaToolPhase::Validate => return prompt_input,
+    };
+    prompt_input.push(serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": instruction}],
+    }));
+    prompt_input
+}
+
+fn is_historical_exec_command(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+        && item.get("name").and_then(serde_json::Value::as_str) == Some("exec_command")
+}
+
+fn next_non_reasoning_item_is_exec_command(input: &[serde_json::Value], start: usize) -> bool {
+    input[start..]
+        .iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning"))
+        .is_some_and(is_historical_exec_command)
+}
+
+fn laguna_tool_phase(input: &[serde_json::Value]) -> LagunaToolPhase {
+    let Some((call_index, call)) = input.iter().enumerate().rev().find(|(_, item)| {
+        matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("function_call" | "custom_tool_call")
+        )
+    }) else {
+        return LagunaToolPhase::Initial;
+    };
+    match call.get("name").and_then(serde_json::Value::as_str) {
+        Some("apply_patch") if historical_tool_call_succeeded(input, call_index, call) => {
+            LagunaToolPhase::Validate
+        }
+        Some("apply_patch") => LagunaToolPhase::Edit,
+        Some("exec_command")
+            if prior_successful_apply_patch(input, call_index)
+                && historical_tool_call_succeeded(input, call_index, call) =>
+        {
+            LagunaToolPhase::Complete
+        }
+        Some("exec_command")
+            if historical_tool_call_succeeded(input, call_index, call)
+                && exec_command_changes_files(call) =>
+        {
+            LagunaToolPhase::Validate
+        }
+        Some("exec_command") => LagunaToolPhase::Edit,
+        _ => LagunaToolPhase::Initial,
+    }
+}
+
+fn prior_successful_apply_patch(input: &[serde_json::Value], before_index: usize) -> bool {
+    input[..before_index]
+        .iter()
+        .enumerate()
+        .any(|(index, item)| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("custom_tool_call")
+                && item.get("name").and_then(serde_json::Value::as_str) == Some("apply_patch")
+                && historical_tool_call_succeeded(input, index, item)
+        })
+}
+
+fn historical_tool_call_succeeded(
+    input: &[serde_json::Value],
+    call_index: usize,
+    call: &serde_json::Value,
+) -> bool {
+    let Some(call_id) = call.get("call_id").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(output) = input[call_index + 1..].iter().find(|item| {
+        matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+    }) else {
+        return false;
+    };
+    let Some(output) = output.get("output").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let normalized = output.to_ascii_lowercase();
+    if normalized.contains("process exited with code ") {
+        return normalized.contains("process exited with code 0");
+    }
+    !["error", "failed", "invalid", "rejected"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn historical_read_only_shell_calls_since_last_mutation(input: &[serde_json::Value]) -> usize {
+    let start = input
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, call)| {
+            let name = call.get("name").and_then(serde_json::Value::as_str);
+            let changes_files = name == Some("apply_patch")
+                || (name == Some("exec_command") && exec_command_changes_files(call));
+            changes_files && historical_tool_call_succeeded(input, *index, call)
+        })
+        .map_or(0, |(index, _)| index + 1);
+    input[start..]
+        .iter()
+        .filter(|call| {
+            call.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                && call.get("name").and_then(serde_json::Value::as_str) == Some("exec_command")
+                && !exec_command_changes_files(call)
+        })
+        .count()
+}
+
+fn exec_command_changes_files(call: &serde_json::Value) -> bool {
+    let Some(arguments) = call
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
+    else {
+        return false;
+    };
+    arguments
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(shell_command_changes_files)
+}
+
+fn shell_command_changes_files(command: &str) -> bool {
+    const MUTATION_MARKERS: &[&str] = &[
+        "mkdir ",
+        "touch ",
+        "cargo init",
+        "cargo new",
+        "cargo fmt",
+        "cat >",
+        "cat <<",
+        "printf ",
+        "tee ",
+        "cp ",
+        "mv ",
+        "install ",
+        "sed -i",
+        "perl -i",
+        "git apply",
+        "apply_patch",
+    ];
+    MUTATION_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+}
+
+fn historical_tool_call_fingerprints(
+    input: &[serde_json::Value],
+) -> InfernoResult<HashMap<String, usize>> {
+    let mut fingerprints = HashMap::new();
+    for item in input.iter().filter(|item| {
+        matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("function_call" | "custom_tool_call")
+        )
+    }) {
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::tokenizer("historical Codex tool call is missing name"))?;
+        let arguments = if item.get("type").and_then(serde_json::Value::as_str)
+            == Some("custom_tool_call")
+        {
+            let input = item
+                .get("input")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::tokenizer("historical Codex custom tool call is missing input")
+                })?;
+            serde_json::json!({"patch": input}).to_string()
+        } else {
+            item.get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::tokenizer("historical Codex tool call is missing arguments"))?
+                .to_string()
+        };
+        let fingerprint = tool_call_fingerprint(&AgentFunctionCall {
+            name: name.to_string(),
+            arguments,
+        })?;
+        *fingerprints.entry(fingerprint).or_insert(0) += 1;
+    }
+    Ok(fingerprints)
+}
+
+fn duplicate_tool_call(
+    output: &AgentOutput,
+    completed_calls: &HashMap<String, usize>,
+) -> InfernoResult<Option<AgentFunctionCall>> {
+    for item in &output.items {
+        let AgentOutputItem::FunctionCall(call) = item else {
+            continue;
+        };
+        let normalized = map_laguna_function_call_to_codex(call.clone());
+        if completed_calls
+            .get(&tool_call_fingerprint(&normalized)?)
+            .copied()
+            .unwrap_or(0)
+            >= LAGUNA_CODEX_MAX_IDENTICAL_TOOL_EXECUTIONS
+        {
+            return Ok(Some(normalized));
+        }
+    }
+    Ok(None)
+}
+
+fn first_tool_outside_contract(
+    output: &AgentOutput,
+    allowed_tools: &HashSet<String>,
+) -> Option<AgentFunctionCall> {
+    output.items.iter().find_map(|item| {
+        let AgentOutputItem::FunctionCall(call) = item else {
+            return None;
+        };
+        let normalized = map_laguna_function_call_to_codex(call.clone());
+        (!allowed_tools.contains(&normalized.name)).then_some(normalized)
+    })
+}
+
+fn first_read_only_shell_call(output: &AgentOutput) -> InfernoResult<Option<AgentFunctionCall>> {
+    for item in &output.items {
+        let AgentOutputItem::FunctionCall(call) = item else {
+            continue;
+        };
+        let normalized = map_laguna_function_call_to_codex(call.clone());
+        if normalized.name != "exec_command" {
+            continue;
+        }
+        let arguments: serde_json::Value = serde_json::from_str(&normalized.arguments)?;
+        let command = arguments
+            .get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::runtime("Laguna shell call requires a string cmd argument"))?;
+        if !shell_command_changes_files(command) {
+            return Ok(Some(normalized));
+        }
+    }
+    Ok(None)
+}
+
+fn tool_call_fingerprint(call: &AgentFunctionCall) -> InfernoResult<String> {
+    let normalized = map_laguna_function_call_to_codex(call.clone());
+    let arguments: serde_json::Value = serde_json::from_str(&normalized.arguments)?;
+    if !arguments.is_object() {
+        return Err(Error::tokenizer(
+            "Codex tool-call arguments must encode a JSON object",
+        ));
+    }
+    Ok(format!(
+        "{}\u{0}{}",
+        normalized.name,
+        serde_json::to_string(&arguments)?
+    ))
+}
+
+fn duplicate_tool_retry_message(call: &AgentFunctionCall) -> serde_json::Value {
+    let mut arguments = call.arguments.chars().take(512).collect::<String>();
+    if arguments.len() < call.arguments.len() {
+        arguments.push_str("...");
+    }
+    let next_action = if call.name == "exec_command" {
+        "The repeated shell command was not run. Do not inspect again. Create or update the requested files now with apply_patch, or emit a mutating shell call such as <tool_call>shell<arg_key>cmd</arg_key><arg_value>printf 'content' > path</arg_value></tool_call>."
+    } else {
+        "Inferno did not run it again. Use the existing result and choose a different action that advances the user's unfinished request now."
+    };
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!(
+                "Your proposed {name} call with arguments {arguments} exactly duplicates a completed call. {next_action}",
+                name = call.name,
+            ),
+        }],
+    })
+}
+
+fn unavailable_tool_retry_message(call: &AgentFunctionCall) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!(
+                "The {name} tool is unavailable in this turn because the inspection step already completed. Do not inspect again. Use apply_patch now if files still need changes, or provide the final answer if the task is complete.",
+                name = call.name,
+            ),
+        }],
+    })
+}
+
+fn repeated_inspection_retry_message() -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "Workspace inspection already completed and Inferno did not run another read-only command. Do not describe the plan. Create or update files now with apply_patch, or emit a mutating shell call in exactly this shape: <tool_call>shell<arg_key>cmd</arg_key><arg_value>mkdir -p src</arg_value></tool_call>. Adapt the command to the task. Do not call ls, find, pwd, cat, head, or another inspection command.",
+        }],
+    })
+}
+
+fn agent_output_has_tool(output: &AgentOutput) -> bool {
+    output
+        .items
+        .iter()
+        .any(|item| matches!(item, AgentOutputItem::FunctionCall(_)))
+}
+
+fn required_tool_retry_message(hit_output_limit: bool) -> serde_json::Value {
+    let reason = if hit_output_limit {
+        "Your previous attempt reached the output limit without completing an action."
+    } else {
+        "Your previous attempt did not provide the required new action."
+    };
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!(
+                "{reason} Do not repeat the plan or print repository contents as prose. Call a tool immediately with a different action that advances the user's unfinished request."
+            ),
+        }],
+    })
 }
 
 fn validate_laguna_gguf_codex_envelope(request: &ResponsesRequest) -> InfernoResult<()> {
@@ -556,7 +1080,12 @@ fn emit_laguna_agent_output(
                 stream.message_done(&text)?;
             }
             AgentOutputItem::FunctionCall(call) => {
-                emit_function_call(call, allowed_tools, model_name, stream)?;
+                emit_function_call(
+                    map_laguna_function_call_to_codex(call),
+                    allowed_tools,
+                    model_name,
+                    stream,
+                )?;
             }
         }
     }
@@ -609,7 +1138,42 @@ fn emit_function_call(
         "call_inferno_{}",
         NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
     );
+    if call.name == "apply_patch" {
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)?;
+        let patch = arguments
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::runtime("Laguna apply_patch call requires a string patch argument")
+            })?;
+        let patch = normalize_laguna_apply_patch(patch);
+        return stream.custom_tool_call_done(&call_id, &call.name, &patch);
+    }
     stream.function_call_done(&call_id, &call.name, &call.arguments)
+}
+
+fn normalize_laguna_apply_patch(patch: &str) -> String {
+    let mut normalized = String::with_capacity(patch.len());
+    let mut add_file_body = false;
+    for line in patch.lines() {
+        if line.starts_with("*** Add File: ") {
+            add_file_body = true;
+            normalized.push_str(line);
+        } else if line.starts_with("*** ") {
+            add_file_body = false;
+            normalized.push_str(line);
+        } else if add_file_body && !line.starts_with('+') {
+            normalized.push('+');
+            normalized.push_str(line);
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push('\n');
+    }
+    if !patch.ends_with('\n') {
+        normalized.pop();
+    }
+    normalized
 }
 
 fn validate_requested_model(requested: &str, loaded: &str) -> InfernoResult<()> {
@@ -624,7 +1188,12 @@ fn validate_requested_model(requested: &str, loaded: &str) -> InfernoResult<()> 
 fn tool_names(tools: &[serde_json::Value]) -> InfernoResult<HashSet<String>> {
     tools
         .iter()
-        .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+        .filter(|tool| {
+            matches!(
+                tool.get("type").and_then(serde_json::Value::as_str),
+                Some("function" | "custom")
+            )
+        })
         .filter(|tool| {
             tool.get("name")
                 .and_then(serde_json::Value::as_str)
@@ -643,6 +1212,7 @@ fn tool_names(tools: &[serde_json::Value]) -> InfernoResult<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokenizer::streamable_agent_text;
 
     use super::*;
 
@@ -651,16 +1221,248 @@ mod tests {
         let names = tool_names(&[
             json!({"type": "function", "name": "exec_command"}),
             json!({"type": "function", "name": "write_stdin"}),
+            json!({"type": "custom", "name": "apply_patch"}),
             json!({"type": "function", "name": "update_plan"}),
             json!({"type": "namespace", "name": "plugin", "tools": []}),
             json!({"type": "web_search", "external_web_access": false}),
         ])
         .unwrap();
 
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
         assert!(names.contains("exec_command"));
         assert!(names.contains("write_stdin"));
+        assert!(names.contains("apply_patch"));
         assert!(!names.contains("update_plan"));
+    }
+
+    #[test]
+    fn laguna_moves_through_inspect_edit_validate_and_complete_phases() {
+        let tools = vec![
+            json!({"type": "function", "name": "exec_command"}),
+            json!({"type": "function", "name": "write_stdin"}),
+            json!({"type": "custom", "name": "apply_patch"}),
+        ];
+        let after_inspection = vec![
+            json!({"type": "message", "role": "assistant", "content": "Inspecting."}),
+            json!({"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_1"}),
+            json!({"type": "function_call_output", "call_id": "call_1", "output": "README.md"}),
+        ];
+
+        let inspection_phase = laguna_tool_phase(&after_inspection);
+        assert_eq!(inspection_phase, LagunaToolPhase::Edit);
+        assert_eq!(
+            historical_read_only_shell_calls_since_last_mutation(&after_inspection),
+            1
+        );
+        let inspection_names = tool_names(&laguna_prompt_tools(inspection_phase, &tools)).unwrap();
+        assert!(inspection_names.contains("exec_command"));
+        assert!(inspection_names.contains("write_stdin"));
+        assert!(inspection_names.contains("apply_patch"));
+        let prompt_input =
+            laguna_prompt_input(&after_inspection, &inspection_names, inspection_phase, true);
+        assert_eq!(prompt_input.len(), 2);
+        assert_eq!(
+            prompt_input[0]
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("function_call_output")
+        );
+        assert_eq!(
+            prompt_input[1]
+                .get("role")
+                .and_then(serde_json::Value::as_str),
+            Some("user")
+        );
+
+        let mut after_edit = after_inspection;
+        after_edit.push(json!({
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch\n",
+            "call_id": "call_2"
+        }));
+        after_edit.push(json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call_2",
+            "output": "Done!"
+        }));
+        let edit_phase = laguna_tool_phase(&after_edit);
+        assert_eq!(edit_phase, LagunaToolPhase::Validate);
+        assert_eq!(
+            historical_read_only_shell_calls_since_last_mutation(&after_edit),
+            0
+        );
+        let edit_names = tool_names(&laguna_prompt_tools(edit_phase, &tools)).unwrap();
+        assert!(edit_names.contains("exec_command"));
+
+        let mut after_failed_edit = after_edit.clone();
+        after_failed_edit.last_mut().unwrap()["output"] =
+            json!("apply_patch verification failed: invalid hunk");
+        let failed_edit_phase = laguna_tool_phase(&after_failed_edit);
+        assert_eq!(failed_edit_phase, LagunaToolPhase::Edit);
+        let failed_edit_names =
+            tool_names(&laguna_prompt_tools(failed_edit_phase, &tools)).unwrap();
+        assert!(failed_edit_names.contains("exec_command"));
+
+        after_edit.push(json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"cargo test\"}",
+            "call_id": "call_3"
+        }));
+        after_edit.push(json!({
+            "type": "function_call_output",
+            "call_id": "call_3",
+            "output": "Process exited with code 0\nOutput:\ntest result: ok"
+        }));
+        let complete_phase = laguna_tool_phase(&after_edit);
+        assert_eq!(complete_phase, LagunaToolPhase::Complete);
+        assert!(laguna_prompt_tools(complete_phase, &tools).is_empty());
+    }
+
+    #[test]
+    fn distinguishes_repeated_inspection_from_shell_file_changes() {
+        let inspection = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "shell".to_string(),
+                arguments: json!({"cmd": "find . -maxdepth 2 -type f"}).to_string(),
+            })],
+        };
+        assert!(first_read_only_shell_call(&inspection).unwrap().is_some());
+
+        let mutation = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "shell".to_string(),
+                arguments: json!({"cmd": "mkdir -p src"}).to_string(),
+            })],
+        };
+        assert!(first_read_only_shell_call(&mutation).unwrap().is_none());
+    }
+
+    #[test]
+    fn laguna_keeps_shell_when_apply_patch_is_not_available() {
+        let tools = vec![json!({"type": "function", "name": "exec_command"})];
+        let input = vec![json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"ls\"}",
+            "call_id": "call_1"
+        })];
+
+        let names = tool_names(&laguna_prompt_tools(laguna_tool_phase(&input), &tools)).unwrap();
+        assert!(names.contains("exec_command"));
+    }
+
+    #[test]
+    fn detects_generated_tools_outside_the_turn_contract() {
+        let output = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "shell".to_string(),
+                arguments: json!({"cmd": "ls"}).to_string(),
+            })],
+        };
+
+        let call =
+            first_tool_outside_contract(&output, &HashSet::from(["apply_patch".to_string()]))
+                .unwrap();
+        assert_eq!(call.name, "exec_command");
+    }
+
+    #[test]
+    fn permits_one_repeat_then_blocks_the_third_identical_shell_call() {
+        let completed_once = historical_tool_call_fingerprints(&[json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"ls -la\"}",
+            "call_id": "call_1"
+        })])
+        .unwrap();
+        let output = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"ls -la\"}".to_string(),
+            })],
+        };
+        assert!(duplicate_tool_call(&output, &completed_once)
+            .unwrap()
+            .is_none());
+
+        let completed_twice = historical_tool_call_fingerprints(&[
+            json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"ls -la\"}",
+                "call_id": "call_1"
+            }),
+            json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"ls -la\"}",
+                "call_id": "call_2"
+            }),
+        ])
+        .unwrap();
+        let duplicate = duplicate_tool_call(&output, &completed_twice)
+            .unwrap()
+            .expect("expected duplicate");
+
+        assert_eq!(duplicate.name, "exec_command");
+        assert_eq!(duplicate.arguments, "{\"cmd\":\"ls -la\"}");
+    }
+
+    #[test]
+    fn permits_new_tool_arguments_after_a_completed_call() {
+        let completed = historical_tool_call_fingerprints(&[json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"ls -la\"}",
+            "call_id": "call_1"
+        })])
+        .unwrap();
+        let output = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"cargo test\"}".to_string(),
+            })],
+        };
+
+        assert!(duplicate_tool_call(&output, &completed).unwrap().is_none());
+    }
+
+    #[test]
+    fn emits_laguna_apply_patch_as_a_responses_custom_tool_call() {
+        let output = AgentOutput {
+            reasoning: String::new(),
+            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
+                name: "apply_patch".to_string(),
+                arguments: json!({"patch": "*** Begin Patch\n*** End Patch\n"}).to_string(),
+            })],
+        };
+        let allowed_tools = HashSet::from(["apply_patch".to_string()]);
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, LAGUNA_GGUF_CODEX_MODEL_ID).unwrap();
+
+        emit_laguna_agent_output(output, "", &allowed_tools, "Laguna", &mut stream).unwrap();
+
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("\"type\":\"custom_tool_call\""));
+        assert!(rendered.contains("\"name\":\"apply_patch\""));
+        assert!(rendered.contains("*** Begin Patch"));
+    }
+
+    #[test]
+    fn normalizes_missing_add_file_prefixes_without_changing_valid_lines() {
+        let malformed = "*** Begin Patch\n*** Add File: Cargo.toml\n[package]\n+name = \"merkle\"\n\n*** Add File: src/lib.rs\npub fn root() {}\n*** End Patch";
+
+        assert_eq!(
+            normalize_laguna_apply_patch(malformed),
+            "*** Begin Patch\n*** Add File: Cargo.toml\n+[package]\n+name = \"merkle\"\n+\n*** Add File: src/lib.rs\n+pub fn root() {}\n*** End Patch"
+        );
     }
 
     #[test]
@@ -681,6 +1483,7 @@ mod tests {
                     .to_string(),
             input: Vec::new(),
             tools: Vec::new(),
+            reasoning: None,
             max_output_tokens: None,
             stream: true,
         };
@@ -708,7 +1511,7 @@ mod tests {
             Some(128)
         );
         assert_eq!(
-            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, None, None, 4_000).unwrap(),
+            laguna_codex_max_new_tokens(LAGUNA_GGUF_CODEX_MODEL_ID, None, None, 32_672).unwrap(),
             Some(96)
         );
     }
@@ -724,7 +1527,7 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("compact"));
-        assert!(error.to_string().contains("4096"));
+        assert!(error.to_string().contains("32768"));
     }
 
     #[test]

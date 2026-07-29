@@ -1,5 +1,6 @@
 use common::{Error, Result};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 use crate::{ChatPrompt, LagunaThinkingMode};
 
@@ -13,6 +14,9 @@ const ARG_KEY_OPEN: &str = "<arg_key>";
 const ARG_KEY_CLOSE: &str = "</arg_key>";
 const ARG_VALUE_OPEN: &str = "<arg_value>";
 const ARG_VALUE_CLOSE: &str = "</arg_value>";
+const CODEX_EXEC_COMMAND: &str = "exec_command";
+const LAGUNA_SHELL: &str = "shell";
+const CODEX_APPLY_PATCH: &str = "apply_patch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentFunctionCall {
@@ -33,9 +37,52 @@ pub struct AgentOutput {
     pub items: Vec<AgentOutputItem>,
 }
 
+pub fn map_laguna_function_call_to_codex(mut call: AgentFunctionCall) -> AgentFunctionCall {
+    if call.name == LAGUNA_SHELL {
+        call.name = CODEX_EXEC_COMMAND.to_string();
+    }
+    if call.name == CODEX_EXEC_COMMAND {
+        call.arguments = normalize_exec_command_arguments(&call.arguments);
+    }
+    call
+}
+
+fn normalize_exec_command_arguments(arguments: &str) -> String {
+    let Ok(mut arguments_json) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let Some(arguments_object) = arguments_json.as_object_mut() else {
+        return arguments.to_string();
+    };
+    if arguments_object
+        .get("workdir")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return arguments.to_string();
+    }
+    let Some(command) = arguments_object.get("cmd").and_then(Value::as_str) else {
+        return arguments.to_string();
+    };
+    let command = command.trim_start();
+    let Some(after_cd) = command.strip_prefix("cd ") else {
+        return arguments.to_string();
+    };
+    let Some(separator) = after_cd.find("&&") else {
+        return arguments.to_string();
+    };
+    let target = after_cd[..separator].trim();
+    if !target.starts_with('/') && !target.starts_with("'/") && !target.starts_with("\"/") {
+        return arguments.to_string();
+    }
+    let normalized_command = after_cd[separator + 2..].trim_start().to_string();
+    arguments_object.insert("cmd".to_string(), Value::String(normalized_command));
+    serde_json::to_string(&arguments_json).unwrap_or_else(|_| arguments.to_string())
+}
+
 /// Direct Codex functions represented by GLM-5.2's native tool grammar.
 pub fn is_supported_codex_function(name: &str) -> bool {
-    matches!(name, "exec_command" | "write_stdin")
+    matches!(name, "exec_command" | "write_stdin" | "apply_patch")
 }
 
 /// Renders the Codex Responses input using GLM-5.2's native chat contract.
@@ -90,12 +137,11 @@ pub fn render_laguna_codex_prompt(
     rendered.push_str(system);
     render_laguna_tools(&mut rendered, &normalized_tools)?;
     rendered.push_str("</system>\n");
-    for item in input {
-        render_laguna_input_item(&mut rendered, item)?;
-    }
-    rendered.push_str("<assistant><think>");
-    if thinking_mode == LagunaThinkingMode::Disabled {
-        rendered.push_str(THINK_END);
+    render_laguna_input_items(&mut rendered, input)?;
+    rendered.push_str("<assistant>");
+    match thinking_mode {
+        LagunaThinkingMode::Enabled => rendered.push_str("<think>"),
+        LagunaThinkingMode::Disabled => rendered.push_str(THINK_END),
     }
     Ok(ChatPrompt { rendered })
 }
@@ -103,8 +149,9 @@ pub fn render_laguna_codex_prompt(
 /// Parses one complete GLM or Laguna generation into Responses-compatible
 /// output items. Both checkpoints use the same reasoning and tool-call tags.
 pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
+    let output = complete_terminated_apply_patch(output);
     let (reasoning, visible) = output
-        .split_once(THINK_END)
+        .rsplit_once(THINK_END)
         .ok_or_else(|| Error::tokenizer("GLM agent output ended before the </think> boundary"))?;
     let mut items = Vec::new();
     let mut remaining = visible;
@@ -127,6 +174,33 @@ pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
         reasoning: reasoning.trim().to_string(),
         items,
     })
+}
+
+fn complete_terminated_apply_patch(output: &str) -> Cow<'_, str> {
+    const APPLY_PATCH_CALL: &str = "<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>";
+    const PATCH_END: &str = "*** End Patch";
+
+    if output.contains(TOOL_CALL_CLOSE) {
+        return Cow::Borrowed(output);
+    }
+    let Some(call_start) = output.rfind(APPLY_PATCH_CALL) else {
+        return Cow::Borrowed(output);
+    };
+    let call = &output[call_start..];
+    let Some(patch_end) = call.rfind(PATCH_END) else {
+        return Cow::Borrowed(output);
+    };
+    let after_patch = &call[patch_end + PATCH_END.len()..];
+    if !after_patch.trim().is_empty() && after_patch.trim() != ARG_VALUE_CLOSE {
+        return Cow::Borrowed(output);
+    }
+
+    let mut completed = output.to_string();
+    if after_patch.trim().is_empty() {
+        completed.push_str(ARG_VALUE_CLOSE);
+    }
+    completed.push_str(TOOL_CALL_CLOSE);
+    Cow::Owned(completed)
 }
 
 /// Returns a parsed agent turn as soon as one complete function call exists.
@@ -200,7 +274,34 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn normalize_laguna_tools(tools: &[Value]) -> Result<Vec<Value>> {
-    normalize_tools(tools)?
+    let mut normalized = normalize_tools(tools)?;
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) != Some("custom")
+            || tool.get("name").and_then(Value::as_str) != Some(CODEX_APPLY_PATCH)
+        {
+            continue;
+        }
+        normalized.push(serde_json::json!({
+            "type": "function",
+            "name": CODEX_APPLY_PATCH,
+            "description": tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Apply a patch to files in the workspace."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "Complete apply_patch payload."
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        }));
+    }
+    normalized
         .into_iter()
         .map(|tool| {
             let mut function = tool
@@ -208,6 +309,9 @@ fn normalize_laguna_tools(tools: &[Value]) -> Result<Vec<Value>> {
                 .cloned()
                 .ok_or_else(|| Error::tokenizer("normalized Laguna tool must be an object"))?;
             function.remove("type");
+            if function.get("name").and_then(Value::as_str) == Some(CODEX_EXEC_COMMAND) {
+                function.insert("name".to_string(), Value::String(LAGUNA_SHELL.to_string()));
+            }
             Ok(serde_json::json!({
                 "type": "function",
                 "function": function,
@@ -227,7 +331,27 @@ fn render_laguna_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
         rendered.push_str(&serde_json::to_string(tool)?);
         rendered.push('\n');
     }
-    rendered.push_str("</available_tools>");
+    let has_apply_patch = tools.iter().any(|tool| {
+        tool.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some(CODEX_APPLY_PATCH)
+    });
+    rendered.push_str(
+        "</available_tools>\n\nWhen repository work requires a tool, call it immediately. Do not describe the planned command, repeat the task, or print file contents as assistant text before the call.\n\nUse exactly this function-call format:\n<tool_call>{function-name}<arg_key>{argument-name}</arg_key><arg_value>{argument-value}</arg_value></tool_call>\n",
+    );
+    if has_apply_patch {
+        rendered.push_str(
+            "\nExample:\n<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch</arg_value></tool_call>\n\nThe patch must start with `*** Begin Patch`, end with `*** End Patch`, and prefix every added content line with `+`. Batch workspace inspection into as few shell calls as practical, then use apply_patch for file changes.",
+        );
+    } else {
+        rendered.push_str(
+            "\nExample:\n<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>",
+        );
+    }
+    rendered.push_str(
+        "\n\nUse the exact tool and argument names from the schemas. Finish the current response after emitting one complete tool call. After receiving a <tool_response>, use that result and continue the task instead of repeating the completed call.",
+    );
     Ok(())
 }
 
@@ -290,21 +414,65 @@ fn render_input_item(rendered: &mut String, item: &Value) -> Result<()> {
     }
 }
 
-fn render_laguna_input_item(rendered: &mut String, item: &Value) -> Result<()> {
-    let item_type = item
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::tokenizer("Codex Responses input item is missing a string type"))?;
-    match item_type {
-        "message" => render_laguna_message(rendered, item),
-        "function_call" | "custom_tool_call" => render_laguna_historical_tool_call(rendered, item),
-        "function_call_output" | "custom_tool_call_output" => {
-            render_laguna_tool_output(rendered, item)
+fn render_laguna_input_items(rendered: &mut String, items: &[Value]) -> Result<()> {
+    let mut assistant_open = false;
+    for (index, item) in items.iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex Responses input item is missing a string type")
+        })?;
+        match item_type {
+            "reasoning" => {}
+            "message" if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+                close_laguna_assistant(rendered, &mut assistant_open);
+                let content =
+                    visible_content(item.get("content").ok_or_else(|| {
+                        Error::tokenizer("Codex message input is missing content")
+                    })?)?;
+                rendered.push_str("<assistant></think>");
+                if !next_non_reasoning_item_is_tool_call(items, index + 1) {
+                    rendered.push_str(&content);
+                }
+                assistant_open = true;
+            }
+            "function_call" | "custom_tool_call" => {
+                if !assistant_open {
+                    rendered.push_str("<assistant></think>");
+                    assistant_open = true;
+                }
+                render_laguna_tool_call(rendered, item)?;
+            }
+            "message" => {
+                close_laguna_assistant(rendered, &mut assistant_open);
+                render_laguna_message(rendered, item)?;
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                close_laguna_assistant(rendered, &mut assistant_open);
+                render_laguna_tool_output(rendered, item)?;
+            }
+            other => {
+                return Err(Error::tokenizer(format!(
+                    "unsupported Codex Responses input item type {other:?}"
+                )));
+            }
         }
-        "reasoning" => Ok(()),
-        other => Err(Error::tokenizer(format!(
-            "unsupported Codex Responses input item type {other:?}"
-        ))),
+    }
+    close_laguna_assistant(rendered, &mut assistant_open);
+    Ok(())
+}
+
+fn next_non_reasoning_item_is_tool_call(items: &[Value], start: usize) -> bool {
+    items[start..]
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"))
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| matches!(item_type, "function_call" | "custom_tool_call"))
+}
+
+fn close_laguna_assistant(rendered: &mut String, assistant_open: &mut bool) {
+    if *assistant_open {
+        rendered.push_str("</assistant>\n");
+        *assistant_open = false;
     }
 }
 
@@ -352,9 +520,9 @@ fn render_laguna_message(rendered: &mut String, item: &Value) -> Result<()> {
             rendered.push_str("</system>\n");
         }
         "assistant" => {
-            rendered.push_str("<assistant><think></think>");
-            rendered.push_str(&content);
-            rendered.push_str("</assistant>\n");
+            return Err(Error::tokenizer(
+                "Laguna assistant message reached the non-assistant renderer",
+            ));
         }
         other => {
             return Err(Error::tokenizer(format!(
@@ -371,12 +539,14 @@ fn render_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()
     render_tool_call(rendered, name, &arguments)
 }
 
-fn render_laguna_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
+fn render_laguna_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
     let (name, arguments) = historical_tool_call(item)?;
-    rendered.push_str("<assistant><think></think>");
-    render_tool_call(rendered, name, &arguments)?;
-    rendered.push_str("</assistant>\n");
-    Ok(())
+    let name = if name == CODEX_EXEC_COMMAND {
+        LAGUNA_SHELL
+    } else {
+        name
+    };
+    render_tool_call(rendered, name, &arguments)
 }
 
 fn historical_tool_call(item: &Value) -> Result<(&str, Map<String, Value>)> {
@@ -384,9 +554,17 @@ fn historical_tool_call(item: &Value) -> Result<(&str, Map<String, Value>)> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::tokenizer("Codex function_call input is missing a string name"))?;
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        let input = item.get("input").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex custom_tool_call input is missing string input")
+        })?;
+        return Ok((
+            name,
+            Map::from_iter([("patch".to_string(), Value::String(input.to_string()))]),
+        ));
+    }
     let arguments = item
         .get("arguments")
-        .or_else(|| item.get("input"))
         .and_then(Value::as_str)
         .ok_or_else(|| Error::tokenizer("Codex function_call input is missing string arguments"))?;
     let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
@@ -440,7 +618,9 @@ fn render_laguna_tool_output(rendered: &mut String, item: &Value) -> Result<()> 
     let output = visible_content(output)?;
     rendered.push_str("<tool_response>");
     rendered.push_str(&output);
-    rendered.push_str("</tool_response>\n");
+    rendered.push_str(
+        "</tool_response>\n<system>The tool call above has already run. Its output and exit code are the result, including when the exit code is non-zero. Never repeat the same call or an equivalent inspection. Use the result and perform a different action that advances the next unfinished requirement.</system>\n",
+    );
     Ok(())
 }
 
@@ -591,6 +771,7 @@ mod tests {
             "Work carefully.",
             &[
                 json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List files"}]}),
+                json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Inspecting."}]}),
                 json!({"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_1"}),
                 json!({"type": "function_call_output", "call_id": "call_1", "output": "README.md"}),
             ],
@@ -610,19 +791,115 @@ mod tests {
             .starts_with("〈|EOS|〉<system>Work carefully."));
         assert!(prompt.rendered.contains("### Tools"));
         assert!(prompt.rendered.contains("<available_tools>"));
-        assert!(prompt.rendered.contains("\"name\":\"exec_command\""));
+        assert!(prompt.rendered.contains("\"name\":\"shell\""));
+        assert!(!prompt.rendered.contains("\"name\":\"exec_command\""));
+        assert!(prompt.rendered.contains(
+            "<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        ));
         assert!(prompt
             .rendered
             .contains("\"function\":{\"description\":\"Run a command\""));
         assert!(!prompt.rendered.contains("\"strict\""));
         assert!(prompt.rendered.contains("<user>List files</user>"));
         assert!(prompt.rendered.contains(
-            "<assistant><think></think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls</arg_value></tool_call></assistant>"
+            "<assistant></think><tool_call>shell<arg_key>cmd</arg_key><arg_value>ls</arg_value></tool_call></assistant>"
         ));
+        assert!(!prompt.rendered.contains("Inspecting."));
+        assert_eq!(prompt.rendered.matches("<assistant></think>").count(), 1);
         assert!(prompt
             .rendered
             .contains("<tool_response>README.md</tool_response>"));
+        assert!(prompt
+            .rendered
+            .contains("Never repeat the same call or an equivalent inspection"));
         assert!(prompt.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn maps_laguna_shell_calls_back_to_codex_exec_command() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: r#"{"cmd":"pwd"}"#.to_string(),
+        };
+
+        assert_eq!(
+            map_laguna_function_call_to_codex(call),
+            AgentFunctionCall {
+                name: CODEX_EXEC_COMMAND.to_string(),
+                arguments: r#"{"cmd":"pwd"}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn removes_a_redundant_absolute_cd_when_codex_already_has_workdir() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: json!({
+                "cmd": "cd /tmp/misspelled-path && mkdir -p src",
+                "workdir": "/tmp/correct-path"
+            })
+            .to_string(),
+        };
+
+        let mapped = map_laguna_function_call_to_codex(call);
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapped.arguments).unwrap(),
+            json!({"cmd": "mkdir -p src", "workdir": "/tmp/correct-path"})
+        );
+    }
+
+    #[test]
+    fn preserves_relative_cd_commands_inside_the_codex_workdir() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: json!({
+                "cmd": "cd crates/core && cargo test",
+                "workdir": "/tmp/project"
+            })
+            .to_string(),
+        };
+
+        let mapped = map_laguna_function_call_to_codex(call);
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapped.arguments).unwrap(),
+            json!({"cmd": "cd crates/core && cargo test", "workdir": "/tmp/project"})
+        );
+    }
+
+    #[test]
+    fn renders_codex_freeform_apply_patch_as_a_laguna_function() {
+        let patch = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+        let prompt = render_laguna_codex_prompt(
+            "Edit the workspace.",
+            &[
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Create hello.txt"}]}),
+                json!({"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "call_1"}),
+                json!({"type": "custom_tool_call_output", "call_id": "call_1", "output": "Done!"}),
+            ],
+            &[json!({
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch"
+            })],
+            LagunaThinkingMode::Disabled,
+        )
+        .unwrap();
+
+        assert!(prompt.rendered.contains("\"name\":\"apply_patch\""));
+        assert!(prompt.rendered.contains("\"patch\":{\"description\""));
+        assert!(prompt
+            .rendered
+            .contains("<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch"));
+        assert!(!prompt.rendered.contains(
+            "<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        ));
+        assert!(prompt
+            .rendered
+            .contains("<tool_response>Done!</tool_response>"));
+        assert!(prompt
+            .rendered
+            .contains("Batch workspace inspection into as few shell calls as practical"));
     }
 
     #[test]
@@ -635,7 +912,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(prompt.rendered.ends_with("<assistant><think></think>"));
+        assert!(prompt.rendered.ends_with("<assistant></think>"));
     }
 
     #[test]
@@ -679,6 +956,16 @@ mod tests {
         assert_eq!(
             output.items,
             vec![AgentOutputItem::Text("The answer is Rome.".to_string())]
+        );
+    }
+
+    #[test]
+    fn uses_the_final_reasoning_boundary_when_laguna_repeats_it() {
+        let output = parse_agent_output("</think>draft answer</think>The final answer.").unwrap();
+
+        assert_eq!(
+            output.items,
+            vec![AgentOutputItem::Text("The final answer.".to_string())]
         );
     }
 
@@ -759,6 +1046,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("<arg_value>"));
+    }
+
+    #[test]
+    fn recovers_a_complete_apply_patch_with_only_the_xml_suffix_missing() {
+        let output = parse_agent_output(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch",
+        )
+        .unwrap();
+        let AgentOutputItem::FunctionCall(call) = &output.items[0] else {
+            panic!("expected function call");
+        };
+        assert_eq!(call.name, "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"patch": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"})
+        );
+    }
+
+    #[test]
+    fn rejects_an_apply_patch_whose_patch_body_is_incomplete() {
+        assert!(parse_agent_output(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello"
+        )
+        .is_err());
     }
 
     #[test]

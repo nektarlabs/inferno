@@ -16,9 +16,9 @@ use tokenizers::{
 };
 
 pub use agent::{
-    is_supported_codex_function, parse_agent_output, parse_complete_agent_tool_call,
-    render_codex_prompt, render_laguna_codex_prompt, streamable_agent_text, AgentFunctionCall,
-    AgentOutput, AgentOutputItem,
+    is_supported_codex_function, map_laguna_function_call_to_codex, parse_agent_output,
+    parse_complete_agent_tool_call, render_codex_prompt, render_laguna_codex_prompt,
+    streamable_agent_text, AgentFunctionCall, AgentOutput, AgentOutputItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
