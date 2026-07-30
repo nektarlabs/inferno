@@ -6,9 +6,9 @@
 
 Inferno is a lightweight Rust inference engine for running selected
 Mixture-of-Experts models on Apple Silicon through native Metal kernels. It
-currently supports GLM-5.2 Q2 and two exact Laguna S 2.1 artifacts: the
-official INT4 Safetensors checkpoint and Antirez's mixed Q2_K/Q3_K GGUF. Its
-primary target is a MacBook Pro with 64 GB of unified memory.
+currently supports GLM-5.2 Q2, two exact Laguna S 2.1 artifacts, and the
+official Laguna XS 2.1 Q4_K_M GGUF. Its primary target is a MacBook Pro with
+64 GB of unified memory.
 
 The name reflects the engineering challenge: these models are larger than the
 available memory, so useful local inference requires careful coordination of
@@ -27,7 +27,8 @@ independently instead of becoming a general inference framework.
 - GLM-5.2 Q2 through `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf`.
 - Laguna S 2.1 through either its official INT4 Safetensors checkpoint or
   `laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf`.
-- Exact top-8 routing for GLM and exact top-10 routing for Laguna.
+- Laguna XS 2.1 through the official `Laguna-XS-2.1-Q4_K_M.gguf`.
+- Exact top-8 routing for GLM and Laguna XS; exact top-10 routing for Laguna S.
 - Native Metal execution with no CPU compute fallback.
 - Interactive chat, one-shot generation, and a streaming Responses API.
 - Persistent expert caches across chat turns and server requests.
@@ -46,6 +47,7 @@ or Safetensors architectures and quantization formats.
 | GLM-5.2 Q2 | — | **1.711 tokens/s** |
 | Laguna S 2.1 INT4 Safetensors | — | **4.680 tokens/s** |
 | Laguna S 2.1 mixed Q2_K/Q3_K GGUF | **494.48 tokens/s** | **54.53 tokens/s** |
+| Laguna XS 2.1 Q4_K_M GGUF | **145.79 tokens/s** | **136.11 tokens/s** |
 
 Best observed results on a 64 GB Apple Silicon MacBook Pro using release builds
 and exact routing. A dash means that a comparable prefill result has not been
@@ -63,6 +65,8 @@ thermal state, and memory pressure.
 - Laguna requires approximately 72 GB for its INT4 Safetensors checkpoint or
   45 GB for the Antirez GGUF; additional free space is required for build
   outputs and normal system operation.
+- Laguna XS Q4_K_M requires approximately 21 GB, plus build outputs and normal
+  system headroom.
 
 Install the Hugging Face CLI with Homebrew if needed:
 
@@ -210,6 +214,52 @@ The directory must contain `config.json`, `generation_config.json`,
 `tokenizer.json`, `model.safetensors.index.json`, and all 15
 `model-*.safetensors` shards.
 
+### Laguna XS 2.1
+
+Inferno supports the exact official Q4_K_M artifact:
+
+```text
+poolside/Laguna-XS-2.1-GGUF
+Laguna-XS-2.1-Q4_K_M.gguf
+```
+
+Download the GGUF and its original configuration and tokenizer sidecars:
+
+```bash
+mkdir -p models/laguna-xs-2.1-gguf
+hf download poolside/Laguna-XS-2.1-GGUF \
+  Laguna-XS-2.1-Q4_K_M.gguf \
+  --local-dir models/laguna-xs-2.1-gguf
+hf download poolside/Laguna-XS-2.1 \
+  config.json \
+  generation_config.json \
+  tokenizer.json \
+  tokenizer_config.json \
+  --local-dir models/laguna-xs-2.1-gguf
+```
+
+The final directory is:
+
+```text
+models/laguna-xs-2.1-gguf/
+  config.json
+  generation_config.json
+  tokenizer.json
+  tokenizer_config.json
+  Laguna-XS-2.1-Q4_K_M.gguf
+```
+
+Published GGUF size: `20,274,300,032` bytes. SHA-256:
+`1ac7079101fca5a6df8c5a7523a3c30ea7d1c0e4b1258090e7d6d4039287f6cb`.
+
+Inferno reuses Laguna S's tokenizer grammar, full/sliding attention schedule,
+Q/K normalization, RoPE, grouped-query attention, F16 KV cache, runtime,
+streaming, chat, and Responses API. The XS path remains separate where the
+models differ: its exact 40-layer config, top-8 routing, Q4_K/Q6_K tensor
+contract, native K-quant Metal projections and MoE, and preserved reasoning
+history. XS kernels are compiled lazily and do not enter the Laguna S or GLM
+kernel libraries.
+
 ## Build
 
 ```bash
@@ -243,6 +293,13 @@ target/release/inferno chat \
   --model models/laguna-s-2.1-gguf
 ```
 
+Start Laguna XS chat:
+
+```bash
+target/release/inferno chat \
+  --model models/laguna-xs-2.1-gguf
+```
+
 Inferno detects the architecture from `config.json` and the weight container
 from the exact files in the model directory. The GGUF path reuses its mapped
 weights and resets only sequence-specific F16 KV state before re-prefilling the
@@ -265,6 +322,14 @@ target/release/inferno generate \
   --prompt "Tell me the capital of Italy."
 ```
 
+Run it with Laguna XS:
+
+```bash
+target/release/inferno generate \
+  --model models/laguna-xs-2.1-gguf \
+  --prompt "Tell me the capital of Italy."
+```
+
 Laguna returns direct answers in `generate`, `chat`, and `serve` by default.
 Add `--thinking` to the selected command to enable reasoning explicitly.
 Thinking mode closes the reasoning section automatically if an eight-token
@@ -276,8 +341,8 @@ context limit.
 
 ### Responses API and Codex
 
-Inferno serves either model through its local streaming Responses API. Start
-the selected persistent model process in one terminal.
+Inferno serves one selected model through its local streaming Responses API.
+Start the persistent model process in one terminal.
 
 GLM:
 
@@ -291,9 +356,16 @@ Laguna:
 target/release/inferno serve --model models/laguna-s-2.1-gguf
 ```
 
+Laguna XS:
+
+```bash
+target/release/inferno serve --model models/laguna-xs-2.1-gguf
+```
+
 The server exposes only the loaded model from `/v1/models`. Requests must use
 `glm-5.2-q2` for GLM, `laguna-s-2.1-int4` for Laguna Safetensors, or
-`laguna-s-2.1-gguf` for the Antirez GGUF.
+`laguna-s-2.1-gguf` for the Antirez GGUF. Laguna XS uses
+`laguna-xs-2.1-gguf`.
 
 Install the included Codex catalog and profiles:
 
@@ -302,6 +374,7 @@ mkdir -p ~/.codex
 cp examples/inferno.config.toml ~/.codex/inferno.config.toml
 cp examples/inferno-laguna.config.toml ~/.codex/inferno-laguna.config.toml
 cp examples/inferno-laguna-gguf.config.toml ~/.codex/inferno-laguna-gguf.config.toml
+cp examples/inferno-laguna-xs-gguf.config.toml ~/.codex/inferno-laguna-xs-gguf.config.toml
 cp examples/inferno.models.json ~/.codex/inferno.models.json
 ```
 
@@ -326,6 +399,12 @@ Start Codex with the Antirez GGUF:
 
 ```bash
 codex --profile inferno-laguna-gguf
+```
+
+Start Codex with Laguna XS:
+
+```bash
+codex --profile inferno-laguna-xs-gguf
 ```
 
 Codex sends each turn through the streaming Responses API. Inferno translates
@@ -356,7 +435,7 @@ target/release/inferno generate \
 ```
 
 Replace the model path with `models/laguna-s-2.1-gguf` to measure the Antirez
-GGUF.
+GGUF, or `models/laguna-xs-2.1-gguf` to measure Laguna XS.
 
 Record memory telemetry without mixing it into generated text:
 
@@ -420,11 +499,13 @@ the mapped INT4 tensors, not second copies. On the 64 GB target, the automatic
 working-set cap is 24 GB; smaller available-memory budgets reduce it
 automatically. Missing experts are prefetched with parallel I/O workers.
 
-The Antirez GGUF path has no separate logical expert cache. Each layer's
-packed Q2_K or Q3_K expert tensor remains memory-mapped, and Metal receives a
-zero-copy view of those bytes. Only the ten expert ranges selected by the
-router are read by the kernel. macOS therefore manages physical residency
-through its unified page cache instead of Inferno allocating a second copy.
+The Laguna GGUF paths have no separate logical expert cache. Each layer's
+packed expert tensor remains memory-mapped, and Metal receives a zero-copy
+view of those bytes. The Laguna S kernel reads the ten selected Q2_K/Q3_K
+experts. Laguna XS reads the eight selected Q4_K experts and uses Q4_K or Q6_K
+for each layer's down projection according to the exact Q4_K_M directory.
+macOS manages physical residency through its unified page cache instead of
+Inferno allocating a second copy.
 
 ```text
 selected expert -> cache hit  -> execute from Metal
@@ -446,11 +527,12 @@ values per token and layer instead of expanded K/V for every attention head.
 The source GGUF remains memory-mapped so macOS can manage always-used weights
 through its page cache.
 
-**Laguna KV cache.** Twelve layers retain the full context, while 36
-sliding-attention layers retain only their 512-token window. The Safetensors
-path stores FP8 KV; the GGUF path stores F16 KV because the artifact has no
-published FP8 KV scales. Both stay on Metal. The bounded sliding state lowers
-KV pressure and leaves more unified memory available for model pages.
+**Laguna KV cache.** Laguna S has twelve full-context layers and 36 sliding
+layers. Laguna XS has ten full-context layers and 30 sliding layers. Sliding
+layers retain only their 512-token window. The Safetensors path stores FP8 KV;
+both GGUF paths store F16 KV because those artifacts have no published FP8 KV
+scales. The cache stays on Metal. Bounded sliding state lowers KV pressure and
+leaves more unified memory available for model pages.
 
 For GLM, the expert cache and hot KV window compete for the same physical
 unified memory. Its fixed default starts from 30 expert slots per routed layer
@@ -488,9 +570,9 @@ headroom remains safe. Swap growth, critically low headroom, or Metal
 working-set pressure causes a shrink.
 
 For Laguna Safetensors, `--expert-cache-gb` selects a fixed working set and
-cannot be combined with the adaptive controller. The Antirez GGUF rejects both
-expert-cache options because its mmap-backed expert residency is managed by
-macOS rather than by that cache.
+cannot be combined with the adaptive controller. Both Laguna GGUF paths reject
+expert-cache options because mmap-backed expert residency is managed by macOS
+rather than by that cache.
 
 ## Development
 
@@ -512,6 +594,10 @@ and published by Poolside.
 
 The mixed Q2_K/Q3_K Laguna GGUF is produced and published by Antirez in
 [antirez/Laguna-S-2.1-GGUF](https://huggingface.co/antirez/Laguna-S-2.1-GGUF).
+
+[Laguna XS 2.1](https://huggingface.co/poolside/Laguna-XS-2.1) and its
+[Q4_K_M GGUF](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF) are
+published by Poolside.
 
 ## License
 

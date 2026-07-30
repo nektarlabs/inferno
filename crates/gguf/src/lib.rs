@@ -21,6 +21,8 @@ pub const DEFAULT_GGUF_ALIGNMENT: u64 = 32;
 pub const GGML_K_QUANT_BLOCK_SIZE: u64 = 256;
 pub const GGML_Q2_K_BLOCK_BYTES: u64 = 84;
 pub const GGML_Q3_K_BLOCK_BYTES: u64 = 110;
+pub const GGML_Q4_K_BLOCK_BYTES: u64 = 144;
+pub const GGML_Q6_K_BLOCK_BYTES: u64 = 210;
 pub const GGML_Q8_0_BLOCK_SIZE: u64 = 32;
 pub const GGML_Q8_0_BLOCK_BYTES: u64 = 34;
 const GGML_Q2_K_SCALE_BYTES: usize = 16;
@@ -115,6 +117,8 @@ pub struct GgufQuantizedTensorStorage<'a> {
 pub enum GgufQuantBlockKind {
     Q2K,
     Q3K,
+    Q4K,
+    Q6K,
     Q8_0,
 }
 
@@ -124,6 +128,8 @@ pub enum GgmlType {
     Q8_0,
     Q2K,
     Q3K,
+    Q4K,
+    Q6K,
     Unsupported(u32),
 }
 
@@ -436,6 +442,14 @@ impl GgufFile {
 
     pub fn tensor_q3_k_f32_values(&self, name: &str) -> Result<Vec<f32>> {
         self.tensor_quantized_storage(name)?.dequantize_q3_k()
+    }
+
+    pub fn tensor_q4_k_f32_values(&self, name: &str) -> Result<Vec<f32>> {
+        self.tensor_quantized_storage(name)?.dequantize_q4_k()
+    }
+
+    pub fn tensor_q6_k_f32_values(&self, name: &str) -> Result<Vec<f32>> {
+        self.tensor_quantized_storage(name)?.dequantize_q6_k()
     }
 
     pub fn tensor_q8_0_f32_values(&self, name: &str) -> Result<Vec<f32>> {
@@ -883,6 +897,78 @@ impl GgufQuantizedTensorStorage<'_> {
         Ok(values)
     }
 
+    pub fn dequantize_q4_k(&self) -> Result<Vec<f32>> {
+        self.dequantize_exact(GgufQuantBlockKind::Q4K, GGML_Q4_K_BLOCK_BYTES, "Q4_K")
+    }
+
+    pub fn dequantize_q6_k(&self) -> Result<Vec<f32>> {
+        self.dequantize_exact(GgufQuantBlockKind::Q6K, GGML_Q6_K_BLOCK_BYTES, "Q6_K")
+    }
+
+    fn dequantize_exact(
+        &self,
+        expected_block: GgufQuantBlockKind,
+        expected_block_bytes: u64,
+        name: &str,
+    ) -> Result<Vec<f32>> {
+        if self.block != expected_block {
+            return Err(Error::gguf(format!(
+                "GGUF tensor {} must be {name} for {name} dequantization, got {}",
+                self.info.name, self.block
+            )));
+        }
+
+        let element_count = usize::try_from(self.info.element_count()?).map_err(|_| {
+            Error::gguf(format!(
+                "GGUF tensor {} element count does not fit usize",
+                self.info.name
+            ))
+        })?;
+        let expected_len = usize::try_from(
+            self.block_count
+                .checked_mul(expected_block_bytes)
+                .ok_or_else(|| {
+                    Error::gguf(format!(
+                        "GGUF tensor {} {name} byte count overflow",
+                        self.info.name
+                    ))
+                })?,
+        )
+        .map_err(|_| {
+            Error::gguf(format!(
+                "GGUF tensor {} {name} byte count does not fit usize",
+                self.info.name
+            ))
+        })?;
+        if self.bytes.len() != expected_len {
+            return Err(Error::gguf(format!(
+                "GGUF tensor {} has {} {name} payload bytes; expected {expected_len}",
+                self.info.name,
+                self.bytes.len()
+            )));
+        }
+
+        let values_per_block = usize::try_from(expected_block.values_per_block())
+            .map_err(|_| Error::gguf("GGUF quant block value count does not fit usize"))?;
+        let block_bytes = usize::try_from(expected_block_bytes)
+            .map_err(|_| Error::gguf("GGUF quant block byte count does not fit usize"))?;
+        let mut values = vec![0.0_f32; element_count];
+        for (block, output) in self
+            .bytes
+            .chunks_exact(block_bytes)
+            .zip(values.chunks_exact_mut(values_per_block))
+        {
+            dequantize_block(expected_block, block, output)?;
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::gguf(format!(
+                "GGUF tensor {} dequantized to non-finite {name} values",
+                self.info.name
+            )));
+        }
+        Ok(values)
+    }
+
     pub fn dequantize_q8_0(&self) -> Result<Vec<f32>> {
         if self.block != GgufQuantBlockKind::Q8_0 {
             return Err(Error::gguf(format!(
@@ -1083,6 +1169,8 @@ fn dequantize_block(kind: GgufQuantBlockKind, block: &[u8], output: &mut [f32]) 
     match kind {
         GgufQuantBlockKind::Q2K => dequantize_q2_k_block(block, output),
         GgufQuantBlockKind::Q3K => dequantize_q3_k_block(block, output),
+        GgufQuantBlockKind::Q4K => dequantize_q4_k_block(block, output),
+        GgufQuantBlockKind::Q6K => dequantize_q6_k_block(block, output),
         GgufQuantBlockKind::Q8_0 => dequantize_q8_0_block(block, output),
     }
 }
@@ -1099,9 +1187,11 @@ impl GgufQuantBlockKind {
         match ty {
             GgmlType::Q2K => Ok(Self::Q2K),
             GgmlType::Q3K => Ok(Self::Q3K),
+            GgmlType::Q4K => Ok(Self::Q4K),
+            GgmlType::Q6K => Ok(Self::Q6K),
             GgmlType::Q8_0 => Ok(Self::Q8_0),
             other => Err(Error::gguf(format!(
-                "GGUF quant block reader supports Q2_K, Q3_K, and Q8_0 only, got {other}"
+                "GGUF quant block reader supports Q2_K, Q3_K, Q4_K, Q6_K, and Q8_0 only, got {other}"
             ))),
         }
     }
@@ -1110,15 +1200,26 @@ impl GgufQuantBlockKind {
         match self {
             Self::Q2K => GGML_Q2_K_BLOCK_BYTES,
             Self::Q3K => GGML_Q3_K_BLOCK_BYTES,
+            Self::Q4K => GGML_Q4_K_BLOCK_BYTES,
+            Self::Q6K => GGML_Q6_K_BLOCK_BYTES,
             Self::Q8_0 => GGML_Q8_0_BLOCK_BYTES,
         }
     }
 
     pub const fn values_per_block(self) -> u64 {
         match self {
-            Self::Q2K | Self::Q3K => GGML_K_QUANT_BLOCK_SIZE,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q6K => GGML_K_QUANT_BLOCK_SIZE,
             Self::Q8_0 => GGML_Q8_0_BLOCK_SIZE,
         }
+    }
+
+    /// Decodes one complete quantization block into scalar values.
+    pub fn decode_block(self, block: &[u8]) -> Result<Vec<f32>> {
+        let value_count = usize::try_from(self.values_per_block())
+            .map_err(|_| Error::gguf("quantization block value count does not fit usize"))?;
+        let mut output = vec![0.0_f32; value_count];
+        dequantize_block(self, block, &mut output)?;
+        Ok(output)
     }
 }
 
@@ -1265,6 +1366,109 @@ fn dequantize_q3_k_block(block: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+fn dequantize_q4_k_block(block: &[u8], output: &mut [f32]) -> Result<()> {
+    let block_len = usize::try_from(GGML_Q4_K_BLOCK_BYTES)
+        .map_err(|_| Error::gguf("Q4_K block byte size does not fit usize"))?;
+    let value_count = usize::try_from(GGML_K_QUANT_BLOCK_SIZE)
+        .map_err(|_| Error::gguf("K-quant block size does not fit usize"))?;
+    if block.len() != block_len {
+        return Err(Error::gguf(format!(
+            "Q4_K block must contain {block_len} bytes, got {}",
+            block.len()
+        )));
+    }
+    if output.len() != value_count {
+        return Err(Error::gguf(format!(
+            "Q4_K output block must contain {value_count} values, got {}",
+            output.len()
+        )));
+    }
+
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    if !d.is_finite() || !dmin.is_finite() {
+        return Err(Error::gguf("Q4_K block contains non-finite scale values"));
+    }
+    let scales = &block[4..16];
+    let quants = &block[16..];
+    for group in 0..8_usize {
+        let (scale, min) = q4_k_scale_min(group, scales);
+        let quant_offset = (group / 2) * 32;
+        let shift = (group & 1) * 4;
+        let output_offset = group * 32;
+        for index in 0..32 {
+            let quant = (quants[quant_offset + index] >> shift) & 0x0f;
+            output[output_offset + index] = d * scale as f32 * quant as f32 - dmin * min as f32;
+        }
+    }
+    Ok(())
+}
+
+fn q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
+    if group < 4 {
+        (scales[group] & 0x3f, scales[group + 4] & 0x3f)
+    } else {
+        (
+            (scales[group + 4] & 0x0f) | ((scales[group - 4] >> 6) << 4),
+            (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+        )
+    }
+}
+
+fn dequantize_q6_k_block(block: &[u8], output: &mut [f32]) -> Result<()> {
+    let block_len = usize::try_from(GGML_Q6_K_BLOCK_BYTES)
+        .map_err(|_| Error::gguf("Q6_K block byte size does not fit usize"))?;
+    let value_count = usize::try_from(GGML_K_QUANT_BLOCK_SIZE)
+        .map_err(|_| Error::gguf("K-quant block size does not fit usize"))?;
+    if block.len() != block_len {
+        return Err(Error::gguf(format!(
+            "Q6_K block must contain {block_len} bytes, got {}",
+            block.len()
+        )));
+    }
+    if output.len() != value_count {
+        return Err(Error::gguf(format!(
+            "Q6_K output block must contain {value_count} values, got {}",
+            output.len()
+        )));
+    }
+
+    let quants_low = &block[..128];
+    let quants_high = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    if !d.is_finite() {
+        return Err(Error::gguf("Q6_K block contains a non-finite scale"));
+    }
+
+    for half in 0..2_usize {
+        let output_base = half * 128;
+        let low_base = half * 64;
+        let high_base = half * 32;
+        let scale_base = half * 8;
+        for index in 0..32_usize {
+            let scale_lane = index / 16;
+            let low0 = quants_low[low_base + index] & 0x0f;
+            let low1 = quants_low[low_base + 32 + index] & 0x0f;
+            let low2 = quants_low[low_base + index] >> 4;
+            let low3 = quants_low[low_base + 32 + index] >> 4;
+            let high = quants_high[high_base + index];
+            let quants = [
+                low0 | ((high & 0x03) << 4),
+                low1 | (((high >> 2) & 0x03) << 4),
+                low2 | (((high >> 4) & 0x03) << 4),
+                low3 | (((high >> 6) & 0x03) << 4),
+            ];
+            for (quarter, quant) in quants.into_iter().enumerate() {
+                let scale = scales[scale_base + scale_lane + quarter * 2] as i8;
+                output[output_base + quarter * 32 + index] =
+                    d * scale as f32 * (quant as f32 - 32.0);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn dequantize_q8_0_block(block: &[u8], output: &mut [f32]) -> Result<()> {
     let block_len = usize::try_from(GGML_Q8_0_BLOCK_BYTES)
         .map_err(|_| Error::gguf("Q8_0 block byte size does not fit usize"))?;
@@ -1327,6 +1531,8 @@ impl fmt::Display for GgufQuantBlockKind {
         match self {
             Self::Q2K => f.write_str("Q2_K"),
             Self::Q3K => f.write_str("Q3_K"),
+            Self::Q4K => f.write_str("Q4_K"),
+            Self::Q6K => f.write_str("Q6_K"),
             Self::Q8_0 => f.write_str("Q8_0"),
         }
     }
@@ -1376,6 +1582,8 @@ impl GgmlType {
             8 => Self::Q8_0,
             10 => Self::Q2K,
             11 => Self::Q3K,
+            12 => Self::Q4K,
+            14 => Self::Q6K,
             other => Self::Unsupported(other),
         }
     }
@@ -1386,12 +1594,17 @@ impl GgmlType {
             Self::Q8_0 => 8,
             Self::Q2K => 10,
             Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q6K => 14,
             Self::Unsupported(code) => code,
         }
     }
 
     pub const fn is_quantized(self) -> bool {
-        matches!(self, Self::Q2K | Self::Q3K | Self::Q8_0)
+        matches!(
+            self,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q6K | Self::Q8_0
+        )
     }
 }
 
@@ -1402,6 +1615,8 @@ impl fmt::Display for GgmlType {
             Self::Q8_0 => "Q8_0",
             Self::Q2K => "Q2_K",
             Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q6K => "Q6_K",
             Self::Unsupported(code) => return write!(f, "UNSUPPORTED_GGML_TYPE_{code}"),
         };
         f.write_str(name)
@@ -1890,10 +2105,47 @@ mod tests {
     }
 
     #[test]
+    fn tensor_q4_k_f32_values_decodes_standard_payload() {
+        let path = unique_temp_file("q4-values");
+        fs::write(&path, tiny_q4_k_values_gguf()).unwrap();
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let storage = gguf.tensor_quantized_storage("q4.weight").unwrap();
+        let values = gguf.tensor_q4_k_f32_values("q4.weight").unwrap();
+
+        assert_eq!(storage.block, GgufQuantBlockKind::Q4K);
+        assert_eq!(storage.block_count, 1);
+        assert_eq!(storage.payload_byte_len, GGML_Q4_K_BLOCK_BYTES);
+        assert_eq!(values.len(), 256);
+        for group in 0..8 {
+            let expected = if group % 2 == 0 { 1.0 } else { 2.0 };
+            assert_eq!(values[group * 32], expected);
+            assert_eq!(values[group * 32 + 31], expected);
+        }
+    }
+
+    #[test]
+    fn tensor_q6_k_f32_values_decodes_standard_payload() {
+        let path = unique_temp_file("q6-values");
+        fs::write(&path, tiny_q6_k_values_gguf()).unwrap();
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let storage = gguf.tensor_quantized_storage("q6.weight").unwrap();
+        let values = gguf.tensor_q6_k_f32_values("q6.weight").unwrap();
+
+        assert_eq!(storage.block, GgufQuantBlockKind::Q6K);
+        assert_eq!(storage.block_count, 1);
+        assert_eq!(storage.payload_byte_len, GGML_Q6_K_BLOCK_BYTES);
+        assert_eq!(values, vec![-32.0; 256]);
+    }
+
+    #[test]
     fn quantized_storage_direct_matmul_matches_dequantized_reference() {
         for (name, bytes) in [
             ("q2.weight", tiny_q2_k_values_gguf()),
             ("q3.weight", tiny_q3_k_values_gguf()),
+            ("q4.weight", tiny_q4_k_values_gguf()),
+            ("q6.weight", tiny_q6_k_values_gguf()),
             ("q8.weight", tiny_q8_0_values_gguf()),
         ] {
             let path = unique_temp_file("direct-matmul");
@@ -1991,7 +2243,9 @@ mod tests {
             .tensor_quantized_storage("output_norm.weight")
             .expect_err("F32 tensor should not decode as K-quant");
 
-        assert!(err.to_string().contains("Q2_K, Q3_K, and Q8_0 only"));
+        assert!(err
+            .to_string()
+            .contains("Q2_K, Q3_K, Q4_K, Q6_K, and Q8_0 only"));
     }
 
     #[test]
@@ -2185,6 +2439,38 @@ mod tests {
         writer.finish()
     }
 
+    fn tiny_q4_k_values_gguf() -> Vec<u8> {
+        let mut writer = GgufWriter::new();
+        writer.header(1, 2);
+        writer.metadata_key("general.architecture");
+        writer.u32(GgufMetadataValueType::String as u32);
+        writer.string("laguna");
+        writer.metadata_key("general.alignment");
+        writer.u32(GgufMetadataValueType::Uint32 as u32);
+        writer.u32(32);
+        writer.tensor_info("q4.weight", &[256], GgmlType::Q4K, 0);
+        writer.pad_to(32);
+        writer.bytes(&q4_k_block(0x3c00, 0x0000, 1, 0, 0x21));
+        writer.bytes(&[0_u8; 16]);
+        writer.finish()
+    }
+
+    fn tiny_q6_k_values_gguf() -> Vec<u8> {
+        let mut writer = GgufWriter::new();
+        writer.header(1, 2);
+        writer.metadata_key("general.architecture");
+        writer.u32(GgufMetadataValueType::String as u32);
+        writer.string("laguna");
+        writer.metadata_key("general.alignment");
+        writer.u32(GgufMetadataValueType::Uint32 as u32);
+        writer.u32(32);
+        writer.tensor_info("q6.weight", &[256], GgmlType::Q6K, 0);
+        writer.pad_to(32);
+        writer.bytes(&q6_k_block(0x3c00, 1, 0x00, 0x00));
+        writer.bytes(&[0_u8; 16]);
+        writer.finish()
+    }
+
     fn tiny_q2_k_multi_block_values_gguf() -> Vec<u8> {
         let mut writer = GgufWriter::new();
         writer.header(1, 2);
@@ -2285,6 +2571,39 @@ mod tests {
         ));
         block.extend(std::iter::repeat_n(quant_byte, GGML_Q3_K_QUANT_BYTES));
         block.extend_from_slice(&packed_scales);
+        block.extend_from_slice(&d.to_le_bytes());
+        block
+    }
+
+    fn q4_k_block(d: u16, dmin: u16, scale: u8, min: u8, quant_byte: u8) -> Vec<u8> {
+        assert!(scale < 64);
+        assert!(min < 64);
+        let mut scales = [0_u8; 12];
+        for group in 0..8 {
+            if group < 4 {
+                scales[group] |= scale & 0x3f;
+                scales[group + 4] |= min & 0x3f;
+            } else {
+                scales[group + 4] |= scale & 0x0f;
+                scales[group - 4] |= (scale >> 4) << 6;
+                scales[group + 4] |= (min & 0x0f) << 4;
+                scales[group] |= (min >> 4) << 6;
+            }
+        }
+
+        let mut block = Vec::with_capacity(GGML_Q4_K_BLOCK_BYTES as usize);
+        block.extend_from_slice(&d.to_le_bytes());
+        block.extend_from_slice(&dmin.to_le_bytes());
+        block.extend_from_slice(&scales);
+        block.extend(std::iter::repeat_n(quant_byte, 128));
+        block
+    }
+
+    fn q6_k_block(d: u16, scale: i8, low: u8, high: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(GGML_Q6_K_BLOCK_BYTES as usize);
+        block.extend(std::iter::repeat_n(low, 128));
+        block.extend(std::iter::repeat_n(high, 64));
+        block.extend(std::iter::repeat_n(scale as u8, 16));
         block.extend_from_slice(&d.to_le_bytes());
         block
     }

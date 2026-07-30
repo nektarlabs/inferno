@@ -113,6 +113,27 @@ pub fn render_laguna_codex_prompt(
     tools: &[Value],
     thinking_mode: LagunaThinkingMode,
 ) -> Result<ChatPrompt> {
+    render_laguna_codex_prompt_inner(instructions, input, tools, thinking_mode, false)
+}
+
+/// Renders a Codex Responses turn using Laguna XS 2.1's published chat
+/// contract, including preserved reasoning from earlier assistant turns.
+pub fn render_laguna_xs_codex_prompt(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
+) -> Result<ChatPrompt> {
+    render_laguna_codex_prompt_inner(instructions, input, tools, thinking_mode, true)
+}
+
+fn render_laguna_codex_prompt_inner(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
+    preserve_reasoning: bool,
+) -> Result<ChatPrompt> {
     let normalized_tools = normalize_laguna_tools(tools)?;
     let system = if instructions.trim().is_empty() {
         LAGUNA_DEFAULT_SYSTEM
@@ -137,7 +158,11 @@ pub fn render_laguna_codex_prompt(
     rendered.push_str(system);
     render_laguna_tools(&mut rendered, &normalized_tools)?;
     rendered.push_str("</system>\n");
-    render_laguna_input_items(&mut rendered, input)?;
+    render_laguna_input_items(
+        &mut rendered,
+        input,
+        preserve_reasoning && thinking_mode == LagunaThinkingMode::Enabled,
+    )?;
     rendered.push_str("<assistant>");
     match thinking_mode {
         LagunaThinkingMode::Enabled => rendered.push_str("<think>"),
@@ -414,13 +439,21 @@ fn render_input_item(rendered: &mut String, item: &Value) -> Result<()> {
     }
 }
 
-fn render_laguna_input_items(rendered: &mut String, items: &[Value]) -> Result<()> {
+fn render_laguna_input_items(
+    rendered: &mut String,
+    items: &[Value],
+    preserve_reasoning: bool,
+) -> Result<()> {
     let mut assistant_open = false;
+    let mut pending_reasoning = String::new();
     for (index, item) in items.iter().enumerate() {
         let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
             Error::tokenizer("Codex Responses input item is missing a string type")
         })?;
         match item_type {
+            "reasoning" if preserve_reasoning => {
+                pending_reasoning.push_str(&reasoning_content(item)?);
+            }
             "reasoning" => {}
             "message" if item.get("role").and_then(Value::as_str) == Some("assistant") => {
                 close_laguna_assistant(rendered, &mut assistant_open);
@@ -428,7 +461,7 @@ fn render_laguna_input_items(rendered: &mut String, items: &[Value]) -> Result<(
                     visible_content(item.get("content").ok_or_else(|| {
                         Error::tokenizer("Codex message input is missing content")
                     })?)?;
-                rendered.push_str("<assistant></think>");
+                open_laguna_assistant(rendered, &mut pending_reasoning, preserve_reasoning);
                 if !next_non_reasoning_item_is_tool_call(items, index + 1) {
                     rendered.push_str(&content);
                 }
@@ -436,16 +469,18 @@ fn render_laguna_input_items(rendered: &mut String, items: &[Value]) -> Result<(
             }
             "function_call" | "custom_tool_call" => {
                 if !assistant_open {
-                    rendered.push_str("<assistant></think>");
+                    open_laguna_assistant(rendered, &mut pending_reasoning, preserve_reasoning);
                     assistant_open = true;
                 }
                 render_laguna_tool_call(rendered, item)?;
             }
             "message" => {
+                reject_orphaned_reasoning(&pending_reasoning)?;
                 close_laguna_assistant(rendered, &mut assistant_open);
                 render_laguna_message(rendered, item)?;
             }
             "function_call_output" | "custom_tool_call_output" => {
+                reject_orphaned_reasoning(&pending_reasoning)?;
                 close_laguna_assistant(rendered, &mut assistant_open);
                 render_laguna_tool_output(rendered, item)?;
             }
@@ -456,8 +491,69 @@ fn render_laguna_input_items(rendered: &mut String, items: &[Value]) -> Result<(
             }
         }
     }
+    reject_orphaned_reasoning(&pending_reasoning)?;
     close_laguna_assistant(rendered, &mut assistant_open);
     Ok(())
+}
+
+fn open_laguna_assistant(
+    rendered: &mut String,
+    pending_reasoning: &mut String,
+    preserve_reasoning: bool,
+) {
+    rendered.push_str("<assistant>");
+    if preserve_reasoning {
+        rendered.push_str("<think>");
+        rendered.push_str(pending_reasoning);
+        rendered.push_str(THINK_END);
+        pending_reasoning.clear();
+    } else {
+        rendered.push_str(THINK_END);
+    }
+}
+
+fn reasoning_content(item: &Value) -> Result<String> {
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| reasoning_parts(parts, "reasoning_text"))
+        .transpose()?
+        .unwrap_or_default();
+    if !content.is_empty() {
+        return Ok(content);
+    }
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| reasoning_parts(parts, "summary_text"))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn reasoning_parts(parts: &[Value], expected_type: &str) -> Result<String> {
+    let mut text = String::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex reasoning content part is missing a string type")
+        })?;
+        if part_type != expected_type {
+            continue;
+        }
+        let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex reasoning content part is missing string text")
+        })?;
+        text.push_str(part_text);
+    }
+    Ok(text)
+}
+
+fn reject_orphaned_reasoning(reasoning: &str) -> Result<()> {
+    if reasoning.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::tokenizer(
+            "Codex reasoning item is not followed by an assistant message or tool call",
+        ))
+    }
 }
 
 fn next_non_reasoning_item_is_tool_call(items: &[Value], start: usize) -> bool {
@@ -913,6 +1009,79 @@ mod tests {
         .unwrap();
 
         assert!(prompt.rendered.ends_with("<assistant></think>"));
+    }
+
+    #[test]
+    fn preserves_xs_reasoning_before_a_historical_tool_call() {
+        let prompt = render_laguna_xs_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "message", "role": "user", "content": "Inspect the workspace"}),
+                json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": "I should list the files first."
+                    }],
+                    "summary": []
+                }),
+                json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "call_id": "call_1"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "README.md"
+                }),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type": "object"}
+            })],
+            LagunaThinkingMode::Enabled,
+        )
+        .unwrap();
+
+        assert!(prompt
+            .rendered
+            .contains("<assistant><think>I should list the files first.</think><tool_call>shell"));
+        assert!(prompt.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn keeps_laguna_s_reasoning_history_omitted() {
+        let prompt = render_laguna_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "reasoning", "content": [{
+                    "type": "reasoning_text",
+                    "text": "Do not replay this."
+                }]}),
+                json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "call_id": "call_1"
+                }),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {"type": "object"}
+            })],
+            LagunaThinkingMode::Enabled,
+        )
+        .unwrap();
+
+        assert!(!prompt.rendered.contains("Do not replay this."));
+        assert!(prompt
+            .rendered
+            .contains("<assistant></think><tool_call>shell"));
     }
 
     #[test]

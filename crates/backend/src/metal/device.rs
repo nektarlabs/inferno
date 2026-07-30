@@ -2,8 +2,9 @@ use std::{path::Path, sync::Arc};
 
 use crate::{
     BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView, DeviceRopeTable, DeviceRouterTopK,
-    DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant, LagunaF16KvCache, LagunaFp8KvCache,
-    LagunaKvRetention, LagunaModelViewReport, Q2ExpertSource, W4ExpertGroup, W4WeightSource,
+    DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant, GgufKQuant, LagunaF16KvCache,
+    LagunaFp8KvCache, LagunaKvRetention, LagunaModelViewReport, Q2ExpertSource, W4ExpertGroup,
+    W4WeightSource,
 };
 use ::metal::{Buffer, CommandQueue, Device};
 use common::{DType, Error, PagedKvView, Result};
@@ -25,6 +26,10 @@ use super::fp8_attention::MetalFp8Attention;
 use super::gguf_moe::MetalGgufMoe;
 use super::gguf_moe_prefill::MetalGgufMoePrefill;
 use super::laguna_views::MetalLagunaViews;
+use super::laguna_xs::MetalLagunaXs;
+use super::laguna_xs_moe_prefill::MetalLagunaXsMoePrefill;
+use super::laguna_xs_mps_prefill::MetalLagunaXsMpsPrefill;
+use super::laguna_xs_prefill::MetalLagunaXsPrefill;
 use super::layout::MetalLayout;
 use super::library::MetalLibrary;
 use super::matmul::MetalMatmul;
@@ -59,6 +64,10 @@ pub struct Metal {
     fp8_attention: MetalFp8Attention,
     gguf_moe: MetalGgufMoe,
     gguf_moe_prefill: MetalGgufMoePrefill,
+    laguna_xs: MetalLagunaXs,
+    laguna_xs_mps_prefill: MetalLagunaXsMpsPrefill,
+    laguna_xs_moe_prefill: MetalLagunaXsMoePrefill,
+    laguna_xs_prefill: MetalLagunaXsPrefill,
     laguna_views: Arc<MetalLagunaViews>,
     batch: BatchSlot,
 }
@@ -91,6 +100,12 @@ impl Metal {
         let fp8_attention = MetalFp8Attention::new(&device, &library, arena.clone())?;
         let gguf_moe_prefill =
             MetalGgufMoePrefill::new(&device, &library, arena.clone(), Arc::clone(&laguna_views))?;
+        let laguna_xs = MetalLagunaXs::new(arena.clone(), Arc::clone(&laguna_views));
+        let laguna_xs_mps_prefill =
+            MetalLagunaXsMpsPrefill::new(arena.clone(), Arc::clone(&laguna_views));
+        let laguna_xs_moe_prefill =
+            MetalLagunaXsMoePrefill::new(arena.clone(), Arc::clone(&laguna_views));
+        let laguna_xs_prefill = MetalLagunaXsPrefill::new(arena.clone(), Arc::clone(&laguna_views));
         let gguf_moe = MetalGgufMoe::new(&device, &library, arena, Arc::clone(&laguna_views))?;
 
         Ok(Self {
@@ -115,6 +130,10 @@ impl Metal {
             fp8_attention,
             gguf_moe,
             gguf_moe_prefill,
+            laguna_xs,
+            laguna_xs_mps_prefill,
+            laguna_xs_moe_prefill,
+            laguna_xs_prefill,
             laguna_views,
             batch: BatchSlot::new(),
         })
@@ -1484,6 +1503,352 @@ impl Metal {
                 token_ids,
                 vocab_size,
                 hidden_size,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_k_matvec(
+        &self,
+        quant: GgufKQuant,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            if MetalLagunaXsMpsPrefill::supports(row_count)
+                && self.laguna_xs_mps_prefill.is_prepared(
+                    quant,
+                    weights,
+                    in_features,
+                    out_features,
+                )?
+            {
+                return self.laguna_xs_mps_prefill.encode(
+                    command_buffer,
+                    &self.device,
+                    quant,
+                    weights,
+                    input,
+                    input_len,
+                    None,
+                    None,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+            if MetalLagunaXsPrefill::supports(row_count, out_features) {
+                return self.laguna_xs_prefill.encode_matvec(
+                    command_buffer,
+                    &self.device,
+                    quant,
+                    weights,
+                    input,
+                    input_len,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+            self.laguna_xs.encode_matvec(
+                command_buffer,
+                &self.device,
+                quant,
+                weights,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_k_matvec_residuals(
+        &self,
+        quant: GgufKQuant,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        residual_a: &Buffer,
+        residual_b: Option<&Buffer>,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            if MetalLagunaXsMpsPrefill::supports(row_count)
+                && self.laguna_xs_mps_prefill.is_prepared(
+                    quant,
+                    weights,
+                    in_features,
+                    out_features,
+                )?
+            {
+                return self.laguna_xs_mps_prefill.encode(
+                    command_buffer,
+                    &self.device,
+                    quant,
+                    weights,
+                    input,
+                    input_len,
+                    Some(residual_a),
+                    residual_b,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+            if MetalLagunaXsPrefill::supports(row_count, out_features) {
+                return self.laguna_xs_prefill.encode_matvec_residuals(
+                    command_buffer,
+                    &self.device,
+                    quant,
+                    weights,
+                    input,
+                    input_len,
+                    residual_a,
+                    residual_b,
+                    row_count,
+                    in_features,
+                    out_features,
+                );
+            }
+            self.laguna_xs.encode_matvec_residuals(
+                command_buffer,
+                &self.device,
+                quant,
+                weights,
+                input,
+                input_len,
+                residual_a,
+                residual_b,
+                row_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    pub(crate) fn prepare_laguna_xs_mps_prefill_weight(
+        &self,
+        quant: GgufKQuant,
+        weights: &[u8],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs_mps_prefill.encode_prepare_weight(
+                command_buffer,
+                &self.device,
+                quant,
+                weights,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_q4_gate_up_swiglu(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_gate_up_swiglu(
+                command_buffer,
+                &self.device,
+                gate_weights,
+                up_weights,
+                input,
+                input_len,
+                row_count,
+                in_features,
+                out_features,
+            )
+        })
+    }
+
+    pub(crate) fn batched_laguna_xs_router_topk(
+        &self,
+        router_logits: &Buffer,
+        router_logits_len: usize,
+        correction_bias: &[f32],
+        routed_scaling_factor: f32,
+    ) -> Result<DeviceRouterTopK> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_router_topk(
+                command_buffer,
+                &self.device,
+                router_logits,
+                router_logits_len,
+                correction_bias,
+                routed_scaling_factor,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_qk_rms_norm_rope_pair(
+        &self,
+        query: &Buffer,
+        query_len: usize,
+        key: &Buffer,
+        key_len: usize,
+        query_norm_weight: &[f32],
+        key_norm_weight: &[f32],
+        query_head_count: usize,
+        position_offset: usize,
+        eps: f32,
+        table: &DeviceRopeTable,
+    ) -> Result<(Buffer, Buffer)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_qk_norm_rope_pair(
+                command_buffer,
+                &self.device,
+                query,
+                query_len,
+                key,
+                key_len,
+                query_norm_weight,
+                key_norm_weight,
+                query_head_count,
+                position_offset,
+                eps,
+                table,
+            )
+        })
+    }
+
+    pub(crate) fn batched_laguna_xs_rms_norm(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &[f32],
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_rms_norm(
+                command_buffer,
+                &self.device,
+                input,
+                input_len,
+                weight,
+                eps,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_attention_projections(
+        &self,
+        query_weights: &[u8],
+        key_weights: &[u8],
+        value_weights: &[u8],
+        value_quant: GgufKQuant,
+        gate_weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        in_features: usize,
+        query_features: usize,
+        key_features: usize,
+        value_features: usize,
+        gate_features: usize,
+    ) -> Result<[Buffer; 4]> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_attention_projections(
+                command_buffer,
+                &self.device,
+                query_weights,
+                key_weights,
+                value_weights,
+                value_quant,
+                gate_weights,
+                input,
+                input_len,
+                in_features,
+                query_features,
+                key_features,
+                value_features,
+                gate_features,
+            )
+        })
+    }
+
+    pub(crate) fn batched_laguna_xs_q4_embedding(
+        &self,
+        weights: &[u8],
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_q4_embedding(
+                command_buffer,
+                &self.device,
+                weights,
+                token_ids,
+                vocab_size,
+                hidden_size,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_gguf_moe(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: GgufKQuant,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            if MetalLagunaXsMoePrefill::supports(routing) {
+                return self.laguna_xs_moe_prefill.encode(
+                    command_buffer,
+                    &self.device,
+                    gate_weights,
+                    up_weights,
+                    down_weights,
+                    down_quant,
+                    input,
+                    input_len,
+                    routing,
+                    in_features,
+                    intermediate_features,
+                    out_features,
+                );
+            }
+            self.laguna_xs.encode_moe(
+                command_buffer,
+                &self.device,
+                gate_weights,
+                up_weights,
+                down_weights,
+                down_quant,
+                input,
+                input_len,
+                routing,
+                in_features,
+                intermediate_features,
+                out_features,
             )
         })
     }

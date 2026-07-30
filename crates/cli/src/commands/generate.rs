@@ -326,21 +326,24 @@ fn run_laguna(
         &config.eos_token_id,
         |token_id| {
             throughput.record_token();
-            if let Some(text) = stream.push(token_id)? {
-                stdout
-                    .write_all(text.as_bytes())
-                    .map_err(|source| Error::Io {
+            let is_stop_token = config.eos_token_id.contains(&token_id);
+            if !is_stop_token {
+                if let Some(text) = stream.push(token_id)? {
+                    stdout
+                        .write_all(text.as_bytes())
+                        .map_err(|source| Error::Io {
+                            path: PathBuf::from("<stdout>"),
+                            source,
+                        })?;
+                    stdout.flush().map_err(|source| Error::Io {
                         path: PathBuf::from("<stdout>"),
                         source,
                     })?;
-                stdout.flush().map_err(|source| Error::Io {
-                    path: PathBuf::from("<stdout>"),
-                    source,
-                })?;
+                }
             }
             let Some(reason) = thinking_guard
                 .as_mut()
-                .and_then(|guard| guard.observe(token_id, config.eos_token_id.contains(&token_id)))
+                .and_then(|guard| guard.observe(token_id, is_stop_token))
             else {
                 return Ok(GenerationControl::Continue);
             };
@@ -565,10 +568,12 @@ pub(super) fn laguna_runtime_options<B: Backend>(
         enable_unified_memory_controller,
     )?;
     match model.artifact_kind() {
-        LagunaArtifactKind::AntirezGguf => Ok(LagunaGenerationOptions {
-            expert_cache_capacity: None,
-            memory_controller: None,
-        }),
+        LagunaArtifactKind::AntirezGguf | LagunaArtifactKind::PoolsideXsGguf => {
+            Ok(LagunaGenerationOptions {
+                expert_cache_capacity: None,
+                memory_controller: None,
+            })
+        }
         LagunaArtifactKind::SafetensorsInt4 => {
             let explicit_cache_bytes = cache_gb_to_bytes("expert cache", expert_cache_gb)?;
             let expert_cache_capacity = laguna_expert_cache_capacity(
@@ -595,15 +600,15 @@ fn validate_laguna_artifact_cache_options(
     expert_cache_gb: Option<f64>,
     enable_unified_memory_controller: bool,
 ) -> InfernoResult<()> {
-    if artifact == LagunaArtifactKind::AntirezGguf {
+    if artifact.is_gguf() {
         if expert_cache_gb.is_some() {
             return Err(Error::runtime(
-                "--expert-cache-gb does not apply to Antirez Laguna GGUF; routed Q2/Q3 experts are mmap-backed",
+                "--expert-cache-gb does not apply to Laguna GGUF; routed experts are mmap-backed",
             ));
         }
         if enable_unified_memory_controller {
             return Err(Error::runtime(
-                "--enable-unified-memory-controller does not apply to Antirez Laguna GGUF because it has no configurable expert cache",
+                "--enable-unified-memory-controller does not apply to Laguna GGUF because it has no configurable expert cache",
             ));
         }
     }
@@ -1587,6 +1592,14 @@ mod tests {
         assert!(controller
             .to_string()
             .contains("no configurable expert cache"));
+
+        let xs_error = validate_laguna_artifact_cache_options(
+            LagunaArtifactKind::PoolsideXsGguf,
+            Some(1.0),
+            false,
+        )
+        .unwrap_err();
+        assert!(xs_error.to_string().contains("mmap-backed"));
     }
 
     #[test]

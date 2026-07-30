@@ -2,23 +2,37 @@ use std::path::{Path, PathBuf};
 
 use backend::Backend;
 use common::{Error, Result};
-use config::LagunaConfig;
+use config::{LagunaConfig, LagunaProfile};
 use tracing::info;
 
 use super::{
     LagunaExpertCacheMetrics, LagunaGgufModel, LagunaGgufSession, LagunaSafetensorsModel,
     LagunaSafetensorsSession, LagunaTokenOutput, LagunaWeightSummary, LAGUNA_GGUF_FILE_NAME,
+    LAGUNA_XS_GGUF_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LagunaArtifactKind {
     SafetensorsInt4,
     AntirezGguf,
+    PoolsideXsGguf,
 }
 
 impl LagunaArtifactKind {
     pub fn uses_expert_cache(self) -> bool {
         matches!(self, Self::SafetensorsInt4)
+    }
+
+    pub fn is_gguf(self) -> bool {
+        matches!(self, Self::AntirezGguf | Self::PoolsideXsGguf)
+    }
+
+    const fn file_name(self) -> Option<&'static str> {
+        match self {
+            Self::SafetensorsInt4 => None,
+            Self::AntirezGguf => Some(LAGUNA_GGUF_FILE_NAME),
+            Self::PoolsideXsGguf => Some(LAGUNA_XS_GGUF_FILE_NAME),
+        }
     }
 }
 
@@ -45,7 +59,7 @@ impl LagunaModel {
         backend: &B,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let artifact = detect_artifact(model_dir)?;
+        let artifact = detect_artifact(model_dir, &config)?;
         info!(
             model_dir = %model_dir.display(),
             ?artifact,
@@ -55,9 +69,11 @@ impl LagunaModel {
             LagunaArtifactKind::SafetensorsInt4 => {
                 LagunaSafetensorsModel::open(model_dir, config, backend).map(Self::Safetensors)
             }
-            LagunaArtifactKind::AntirezGguf => {
-                LagunaGgufModel::open(model_dir.join(LAGUNA_GGUF_FILE_NAME), config, backend)
-                    .map(Self::Gguf)
+            LagunaArtifactKind::AntirezGguf | LagunaArtifactKind::PoolsideXsGguf => {
+                let file_name = artifact
+                    .file_name()
+                    .expect("GGUF artifact kinds always have an exact file name");
+                LagunaGgufModel::open(model_dir.join(file_name), config, backend).map(Self::Gguf)
             }
         }
     }
@@ -65,7 +81,10 @@ impl LagunaModel {
     pub fn artifact_kind(&self) -> LagunaArtifactKind {
         match self {
             Self::Safetensors(_) => LagunaArtifactKind::SafetensorsInt4,
-            Self::Gguf(_) => LagunaArtifactKind::AntirezGguf,
+            Self::Gguf(model) => match model.flavor() {
+                super::LagunaGgufFlavor::S21Q2Q3 => LagunaArtifactKind::AntirezGguf,
+                super::LagunaGgufFlavor::Xs21Q4KM => LagunaArtifactKind::PoolsideXsGguf,
+            },
         }
     }
 
@@ -110,7 +129,7 @@ impl LagunaModel {
             Self::Gguf(model) => {
                 if expert_cache_capacity.is_some() {
                     return Err(Error::cache(
-                        "Antirez Laguna GGUF uses mmap-backed Q2/Q3 experts and has no configurable expert cache",
+                        "Laguna GGUF uses mmap-backed quantized experts and has no configurable expert cache",
                     ));
                 }
                 model
@@ -223,17 +242,17 @@ impl LagunaSession {
     pub fn resize_expert_cache_capacity(&mut self, capacity_experts: usize) -> Result<()> {
         match self {
             Self::Safetensors(session) => session.resize_expert_cache_capacity(capacity_experts),
-            Self::Gguf(_) => Err(Error::cache(
-                "Antirez Laguna GGUF has no configurable expert cache",
-            )),
+            Self::Gguf(_) => Err(Error::cache("Laguna GGUF has no configurable expert cache")),
         }
     }
 }
 
-fn detect_artifact(model_dir: &Path) -> Result<LagunaArtifactKind> {
-    let has_gguf = model_dir.join(LAGUNA_GGUF_FILE_NAME).is_file();
+fn detect_artifact(model_dir: &Path, config: &LagunaConfig) -> Result<LagunaArtifactKind> {
+    let profile = config.profile()?;
+    let has_s_gguf = model_dir.join(LAGUNA_GGUF_FILE_NAME).is_file();
+    let has_xs_gguf = model_dir.join(LAGUNA_XS_GGUF_FILE_NAME).is_file();
     let has_safetensors = contains_safetensors(model_dir)?;
-    artifact_from_presence(has_gguf, has_safetensors).map_err(|error| {
+    artifact_from_presence(profile, has_s_gguf, has_xs_gguf, has_safetensors).map_err(|error| {
         Error::weights(format!(
             "Laguna model directory {}: {error}",
             model_dir.display()
@@ -242,18 +261,34 @@ fn detect_artifact(model_dir: &Path) -> Result<LagunaArtifactKind> {
 }
 
 fn artifact_from_presence(
-    has_gguf: bool,
+    profile: LagunaProfile,
+    has_s_gguf: bool,
+    has_xs_gguf: bool,
     has_safetensors: bool,
 ) -> std::result::Result<LagunaArtifactKind, &'static str> {
-    match (has_gguf, has_safetensors) {
-        (true, false) => Ok(LagunaArtifactKind::AntirezGguf),
-        (false, true) => Ok(LagunaArtifactKind::SafetensorsInt4),
-        (true, true) => Err(
-            "contains both the Antirez GGUF and Safetensors shards; keep one weight artifact per directory",
-        ),
-        (false, false) => {
-            Err("contains neither the exact Antirez GGUF nor Safetensors weight shards")
-        }
+    match profile {
+        LagunaProfile::S21 => match (has_s_gguf, has_xs_gguf, has_safetensors) {
+            (true, false, false) => Ok(LagunaArtifactKind::AntirezGguf),
+            (false, false, true) => Ok(LagunaArtifactKind::SafetensorsInt4),
+            (false, true, false) => {
+                Err("contains Laguna XS weights but config.json describes Laguna S 2.1")
+            }
+            (false, false, false) => {
+                Err("contains neither the exact Laguna S GGUF nor Safetensors weight shards")
+            }
+            _ => Err("contains multiple Laguna weight artifacts; keep one artifact per directory"),
+        },
+        LagunaProfile::Xs21 => match (has_s_gguf, has_xs_gguf, has_safetensors) {
+            (false, true, false) => Ok(LagunaArtifactKind::PoolsideXsGguf),
+            (true, false, false) => {
+                Err("contains Laguna S weights but config.json describes Laguna XS 2.1")
+            }
+            (false, false, true) => {
+                Err("Laguna XS Safetensors are not a supported Inferno artifact")
+            }
+            (false, false, false) => Err("does not contain the exact Laguna XS Q4_K_M GGUF"),
+            _ => Err("contains multiple Laguna weight artifacts; keep one artifact per directory"),
+        },
     }
 }
 
@@ -281,28 +316,45 @@ fn contains_safetensors(model_dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{artifact_from_presence, LagunaArtifactKind};
+    use config::LagunaProfile;
 
     #[test]
     fn only_safetensors_artifacts_use_the_expert_cache() {
         assert!(LagunaArtifactKind::SafetensorsInt4.uses_expert_cache());
         assert!(!LagunaArtifactKind::AntirezGguf.uses_expert_cache());
+        assert!(!LagunaArtifactKind::PoolsideXsGguf.uses_expert_cache());
+        assert!(LagunaArtifactKind::AntirezGguf.is_gguf());
+        assert!(LagunaArtifactKind::PoolsideXsGguf.is_gguf());
     }
 
     #[test]
     fn artifact_selection_is_exact_and_unambiguous() {
         assert_eq!(
-            artifact_from_presence(true, false).unwrap(),
+            artifact_from_presence(LagunaProfile::S21, true, false, false).unwrap(),
             LagunaArtifactKind::AntirezGguf
         );
         assert_eq!(
-            artifact_from_presence(false, true).unwrap(),
+            artifact_from_presence(LagunaProfile::S21, false, false, true).unwrap(),
             LagunaArtifactKind::SafetensorsInt4
         );
-        assert!(artifact_from_presence(true, true)
-            .unwrap_err()
-            .contains("both"));
-        assert!(artifact_from_presence(false, false)
-            .unwrap_err()
-            .contains("neither"));
+        assert_eq!(
+            artifact_from_presence(LagunaProfile::Xs21, false, true, false).unwrap(),
+            LagunaArtifactKind::PoolsideXsGguf
+        );
+        assert!(
+            artifact_from_presence(LagunaProfile::S21, true, false, true)
+                .unwrap_err()
+                .contains("multiple")
+        );
+        assert!(
+            artifact_from_presence(LagunaProfile::Xs21, false, false, false)
+                .unwrap_err()
+                .contains("exact Laguna XS")
+        );
+        assert!(
+            artifact_from_presence(LagunaProfile::Xs21, true, false, false)
+                .unwrap_err()
+                .contains("Laguna S weights")
+        );
     }
 }

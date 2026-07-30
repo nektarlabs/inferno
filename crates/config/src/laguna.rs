@@ -6,21 +6,66 @@ use serde::Deserialize;
 const SUPPORTED_MODEL_TYPE: &str = "laguna";
 const SUPPORTED_ARCHITECTURE: &str = "LagunaForCausalLM";
 const SUPPORTED_VOCAB_SIZE: usize = 100_352;
-const SUPPORTED_HIDDEN_SIZE: usize = 3_072;
-const SUPPORTED_DENSE_INTERMEDIATE_SIZE: usize = 12_288;
-const SUPPORTED_MOE_INTERMEDIATE_SIZE: usize = 1_024;
-const SUPPORTED_SHARED_INTERMEDIATE_SIZE: usize = 1_024;
-const SUPPORTED_LAYER_COUNT: usize = 48;
 const SUPPORTED_GLOBAL_QUERY_HEADS: usize = 48;
 const SUPPORTED_KV_HEADS: usize = 8;
 const SUPPORTED_HEAD_DIM: usize = 128;
 const SUPPORTED_MAX_CONTEXT: usize = 262_144;
 const SUPPORTED_EXPERTS: usize = 256;
-const SUPPORTED_TOP_K: usize = 10;
 const SUPPORTED_SLIDING_WINDOW: usize = 512;
 const SUPPORTED_INT4_GROUP_SIZE: usize = 32;
 const SUPPORTED_RMS_NORM_EPS: f64 = 1e-6;
 const SUPPORTED_ROUTED_SCALING_FACTOR: f64 = 2.5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagunaProfile {
+    S21,
+    Xs21,
+}
+
+impl LagunaProfile {
+    const fn contract(self) -> LagunaProfileContract {
+        match self {
+            Self::S21 => LagunaProfileContract {
+                display_name: "Laguna S 2.1",
+                hidden_size: 3_072,
+                dense_intermediate_size: 12_288,
+                moe_intermediate_size: 1_024,
+                shared_intermediate_size: 1_024,
+                layer_count: 48,
+                top_k: 10,
+                sliding_query_heads: 72,
+                yarn_beta_fast: 32.0,
+                requires_compressed_tensors_config: true,
+            },
+            Self::Xs21 => LagunaProfileContract {
+                display_name: "Laguna XS 2.1",
+                hidden_size: 2_048,
+                dense_intermediate_size: 8_192,
+                moe_intermediate_size: 512,
+                shared_intermediate_size: 512,
+                layer_count: 40,
+                top_k: 8,
+                sliding_query_heads: 64,
+                yarn_beta_fast: 64.0,
+                requires_compressed_tensors_config: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LagunaProfileContract {
+    display_name: &'static str,
+    hidden_size: usize,
+    dense_intermediate_size: usize,
+    moe_intermediate_size: usize,
+    shared_intermediate_size: usize,
+    layer_count: usize,
+    top_k: usize,
+    sliding_query_heads: usize,
+    yarn_beta_fast: f64,
+    requires_compressed_tensors_config: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +108,7 @@ pub struct LagunaConfig {
     pub norm_topk_prob: bool,
     pub moe_routed_scaling_factor: f64,
     pub moe_apply_router_weight_on_input: bool,
+    #[serde(default)]
     pub moe_router_logit_softcapping: f64,
     pub decoder_sparse_step: usize,
     pub mlp_only_layers: Vec<usize>,
@@ -80,7 +126,8 @@ pub struct LagunaConfig {
     pub use_cache: bool,
     pub torch_dtype: String,
     pub rope_parameters: LagunaRopeParameters,
-    pub quantization_config: LagunaQuantizationConfig,
+    #[serde(default)]
+    pub quantization_config: Option<LagunaQuantizationConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -194,6 +241,10 @@ impl LagunaConfig {
         Ok(self)
     }
 
+    pub fn profile(&self) -> Result<LagunaProfile> {
+        detect_profile(self)
+    }
+
     pub fn attention_kind(&self, layer_index: usize) -> Option<LagunaAttentionKind> {
         self.layer_types.get(layer_index).copied()
     }
@@ -294,6 +345,9 @@ impl LagunaConfig {
 }
 
 fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
+    let profile = detect_profile(config)?;
+    let contract = profile.contract();
+
     require_equal("model_type", &config.model_type, SUPPORTED_MODEL_TYPE)?;
     if config.architectures.as_slice() != [SUPPORTED_ARCHITECTURE] {
         return Err(Error::config(format!(
@@ -302,26 +356,26 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         )));
     }
     require_usize("vocab_size", config.vocab_size, SUPPORTED_VOCAB_SIZE)?;
-    require_usize("hidden_size", config.hidden_size, SUPPORTED_HIDDEN_SIZE)?;
+    require_usize("hidden_size", config.hidden_size, contract.hidden_size)?;
     require_usize(
         "intermediate_size",
         config.intermediate_size,
-        SUPPORTED_DENSE_INTERMEDIATE_SIZE,
+        contract.dense_intermediate_size,
     )?;
     require_usize(
         "moe_intermediate_size",
         config.moe_intermediate_size,
-        SUPPORTED_MOE_INTERMEDIATE_SIZE,
+        contract.moe_intermediate_size,
     )?;
     require_usize(
         "shared_expert_intermediate_size",
         config.shared_expert_intermediate_size,
-        SUPPORTED_SHARED_INTERMEDIATE_SIZE,
+        contract.shared_intermediate_size,
     )?;
     require_usize(
         "num_hidden_layers",
         config.num_hidden_layers,
-        SUPPORTED_LAYER_COUNT,
+        contract.layer_count,
     )?;
     require_usize(
         "num_attention_heads",
@@ -343,7 +397,7 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
     require_usize(
         "num_experts_per_tok",
         config.num_experts_per_tok,
-        SUPPORTED_TOP_K,
+        contract.top_k,
     )?;
     require_usize(
         "sliding_window",
@@ -351,9 +405,10 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         SUPPORTED_SLIDING_WINDOW,
     )?;
     if config.qkv_bias || config.attention_bias {
-        return Err(Error::config(
-            "Laguna S 2.1 INT4 requires bias-free Q/K/V and attention output projections",
-        ));
+        return Err(Error::config(format!(
+            "{} requires bias-free Q/K/V and attention output projections",
+            contract.display_name
+        )));
     }
     if config.hidden_act != "silu" {
         return Err(Error::config(format!(
@@ -378,9 +433,10 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         ));
     }
     if config.moe_router_logit_softcapping != 0.0 {
-        return Err(Error::config(
-            "Laguna S 2.1 INT4 requires disabled router logit soft-capping",
-        ));
+        return Err(Error::config(format!(
+            "{} requires disabled router logit soft-capping",
+            contract.display_name
+        )));
     }
     if config.decoder_sparse_step != 1 || config.mlp_only_layers != [0] {
         return Err(Error::config(format!(
@@ -389,9 +445,10 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         )));
     }
     if config.swa_attention_sink_enabled {
-        return Err(Error::config(
-            "Laguna S 2.1 INT4 does not contain sliding-attention sink weights",
-        ));
+        return Err(Error::config(format!(
+            "{} does not contain sliding-attention sink weights",
+            contract.display_name
+        )));
     }
     if config.gating_types.len() != config.num_hidden_layers
         || config
@@ -416,9 +473,10 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         ));
     }
     if !config.norm_topk_prob {
-        return Err(Error::config(
-            "Laguna S 2.1 requires normalized top-k router weights",
-        ));
+        return Err(Error::config(format!(
+            "{} requires normalized top-k router weights",
+            contract.display_name
+        )));
     }
     if config.moe_routed_scaling_factor != SUPPORTED_ROUTED_SCALING_FACTOR
         || config.rms_norm_eps != SUPPORTED_RMS_NORM_EPS
@@ -429,13 +487,23 @@ fn validate_supported_contract(config: &LagunaConfig) -> Result<()> {
         )));
     }
 
-    validate_layer_schedule(config)?;
-    validate_rope(config)?;
-    validate_quantization(config)?;
+    validate_layer_schedule(config, contract)?;
+    validate_rope(config, contract)?;
+    validate_quantization(config, contract)?;
     Ok(())
 }
 
-fn validate_layer_schedule(config: &LagunaConfig) -> Result<()> {
+fn detect_profile(config: &LagunaConfig) -> Result<LagunaProfile> {
+    match config.hidden_size {
+        3_072 => Ok(LagunaProfile::S21),
+        2_048 => Ok(LagunaProfile::Xs21),
+        hidden_size => Err(Error::config(format!(
+            "unsupported Laguna hidden_size {hidden_size}; supported profiles are Laguna S 2.1 (3072) and Laguna XS 2.1 (2048)"
+        ))),
+    }
+}
+
+fn validate_layer_schedule(config: &LagunaConfig, contract: LagunaProfileContract) -> Result<()> {
     if config.layer_types.len() != config.num_hidden_layers
         || config.mlp_layer_types.len() != config.num_hidden_layers
         || config.num_attention_heads_per_layer.len() != config.num_hidden_layers
@@ -459,9 +527,9 @@ fn validate_layer_schedule(config: &LagunaConfig) -> Result<()> {
             )));
         }
         let expected_heads = if expected_attention == LagunaAttentionKind::FullAttention {
-            48
+            SUPPORTED_GLOBAL_QUERY_HEADS
         } else {
-            72
+            contract.sliding_query_heads
         };
         if config.num_attention_heads_per_layer[layer_index] != expected_heads {
             return Err(Error::config(format!(
@@ -490,7 +558,7 @@ fn validate_layer_schedule(config: &LagunaConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_rope(config: &LagunaConfig) -> Result<()> {
+fn validate_rope(config: &LagunaConfig, contract: LagunaProfileContract) -> Result<()> {
     let full = &config.rope_parameters.full_attention;
     let sliding = &config.rope_parameters.sliding_attention;
     if full.rope_type != "yarn"
@@ -499,7 +567,7 @@ fn validate_rope(config: &LagunaConfig) -> Result<()> {
         || full.factor != Some(32.0)
         || full.original_max_position_embeddings != Some(8_192)
         || full.beta_slow != Some(1.0)
-        || full.beta_fast != Some(32.0)
+        || full.beta_fast != Some(contract.yarn_beta_fast)
         || full.attention_factor != Some(1.346_573_590_279_972_7)
         || sliding.rope_type != "default"
         || sliding.rope_theta != 10_000.0
@@ -605,8 +673,23 @@ fn rotary_dimension(head_dim: usize, factor: f64) -> Result<usize> {
     Ok(rotary_dim)
 }
 
-fn validate_quantization(config: &LagunaConfig) -> Result<()> {
-    let quant = &config.quantization_config;
+fn validate_quantization(config: &LagunaConfig, contract: LagunaProfileContract) -> Result<()> {
+    if !contract.requires_compressed_tensors_config {
+        if config.quantization_config.is_some() {
+            return Err(Error::config(format!(
+                "{} config must not declare the Laguna S compressed-tensors INT4 contract; GGUF quantization is validated from the artifact",
+                contract.display_name
+            )));
+        }
+        return Ok(());
+    }
+
+    let quant = config.quantization_config.as_ref().ok_or_else(|| {
+        Error::config(format!(
+            "{} config is missing quantization_config",
+            contract.display_name
+        ))
+    })?;
     if quant.format != "pack-quantized"
         || quant.quant_method != "compressed-tensors"
         || quant.quantization_status != "compressed"
@@ -725,11 +808,51 @@ mod tests {
     fn parses_exact_laguna_s_2_1_int4_contract() {
         let config = LagunaConfig::from_json_str(&supported_config_json()).unwrap();
 
+        assert_eq!(config.profile().unwrap(), LagunaProfile::S21);
         assert_eq!(config.query_width(0), Some(6_144));
         assert_eq!(config.query_width(1), Some(9_216));
         assert_eq!(config.key_value_width(), 1_024);
         assert_eq!(config.rotary_dim(0), Some(64));
         assert_eq!(config.rotary_dim(1), Some(128));
+    }
+
+    #[test]
+    fn parses_exact_laguna_xs_2_1_contract() {
+        let config = LagunaConfig::from_json_str(&xs_config_json()).unwrap();
+
+        assert_eq!(config.profile().unwrap(), LagunaProfile::Xs21);
+        assert_eq!(config.hidden_size, 2_048);
+        assert_eq!(config.num_hidden_layers, 40);
+        assert_eq!(config.num_experts_per_tok, 8);
+        assert_eq!(config.query_width(0), Some(6_144));
+        assert_eq!(config.query_width(1), Some(8_192));
+        assert_eq!(config.key_value_width(), 1_024);
+        assert_eq!(config.rotary_dim(0), Some(64));
+        assert_eq!(config.rotary_dim(1), Some(128));
+        assert!(config.quantization_config.is_none());
+    }
+
+    #[test]
+    fn laguna_xs_sliding_window_bounds_three_quarters_of_the_kv_layers() {
+        let config = LagunaConfig::from_json_str(&xs_config_json()).unwrap();
+        let budget = config.fp8_kv_cache_budget(1, 262_144).unwrap();
+
+        assert_eq!(budget.full_layer_count, 10);
+        assert_eq!(budget.sliding_layer_count, 30);
+        assert_eq!(budget.full_retained_tokens_per_layer, 262_144);
+        assert_eq!(budget.sliding_retained_tokens_per_layer, 512);
+        assert_eq!(budget.full_bytes, 5_368_709_120);
+        assert_eq!(budget.sliding_bytes, 31_457_280);
+        assert_eq!(budget.total_bytes, 5_400_166_400);
+    }
+
+    #[test]
+    fn rejects_a_hybrid_laguna_xs_contract() {
+        let mut value: serde_json::Value = serde_json::from_str(&xs_config_json()).unwrap();
+        value["num_experts_per_tok"] = json!(10);
+
+        let error = LagunaConfig::from_json_str(&value.to_string()).unwrap_err();
+        assert!(error.to_string().contains("num_experts_per_tok must be 8"));
     }
 
     #[test]
@@ -938,5 +1061,45 @@ mod tests {
             "quantization_config": quantization_config
         })
         .to_string()
+    }
+
+    fn xs_config_json() -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&supported_config_json()).unwrap();
+        let layer_types = (0..40)
+            .map(|layer| {
+                if layer % 4 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect::<Vec<_>>();
+        let heads = (0..40)
+            .map(|layer| if layer % 4 == 0 { 48 } else { 64 })
+            .collect::<Vec<_>>();
+        let mlp = (0..40)
+            .map(|layer| if layer == 0 { "dense" } else { "sparse" })
+            .collect::<Vec<_>>();
+
+        value["hidden_size"] = json!(2_048);
+        value["intermediate_size"] = json!(8_192);
+        value["moe_intermediate_size"] = json!(512);
+        value["shared_expert_intermediate_size"] = json!(512);
+        value["num_hidden_layers"] = json!(40);
+        value["num_experts_per_tok"] = json!(8);
+        value["layer_types"] = json!(layer_types);
+        value["num_attention_heads_per_layer"] = json!(heads);
+        value["mlp_layer_types"] = json!(mlp);
+        value["gating_types"] = json!(vec!["per_head"; 40]);
+        value["rope_parameters"]["full_attention"]["beta_fast"] = json!(64.0);
+        value
+            .as_object_mut()
+            .expect("test config must be an object")
+            .remove("quantization_config");
+        value
+            .as_object_mut()
+            .expect("test config must be an object")
+            .remove("moe_router_logit_softcapping");
+        value.to_string()
     }
 }

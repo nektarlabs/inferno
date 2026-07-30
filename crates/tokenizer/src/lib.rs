@@ -18,7 +18,8 @@ use tokenizers::{
 pub use agent::{
     is_supported_codex_function, map_laguna_function_call_to_codex, parse_agent_output,
     parse_complete_agent_tool_call, render_codex_prompt, render_laguna_codex_prompt,
-    streamable_agent_text, AgentFunctionCall, AgentOutput, AgentOutputItem,
+    render_laguna_xs_codex_prompt, streamable_agent_text, AgentFunctionCall, AgentOutput,
+    AgentOutputItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,13 @@ pub struct ChatPrompt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTurn {
     pub user: String,
+    pub assistant: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LagunaReasoningTurn {
+    pub user: String,
+    pub reasoning: String,
     pub assistant: String,
 }
 
@@ -295,6 +303,53 @@ pub fn render_laguna_chat_prompt(
     ChatPrompt { rendered }
 }
 
+/// Renders Laguna XS 2.1 chat history while preserving earlier reasoning when
+/// thinking is enabled, as required by the model's published chat contract.
+pub fn render_laguna_xs_chat_prompt(
+    history: &[LagunaReasoningTurn],
+    prompt: &str,
+    thinking_mode: LagunaThinkingMode,
+) -> ChatPrompt {
+    const DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+
+    let history_bytes = history.iter().fold(0_usize, |total, turn| {
+        total
+            .saturating_add(turn.user.len())
+            .saturating_add(turn.reasoning.len())
+            .saturating_add(turn.assistant.len())
+    });
+    let mut rendered = String::with_capacity(
+        "〈|EOS|〉<system></system>\n<user></user>\n<assistant><think>".len()
+            + DEFAULT_SYSTEM.len()
+            + history_bytes
+            + prompt.len(),
+    );
+    rendered.push_str("〈|EOS|〉<system>");
+    rendered.push_str(DEFAULT_SYSTEM);
+    rendered.push_str("</system>\n");
+    for turn in history {
+        rendered.push_str("<user>");
+        rendered.push_str(&turn.user);
+        rendered.push_str("</user>\n<assistant>");
+        if thinking_mode == LagunaThinkingMode::Enabled {
+            rendered.push_str("<think>");
+            rendered.push_str(turn.reasoning.trim());
+            rendered.push_str("</think>");
+        } else {
+            rendered.push_str("</think>");
+        }
+        rendered.push_str(turn.assistant.trim());
+        rendered.push_str("</assistant>\n");
+    }
+    rendered.push_str("<user>");
+    rendered.push_str(prompt);
+    rendered.push_str("</user>\n<assistant><think>");
+    if thinking_mode == LagunaThinkingMode::Disabled {
+        rendered.push_str("</think>");
+    }
+    ChatPrompt { rendered }
+}
+
 pub fn render_chat_prompt(history: &[ChatTurn], prompt: &str) -> ChatPrompt {
     let history_bytes = history.iter().fold(0_usize, |total, turn| {
         total
@@ -481,6 +536,41 @@ mod tests {
             rendered.rendered,
             "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>What is the capital of Italy?</user>\n<assistant><think></think>Rome.</assistant>\n<user>And France?</user>\n<assistant><think></think>"
         );
+    }
+
+    #[test]
+    fn renders_xs_history_with_preserved_reasoning_when_enabled() {
+        let history = vec![LagunaReasoningTurn {
+            user: "Inspect the project.".to_string(),
+            reasoning: "I should list the files.".to_string(),
+            assistant: "I will inspect it.".to_string(),
+        }];
+
+        let rendered =
+            render_laguna_xs_chat_prompt(&history, "Continue.", LagunaThinkingMode::Enabled);
+
+        assert!(rendered.rendered.contains(
+            "<assistant><think>I should list the files.</think>I will inspect it.</assistant>"
+        ));
+        assert!(rendered.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn omits_xs_history_reasoning_when_thinking_is_disabled() {
+        let history = vec![LagunaReasoningTurn {
+            user: "Inspect the project.".to_string(),
+            reasoning: "Do not replay this.".to_string(),
+            assistant: "Done.".to_string(),
+        }];
+
+        let rendered =
+            render_laguna_xs_chat_prompt(&history, "Continue.", LagunaThinkingMode::Disabled);
+
+        assert!(!rendered.rendered.contains("Do not replay this."));
+        assert!(rendered
+            .rendered
+            .contains("<assistant></think>Done.</assistant>"));
+        assert!(rendered.rendered.ends_with("<assistant><think></think>"));
     }
 
     #[test]

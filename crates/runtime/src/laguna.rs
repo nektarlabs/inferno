@@ -15,6 +15,7 @@ use crate::{
 
 const LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS: usize = 4_096;
 const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
+const LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
 const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
 const LAGUNA_THINKING_NGRAM_TOKENS: usize = 8;
 const LAGUNA_THINKING_NGRAM_LIMIT: u8 = 4;
@@ -431,6 +432,7 @@ fn prefill_chunk_tokens(artifact: LagunaArtifactKind) -> usize {
     match artifact {
         LagunaArtifactKind::SafetensorsInt4 => LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
         LagunaArtifactKind::AntirezGguf => LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+        LagunaArtifactKind::PoolsideXsGguf => LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
     }
 }
 
@@ -516,6 +518,7 @@ mod tests {
         LagunaThinkingGuard, LagunaThinkingGuardReason, LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
         LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS, LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
         LAGUNA_THINKING_END_TOKEN_ID, LAGUNA_THINKING_TOKEN_BUDGET,
+        LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
     };
     use crate::LagunaMemoryControllerSpec;
     use model::LagunaArtifactKind;
@@ -678,6 +681,10 @@ mod tests {
         assert_eq!(
             prefill_chunk_tokens(LagunaArtifactKind::SafetensorsInt4),
             4_096
+        );
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::PoolsideXsGguf),
+            LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS
         );
         assert!(LAGUNA_GGUF_PREFILL_CHUNK_TOKENS < LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS);
     }

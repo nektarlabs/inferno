@@ -30,6 +30,7 @@ use http::{read_request, write_json_error, write_json_response};
 pub const GLM_CODEX_MODEL_ID: &str = "glm-5.2-q2";
 pub const LAGUNA_CODEX_MODEL_ID: &str = "laguna-s-2.1-int4";
 pub const LAGUNA_GGUF_CODEX_MODEL_ID: &str = "laguna-s-2.1-gguf";
+pub const LAGUNA_XS_GGUF_CODEX_MODEL_ID: &str = "laguna-xs-2.1-gguf";
 const CODEX_MODEL_CATALOG: &str = include_str!("../../../examples/inferno.models.json");
 const EXCLUSIVE_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -467,6 +468,7 @@ mod tests {
             GLM_CODEX_MODEL_ID,
             LAGUNA_CODEX_MODEL_ID,
             LAGUNA_GGUF_CODEX_MODEL_ID,
+            LAGUNA_XS_GGUF_CODEX_MODEL_ID,
         ] {
             let catalog = codex_model_catalog(model_id).unwrap();
             let models = catalog["models"].as_array().unwrap();

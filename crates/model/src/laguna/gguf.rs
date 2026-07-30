@@ -5,7 +5,7 @@ use ::gguf::{
     GgufTensorInfo, GgufTensorStorage,
 };
 use common::{Error, Result};
-use config::LagunaConfig;
+use config::{LagunaConfig, LagunaProfile};
 use inferno_io::MappedBytes;
 
 pub const LAGUNA_GGUF_REPO_ID: &str = "antirez/Laguna-S-2.1-GGUF";
@@ -15,10 +15,110 @@ pub const LAGUNA_GGUF_FILE_BYTES: u64 = 48_260_803_968;
 pub const LAGUNA_GGUF_SHA256: &str =
     "61fc66596597985cb9408a8530de6322d9e0d5b1d2ad4ed6503938018e0ce903";
 
-const EXPECTED_TENSOR_COUNT: u64 = 814;
-const EXPECTED_METADATA_COUNT: u64 = 59;
-const EXPECTED_TENSOR_DATA_OFFSET: u64 = 3_733_888;
+pub const LAGUNA_XS_GGUF_REPO_ID: &str = "poolside/Laguna-XS-2.1-GGUF";
+pub const LAGUNA_XS_GGUF_REPO_URL: &str = "https://huggingface.co/poolside/Laguna-XS-2.1-GGUF";
+pub const LAGUNA_XS_GGUF_FILE_NAME: &str = "Laguna-XS-2.1-Q4_K_M.gguf";
+pub const LAGUNA_XS_GGUF_FILE_BYTES: u64 = 20_274_300_032;
+pub const LAGUNA_XS_GGUF_SHA256: &str =
+    "1ac7079101fca5a6df8c5a7523a3c30ea7d1c0e4b1258090e7d6d4039287f6cb";
+
 const FIRST_Q3_LAYER: usize = 21;
+const LAGUNA_XS_Q6_LAYERS: [usize; 20] = [
+    0, 1, 2, 3, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 35, 36, 37, 38, 39,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagunaGgufFlavor {
+    S21Q2Q3,
+    Xs21Q4KM,
+}
+
+impl LagunaGgufFlavor {
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::S21Q2Q3 => LAGUNA_GGUF_FILE_NAME,
+            Self::Xs21Q4KM => LAGUNA_XS_GGUF_FILE_NAME,
+        }
+    }
+
+    const fn container(self) -> LagunaGgufContainer {
+        match self {
+            Self::S21Q2Q3 => LagunaGgufContainer {
+                file_bytes: LAGUNA_GGUF_FILE_BYTES,
+                tensor_count: 814,
+                metadata_count: 59,
+                tensor_data_offset: 3_733_888,
+                file_type: 10,
+            },
+            Self::Xs21Q4KM => LagunaGgufContainer {
+                file_bytes: LAGUNA_XS_GGUF_FILE_BYTES,
+                tensor_count: 678,
+                metadata_count: 56,
+                tensor_data_offset: 3_725_440,
+                file_type: 15,
+            },
+        }
+    }
+
+    const fn root_types(self) -> (GgmlType, GgmlType) {
+        match self {
+            Self::S21Q2Q3 => (GgmlType::Q8_0, GgmlType::Q8_0),
+            Self::Xs21Q4KM => (GgmlType::Q4K, GgmlType::Q6K),
+        }
+    }
+
+    const fn attention_type(self, layer_index: usize, value: bool) -> GgmlType {
+        match self {
+            Self::S21Q2Q3 => GgmlType::Q8_0,
+            Self::Xs21Q4KM if value && laguna_xs_uses_q6(layer_index) => GgmlType::Q6K,
+            Self::Xs21Q4KM => GgmlType::Q4K,
+        }
+    }
+
+    const fn dense_types(self, layer_index: usize) -> (GgmlType, GgmlType) {
+        match self {
+            Self::S21Q2Q3 => (GgmlType::Q8_0, GgmlType::Q8_0),
+            Self::Xs21Q4KM if laguna_xs_uses_q6(layer_index) => (GgmlType::Q4K, GgmlType::Q6K),
+            Self::Xs21Q4KM => (GgmlType::Q4K, GgmlType::Q4K),
+        }
+    }
+
+    const fn routed_types(self, layer_index: usize) -> (GgmlType, GgmlType) {
+        match self {
+            Self::S21Q2Q3 if layer_index < FIRST_Q3_LAYER => (GgmlType::Q2K, GgmlType::Q2K),
+            Self::S21Q2Q3 => (GgmlType::Q3K, GgmlType::Q3K),
+            Self::Xs21Q4KM if laguna_xs_uses_q6(layer_index) => (GgmlType::Q4K, GgmlType::Q6K),
+            Self::Xs21Q4KM => (GgmlType::Q4K, GgmlType::Q4K),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LagunaGgufContainer {
+    file_bytes: u64,
+    tensor_count: u64,
+    metadata_count: u64,
+    tensor_data_offset: u64,
+    file_type: u64,
+}
+
+const fn laguna_xs_uses_q6(layer_index: usize) -> bool {
+    let mut index = 0;
+    while index < LAGUNA_XS_Q6_LAYERS.len() {
+        if LAGUNA_XS_Q6_LAYERS[index] == layer_index {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn flavor_for_config(config: &LagunaConfig) -> Result<LagunaGgufFlavor> {
+    match config.profile()? {
+        LagunaProfile::S21 => Ok(LagunaGgufFlavor::S21Q2Q3),
+        LagunaProfile::Xs21 => Ok(LagunaGgufFlavor::Xs21Q4KM),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LagunaGgufRoot {
@@ -77,24 +177,27 @@ pub struct LagunaGgufLayer {
 #[derive(Debug)]
 pub struct LagunaGgufIndex {
     file: GgufFile,
+    flavor: LagunaGgufFlavor,
     pub root: LagunaGgufRoot,
     pub layers: Vec<LagunaGgufLayer>,
 }
 
 impl LagunaGgufIndex {
     pub fn open(path: impl AsRef<Path>, config: &LagunaConfig) -> Result<Self> {
+        let flavor = flavor_for_config(config)?;
         let file = GgufFile::open(path)?;
-        validate_container(&file)?;
-        validate_metadata(&file, config)?;
+        validate_container(&file, flavor)?;
+        validate_metadata(&file, config, flavor)?;
 
-        let mut used = HashSet::with_capacity(EXPECTED_TENSOR_COUNT as usize);
+        let mut used = HashSet::with_capacity(flavor.container().tensor_count as usize);
+        let (embedding_type, output_type) = flavor.root_types();
         let root = LagunaGgufRoot {
             embedding: required(
                 &file,
                 &mut used,
                 "token_embd.weight",
                 &[config.hidden_size, config.vocab_size],
-                GgmlType::Q8_0,
+                embedding_type,
             )?,
             final_norm: required(
                 &file,
@@ -108,13 +211,13 @@ impl LagunaGgufIndex {
                 &mut used,
                 "output.weight",
                 &[config.hidden_size, config.vocab_size],
-                GgmlType::Q8_0,
+                output_type,
             )?,
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_index in 0..config.num_hidden_layers {
-            layers.push(index_layer(&file, &mut used, config, layer_index)?);
+            layers.push(index_layer(&file, &mut used, config, flavor, layer_index)?);
         }
         if used.len() != file.tensors().len() {
             let unexpected = file
@@ -130,7 +233,16 @@ impl LagunaGgufIndex {
             )));
         }
 
-        Ok(Self { file, root, layers })
+        Ok(Self {
+            file,
+            flavor,
+            root,
+            layers,
+        })
+    }
+
+    pub const fn flavor(&self) -> LagunaGgufFlavor {
+        self.flavor
     }
 
     pub fn path(&self) -> &Path {
@@ -175,6 +287,7 @@ fn index_layer(
     file: &GgufFile,
     used: &mut HashSet<String>,
     config: &LagunaConfig,
+    flavor: LagunaGgufFlavor,
     layer_index: usize,
 ) -> Result<LagunaGgufLayer> {
     let prefix = format!("blk.{layer_index}");
@@ -199,28 +312,28 @@ fn index_layer(
             used,
             &format!("{prefix}.attn_q.weight"),
             &[config.hidden_size, query_width],
-            GgmlType::Q8_0,
+            flavor.attention_type(layer_index, false),
         )?,
         key: required(
             file,
             used,
             &format!("{prefix}.attn_k.weight"),
             &[config.hidden_size, kv_width],
-            GgmlType::Q8_0,
+            flavor.attention_type(layer_index, false),
         )?,
         value: required(
             file,
             used,
             &format!("{prefix}.attn_v.weight"),
             &[config.hidden_size, kv_width],
-            GgmlType::Q8_0,
+            flavor.attention_type(layer_index, true),
         )?,
         gate: required(
             file,
             used,
             &format!("{prefix}.attn_gate.weight"),
             &[config.hidden_size, query_heads],
-            GgmlType::Q8_0,
+            flavor.attention_type(layer_index, false),
         )?,
         query_norm: required(
             file,
@@ -241,7 +354,7 @@ fn index_layer(
             used,
             &format!("{prefix}.attn_output.weight"),
             &[query_width, config.hidden_size],
-            GgmlType::Q8_0,
+            flavor.attention_type(layer_index, false),
         )?,
     };
     let post_attention_norm = required(
@@ -259,13 +372,11 @@ fn index_layer(
             "",
             config.hidden_size,
             config.intermediate_size,
+            flavor,
+            layer_index,
         )?)
     } else {
-        let expert_type = if layer_index < FIRST_Q3_LAYER {
-            GgmlType::Q2K
-        } else {
-            GgmlType::Q3K
-        };
+        let (expert_gate_up_type, expert_down_type) = flavor.routed_types(layer_index);
         LagunaGgufMlp::Moe(Box::new(LagunaGgufMoe {
             router: required(
                 file,
@@ -290,7 +401,7 @@ fn index_layer(
                     config.moe_intermediate_size,
                     config.num_experts,
                 ],
-                expert_type,
+                expert_gate_up_type,
             )?,
             routed_up: required(
                 file,
@@ -301,7 +412,7 @@ fn index_layer(
                     config.moe_intermediate_size,
                     config.num_experts,
                 ],
-                expert_type,
+                expert_gate_up_type,
             )?,
             routed_down: required(
                 file,
@@ -312,7 +423,7 @@ fn index_layer(
                     config.hidden_size,
                     config.num_experts,
                 ],
-                expert_type,
+                expert_down_type,
             )?,
             shared: index_dense(
                 file,
@@ -321,6 +432,8 @@ fn index_layer(
                 "_shexp",
                 config.hidden_size,
                 config.shared_expert_intermediate_size,
+                flavor,
+                layer_index,
             )?,
         }))
     };
@@ -340,28 +453,31 @@ fn index_dense(
     suffix: &str,
     hidden_size: usize,
     intermediate_size: usize,
+    flavor: LagunaGgufFlavor,
+    layer_index: usize,
 ) -> Result<LagunaGgufDense> {
+    let (gate_up_type, down_type) = flavor.dense_types(layer_index);
     Ok(LagunaGgufDense {
         gate: required(
             file,
             used,
             &format!("{prefix}.ffn_gate{suffix}.weight"),
             &[hidden_size, intermediate_size],
-            GgmlType::Q8_0,
+            gate_up_type,
         )?,
         up: required(
             file,
             used,
             &format!("{prefix}.ffn_up{suffix}.weight"),
             &[hidden_size, intermediate_size],
-            GgmlType::Q8_0,
+            gate_up_type,
         )?,
         down: required(
             file,
             used,
             &format!("{prefix}.ffn_down{suffix}.weight"),
             &[intermediate_size, hidden_size],
-            GgmlType::Q8_0,
+            down_type,
         )?,
     })
 }
@@ -396,7 +512,7 @@ fn required(
         )));
     }
     match ty {
-        GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q8_0 => {
+        GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q8_0 => {
             file.tensor_quantized_storage(name)?;
         }
         GgmlType::F32 => {
@@ -416,18 +532,20 @@ fn required(
     Ok(tensor.clone())
 }
 
-fn validate_container(file: &GgufFile) -> Result<()> {
+fn validate_container(file: &GgufFile, flavor: LagunaGgufFlavor) -> Result<()> {
     let summary = file.summary();
-    if summary.file_size != LAGUNA_GGUF_FILE_BYTES
-        || summary.tensor_count != EXPECTED_TENSOR_COUNT
-        || summary.metadata_kv_count != EXPECTED_METADATA_COUNT
-        || summary.tensor_data_offset != EXPECTED_TENSOR_DATA_OFFSET
+    let expected = flavor.container();
+    if summary.file_size != expected.file_bytes
+        || summary.tensor_count != expected.tensor_count
+        || summary.metadata_kv_count != expected.metadata_count
+        || summary.tensor_data_offset != expected.tensor_data_offset
         || summary.architecture.as_deref() != Some("laguna")
         || summary.quantization_version != Some(2)
-        || summary.file_type != Some(10)
+        || summary.file_type != Some(expected.file_type)
     {
         return Err(Error::weights(format!(
-            "GGUF is not the exact {LAGUNA_GGUF_FILE_NAME} artifact: size={}, tensors={}, metadata={}, data_offset={}, architecture={:?}, quantization={:?}, file_type={:?}",
+            "GGUF is not the exact {} artifact: size={}, tensors={}, metadata={}, data_offset={}, architecture={:?}, quantization={:?}, file_type={:?}",
+            flavor.file_name(),
             summary.file_size,
             summary.tensor_count,
             summary.metadata_kv_count,
@@ -440,7 +558,11 @@ fn validate_container(file: &GgufFile) -> Result<()> {
     Ok(())
 }
 
-fn validate_metadata(file: &GgufFile, config: &LagunaConfig) -> Result<()> {
+fn validate_metadata(
+    file: &GgufFile,
+    config: &LagunaConfig,
+    flavor: LagunaGgufFlavor,
+) -> Result<()> {
     let exact_unsigned = [
         ("laguna.block_count", config.num_hidden_layers),
         ("laguna.context_length", config.max_position_embeddings),
@@ -498,7 +620,11 @@ fn validate_metadata(file: &GgufFile, config: &LagunaConfig) -> Result<()> {
     // correction from the external Laguna config when preparing its RoPE
     // table.
     expect_f32(file, "laguna.rope.scaling.yarn_attn_factor", 1.0)?;
-    expect_f32(file, "laguna.rope.scaling.yarn_beta_fast", 32.0)?;
+    let yarn_beta_fast = match flavor {
+        LagunaGgufFlavor::S21Q2Q3 => 32.0,
+        LagunaGgufFlavor::Xs21Q4KM => 64.0,
+    };
+    expect_f32(file, "laguna.rope.scaling.yarn_beta_fast", yarn_beta_fast)?;
     expect_f32(file, "laguna.rope.scaling.yarn_beta_slow", 1.0)?;
     if metadata_i32_array(file, "laguna.attention.head_count")?
         != config
@@ -512,6 +638,41 @@ fn validate_metadata(file: &GgufFile, config: &LagunaConfig) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{laguna_xs_uses_q6, LagunaGgufFlavor, LAGUNA_XS_Q6_LAYERS};
+    use gguf::GgmlType;
+
+    #[test]
+    fn xs_q6_layer_schedule_matches_the_official_q4_k_m_directory() {
+        let actual = (0..40)
+            .filter(|layer_index| laguna_xs_uses_q6(*layer_index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, LAGUNA_XS_Q6_LAYERS);
+    }
+
+    #[test]
+    fn s_and_xs_quantization_contracts_remain_separate() {
+        assert_eq!(
+            LagunaGgufFlavor::S21Q2Q3.routed_types(20),
+            (GgmlType::Q2K, GgmlType::Q2K)
+        );
+        assert_eq!(
+            LagunaGgufFlavor::S21Q2Q3.routed_types(21),
+            (GgmlType::Q3K, GgmlType::Q3K)
+        );
+        assert_eq!(
+            LagunaGgufFlavor::Xs21Q4KM.routed_types(1),
+            (GgmlType::Q4K, GgmlType::Q6K)
+        );
+        assert_eq!(
+            LagunaGgufFlavor::Xs21Q4KM.routed_types(5),
+            (GgmlType::Q4K, GgmlType::Q4K)
+        );
+    }
 }
 
 fn expect_bool(file: &GgufFile, key: &str, expected: bool) -> Result<()> {

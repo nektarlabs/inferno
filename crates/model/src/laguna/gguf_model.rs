@@ -1,15 +1,16 @@
 use std::path::Path;
 
 use backend::{
-    Backend, DeviceRopeTable, DeviceValue, GgufExpertQuant, LagunaF16KvCache, LagunaKvRetention,
+    Backend, DeviceRopeTable, DeviceValue, GgufExpertQuant, GgufKQuant, LagunaF16KvCache,
+    LagunaKvRetention,
 };
 use common::{Error, F32Tensor, Result};
 use config::{LagunaAttentionKind, LagunaConfig};
 use gguf::{GgmlType, GgufQuantBlockKind, GgufTensorAdvice, GgufTensorInfo};
 
 use super::{
-    LagunaGgufDense, LagunaGgufIndex, LagunaGgufLayer, LagunaGgufMlp, LagunaGgufMoe,
-    LagunaTokenOutput,
+    LagunaGgufDense, LagunaGgufFlavor, LagunaGgufIndex, LagunaGgufLayer, LagunaGgufMlp,
+    LagunaGgufMoe, LagunaTokenOutput,
 };
 
 /// Layers per command-buffer submission.
@@ -65,6 +66,10 @@ pub struct LagunaGgufSession {
 }
 
 impl LagunaGgufModel {
+    pub const fn flavor(&self) -> super::LagunaGgufFlavor {
+        self.index.flavor()
+    }
+
     pub fn open<B: Backend>(
         gguf_path: impl AsRef<Path>,
         config: LagunaConfig,
@@ -72,7 +77,7 @@ impl LagunaGgufModel {
     ) -> Result<Self> {
         if !backend.device_values_supported() {
             return Err(Error::backend(
-                "Antirez Laguna GGUF inference requires native device-resident Metal execution",
+                "Laguna GGUF inference requires native device-resident Metal execution",
             ));
         }
         let index = LagunaGgufIndex::open(gguf_path, &config)?;
@@ -83,7 +88,7 @@ impl LagunaGgufModel {
                 index.tensor_data_offset()?,
                 index.max_tensor_storage_byte_len()?,
             )?
-            .ok_or_else(|| Error::backend("Laguna Q2/Q3 GGUF model views require native Metal"))?;
+            .ok_or_else(|| Error::backend("Laguna GGUF model views require native Metal"))?;
         tracing::debug!(
             target: "inferno::laguna",
             view_count = view_report.view_count,
@@ -91,9 +96,19 @@ impl LagunaGgufModel {
             mapped_view_gb = view_report.view_bytes as f64 / 1024_f64.powi(3),
             max_view_gb = view_report.max_view_bytes as f64 / 1024_f64.powi(3),
             warmup_samples = view_report.warmup_samples,
-            "prepared persistent Laguna Q2/Q3 Metal model views"
+            flavor = ?index.flavor(),
+            "prepared persistent Laguna Metal model views"
         );
         let prepared = PreparedWeights::new(&index, &config, backend)?;
+        if index.flavor() == LagunaGgufFlavor::Xs21Q4KM {
+            let prepared_bytes = prepare_xs_dense_prefill_weights(&index, &config, backend)?;
+            backend.device_flush()?;
+            tracing::debug!(
+                target: "inferno::laguna",
+                prepared_gb = prepared_bytes as f64 / 1024_f64.powi(3),
+                "prepared Laguna XS dense FP16 prefill weights"
+            );
+        }
         Ok(Self {
             config,
             index,
@@ -179,23 +194,46 @@ impl LagunaGgufModel {
         )?;
         let normalized = required(
             "Laguna GGUF final RMSNorm",
-            backend.rms_norm_device(
+            self.rms_norm_device(
                 &last,
                 &self.prepared.final_norm,
+                1,
                 self.config.rms_norm_eps as f32,
+                backend,
             )?,
         )?;
-        let output = self.q8_bytes(&self.index.root.output)?;
-        let (token_id, token_score) = backend
-            .laguna_q8_0_matvec_argmax_device(
-                output,
-                &normalized,
-                self.config.hidden_size,
-                self.config.vocab_size,
-            )?
-            .ok_or_else(|| {
-                Error::backend("Laguna GGUF Q8_0 output-head argmax requires native Metal")
-            })?;
+        let (token_id, token_score) = match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => {
+                let output = self.q8_bytes(&self.index.root.output)?;
+                backend
+                    .laguna_q8_0_matvec_argmax_device(
+                        output,
+                        &normalized,
+                        self.config.hidden_size,
+                        self.config.vocab_size,
+                    )?
+                    .ok_or_else(|| {
+                        Error::backend(
+                            "Laguna S GGUF Q8_0 output-head argmax requires native Metal",
+                        )
+                    })?
+            }
+            LagunaGgufFlavor::Xs21Q4KM => {
+                let scores = self
+                    .xs_matvec(
+                        &self.index.root.output,
+                        &normalized,
+                        1,
+                        self.config.hidden_size,
+                        self.config.vocab_size,
+                        backend,
+                    )?
+                    .reshape(vec![self.config.vocab_size])?;
+                backend
+                    .argmax_f32_device(&scores)?
+                    .ok_or_else(|| Error::backend("Laguna XS argmax requires native Metal"))?
+            }
+        };
         session.validate_after_forward(1)?;
         Ok(LagunaTokenOutput {
             token_id,
@@ -223,18 +261,29 @@ impl LagunaGgufModel {
     ) -> Result<DeviceValue> {
         validate_token_ids(&self.config, token_ids)?;
         session.validate_before_forward(self.config.num_hidden_layers, token_ids.len())?;
-        let embedding = self.q8_bytes(&self.index.root.embedding)?;
-        let mut hidden = required(
-            "Laguna GGUF embedding",
-            backend.q8_0_embedding_device(
-                embedding,
-                token_ids,
-                &[session.batch, token_ids.len()],
-                self.config.vocab_size,
-                self.config.hidden_size,
+        let token_shape = [session.batch, token_ids.len()];
+        let mut hidden = match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => required(
+                "Laguna S GGUF embedding",
+                backend.q8_0_embedding_device(
+                    self.q8_bytes(&self.index.root.embedding)?,
+                    token_ids,
+                    &token_shape,
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                )?,
             )?,
-        )?;
-
+            LagunaGgufFlavor::Xs21Q4KM => required(
+                "Laguna XS GGUF embedding",
+                backend.q4_k_embedding_device(
+                    self.k_bytes(&self.index.root.embedding)?.1,
+                    token_ids,
+                    &token_shape,
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                )?,
+            )?,
+        };
         for layer_index in 0..self.config.num_hidden_layers {
             let layer = self.index.layers.get(layer_index).ok_or_else(|| {
                 Error::weights(format!("missing Laguna GGUF layer {layer_index}"))
@@ -272,10 +321,12 @@ impl LagunaGgufModel {
         let row_count = hidden.element_count()? / self.config.hidden_size;
         let normalized = required(
             "Laguna GGUF attention RMSNorm",
-            backend.rms_norm_device(
+            self.rms_norm_device(
                 hidden,
                 &prepared.input_norm,
+                row_count,
                 self.config.rms_norm_eps as f32,
+                backend,
             )?,
         )?;
         let attention = &layer.attention;
@@ -287,46 +338,114 @@ impl LagunaGgufModel {
             .checked_mul(self.config.head_dim)
             .ok_or_else(|| Error::model("Laguna GGUF query width overflow"))?;
         let kv_width = self.config.key_value_width();
-        let [query, key, value, gate] = match backend.laguna_q8_0_attention_projections_device(
-            self.q8_bytes(&attention.query)?,
-            self.q8_bytes(&attention.key)?,
-            self.q8_bytes(&attention.value)?,
-            self.q8_bytes(&attention.gate)?,
-            &normalized,
-            row_count,
-            self.config.hidden_size,
-            query_width,
-            kv_width,
-            kv_width,
-            query_heads,
-        )? {
-            Some(projections) => projections,
-            None => {
-                let (query, key) = required_pair(
-                    "Laguna GGUF Q/K projection",
-                    backend.q8_0_matvec_pair_device(
-                        self.q8_bytes(&attention.query)?,
-                        self.q8_bytes(&attention.key)?,
-                        &normalized,
-                        row_count,
-                        self.config.hidden_size,
-                        query_width,
-                        kv_width,
-                    )?,
-                )?;
-                let (value, gate) = required_pair(
-                    "Laguna GGUF V/gate projection",
-                    backend.q8_0_matvec_pair_device(
-                        self.q8_bytes(&attention.value)?,
-                        self.q8_bytes(&attention.gate)?,
-                        &normalized,
-                        row_count,
-                        self.config.hidden_size,
-                        kv_width,
-                        query_heads,
-                    )?,
-                )?;
-                [query, key, value, gate]
+        let [query, key, value, gate] = match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => {
+                match backend.laguna_q8_0_attention_projections_device(
+                    self.q8_bytes(&attention.query)?,
+                    self.q8_bytes(&attention.key)?,
+                    self.q8_bytes(&attention.value)?,
+                    self.q8_bytes(&attention.gate)?,
+                    &normalized,
+                    row_count,
+                    self.config.hidden_size,
+                    query_width,
+                    kv_width,
+                    kv_width,
+                    query_heads,
+                )? {
+                    Some(projections) => projections,
+                    None => {
+                        let (query, key) = required_pair(
+                            "Laguna S GGUF Q/K projection",
+                            backend.q8_0_matvec_pair_device(
+                                self.q8_bytes(&attention.query)?,
+                                self.q8_bytes(&attention.key)?,
+                                &normalized,
+                                row_count,
+                                self.config.hidden_size,
+                                query_width,
+                                kv_width,
+                            )?,
+                        )?;
+                        let (value, gate) = required_pair(
+                            "Laguna S GGUF V/gate projection",
+                            backend.q8_0_matvec_pair_device(
+                                self.q8_bytes(&attention.value)?,
+                                self.q8_bytes(&attention.gate)?,
+                                &normalized,
+                                row_count,
+                                self.config.hidden_size,
+                                kv_width,
+                                query_heads,
+                            )?,
+                        )?;
+                        [query, key, value, gate]
+                    }
+                }
+            }
+            LagunaGgufFlavor::Xs21Q4KM => {
+                let (query_quant, query_weights) = self.k_bytes(&attention.query)?;
+                let (key_quant, key_weights) = self.k_bytes(&attention.key)?;
+                let (value_quant, value_weights) = self.k_bytes(&attention.value)?;
+                let (gate_quant, gate_weights) = self.k_bytes(&attention.gate)?;
+                if query_quant != GgufKQuant::Q4K
+                    || key_quant != GgufKQuant::Q4K
+                    || gate_quant != GgufKQuant::Q4K
+                {
+                    return Err(Error::weights(format!(
+                        "Laguna XS Q/K/gate projections must be Q4_K, got {query_quant:?}/{key_quant:?}/{gate_quant:?}"
+                    )));
+                }
+                match backend.laguna_xs_attention_projections_device(
+                    query_weights,
+                    key_weights,
+                    value_weights,
+                    value_quant,
+                    gate_weights,
+                    &normalized,
+                    row_count,
+                    self.config.hidden_size,
+                    query_width,
+                    kv_width,
+                    kv_width,
+                    query_heads,
+                )? {
+                    Some(projections) => projections,
+                    None => [
+                        self.xs_matvec(
+                            &attention.query,
+                            &normalized,
+                            row_count,
+                            self.config.hidden_size,
+                            query_width,
+                            backend,
+                        )?,
+                        self.xs_matvec(
+                            &attention.key,
+                            &normalized,
+                            row_count,
+                            self.config.hidden_size,
+                            kv_width,
+                            backend,
+                        )?,
+                        self.xs_matvec(
+                            &attention.value,
+                            &normalized,
+                            row_count,
+                            self.config.hidden_size,
+                            kv_width,
+                            backend,
+                        )?,
+                        self.xs_matvec(
+                            &attention.gate,
+                            &normalized,
+                            row_count,
+                            self.config.hidden_size,
+                            query_heads,
+                            backend,
+                        )?,
+                    ],
+                }
             }
         };
         let [batch, tokens, _] = hidden.dims() else {
@@ -355,9 +474,8 @@ impl LagunaGgufModel {
             None => return Err(Error::config("Laguna GGUF attention layer is out of range")),
         };
         let position = cache.inner.total_tokens();
-        let (query, key) = required_pair(
-            "Laguna GGUF Q/K RMSNorm and RoPE",
-            backend.laguna_qk_rms_norm_rope_pair_device(
+        let xs_qk = if self.flavor() == LagunaGgufFlavor::Xs21Q4KM {
+            backend.laguna_xs_qk_rms_norm_rope_pair_device(
                 &query,
                 &key,
                 &prepared.query_norm,
@@ -365,8 +483,25 @@ impl LagunaGgufModel {
                 self.config.rms_norm_eps as f32,
                 position,
                 rope,
+            )?
+        } else {
+            None
+        };
+        let (query, key) = match xs_qk {
+            Some(pair) => pair,
+            None => required_pair(
+                "Laguna GGUF Q/K RMSNorm and RoPE",
+                backend.laguna_qk_rms_norm_rope_pair_device(
+                    &query,
+                    &key,
+                    &prepared.query_norm,
+                    &prepared.key_norm,
+                    self.config.rms_norm_eps as f32,
+                    position,
+                    rope,
+                )?,
             )?,
-        )?;
+        };
         profile_prefill_boundary(
             backend,
             row_count,
@@ -384,24 +519,37 @@ impl LagunaGgufModel {
         )?
         .reshape(vec![*batch, *tokens, query_width])?;
         profile_prefill_boundary(backend, row_count, "laguna.prefill.attention_core")?;
-        let post_attention = required(
-            "Laguna GGUF attention output and residual",
-            backend.q8_0_matvec_add_device(
-                self.q8_bytes(&attention.output)?,
+        let post_attention = match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => required(
+                "Laguna S GGUF attention output and residual",
+                backend.q8_0_matvec_add_device(
+                    self.q8_bytes(&attention.output)?,
+                    &context,
+                    hidden,
+                    row_count,
+                    query_width,
+                    self.config.hidden_size,
+                )?,
+            )?,
+            LagunaGgufFlavor::Xs21Q4KM => self.xs_matvec_add(
+                &attention.output,
                 &context,
                 hidden,
                 row_count,
                 query_width,
                 self.config.hidden_size,
+                backend,
             )?,
-        )?;
+        };
         profile_prefill_boundary(backend, row_count, "laguna.prefill.attention_output")?;
         let mlp_input = required(
             "Laguna GGUF MLP RMSNorm",
-            backend.rms_norm_device(
+            self.rms_norm_device(
                 &post_attention,
                 &prepared.post_attention_norm,
+                row_count,
                 self.config.rms_norm_eps as f32,
+                backend,
             )?,
         )?;
         match (&layer.mlp, &prepared.moe) {
@@ -423,6 +571,22 @@ impl LagunaGgufModel {
         }
     }
 
+    fn rms_norm_device<B: Backend>(
+        &self,
+        input: &DeviceValue,
+        weight: &F32Tensor,
+        row_count: usize,
+        eps: f32,
+        backend: &B,
+    ) -> Result<Option<DeviceValue>> {
+        if self.flavor() == LagunaGgufFlavor::Xs21Q4KM && row_count == 1 {
+            if let Some(output) = backend.laguna_xs_rms_norm_device(input, weight, eps)? {
+                return Ok(Some(output));
+            }
+        }
+        backend.rms_norm_device(input, weight, eps)
+    }
+
     fn forward_dense<B: Backend>(
         &self,
         dense: &LagunaGgufDense,
@@ -431,28 +595,52 @@ impl LagunaGgufModel {
         row_count: usize,
         backend: &B,
     ) -> Result<DeviceValue> {
-        let activated = required(
-            "Laguna GGUF dense gate/up",
-            backend.q8_0_gate_up_swiglu_device(
-                self.q8_bytes(&dense.gate)?,
-                self.q8_bytes(&dense.up)?,
-                input,
-                row_count,
-                self.config.hidden_size,
-                self.config.intermediate_size,
-            )?,
-        )?;
-        required(
-            "Laguna GGUF dense down and residual",
-            backend.q8_0_matvec_add_device(
-                self.q8_bytes(&dense.down)?,
-                &activated,
-                residual,
-                row_count,
-                self.config.intermediate_size,
-                self.config.hidden_size,
-            )?,
-        )
+        match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => {
+                let activated = required(
+                    "Laguna S GGUF dense gate/up",
+                    backend.q8_0_gate_up_swiglu_device(
+                        self.q8_bytes(&dense.gate)?,
+                        self.q8_bytes(&dense.up)?,
+                        input,
+                        row_count,
+                        self.config.hidden_size,
+                        self.config.intermediate_size,
+                    )?,
+                )?;
+                required(
+                    "Laguna S GGUF dense down and residual",
+                    backend.q8_0_matvec_add_device(
+                        self.q8_bytes(&dense.down)?,
+                        &activated,
+                        residual,
+                        row_count,
+                        self.config.intermediate_size,
+                        self.config.hidden_size,
+                    )?,
+                )
+            }
+            LagunaGgufFlavor::Xs21Q4KM => {
+                let activated = self.xs_gate_up_swiglu(
+                    &dense.gate,
+                    &dense.up,
+                    input,
+                    row_count,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                    backend,
+                )?;
+                self.xs_matvec_add(
+                    &dense.down,
+                    &activated,
+                    residual,
+                    row_count,
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    backend,
+                )
+            }
+        }
     }
 
     fn forward_moe<B: Backend>(
@@ -469,71 +657,136 @@ impl LagunaGgufModel {
             "Laguna GGUF router",
             backend.linear_f32_device(&flat_input, &prepared.router)?,
         )?;
-        let routing = backend
-            .moe_router_topk_resident_device(
+        let xs_routing = if self.flavor() == LagunaGgufFlavor::Xs21Q4KM {
+            backend.laguna_xs_router_topk_device(
                 &logits,
                 &prepared.correction_bias,
                 self.config.num_experts_per_tok,
                 self.config.norm_topk_prob,
                 self.config.moe_routed_scaling_factor as f32,
             )?
-            .ok_or_else(|| Error::backend("Laguna GGUF routing requires native Metal"))?;
+        } else {
+            None
+        };
+        let routing = match xs_routing {
+            Some(routing) => routing,
+            None => backend
+                .moe_router_topk_resident_device(
+                    &logits,
+                    &prepared.correction_bias,
+                    self.config.num_experts_per_tok,
+                    self.config.norm_topk_prob,
+                    self.config.moe_routed_scaling_factor as f32,
+                )?
+                .ok_or_else(|| Error::backend("Laguna GGUF routing requires native Metal"))?,
+        };
         profile_prefill_boundary(backend, row_count, "laguna.prefill.router")?;
         let routed_gate = self.index.quantized_storage(&moe.routed_gate)?;
         let routed_up = self.index.quantized_storage(&moe.routed_up)?;
         let routed_down = self.index.quantized_storage(&moe.routed_down)?;
-        if routed_gate.block != routed_up.block || routed_gate.block != routed_down.block {
-            return Err(Error::weights(
-                "Laguna GGUF routed gate/up/down quantization types disagree",
-            ));
-        }
-        let quant = match routed_gate.block {
-            GgufQuantBlockKind::Q2K => GgufExpertQuant::Q2K,
-            GgufQuantBlockKind::Q3K => GgufExpertQuant::Q3K,
-            GgufQuantBlockKind::Q8_0 => {
-                return Err(Error::weights(
-                    "Laguna GGUF routed experts must be Q2_K or Q3_K",
-                ))
+        match self.flavor() {
+            LagunaGgufFlavor::S21Q2Q3 => {
+                if routed_gate.block != routed_up.block || routed_gate.block != routed_down.block {
+                    return Err(Error::weights(
+                        "Laguna S GGUF routed gate/up/down quantization types disagree",
+                    ));
+                }
+                let quant = match routed_gate.block {
+                    GgufQuantBlockKind::Q2K => GgufExpertQuant::Q2K,
+                    GgufQuantBlockKind::Q3K => GgufExpertQuant::Q3K,
+                    other => {
+                        return Err(Error::weights(format!(
+                            "Laguna S routed experts must be Q2_K or Q3_K, got {other}"
+                        )))
+                    }
+                };
+                let routed = required(
+                    "Laguna S GGUF routed experts",
+                    backend.laguna_gguf_moe_device(
+                        routed_gate.bytes,
+                        routed_up.bytes,
+                        routed_down.bytes,
+                        quant,
+                        &flat_input,
+                        &routing,
+                        self.config.hidden_size,
+                        self.config.moe_intermediate_size,
+                        self.config.hidden_size,
+                    )?,
+                )?;
+                profile_prefill_boundary(backend, row_count, "laguna.prefill.routed_experts")?;
+                let shared_activated = required(
+                    "Laguna S GGUF shared expert gate/up",
+                    backend.q8_0_gate_up_swiglu_device(
+                        self.q8_bytes(&moe.shared.gate)?,
+                        self.q8_bytes(&moe.shared.up)?,
+                        &flat_input,
+                        row_count,
+                        self.config.hidden_size,
+                        self.config.shared_expert_intermediate_size,
+                    )?,
+                )?;
+                required(
+                    "Laguna S GGUF shared expert down, routed combine, and residual",
+                    backend.laguna_q8_0_matvec_add2_device(
+                        self.q8_bytes(&moe.shared.down)?,
+                        &shared_activated,
+                        &routed,
+                        residual,
+                        row_count,
+                        self.config.shared_expert_intermediate_size,
+                        self.config.hidden_size,
+                    )?,
+                )
             }
-        };
-        let routed = required(
-            "Laguna GGUF routed experts",
-            backend.laguna_gguf_moe_device(
-                routed_gate.bytes,
-                routed_up.bytes,
-                routed_down.bytes,
-                quant,
-                &flat_input,
-                &routing,
-                self.config.hidden_size,
-                self.config.moe_intermediate_size,
-                self.config.hidden_size,
-            )?,
-        )?;
-        profile_prefill_boundary(backend, row_count, "laguna.prefill.routed_experts")?;
-        let shared_activated = required(
-            "Laguna GGUF shared expert gate/up",
-            backend.q8_0_gate_up_swiglu_device(
-                self.q8_bytes(&moe.shared.gate)?,
-                self.q8_bytes(&moe.shared.up)?,
-                &flat_input,
-                row_count,
-                self.config.hidden_size,
-                self.config.shared_expert_intermediate_size,
-            )?,
-        )?;
-        required(
-            "Laguna GGUF shared expert down, routed combine, and residual",
-            backend.laguna_q8_0_matvec_add2_device(
-                self.q8_bytes(&moe.shared.down)?,
-                &shared_activated,
-                &routed,
-                residual,
-                row_count,
-                self.config.shared_expert_intermediate_size,
-                self.config.hidden_size,
-            )?,
-        )
+            LagunaGgufFlavor::Xs21Q4KM => {
+                if routed_gate.block != GgufQuantBlockKind::Q4K
+                    || routed_up.block != GgufQuantBlockKind::Q4K
+                {
+                    return Err(Error::weights(format!(
+                        "Laguna XS routed gate/up must be Q4_K, got {}/{}",
+                        routed_gate.block, routed_up.block
+                    )));
+                }
+                let down_quant = k_quant(routed_down.block)?;
+                let routed = required(
+                    "Laguna XS GGUF routed experts",
+                    backend.laguna_xs_gguf_moe_device(
+                        routed_gate.bytes,
+                        routed_up.bytes,
+                        routed_down.bytes,
+                        down_quant,
+                        &flat_input,
+                        &routing,
+                        self.config.hidden_size,
+                        self.config.moe_intermediate_size,
+                        self.config.hidden_size,
+                    )?,
+                )?;
+                profile_prefill_boundary(backend, row_count, "laguna.prefill.routed_experts")?;
+                let shared_activated = self.xs_gate_up_swiglu(
+                    &moe.shared.gate,
+                    &moe.shared.up,
+                    &flat_input,
+                    row_count,
+                    self.config.hidden_size,
+                    self.config.shared_expert_intermediate_size,
+                    backend,
+                )?;
+                let flat_residual = residual.reshape(vec![row_count, self.config.hidden_size])?;
+                self.xs_matvec_add2(
+                    &moe.shared.down,
+                    &shared_activated,
+                    &routed,
+                    &flat_residual,
+                    row_count,
+                    self.config.shared_expert_intermediate_size,
+                    self.config.hidden_size,
+                    backend,
+                )
+                .and_then(|output| output.reshape(residual.dims().to_vec()))
+            }
+        }
     }
 
     fn q8_bytes<'a>(&'a self, tensor: &'a GgufTensorInfo) -> Result<&'a [u8]> {
@@ -545,6 +798,138 @@ impl LagunaGgufModel {
             )));
         }
         Ok(storage.bytes)
+    }
+
+    fn k_bytes<'a>(&'a self, tensor: &'a GgufTensorInfo) -> Result<(GgufKQuant, &'a [u8])> {
+        let storage = self.index.quantized_storage(tensor)?;
+        Ok((k_quant(storage.block)?, storage.bytes))
+    }
+
+    fn xs_matvec<B: Backend>(
+        &self,
+        tensor: &GgufTensorInfo,
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+        backend: &B,
+    ) -> Result<DeviceValue> {
+        let (quant, weights) = self.k_bytes(tensor)?;
+        required(
+            &format!("Laguna XS {} projection", tensor.name),
+            backend.gguf_k_matvec_device(
+                quant,
+                weights,
+                input,
+                row_count,
+                in_features,
+                out_features,
+            )?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xs_gate_up_swiglu<B: Backend>(
+        &self,
+        gate: &GgufTensorInfo,
+        up: &GgufTensorInfo,
+        input: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+        backend: &B,
+    ) -> Result<DeviceValue> {
+        let (gate_quant, gate_weights) = self.k_bytes(gate)?;
+        let (up_quant, up_weights) = self.k_bytes(up)?;
+        if gate_quant != GgufKQuant::Q4K || up_quant != GgufKQuant::Q4K {
+            return Err(Error::weights(format!(
+                "Laguna XS gate/up must be Q4_K, got {gate_quant:?}/{up_quant:?}"
+            )));
+        }
+        if let Some(output) = backend.laguna_xs_q4_gate_up_swiglu_device(
+            gate_weights,
+            up_weights,
+            input,
+            row_count,
+            in_features,
+            out_features,
+        )? {
+            return Ok(output);
+        }
+        let gate = self.xs_matvec(gate, input, row_count, in_features, out_features, backend)?;
+        let up = self.xs_matvec(up, input, row_count, in_features, out_features, backend)?;
+        required(
+            "Laguna XS gate/up SwiGLU",
+            backend.swiglu_device(&gate, &up)?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xs_matvec_add<B: Backend>(
+        &self,
+        tensor: &GgufTensorInfo,
+        input: &DeviceValue,
+        residual: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+        backend: &B,
+    ) -> Result<DeviceValue> {
+        let (quant, weights) = self.k_bytes(tensor)?;
+        if let Some(output) = backend.laguna_xs_k_matvec_add_device(
+            quant,
+            weights,
+            input,
+            residual,
+            row_count,
+            in_features,
+            out_features,
+        )? {
+            return Ok(output);
+        }
+        let projected =
+            self.xs_matvec(tensor, input, row_count, in_features, out_features, backend)?;
+        required(
+            "Laguna XS projection residual",
+            backend.add_device(&projected, residual)?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn xs_matvec_add2<B: Backend>(
+        &self,
+        tensor: &GgufTensorInfo,
+        input: &DeviceValue,
+        residual_a: &DeviceValue,
+        residual_b: &DeviceValue,
+        row_count: usize,
+        in_features: usize,
+        out_features: usize,
+        backend: &B,
+    ) -> Result<DeviceValue> {
+        let (quant, weights) = self.k_bytes(tensor)?;
+        if let Some(output) = backend.laguna_xs_k_matvec_add2_device(
+            quant,
+            weights,
+            input,
+            residual_a,
+            residual_b,
+            row_count,
+            in_features,
+            out_features,
+        )? {
+            return Ok(output);
+        }
+        let projected =
+            self.xs_matvec(tensor, input, row_count, in_features, out_features, backend)?;
+        let combined = required(
+            "Laguna XS projection first residual",
+            backend.add_device(&projected, residual_a)?,
+        )?;
+        required(
+            "Laguna XS projection second residual",
+            backend.add_device(&combined, residual_b)?,
+        )
     }
 
     fn prepare_attention_caches<B: Backend>(
@@ -592,6 +977,102 @@ impl LagunaGgufModel {
         }
         Ok(())
     }
+}
+
+fn prepare_xs_dense_prefill_weights<B: Backend>(
+    index: &LagunaGgufIndex,
+    config: &LagunaConfig,
+    backend: &B,
+) -> Result<u64> {
+    let mut prepared_bytes = 0_u64;
+    for layer in &index.layers {
+        let query_heads = config
+            .query_heads(layer.layer_index)
+            .ok_or_else(|| Error::config("Laguna XS layer has no query-head count"))?;
+        let query_width = query_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| Error::model("Laguna XS query width overflow"))?;
+        let kv_width = config.key_value_width();
+        for (tensor, input_width, output_width) in [
+            (&layer.attention.query, config.hidden_size, query_width),
+            (&layer.attention.key, config.hidden_size, kv_width),
+            (&layer.attention.value, config.hidden_size, kv_width),
+            (&layer.attention.gate, config.hidden_size, query_heads),
+            (&layer.attention.output, query_width, config.hidden_size),
+        ] {
+            prepared_bytes = prepared_bytes
+                .checked_add(prepare_xs_dense_prefill_weight(
+                    index,
+                    tensor,
+                    input_width,
+                    output_width,
+                    backend,
+                )?)
+                .ok_or_else(|| Error::backend("Laguna XS prepared weight byte count overflow"))?;
+        }
+
+        let shared_or_dense = match &layer.mlp {
+            LagunaGgufMlp::Dense(dense) => (
+                &dense.gate,
+                &dense.up,
+                &dense.down,
+                config.intermediate_size,
+            ),
+            LagunaGgufMlp::Moe(moe) => (
+                &moe.shared.gate,
+                &moe.shared.up,
+                &moe.shared.down,
+                config.shared_expert_intermediate_size,
+            ),
+        };
+        for tensor in [shared_or_dense.0, shared_or_dense.1] {
+            prepared_bytes = prepared_bytes
+                .checked_add(prepare_xs_dense_prefill_weight(
+                    index,
+                    tensor,
+                    config.hidden_size,
+                    shared_or_dense.3,
+                    backend,
+                )?)
+                .ok_or_else(|| Error::backend("Laguna XS prepared weight byte count overflow"))?;
+        }
+        prepared_bytes = prepared_bytes
+            .checked_add(prepare_xs_dense_prefill_weight(
+                index,
+                shared_or_dense.2,
+                shared_or_dense.3,
+                config.hidden_size,
+                backend,
+            )?)
+            .ok_or_else(|| Error::backend("Laguna XS prepared weight byte count overflow"))?;
+    }
+    Ok(prepared_bytes)
+}
+
+fn prepare_xs_dense_prefill_weight<B: Backend>(
+    index: &LagunaGgufIndex,
+    tensor: &GgufTensorInfo,
+    in_features: usize,
+    out_features: usize,
+    backend: &B,
+) -> Result<u64> {
+    let storage = index.quantized_storage(tensor)?;
+    let quant = k_quant(storage.block)?;
+    if !backend.prepare_laguna_xs_mps_prefill_weight(
+        quant,
+        storage.bytes,
+        in_features,
+        out_features,
+    )? {
+        return Err(Error::backend(
+            "Laguna XS dense FP16 prefill preparation requires Metal Performance Shaders",
+        ));
+    }
+    in_features
+        .checked_mul(out_features)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::backend("Laguna XS prepared weight size overflow"))
 }
 
 impl PreparedWeights {
@@ -702,7 +1183,9 @@ fn apply_memory_advice(index: &LagunaGgufIndex) -> Result<()> {
         &index.root.final_norm,
         &index.root.output,
     ]) {
-        let advice = if tensor.name.contains("_exps.weight") {
+        let advice = if index.flavor() == LagunaGgufFlavor::S21Q2Q3
+            && tensor.name.contains("_exps.weight")
+        {
             GgufTensorAdvice::Random
         } else {
             GgufTensorAdvice::WillNeed
@@ -787,6 +1270,16 @@ fn validate_token_ids(config: &LagunaConfig, token_ids: &[u32]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn k_quant(block: GgufQuantBlockKind) -> Result<GgufKQuant> {
+    match block {
+        GgufQuantBlockKind::Q4K => Ok(GgufKQuant::Q4K),
+        GgufQuantBlockKind::Q6K => Ok(GgufKQuant::Q6K),
+        other => Err(Error::weights(format!(
+            "Laguna XS projection must be Q4_K or Q6_K, got {other}"
+        ))),
+    }
 }
 
 fn required(label: &str, value: Option<DeviceValue>) -> Result<DeviceValue> {

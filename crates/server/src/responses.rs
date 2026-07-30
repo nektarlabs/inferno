@@ -155,6 +155,58 @@ impl<'a> ResponsesStream<'a> {
         Ok(())
     }
 
+    /// Emits one completed raw reasoning item so a Responses client can replay
+    /// it on the next turn without displaying it as assistant text.
+    pub fn reasoning_done(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let item_id = format!("rs_{}_{}", self.response_id, self.output_index);
+        self.event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                    "content": []
+                }
+            }),
+        )?;
+        self.event(
+            "response.reasoning_text.done",
+            json!({
+                "type": "response.reasoning_text.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item_id": item_id,
+                "content_index": 0,
+                "text": text
+            }),
+        )?;
+        self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": text}]
+                }
+            }),
+        )?;
+        self.output_index += 1;
+        Ok(())
+    }
+
     pub fn function_call_done(&mut self, call_id: &str, name: &str, arguments: &str) -> Result<()> {
         if call_id.is_empty() || name.is_empty() {
             return Err(Error::runtime(
@@ -375,5 +427,19 @@ mod tests {
         assert!(rendered.contains("\"name\":\"apply_patch\""));
         assert!(rendered.contains("\\\"cmd\\\":\\\"pwd\\\""));
         assert!(rendered.contains("\"total_tokens\":12"));
+    }
+
+    #[test]
+    fn emits_completed_reasoning_for_client_replay() {
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, "laguna-xs-2.1-gguf").unwrap();
+        stream.reasoning_done("Inspect the repository.").unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+
+        assert!(rendered.contains("event: response.reasoning_text.done"));
+        assert!(rendered.contains("\"type\":\"reasoning\""));
+        assert!(rendered.contains("\"type\":\"reasoning_text\""));
+        assert!(rendered.contains("Inspect the repository."));
+        assert!(rendered.contains("\"output_index\":0"));
     }
 }

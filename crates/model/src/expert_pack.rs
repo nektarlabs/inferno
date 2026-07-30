@@ -483,6 +483,8 @@ fn tensor_type_code(ty: GgmlType) -> u64 {
         GgmlType::Q8_0 => 8,
         GgmlType::Q2K => 10,
         GgmlType::Q3K => 11,
+        GgmlType::Q4K => 12,
+        GgmlType::Q6K => 14,
         GgmlType::Unsupported(value) => u64::from(value),
     }
 }

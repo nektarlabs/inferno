@@ -25,12 +25,16 @@ pub(crate) struct MetalLibrary {
 
 impl MetalLibrary {
     pub(crate) fn compile(device: &Device) -> Result<Self> {
-        let options = CompileOptions::new();
         let source = format!(
             "{ATTENTION_KERNELS}\n{ACTIVATION_KERNELS}\n{BF16_KERNELS}\n{CAST_KERNELS}\n{LAYOUT_KERNELS}\n{MATMUL_KERNELS}\n{NORM_KERNELS}\n{Q2_KERNELS}\n{GGUF_MOE_KERNELS}\n{GGUF_MOE_PREFILL_KERNELS}\n{LAGUNA_VIEWS_KERNELS}\n{W4_KERNELS}\n{ROPE_KERNELS}\n{MOE_KERNELS}\n{DSA_KERNELS}\n{FP8_ATTENTION_KERNELS}\n{F16_ATTENTION_KERNELS}"
         );
+        Self::compile_source(device, &source)
+    }
+
+    pub(crate) fn compile_source(device: &Device, source: &str) -> Result<Self> {
+        let options = CompileOptions::new();
         let library = device
-            .new_library_with_source(&source, &options)
+            .new_library_with_source(source, &options)
             .map_err(|message| {
                 Error::backend(format!("failed to compile native Metal kernels: {message}"))
             })?;

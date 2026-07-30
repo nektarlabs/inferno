@@ -257,6 +257,7 @@ pub(crate) enum KernelArg<'a> {
     Buffer(&'a Buffer),
     BufferOffset(&'a Buffer, usize),
     U32(u32),
+    F32(f32),
 }
 
 fn bind_args(encoder: &::metal::ComputeCommandEncoderRef, args: &[KernelArg<'_>]) -> Result<()> {
@@ -279,6 +280,11 @@ fn bind_args(encoder: &::metal::ComputeCommandEncoderRef, args: &[KernelArg<'_>]
                 slot,
                 std::mem::size_of::<u32>() as NSUInteger,
                 value as *const u32 as *const std::ffi::c_void,
+            ),
+            KernelArg::F32(value) => encoder.set_bytes(
+                slot,
+                std::mem::size_of::<f32>() as NSUInteger,
+                value as *const f32 as *const std::ffi::c_void,
             ),
         }
     }

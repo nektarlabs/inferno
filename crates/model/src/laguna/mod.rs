@@ -18,9 +18,11 @@ pub use mlp::{
 pub use model::{LagunaSafetensorsModel, LagunaSafetensorsSession, LagunaTokenOutput};
 
 pub use gguf::{
-    LagunaGgufAttention, LagunaGgufDense, LagunaGgufIndex, LagunaGgufLayer, LagunaGgufMlp,
-    LagunaGgufMoe, LagunaGgufRoot, LAGUNA_GGUF_FILE_BYTES, LAGUNA_GGUF_FILE_NAME,
-    LAGUNA_GGUF_REPO_ID, LAGUNA_GGUF_REPO_URL, LAGUNA_GGUF_SHA256,
+    LagunaGgufAttention, LagunaGgufDense, LagunaGgufFlavor, LagunaGgufIndex, LagunaGgufLayer,
+    LagunaGgufMlp, LagunaGgufMoe, LagunaGgufRoot, LAGUNA_GGUF_FILE_BYTES, LAGUNA_GGUF_FILE_NAME,
+    LAGUNA_GGUF_REPO_ID, LAGUNA_GGUF_REPO_URL, LAGUNA_GGUF_SHA256, LAGUNA_XS_GGUF_FILE_BYTES,
+    LAGUNA_XS_GGUF_FILE_NAME, LAGUNA_XS_GGUF_REPO_ID, LAGUNA_XS_GGUF_REPO_URL,
+    LAGUNA_XS_GGUF_SHA256,
 };
 pub use gguf_model::{LagunaGgufModel, LagunaGgufSession};
 pub use index::{

@@ -20,8 +20,8 @@ const PREFILL_ATTENTION_KERNEL: &str = "laguna_prefill_gated_gqa_f16_attention_f
 const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
-const GLOBAL_QUERY_HEADS: usize = 48;
 const SLIDING_QUERY_HEADS: usize = 72;
+const MAX_QUERY_HEADS: usize = SLIDING_QUERY_HEADS;
 const SLIDING_WINDOW: usize = 512;
 const ATTENTION_THREADS: usize = 256;
 const PREFILL_MIN_TOKENS: usize = 8;
@@ -335,14 +335,9 @@ fn validate_execution(
             cache.batch
         )));
     }
-    let expected_query_heads = match cache.retention {
-        LagunaKvRetention::Full => GLOBAL_QUERY_HEADS,
-        LagunaKvRetention::Sliding => SLIDING_QUERY_HEADS,
-    };
-    if query_heads != expected_query_heads {
+    if query_heads == 0 || query_heads > MAX_QUERY_HEADS || !query_heads.is_multiple_of(KV_HEADS) {
         return Err(Error::backend(format!(
-            "Laguna {:?} F16 attention requires {expected_query_heads} query heads, got {query_heads}",
-            cache.retention
+            "Laguna F16 attention query-head count must be a positive multiple of {KV_HEADS} up to {MAX_QUERY_HEADS}, got {query_heads}"
         )));
     }
     if cache.stored_tokens > cache.capacity_tokens || cache.stored_tokens > cache.total_tokens {
@@ -417,9 +412,12 @@ mod tests {
     use crate::{Backend, LagunaKvRetention, MetalBackend};
     use common::F32Tensor;
 
-    use super::{GLOBAL_QUERY_HEADS, HEAD_DIM, KV_HEADS, SLIDING_QUERY_HEADS, SLIDING_WINDOW};
+    use super::{HEAD_DIM, KV_HEADS, SLIDING_WINDOW};
 
     const QUERY_HEADS: usize = 48;
+    const GLOBAL_QUERY_HEADS: usize = 48;
+    const LAGUNA_XS_SLIDING_QUERY_HEADS: usize = 64;
+    const SLIDING_QUERY_HEADS: usize = 72;
 
     #[test]
     fn f16_cache_preserves_prefill_values_for_decode() {
@@ -546,6 +544,11 @@ mod tests {
         };
         for (retention, query_heads, tokens) in [
             (LagunaKvRetention::Full, GLOBAL_QUERY_HEADS, 37),
+            (
+                LagunaKvRetention::Sliding,
+                LAGUNA_XS_SLIDING_QUERY_HEADS,
+                37,
+            ),
             (LagunaKvRetention::Sliding, SLIDING_QUERY_HEADS, 600),
         ] {
             let query_values = patterned_values(tokens * query_heads * HEAD_DIM, 17, 8, 16.0);

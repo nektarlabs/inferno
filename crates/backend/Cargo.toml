@@ -20,6 +20,9 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 tracing.workspace = true
 
+[dev-dependencies]
+gguf = { path = "../gguf" }
+
 [[bench]]
 name = "dsa_topk"
 harness = false

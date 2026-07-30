@@ -27,11 +27,13 @@ use runtime::{
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, ServerAdmission,
     GLM_CODEX_MODEL_ID, LAGUNA_CODEX_MODEL_ID, LAGUNA_GGUF_CODEX_MODEL_ID,
+    LAGUNA_XS_GGUF_CODEX_MODEL_ID,
 };
 use tokenizer::{
     is_supported_codex_function, map_laguna_function_call_to_codex, parse_agent_output,
     parse_complete_agent_tool_call, render_codex_prompt, render_laguna_codex_prompt,
-    AgentFunctionCall, AgentOutput, AgentOutputItem, LagunaThinkingMode, Tokenizer,
+    render_laguna_xs_codex_prompt, AgentFunctionCall, AgentOutput, AgentOutputItem,
+    LagunaThinkingMode, Tokenizer,
 };
 use tracing::{debug, info};
 
@@ -256,6 +258,7 @@ fn run_laguna(
     let model_id = match model.artifact_kind() {
         LagunaArtifactKind::SafetensorsInt4 => LAGUNA_CODEX_MODEL_ID,
         LagunaArtifactKind::AntirezGguf => LAGUNA_GGUF_CODEX_MODEL_ID,
+        LagunaArtifactKind::PoolsideXsGguf => LAGUNA_XS_GGUF_CODEX_MODEL_ID,
     };
 
     let listener = TcpListener::bind(bind)?;
@@ -360,7 +363,7 @@ struct LagunaCodexHandler<'runtime> {
 
 impl ResponsesHandler for LagunaCodexHandler<'_> {
     fn admission(&self) -> ServerAdmission {
-        if self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID {
+        if is_laguna_gguf_model_id(self.model_id) {
             ServerAdmission::RejectWhenBusy
         } else {
             ServerAdmission::Queue
@@ -373,7 +376,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
         stream: &mut ResponsesStream<'_>,
     ) -> InfernoResult<ResponseUsage> {
         validate_requested_model(&request.model, self.model_id)?;
-        if self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID {
+        if is_laguna_gguf_model_id(self.model_id) {
             validate_laguna_gguf_codex_envelope(&request)?;
         }
         let allowed_tools = tool_names(&request.tools)?;
@@ -484,7 +487,15 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 continue;
             }
 
-            emit_laguna_agent_output(turn.output, "", &prompt_allowed_tools, "Laguna", stream)?;
+            emit_laguna_agent_output(
+                turn.output,
+                "",
+                &prompt_allowed_tools,
+                "Laguna",
+                self.model_id == LAGUNA_XS_GGUF_CODEX_MODEL_ID
+                    && thinking_mode == LagunaThinkingMode::Enabled,
+                stream,
+            )?;
             return Ok(ResponseUsage {
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
@@ -513,7 +524,11 @@ impl LagunaCodexHandler<'_> {
         thinking_mode: LagunaThinkingMode,
         stream: &mut ResponsesStream<'_>,
     ) -> InfernoResult<LagunaAgentTurn> {
-        let prompt = render_laguna_codex_prompt(instructions, input, tools, thinking_mode)?;
+        let prompt = if self.model_id == LAGUNA_XS_GGUF_CODEX_MODEL_ID {
+            render_laguna_xs_codex_prompt(instructions, input, tools, thinking_mode)?
+        } else {
+            render_laguna_codex_prompt(instructions, input, tools, thinking_mode)?
+        };
         let encoded = self.tokenizer.encode(&prompt.rendered, false)?;
         let max_new_tokens = laguna_codex_max_new_tokens(
             self.model_id,
@@ -543,7 +558,7 @@ impl LagunaCodexHandler<'_> {
         let mut output_tokens = 0_usize;
         let mut thinking_guard =
             (thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
-        let heartbeat_during_prefill = self.model_id == LAGUNA_GGUF_CODEX_MODEL_ID;
+        let heartbeat_during_prefill = is_laguna_gguf_model_id(self.model_id);
         let stream_cell = std::cell::RefCell::new(stream);
         let generation = self
             .runtime
@@ -569,12 +584,15 @@ impl LagunaCodexHandler<'_> {
                     output_tokens = output_tokens
                         .checked_add(1)
                         .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
-                    if let Some(text) = decoded.push(token_id)? {
-                        generated_text.push_str(&text);
+                    let is_stop_token = self.config.eos_token_id.contains(&token_id);
+                    if !is_stop_token {
+                        if let Some(text) = decoded.push(token_id)? {
+                            generated_text.push_str(&text);
+                        }
                     }
-                    let forced_boundary = thinking_guard.as_mut().and_then(|guard| {
-                        guard.observe(token_id, self.config.eos_token_id.contains(&token_id))
-                    });
+                    let forced_boundary = thinking_guard
+                        .as_mut()
+                        .and_then(|guard| guard.observe(token_id, is_stop_token));
                     if let Some(reason) = forced_boundary {
                         debug!(?reason, "forcing Laguna reasoning boundary");
                         if let Some(text) = decoded.push(LAGUNA_THINKING_END_TOKEN_ID)? {
@@ -1033,13 +1051,20 @@ fn validate_laguna_gguf_codex_envelope(request: &ResponsesRequest) -> InfernoRes
     Ok(())
 }
 
+fn is_laguna_gguf_model_id(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        LAGUNA_GGUF_CODEX_MODEL_ID | LAGUNA_XS_GGUF_CODEX_MODEL_ID
+    )
+}
+
 fn laguna_codex_max_new_tokens(
     model_id: &str,
     configured_limit: Option<usize>,
     requested_limit: Option<usize>,
     prompt_tokens: usize,
 ) -> InfernoResult<Option<usize>> {
-    if model_id != LAGUNA_GGUF_CODEX_MODEL_ID {
+    if !is_laguna_gguf_model_id(model_id) {
         return Ok(configured_limit);
     }
     let available_tokens = LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS
@@ -1061,8 +1086,12 @@ fn emit_laguna_agent_output(
     streamed_text: &str,
     allowed_tools: &HashSet<String>,
     model_name: &str,
+    preserve_reasoning: bool,
     stream: &mut ResponsesStream<'_>,
 ) -> InfernoResult<()> {
+    if preserve_reasoning {
+        stream.reasoning_done(&output.reasoning)?;
+    }
     let mut streamed_message_finished = false;
     for item in output.items {
         match item {
@@ -1447,7 +1476,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut stream = ResponsesStream::begin(&mut bytes, LAGUNA_GGUF_CODEX_MODEL_ID).unwrap();
 
-        emit_laguna_agent_output(output, "", &allowed_tools, "Laguna", &mut stream).unwrap();
+        emit_laguna_agent_output(output, "", &allowed_tools, "Laguna", false, &mut stream).unwrap();
 
         let rendered = String::from_utf8(bytes).unwrap();
         assert!(rendered.contains("\"type\":\"custom_tool_call\""));
@@ -1555,6 +1584,7 @@ mod tests {
             "Creating the file.",
             &allowed_tools,
             "Laguna",
+            false,
             &mut stream,
         )
         .unwrap();
@@ -1598,5 +1628,25 @@ mod tests {
             output.items.get(1),
             Some(AgentOutputItem::FunctionCall(call)) if call.name == "exec_command"
         ));
+    }
+
+    #[test]
+    fn emits_reasoning_only_for_the_xs_preserved_reasoning_path() {
+        let output = parse_agent_output(
+            "Inspect the workspace first.</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap();
+        let allowed_tools = HashSet::from(["exec_command".to_string()]);
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, LAGUNA_XS_GGUF_CODEX_MODEL_ID).unwrap();
+
+        emit_laguna_agent_output(output, "", &allowed_tools, "Laguna XS", true, &mut stream)
+            .unwrap();
+        drop(stream);
+
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("\"type\":\"reasoning\""));
+        assert!(rendered.contains("Inspect the workspace first."));
+        assert!(rendered.contains("\"type\":\"function_call\""));
     }
 }

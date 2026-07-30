@@ -9,7 +9,7 @@ use backend::{Backend, MetalBackend};
 use common::{Error, Result as InfernoResult};
 use config::{
     detect_model_architecture, load_config, load_generation_config, load_laguna_config,
-    LagunaConfig, ModelArchitecture,
+    LagunaConfig, LagunaProfile, ModelArchitecture,
 };
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
@@ -27,7 +27,8 @@ use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, LocalModes, OptionalActions, QueueSelector, Termios,
 };
 use tokenizer::{
-    render_chat_prompt, render_laguna_chat_prompt, ChatTurn, LagunaThinkingMode, Tokenizer,
+    render_chat_prompt, render_laguna_chat_prompt, render_laguna_xs_chat_prompt, ChatPrompt,
+    ChatTurn, LagunaReasoningTurn, LagunaThinkingMode, Tokenizer,
 };
 use tracing::debug;
 
@@ -216,6 +217,7 @@ fn run_laguna(
             max_new_tokens,
             thinking_mode: laguna_thinking_mode(thinking),
             throughput_summary,
+            profile: config.profile()?,
         },
         &mut runtime,
     )
@@ -226,6 +228,49 @@ struct LagunaChatOptions {
     max_new_tokens: Option<usize>,
     thinking_mode: LagunaThinkingMode,
     throughput_summary: bool,
+    profile: LagunaProfile,
+}
+
+enum LagunaChatHistory {
+    S(Vec<ChatTurn>),
+    Xs(Vec<LagunaReasoningTurn>),
+}
+
+impl LagunaChatHistory {
+    fn new(profile: LagunaProfile) -> Self {
+        match profile {
+            LagunaProfile::S21 => Self::S(Vec::new()),
+            LagunaProfile::Xs21 => Self::Xs(Vec::new()),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::S(history) => history.clear(),
+            Self::Xs(history) => history.clear(),
+        }
+    }
+
+    fn render(&self, prompt: &str, thinking_mode: LagunaThinkingMode) -> ChatPrompt {
+        match self {
+            Self::S(history) => render_laguna_chat_prompt(history, prompt, thinking_mode),
+            Self::Xs(history) => render_laguna_xs_chat_prompt(history, prompt, thinking_mode),
+        }
+    }
+
+    fn push(&mut self, user: &str, assistant: &AssistantStream) {
+        match self {
+            Self::S(history) => history.push(ChatTurn {
+                user: user.to_string(),
+                assistant: assistant.answer().trim().to_string(),
+            }),
+            Self::Xs(history) => history.push(LagunaReasoningTurn {
+                user: user.to_string(),
+                reasoning: assistant.thinking().trim().to_string(),
+                assistant: assistant.answer().trim().to_string(),
+            }),
+        }
+    }
 }
 
 fn run_laguna_interactive_loop(
@@ -242,7 +287,7 @@ fn run_laguna_interactive_loop(
     let output_is_terminal = stdout.is_terminal();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
-    let mut history = Vec::<ChatTurn>::new();
+    let mut history = LagunaChatHistory::new(options.profile);
     let mut line = String::new();
 
     loop {
@@ -271,7 +316,7 @@ fn run_laguna_interactive_loop(
             ChatInput::Prompt => {}
         }
 
-        let rendered = render_laguna_chat_prompt(&history, prompt, options.thinking_mode);
+        let rendered = history.render(prompt, options.thinking_mode);
         let encoded = tokenizer.encode(&rendered.rendered, false)?;
         validate_laguna_prompt(
             config,
@@ -295,12 +340,16 @@ fn run_laguna_interactive_loop(
             &config.eos_token_id,
             |token_id| {
                 throughput.record_token();
-                if let Some(text) = decoded.push(token_id)? {
-                    write_events(&mut output, assistant.push(&text), output_is_terminal)?;
+                let is_stop_token = config.eos_token_id.contains(&token_id);
+                if !is_stop_token {
+                    if let Some(text) = decoded.push(token_id)? {
+                        write_events(&mut output, assistant.push(&text), output_is_terminal)?;
+                    }
                 }
-                let Some(reason) = thinking_guard.as_mut().and_then(|guard| {
-                    guard.observe(token_id, config.eos_token_id.contains(&token_id))
-                }) else {
+                let Some(reason) = thinking_guard
+                    .as_mut()
+                    .and_then(|guard| guard.observe(token_id, is_stop_token))
+                else {
                     return Ok(GenerationControl::Continue);
                 };
 
@@ -336,10 +385,7 @@ fn run_laguna_interactive_loop(
             )?;
         }
 
-        history.push(ChatTurn {
-            user: prompt.to_string(),
-            assistant: assistant.answer().trim().to_string(),
-        });
+        history.push(prompt, &assistant);
     }
 }
 
@@ -571,6 +617,10 @@ impl AssistantStream {
 
     fn answer(&self) -> &str {
         &self.answer
+    }
+
+    fn thinking(&self) -> &str {
+        &self.thinking
     }
 }
 
