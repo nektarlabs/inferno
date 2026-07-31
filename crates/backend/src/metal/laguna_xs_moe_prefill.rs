@@ -27,6 +27,7 @@ const TOP_K: usize = 8;
 const EXPERT_COUNT: usize = 256;
 const OUTPUT_TILE: usize = 32;
 const SMALL_ASSIGNMENT_TILE: usize = 8;
+const MEDIUM_ASSIGNMENT_TILE: usize = 16;
 const LARGE_ASSIGNMENT_TILE: usize = 32;
 const MATMUL_THREADS: usize = 128;
 const MAP_THREADS: usize = 256;
@@ -35,7 +36,7 @@ const COMBINE_THREADS: usize = 256;
 // threadgroup memory keeps more prompt GEMM threadgroups resident on Metal.
 const GATE_UP_SHARED_BYTES: usize = 8 * 1024;
 const DOWN_SHARED_BYTES: usize = 4 * 1024;
-const INDIRECT_ARGUMENT_U32S: usize = 12;
+const INDIRECT_ARGUMENT_U32S: usize = 18;
 const MIN_TOKENS: usize = 4;
 const KERNEL_SOURCE: &str = include_str!("kernels/laguna_xs_moe_prefill_kernels.metal");
 
@@ -65,10 +66,13 @@ pub(crate) struct MetalLagunaXsMoePrefill {
 struct Pipelines {
     build_map: ComputePipelineState,
     q4_gate_up_small: ComputePipelineState,
+    q4_gate_up_medium: ComputePipelineState,
     q4_gate_up_large: ComputePipelineState,
     q4_down_small: ComputePipelineState,
+    q4_down_medium: ComputePipelineState,
     q4_down_large: ComputePipelineState,
     q6_down_small: ComputePipelineState,
+    q6_down_medium: ComputePipelineState,
     q6_down_large: ComputePipelineState,
     combine: ComputePipelineState,
 }
@@ -131,6 +135,11 @@ impl MetalLagunaXsMoePrefill {
                 .checked_mul(4)
                 .ok_or_else(|| Error::backend("Laguna XS small work tile buffer overflow"))?,
         )?;
+        let medium_work_tiles = self.arena.empty_u32(
+            EXPERT_COUNT
+                .checked_mul(4)
+                .ok_or_else(|| Error::backend("Laguna XS medium work tile buffer overflow"))?,
+        )?;
         let maximum_large_work_tiles = EXPERT_COUNT
             .checked_mul(token_count.div_ceil(LARGE_ASSIGNMENT_TILE))
             .ok_or_else(|| Error::backend("Laguna XS work tile count overflow"))?;
@@ -167,9 +176,11 @@ impl MetalLagunaXsMoePrefill {
                 KernelArg::Buffer(&expert_counts),
                 KernelArg::Buffer(&assignment_map),
                 KernelArg::Buffer(&small_work_tiles),
+                KernelArg::Buffer(&medium_work_tiles),
                 KernelArg::Buffer(&large_work_tiles),
                 KernelArg::Buffer(&indirect_arguments),
                 KernelArg::U32(as_u32(SMALL_ASSIGNMENT_TILE, "small assignment tile")?),
+                KernelArg::U32(as_u32(MEDIUM_ASSIGNMENT_TILE, "medium assignment tile")?),
                 KernelArg::U32(as_u32(token_count, "token count")?),
                 KernelArg::U32(as_u32(
                     intermediate_features / OUTPUT_TILE,
@@ -222,6 +233,28 @@ impl MetalLagunaXsMoePrefill {
         )?;
         encode_threadgroups_indirect_args(
             command_buffer,
+            &pipelines.q4_gate_up_medium,
+            &[
+                KernelArg::BufferOffset(&gate.storage, gate.byte_offset),
+                KernelArg::BufferOffset(&up.storage, up.byte_offset),
+                KernelArg::Buffer(input),
+                KernelArg::Buffer(&assignment_map),
+                KernelArg::Buffer(&medium_work_tiles),
+                KernelArg::Buffer(&routing.expert_weights),
+                KernelArg::Buffer(&intermediate),
+                KernelArg::U32(as_u32(in_features, "input width")?),
+                KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+                KernelArg::U32(as_u32(token_count, "token count")?),
+                KernelArg::U32(as_u32(gate_row_bytes, "gate row bytes")?),
+                KernelArg::U32(as_u32(gate_expert_stride, "gate expert stride")?),
+            ],
+            &indirect_arguments,
+            6 * std::mem::size_of::<u32>(),
+            MATMUL_THREADS,
+            GATE_UP_SHARED_BYTES,
+        )?;
+        encode_threadgroups_indirect_args(
+            command_buffer,
             &pipelines.q4_gate_up_large,
             &[
                 KernelArg::BufferOffset(&gate.storage, gate.byte_offset),
@@ -238,14 +271,21 @@ impl MetalLagunaXsMoePrefill {
                 KernelArg::U32(as_u32(gate_expert_stride, "gate expert stride")?),
             ],
             &indirect_arguments,
-            6 * std::mem::size_of::<u32>(),
+            12 * std::mem::size_of::<u32>(),
             MATMUL_THREADS,
             GATE_UP_SHARED_BYTES,
         )?;
-
-        let (small_down_pipeline, large_down_pipeline) = match down_quant {
-            GgufKQuant::Q4K => (&pipelines.q4_down_small, &pipelines.q4_down_large),
-            GgufKQuant::Q6K => (&pipelines.q6_down_small, &pipelines.q6_down_large),
+        let (small_down_pipeline, medium_down_pipeline, large_down_pipeline) = match down_quant {
+            GgufKQuant::Q4K => (
+                &pipelines.q4_down_small,
+                &pipelines.q4_down_medium,
+                &pipelines.q4_down_large,
+            ),
+            GgufKQuant::Q6K => (
+                &pipelines.q6_down_small,
+                &pipelines.q6_down_medium,
+                &pipelines.q6_down_large,
+            ),
         };
         encode_threadgroups_indirect_args(
             command_buffer,
@@ -269,6 +309,26 @@ impl MetalLagunaXsMoePrefill {
         )?;
         encode_threadgroups_indirect_args(
             command_buffer,
+            medium_down_pipeline,
+            &[
+                KernelArg::BufferOffset(&down.storage, down.byte_offset),
+                KernelArg::Buffer(&intermediate),
+                KernelArg::Buffer(&assignment_map),
+                KernelArg::Buffer(&medium_work_tiles),
+                KernelArg::Buffer(&assignment_output),
+                KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+                KernelArg::U32(as_u32(out_features, "output width")?),
+                KernelArg::U32(as_u32(token_count, "token count")?),
+                KernelArg::U32(as_u32(down_row_bytes, "down row bytes")?),
+                KernelArg::U32(as_u32(down_expert_stride, "down expert stride")?),
+            ],
+            &indirect_arguments,
+            9 * std::mem::size_of::<u32>(),
+            MATMUL_THREADS,
+            DOWN_SHARED_BYTES,
+        )?;
+        encode_threadgroups_indirect_args(
+            command_buffer,
             large_down_pipeline,
             &[
                 KernelArg::BufferOffset(&down.storage, down.byte_offset),
@@ -283,7 +343,7 @@ impl MetalLagunaXsMoePrefill {
                 KernelArg::U32(as_u32(down_expert_stride, "down expert stride")?),
             ],
             &indirect_arguments,
-            9 * std::mem::size_of::<u32>(),
+            15 * std::mem::size_of::<u32>(),
             MATMUL_THREADS,
             DOWN_SHARED_BYTES,
         )?;
@@ -379,6 +439,11 @@ impl MetalLagunaXsMoePrefill {
                     &library,
                     "laguna_xs_prefill_q4_gate_up_small_mma_kernel",
                 )?,
+                q4_gate_up_medium: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_prefill_q4_gate_up_medium_mma_kernel",
+                )?,
                 q4_gate_up_large: compute_pipeline(
                     device,
                     &library,
@@ -389,6 +454,11 @@ impl MetalLagunaXsMoePrefill {
                     &library,
                     "laguna_xs_prefill_q4_down_small_mma_kernel",
                 )?,
+                q4_down_medium: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_prefill_q4_down_medium_mma_kernel",
+                )?,
                 q4_down_large: compute_pipeline(
                     device,
                     &library,
@@ -398,6 +468,11 @@ impl MetalLagunaXsMoePrefill {
                     device,
                     &library,
                     "laguna_xs_prefill_q6_down_small_mma_kernel",
+                )?,
+                q6_down_medium: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_prefill_q6_down_medium_mma_kernel",
                 )?,
                 q6_down_large: compute_pipeline(
                     device,

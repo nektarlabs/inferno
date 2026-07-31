@@ -8,10 +8,12 @@ constant uint LAGUNA_XS_MOE_BLOCK_VALUES = 256u;
 constant uint LAGUNA_XS_MOE_GROUPS_PER_BLOCK = 8u;
 constant uint LAGUNA_XS_MOE_OUTPUT_TILE = 32u;
 constant uint LAGUNA_XS_MOE_SMALL_ASSIGNMENT_TILE = 8u;
+constant uint LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE = 16u;
 constant uint LAGUNA_XS_MOE_LARGE_ASSIGNMENT_TILE = 32u;
 constant uint LAGUNA_XS_MOE_K_TILE = 32u;
 constant uint LAGUNA_XS_MOE_THREADS = 128u;
 constant uint LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS = 1u;
+constant uint LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS = 2u;
 constant uint LAGUNA_XS_MOE_LARGE_TOKEN_GROUPS = 4u;
 constant uint LAGUNA_XS_MOE_STAGE_VALUES =
     LAGUNA_XS_MOE_OUTPUT_TILE * LAGUNA_XS_MOE_K_TILE;
@@ -85,12 +87,12 @@ struct LagunaXsMoeQ6Operations {
         uint quarter = group - half_index * 4u;
         uint low_base = half_index * 64u;
         uint high_base = half_index * 32u;
-        uchar4 low_even =
+        uchar4 low =
             *reinterpret_cast<const device uchar4*>(
-                block->low_quants + low_base + lane);
-        uchar4 low_odd =
-            *reinterpret_cast<const device uchar4*>(
-                block->low_quants + low_base + 32u + lane);
+                block->low_quants
+                    + low_base
+                    + ((quarter & 1u) * 32u)
+                    + lane);
         uchar4 high =
             *reinterpret_cast<const device uchar4*>(
                 block->high_quants + high_base + lane);
@@ -98,12 +100,12 @@ struct LagunaXsMoeQ6Operations {
         switch (quarter) {
             case 0u:
                 quantized =
-                    (low_even & uchar4(15u))
+                    (low & uchar4(15u))
                     | ((high & uchar4(3u)) << uchar4(4u));
                 break;
             case 1u:
                 quantized =
-                    (low_odd & uchar4(15u))
+                    (low & uchar4(15u))
                     | (
                         ((high >> uchar4(2u)) & uchar4(3u))
                         << uchar4(4u)
@@ -111,7 +113,7 @@ struct LagunaXsMoeQ6Operations {
                 break;
             case 2u:
                 quantized =
-                    (low_even >> uchar4(4u))
+                    (low >> uchar4(4u))
                     | (
                         ((high >> uchar4(4u)) & uchar4(3u))
                         << uchar4(4u)
@@ -119,7 +121,7 @@ struct LagunaXsMoeQ6Operations {
                 break;
             default:
                 quantized =
-                    (low_odd >> uchar4(4u))
+                    (low >> uchar4(4u))
                     | (
                         ((high >> uchar4(6u)) & uchar4(3u))
                         << uchar4(4u)
@@ -142,12 +144,14 @@ kernel void laguna_xs_prefill_build_expert_map_kernel(
     device atomic_uint* expert_counts [[buffer(1)]],
     device uint* assignment_map [[buffer(2)]],
     device uint4* small_work_tiles [[buffer(3)]],
-    device uint4* large_work_tiles [[buffer(4)]],
-    device atomic_uint* indirect_arguments [[buffer(5)]],
-    constant uint& small_assignment_tile [[buffer(6)]],
-    constant uint& token_count [[buffer(7)]],
-    constant uint& gate_output_tiles [[buffer(8)]],
-    constant uint& down_output_tiles [[buffer(9)]],
+    device uint4* medium_work_tiles [[buffer(4)]],
+    device uint4* large_work_tiles [[buffer(5)]],
+    device atomic_uint* indirect_arguments [[buffer(6)]],
+    constant uint& small_assignment_tile [[buffer(7)]],
+    constant uint& medium_assignment_tile [[buffer(8)]],
+    constant uint& token_count [[buffer(9)]],
+    constant uint& gate_output_tiles [[buffer(10)]],
+    constant uint& down_output_tiles [[buffer(11)]],
     ushort thread_index [[thread_index_in_threadgroup]],
     ushort threads_per_group [[threads_per_threadgroup]]
 ) {
@@ -158,7 +162,7 @@ kernel void laguna_xs_prefill_build_expert_map_kernel(
             0u,
             memory_order_relaxed);
     }
-    if (thread_id < 12u) {
+    if (thread_id < 18u) {
         atomic_store_explicit(
             indirect_arguments + thread_id,
             0u,
@@ -193,6 +197,16 @@ kernel void laguna_xs_prefill_build_expert_map_kernel(
                 0u,
                 count,
                 0u);
+        } else if (count > 0u && count <= medium_assignment_tile) {
+            uint tile = atomic_fetch_add_explicit(
+                indirect_arguments + 6u,
+                1u,
+                memory_order_relaxed);
+            medium_work_tiles[tile] = uint4(
+                thread_id,
+                0u,
+                count,
+                0u);
         } else if (count > 0u) {
             uint tile_count =
                 (
@@ -201,7 +215,7 @@ kernel void laguna_xs_prefill_build_expert_map_kernel(
                     - 1u
                 ) / LAGUNA_XS_MOE_LARGE_ASSIGNMENT_TILE;
             uint first_tile = atomic_fetch_add_explicit(
-                indirect_arguments + 6u,
+                indirect_arguments + 12u,
                 tile_count,
                 memory_order_relaxed);
             for (uint tile = 0u; tile < tile_count; tile++) {
@@ -219,23 +233,32 @@ kernel void laguna_xs_prefill_build_expert_map_kernel(
         uint work_tile_count = atomic_load_explicit(
             indirect_arguments,
             memory_order_relaxed);
-        uint large_work_tile_count = atomic_load_explicit(
+        uint medium_work_tile_count = atomic_load_explicit(
             indirect_arguments + 6u,
+            memory_order_relaxed);
+        uint large_work_tile_count = atomic_load_explicit(
+            indirect_arguments + 12u,
             memory_order_relaxed);
         device uint* arguments =
             reinterpret_cast<device uint*>(indirect_arguments);
-        arguments[0] = work_tile_count;
-        arguments[1] = gate_output_tiles;
+        arguments[0] = gate_output_tiles;
+        arguments[1] = work_tile_count;
         arguments[2] = 1u;
-        arguments[3] = work_tile_count;
-        arguments[4] = down_output_tiles;
+        arguments[3] = down_output_tiles;
+        arguments[4] = work_tile_count;
         arguments[5] = 1u;
-        arguments[6] = large_work_tile_count;
-        arguments[7] = gate_output_tiles;
+        arguments[6] = gate_output_tiles;
+        arguments[7] = medium_work_tile_count;
         arguments[8] = 1u;
-        arguments[9] = large_work_tile_count;
-        arguments[10] = down_output_tiles;
+        arguments[9] = down_output_tiles;
+        arguments[10] = medium_work_tile_count;
         arguments[11] = 1u;
+        arguments[12] = gate_output_tiles;
+        arguments[13] = large_work_tile_count;
+        arguments[14] = 1u;
+        arguments[15] = down_output_tiles;
+        arguments[16] = large_work_tile_count;
+        arguments[17] = 1u;
     }
 }
 
@@ -354,14 +377,14 @@ static inline void laguna_xs_moe_gate_up(
     uint thread_index,
     uint simdgroup_index
 ) {
-    uint4 work_tile = work_tiles[group_position.x];
+    uint4 work_tile = work_tiles[group_position.y];
     uint expert = work_tile.x;
     uint assignment_start = work_tile.y;
     uint valid_assignments = min(
         AssignmentTile,
         work_tile.z - assignment_start);
     uint output_start =
-        group_position.y * LAGUNA_XS_MOE_OUTPUT_TILE;
+        group_position.x * LAGUNA_XS_MOE_OUTPUT_TILE;
     uint k_tile_count = input_features / LAGUNA_XS_MOE_K_TILE;
 
     threadgroup half* staging =
@@ -644,14 +667,14 @@ static inline void laguna_xs_moe_down(
     uint thread_index,
     uint simdgroup_index
 ) {
-    uint4 work_tile = work_tiles[group_position.x];
+    uint4 work_tile = work_tiles[group_position.y];
     uint expert = work_tile.x;
     uint assignment_start = work_tile.y;
     uint valid_assignments = min(
         AssignmentTile,
         work_tile.z - assignment_start);
     uint output_start =
-        group_position.y * LAGUNA_XS_MOE_OUTPUT_TILE;
+        group_position.x * LAGUNA_XS_MOE_OUTPUT_TILE;
     uint k_tile_count = input_features / LAGUNA_XS_MOE_K_TILE;
 
     threadgroup half* staging =
@@ -916,6 +939,10 @@ typedef decltype(laguna_xs_prefill_q4_gate_up_mma_impl<
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>)
     LagunaXsQ4GateUpSmallMma;
 typedef decltype(laguna_xs_prefill_q4_gate_up_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>)
+    LagunaXsQ4GateUpMediumMma;
+typedef decltype(laguna_xs_prefill_q4_gate_up_mma_impl<
     LAGUNA_XS_MOE_LARGE_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_LARGE_TOKEN_GROUPS>)
     LagunaXsQ4GateUpLargeMma;
@@ -924,6 +951,10 @@ typedef decltype(laguna_xs_prefill_q4_down_mma_impl<
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>)
     LagunaXsQ4DownSmallMma;
 typedef decltype(laguna_xs_prefill_q4_down_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>)
+    LagunaXsQ4DownMediumMma;
+typedef decltype(laguna_xs_prefill_q4_down_mma_impl<
     LAGUNA_XS_MOE_LARGE_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_LARGE_TOKEN_GROUPS>)
     LagunaXsQ4DownLargeMma;
@@ -931,6 +962,10 @@ typedef decltype(laguna_xs_prefill_q6_down_mma_impl<
     LAGUNA_XS_MOE_SMALL_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>)
     LagunaXsQ6DownSmallMma;
+typedef decltype(laguna_xs_prefill_q6_down_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>)
+    LagunaXsQ6DownMediumMma;
 typedef decltype(laguna_xs_prefill_q6_down_mma_impl<
     LAGUNA_XS_MOE_LARGE_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_LARGE_TOKEN_GROUPS>)
@@ -941,6 +976,12 @@ kernel LagunaXsQ4GateUpSmallMma
 laguna_xs_prefill_q4_gate_up_mma_impl<
     LAGUNA_XS_MOE_SMALL_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>;
+
+template [[host_name("laguna_xs_prefill_q4_gate_up_medium_mma_kernel")]]
+kernel LagunaXsQ4GateUpMediumMma
+laguna_xs_prefill_q4_gate_up_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>;
 
 template [[host_name("laguna_xs_prefill_q4_gate_up_large_mma_kernel")]]
 kernel LagunaXsQ4GateUpLargeMma
@@ -954,6 +995,12 @@ laguna_xs_prefill_q4_down_mma_impl<
     LAGUNA_XS_MOE_SMALL_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>;
 
+template [[host_name("laguna_xs_prefill_q4_down_medium_mma_kernel")]]
+kernel LagunaXsQ4DownMediumMma
+laguna_xs_prefill_q4_down_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>;
+
 template [[host_name("laguna_xs_prefill_q4_down_large_mma_kernel")]]
 kernel LagunaXsQ4DownLargeMma
 laguna_xs_prefill_q4_down_mma_impl<
@@ -965,6 +1012,12 @@ kernel LagunaXsQ6DownSmallMma
 laguna_xs_prefill_q6_down_mma_impl<
     LAGUNA_XS_MOE_SMALL_ASSIGNMENT_TILE,
     LAGUNA_XS_MOE_SMALL_TOKEN_GROUPS>;
+
+template [[host_name("laguna_xs_prefill_q6_down_medium_mma_kernel")]]
+kernel LagunaXsQ6DownMediumMma
+laguna_xs_prefill_q6_down_mma_impl<
+    LAGUNA_XS_MOE_MEDIUM_ASSIGNMENT_TILE,
+    LAGUNA_XS_MOE_MEDIUM_TOKEN_GROUPS>;
 
 template [[host_name("laguna_xs_prefill_q6_down_large_mma_kernel")]]
 kernel LagunaXsQ6DownLargeMma
