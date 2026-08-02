@@ -1120,6 +1120,92 @@ kernel void laguna_xs_rms_norm_decode_f32_kernel(
 }
 
 /*
+ * Decode-only RMSNorm plus the following [256,2048] F32 router projection.
+ * Thirty-two threadgroups each reproduce the small normalization and own
+ * eight router rows. Only threadgroup zero publishes the normalized hidden
+ * row consumed by the experts; all groups keep their copy in threadgroup
+ * memory so router weights never reread it from device memory.
+ */
+kernel void laguna_xs_rms_norm_router_decode_f32_kernel(
+    const device float* input [[buffer(0)]],
+    const device float* norm_weight [[buffer(1)]],
+    const device float* router_weight [[buffer(2)]],
+    device float* normalized [[buffer(3)]],
+    device float* router_logits [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint hidden_size = 2048u;
+    constexpr uint expert_count = 256u;
+    constexpr uint values_per_thread = 8u;
+    constexpr uint simdgroup_count = 8u;
+    constexpr uint router_rows_per_group = 8u;
+    constexpr uint packed_values_per_row = hidden_size / 4u;
+
+    uint value_base = uint(thread_index) * values_per_thread;
+    float4 first = *reinterpret_cast<const device float4*>(
+        input + value_base);
+    float4 second = *reinterpret_cast<const device float4*>(
+        input + value_base + 4u);
+    float local_sum = dot(first, first) + dot(second, second);
+    float simd_sum_value = simd_sum(local_sum);
+
+    threadgroup float partial_sums[simdgroup_count];
+    threadgroup float normalized_row[hidden_size];
+    if (simd_lane == 0u) {
+        partial_sums[simdgroup_index] = simd_sum_value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float partial = simd_lane < simdgroup_count
+        ? partial_sums[simd_lane]
+        : 0.0f;
+    float inverse_rms = rsqrt(
+        simd_sum(partial) / float(hidden_size) + epsilon);
+    float4 first_weight = *reinterpret_cast<const device float4*>(
+        norm_weight + value_base);
+    float4 second_weight = *reinterpret_cast<const device float4*>(
+        norm_weight + value_base + 4u);
+    float4 first_normalized = first * first_weight * inverse_rms;
+    float4 second_normalized = second * second_weight * inverse_rms;
+    *reinterpret_cast<threadgroup float4*>(normalized_row + value_base) =
+        first_normalized;
+    *reinterpret_cast<threadgroup float4*>(normalized_row + value_base + 4u) =
+        second_normalized;
+    if (threadgroup_position.x == 0u) {
+        *reinterpret_cast<device float4*>(normalized + value_base) =
+            first_normalized;
+        *reinterpret_cast<device float4*>(normalized + value_base + 4u) =
+            second_normalized;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint router_row = threadgroup_position.x * router_rows_per_group
+        + uint(simdgroup_index);
+    if (router_row >= expert_count) {
+        return;
+    }
+    const threadgroup float4* input4 =
+        reinterpret_cast<const threadgroup float4*>(normalized_row);
+    const device packed_float4* weight4 =
+        reinterpret_cast<const device packed_float4*>(
+            router_weight + router_row * hidden_size);
+    float sum = 0.0f;
+    for (uint index = uint(simd_lane);
+         index < packed_values_per_row;
+         index += 32u) {
+        sum += dot(input4[index], float4(weight4[index]));
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0u) {
+        router_logits[router_row] = sum;
+    }
+}
+
+/*
  * Decode projects Q, K, V, and the attention gate from the same normalized
  * hidden row. Each SIMD group processes two adjacent rows within one physical
  * tensor, so packed Q4 activation fragments are reused without crossing GGUF

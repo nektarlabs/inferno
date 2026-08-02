@@ -1750,6 +1750,27 @@ impl Metal {
         })
     }
 
+    pub(crate) fn batched_laguna_xs_rms_norm_router(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        norm_weight: &[f32],
+        router_weight: &[f32],
+        eps: f32,
+    ) -> Result<(Buffer, Buffer)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_rms_norm_router(
+                command_buffer,
+                &self.device,
+                input,
+                input_len,
+                norm_weight,
+                router_weight,
+                eps,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_laguna_xs_attention_projections(
         &self,

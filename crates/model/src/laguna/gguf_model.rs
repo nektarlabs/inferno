@@ -542,16 +542,32 @@ impl LagunaGgufModel {
             )?,
         };
         profile_prefill_boundary(backend, row_count, "laguna.prefill.attention_output")?;
-        let mlp_input = required(
-            "Laguna GGUF MLP RMSNorm",
-            self.rms_norm_device(
-                &post_attention,
-                &prepared.post_attention_norm,
-                row_count,
-                self.config.rms_norm_eps as f32,
-                backend,
+        let fused_norm_router = if self.flavor() == LagunaGgufFlavor::Xs21Q4KM && row_count == 1 {
+            match &prepared.moe {
+                Some(moe) => backend.laguna_xs_rms_norm_router_device(
+                    &post_attention,
+                    &prepared.post_attention_norm,
+                    &moe.router,
+                    self.config.rms_norm_eps as f32,
+                )?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mlp_input = match &fused_norm_router {
+            Some((normalized, _)) => normalized.clone(),
+            None => required(
+                "Laguna GGUF MLP RMSNorm",
+                self.rms_norm_device(
+                    &post_attention,
+                    &prepared.post_attention_norm,
+                    row_count,
+                    self.config.rms_norm_eps as f32,
+                    backend,
+                )?,
             )?,
-        )?;
+        };
         match (&layer.mlp, &prepared.moe) {
             (LagunaGgufMlp::Dense(dense), None) => {
                 self.forward_dense(dense, &mlp_input, &post_attention, row_count, backend)
@@ -561,6 +577,7 @@ impl LagunaGgufModel {
                 prepared_moe,
                 &mlp_input,
                 &post_attention,
+                fused_norm_router.as_ref().map(|(_, logits)| logits),
                 row_count,
                 backend,
             ),
@@ -649,14 +666,18 @@ impl LagunaGgufModel {
         prepared: &PreparedMoe,
         input: &DeviceValue,
         residual: &DeviceValue,
+        router_logits: Option<&DeviceValue>,
         row_count: usize,
         backend: &B,
     ) -> Result<DeviceValue> {
         let flat_input = input.reshape(vec![row_count, self.config.hidden_size])?;
-        let logits = required(
-            "Laguna GGUF router",
-            backend.linear_f32_device(&flat_input, &prepared.router)?,
-        )?;
+        let logits = match router_logits {
+            Some(logits) => logits.clone(),
+            None => required(
+                "Laguna GGUF router",
+                backend.linear_f32_device(&flat_input, &prepared.router)?,
+            )?,
+        };
         let xs_routing = if self.flavor() == LagunaGgufFlavor::Xs21Q4KM {
             backend.laguna_xs_router_topk_device(
                 &logits,

@@ -1133,6 +1133,17 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    /// Fuses Laguna XS decode RMSNorm with its following F32 router GEMV.
+    fn laguna_xs_rms_norm_router_device(
+        &self,
+        _input: &DeviceValue,
+        _norm_weight: &F32Tensor,
+        _router_weight: &F32Tensor,
+        _eps: f32,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
     fn prepare_bf16_matrix(
         &self,
         _bytes: &[u8],
@@ -4523,6 +4534,54 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (input, weight, eps);
+            Ok(None)
+        }
+    }
+
+    fn laguna_xs_rms_norm_router_device(
+        &self,
+        input: &DeviceValue,
+        norm_weight: &F32Tensor,
+        router_weight: &F32Tensor,
+        eps: f32,
+    ) -> Result<Option<(DeviceValue, DeviceValue)>> {
+        const HIDDEN_SIZE: usize = 2_048;
+        const EXPERT_COUNT: usize = 256;
+        if input.dtype() != DType::F32 {
+            return Err(Error::backend(format!(
+                "Laguna XS fused norm+router input must be F32, got {:?}",
+                input.dtype()
+            )));
+        }
+        if input.dims().last().copied() != Some(HIDDEN_SIZE)
+            || input.element_count()? != HIDDEN_SIZE
+            || norm_weight.dims() != [HIDDEN_SIZE]
+            || router_weight.dims() != [EXPERT_COUNT, HIDDEN_SIZE]
+        {
+            return Ok(None);
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (normalized, router_logits) = native_metal.batched_laguna_xs_rms_norm_router(
+                &input.buffer,
+                HIDDEN_SIZE,
+                norm_weight.values(),
+                router_weight.values(),
+                eps,
+            )?;
+            return Ok(Some((
+                DeviceValue::new(input.dims().to_vec(), normalized),
+                DeviceValue::new(vec![1, EXPERT_COUNT], router_logits),
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, norm_weight, router_weight, eps);
             Ok(None)
         }
     }

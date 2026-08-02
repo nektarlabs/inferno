@@ -61,6 +61,7 @@ struct LagunaXsPipelines {
     router_top8_decode: ComputePipelineState,
     qk_norm_rope_pair_decode: ComputePipelineState,
     rms_norm_decode: ComputePipelineState,
+    rms_norm_router_decode: ComputePipelineState,
     q4_attention_projections: ComputePipelineState,
     q6_value_attention_projections: ComputePipelineState,
     q4_embedding: ComputePipelineState,
@@ -131,6 +132,11 @@ impl MetalLagunaXs {
                     device,
                     &library,
                     "laguna_xs_rms_norm_decode_f32_kernel",
+                )?,
+                rms_norm_router_decode: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_rms_norm_router_decode_f32_kernel",
                 )?,
                 q4_attention_projections: compute_pipeline(
                     device,
@@ -431,6 +437,64 @@ impl MetalLagunaXs {
             THREADS,
         )?;
         Ok(output)
+    }
+
+    pub(crate) fn encode_rms_norm_router(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        input: &Buffer,
+        input_len: usize,
+        norm_weight: &[f32],
+        router_weight: &[f32],
+        eps: f32,
+    ) -> Result<(Buffer, Buffer)> {
+        const HIDDEN_SIZE: usize = 2_048;
+        const EXPERT_COUNT: usize = 256;
+        const THREADS: usize = 256;
+        const ROUTER_ROWS_PER_GROUP: usize = 8;
+        let expected_router_len = HIDDEN_SIZE * EXPERT_COUNT;
+        if input_len != HIDDEN_SIZE
+            || norm_weight.len() != HIDDEN_SIZE
+            || router_weight.len() != expected_router_len
+        {
+            return Err(Error::backend(format!(
+                "Laguna XS fused norm+router requires input/norm/router lengths {HIDDEN_SIZE}/{HIDDEN_SIZE}/{expected_router_len}, got {input_len}/{}/{}",
+                norm_weight.len(),
+                router_weight.len()
+            )));
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err(Error::backend(format!(
+                "Laguna XS fused norm+router epsilon must be finite and positive, got {eps}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Laguna XS fused norm+router input")?;
+
+        let normalized = self.arena.empty_f32(HIDDEN_SIZE)?;
+        let router_logits = self.arena.empty_f32(EXPERT_COUNT)?;
+        let norm_weight = self.f32_weights.get(device, norm_weight)?;
+        let router_weight = self.f32_weights.get(device, router_weight)?;
+        let pipelines = self.pipelines(device)?;
+        let pipelines = pipelines
+            .as_ref()
+            .ok_or_else(|| Error::backend("Laguna XS Metal pipelines were not initialized"))?;
+        let args = [
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(&norm_weight),
+            KernelArg::Buffer(&router_weight),
+            KernelArg::Buffer(&normalized),
+            KernelArg::Buffer(&router_logits),
+            KernelArg::F32(eps),
+        ];
+        encode_1d_threadgroups_args(
+            command_buffer,
+            &pipelines.rms_norm_router_decode,
+            &args,
+            EXPERT_COUNT / ROUTER_ROWS_PER_GROUP,
+            THREADS,
+        )?;
+        Ok((normalized, router_logits))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1792,6 +1856,72 @@ mod tests {
         assert_eq!(specialized.dims(), &[1, hidden_size]);
         for (actual, expected) in specialized.values().iter().zip(reference.values()) {
             assert_close(*actual, *expected, "vectorized decode RMSNorm");
+        }
+    }
+
+    #[test]
+    fn fused_decode_rms_norm_router_matches_separate_kernels() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let hidden_size = 2_048;
+        let expert_count = 256;
+        let eps = 1e-6;
+        let input = F32Tensor::new(
+            (0..hidden_size)
+                .map(|index| ((index % 37) as f32 - 18.0) / 23.0)
+                .collect(),
+            [1, hidden_size],
+        )
+        .unwrap();
+        let norm_weight = F32Tensor::new(
+            (0..hidden_size)
+                .map(|index| 0.5 + (index % 29) as f32 / 31.0)
+                .collect(),
+            [hidden_size],
+        )
+        .unwrap();
+        let router_weight = F32Tensor::new(
+            (0..expert_count * hidden_size)
+                .map(|index| ((index % 43) as f32 - 21.0) / 1024.0)
+                .collect(),
+            [expert_count, hidden_size],
+        )
+        .unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+        let reference_normalized = backend
+            .laguna_xs_rms_norm_device(&input, &norm_weight, eps)
+            .unwrap()
+            .unwrap();
+        let reference_logits = backend
+            .linear_f32_device(&reference_normalized, &router_weight)
+            .unwrap()
+            .unwrap();
+        let (fused_normalized, fused_logits) = backend
+            .laguna_xs_rms_norm_router_device(&input, &norm_weight, &router_weight, eps)
+            .unwrap()
+            .unwrap();
+
+        let reference_normalized = backend
+            .device_download_f32_tensor(&reference_normalized)
+            .unwrap();
+        let reference_logits = backend
+            .device_download_f32_tensor(&reference_logits)
+            .unwrap();
+        let fused_normalized = backend
+            .device_download_f32_tensor(&fused_normalized)
+            .unwrap();
+        let fused_logits = backend.device_download_f32_tensor(&fused_logits).unwrap();
+
+        for (actual, expected) in fused_normalized
+            .values()
+            .iter()
+            .zip(reference_normalized.values())
+        {
+            assert_close(*actual, *expected, "fused decode RMSNorm");
+        }
+        for (actual, expected) in fused_logits.values().iter().zip(reference_logits.values()) {
+            assert_close(*actual, *expected, "fused decode router");
         }
     }
 
