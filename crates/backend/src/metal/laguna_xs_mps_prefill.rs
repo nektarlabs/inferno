@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -10,7 +10,7 @@ use ::metal::{
 use common::{Error, Result};
 use objc::{
     msg_send,
-    rc::StrongPtr,
+    rc::{autoreleasepool, StrongPtr},
     runtime::{Class, Object, NO, YES},
     sel, sel_impl,
 };
@@ -19,7 +19,7 @@ use crate::GgufKQuant;
 
 use super::{
     arena::MetalArena,
-    buffers::{require_f32_capacity, u8_buffer_no_copy},
+    buffers::{empty_f16_buffer, require_f32_capacity, u8_buffer_no_copy},
     command::{encode_1d_threadgroups_args, KernelArg},
     laguna_views::MetalLagunaViews,
     library::MetalLibrary,
@@ -32,6 +32,7 @@ const Q6_K_BLOCK_BYTES: usize = 210;
 const VECTOR_WIDTH: usize = 4;
 const THREAD_COUNT: usize = 256;
 const MIN_ROWS: usize = 64;
+const MAX_CACHED_GEMM_ROW_SHAPES: usize = 2;
 const MPS_DATA_TYPE_F16: u32 = 0x1000_0010;
 const KERNEL_SOURCE: &str = include_str!("kernels/laguna_xs_mps_prefill_kernels.metal");
 
@@ -66,6 +67,27 @@ struct MpsKernel(StrongPtr);
 unsafe impl Send for MpsKernel {}
 unsafe impl Sync for MpsKernel {}
 
+#[derive(Default)]
+struct GemmCache {
+    kernels: HashMap<GemmKey, MpsKernel>,
+    row_shapes: VecDeque<usize>,
+}
+
+impl GemmCache {
+    fn select_row_shape(&mut self, rows: usize) {
+        if let Some(position) = self.row_shapes.iter().position(|cached| *cached == rows) {
+            self.row_shapes.remove(position);
+        }
+        self.row_shapes.push_back(rows);
+
+        while self.row_shapes.len() > MAX_CACHED_GEMM_ROW_SHAPES {
+            if let Some(evicted_rows) = self.row_shapes.pop_front() {
+                self.kernels.retain(|key, _| key.rows != evicted_rows);
+            }
+        }
+    }
+}
+
 struct Pipelines {
     dequant_q4: ComputePipelineState,
     dequant_q6: ComputePipelineState,
@@ -84,7 +106,7 @@ pub(crate) struct MetalLagunaXsMpsPrefill {
     pipelines: Mutex<Option<Pipelines>>,
     arena: MetalArena,
     weights: Mutex<HashMap<WeightKey, Buffer>>,
-    gemms: Mutex<HashMap<GemmKey, MpsKernel>>,
+    gemms: Mutex<GemmCache>,
     laguna_views: Arc<MetalLagunaViews>,
 }
 
@@ -94,7 +116,7 @@ impl MetalLagunaXsMpsPrefill {
             pipelines: Mutex::new(None),
             arena,
             weights: Mutex::new(HashMap::new()),
-            gemms: Mutex::new(HashMap::new()),
+            gemms: Mutex::new(GemmCache::default()),
             laguna_views,
         }
     }
@@ -139,7 +161,10 @@ impl MetalLagunaXsMpsPrefill {
         let value_count = in_features
             .checked_mul(out_features)
             .ok_or_else(|| Error::backend("Laguna XS MPS weight value count overflow"))?;
-        let output = self.arena.empty_f16(value_count)?;
+        // Prepared weights live for the lifetime of the model. Allocating them
+        // from the transient arena would permanently occupy that heap and force
+        // every prefill activation onto fresh direct Metal buffers.
+        let output = empty_f16_buffer(device, value_count)?;
         let source = self.weight_buffer(device, weights)?;
         let pipelines = self.pipelines(device)?;
         let pipelines = pipelines
@@ -300,28 +325,32 @@ impl MetalLagunaXsMpsPrefill {
             .gemms
             .lock()
             .map_err(|_| Error::backend("Laguna XS MPS GEMM cache lock poisoned"))?;
-        if !gemms.contains_key(&key) {
-            gemms.insert(key, create_gemm(device, key)?);
+        gemms.select_row_shape(rows);
+        if !gemms.kernels.contains_key(&key) {
+            gemms.kernels.insert(key, create_gemm(device, key)?);
         }
         let gemm = gemms
+            .kernels
             .get(&key)
             .ok_or_else(|| Error::backend("Laguna XS MPS GEMM cache insertion failed"))?;
-        let left = create_matrix(input, 0, rows, inner)?;
-        let right = create_matrix(weight, 0, columns, inner)?;
-        let result = create_matrix(output, 0, rows, columns)?;
-        let command_buffer = command_buffer.as_ptr().cast::<Object>();
-        // SAFETY: all objects wrap live Metal buffers on the same device. Matrix
-        // dimensions match the immutable GEMM descriptor stored in `gemm`.
-        unsafe {
-            let _: () = msg_send![
-                *gemm.0,
-                encodeToCommandBuffer: command_buffer
-                leftMatrix: *left
-                rightMatrix: *right
-                resultMatrix: *result
-            ];
-        }
-        Ok(())
+        autoreleasepool(|| {
+            let left = create_matrix(input, 0, rows, inner)?;
+            let right = create_matrix(weight, 0, columns, inner)?;
+            let result = create_matrix(output, 0, rows, columns)?;
+            let command_buffer = command_buffer.as_ptr().cast::<Object>();
+            // SAFETY: all objects wrap live Metal buffers on the same device.
+            // Matrix dimensions match the immutable GEMM descriptor.
+            unsafe {
+                let _: () = msg_send![
+                    *gemm.0,
+                    encodeToCommandBuffer: command_buffer
+                    leftMatrix: *left
+                    rightMatrix: *right
+                    resultMatrix: *result
+                ];
+            }
+            Ok(())
+        })
     }
 
     fn pipelines(&self, device: &Device) -> Result<MutexGuard<'_, Option<Pipelines>>> {
@@ -513,4 +542,24 @@ fn weight_key(
 fn as_u32(value: usize, label: &str) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| Error::backend(format!("Laguna XS MPS {label} exceeds Metal u32")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GemmCache, MAX_CACHED_GEMM_ROW_SHAPES};
+
+    #[test]
+    fn gemm_cache_keeps_only_the_two_most_recent_row_shapes() {
+        let mut cache = GemmCache::default();
+        cache.select_row_shape(1_024);
+        cache.select_row_shape(233);
+        cache.select_row_shape(1_024);
+        cache.select_row_shape(417);
+
+        assert_eq!(MAX_CACHED_GEMM_ROW_SHAPES, 2);
+        assert_eq!(
+            cache.row_shapes.into_iter().collect::<Vec<_>>(),
+            [1_024, 417]
+        );
+    }
 }

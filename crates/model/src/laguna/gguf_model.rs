@@ -22,6 +22,15 @@ use super::{
 /// layer measured flat.
 const LAYER_SUBMISSION_CHUNK: usize = 1;
 
+/// Maximum Laguna XS prefill layers retained by submitted Metal command
+/// buffers before waiting for completion.
+///
+/// MPS retains each layer's temporary matrices until its command buffer is
+/// released. Keeping all 48 layers in flight can exceed 64 GB of unified
+/// memory on long Codex prompts. Eight layers preserve CPU/GPU overlap while
+/// bounding that transient working set. Decode remains fully asynchronous.
+const LAGUNA_XS_PREFILL_LAYERS_IN_FLIGHT: usize = 8;
+
 #[derive(Debug)]
 pub struct LagunaGgufModel {
     config: LagunaConfig,
@@ -181,6 +190,53 @@ impl LagunaGgufModel {
         Ok(())
     }
 
+    pub fn checkpoint_session<B: Backend>(
+        &self,
+        session: &mut LagunaGgufSession,
+        backend: &B,
+    ) -> Result<()> {
+        if self.flavor() != LagunaGgufFlavor::Xs21Q4KM {
+            return Err(Error::cache(
+                "KV prefix checkpoints are supported only for Laguna XS GGUF",
+            ));
+        }
+        let position = session.position()?;
+        if position == 0 {
+            return Err(Error::cache(
+                "Laguna XS KV prefix checkpoint requires a non-empty sequence",
+            ));
+        }
+        for cache in &mut session.attention_caches {
+            if !backend.checkpoint_laguna_f16_kv_cache(&mut cache.inner)? {
+                return Err(Error::backend(
+                    "Laguna XS KV prefix checkpoint requires native Metal",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore_session_checkpoint<B: Backend>(
+        &self,
+        session: &mut LagunaGgufSession,
+        backend: &B,
+    ) -> Result<()> {
+        if self.flavor() != LagunaGgufFlavor::Xs21Q4KM {
+            return Err(Error::cache(
+                "KV prefix checkpoints are supported only for Laguna XS GGUF",
+            ));
+        }
+        for cache in &mut session.attention_caches {
+            if !backend.restore_laguna_f16_kv_cache_checkpoint(&mut cache.inner)? {
+                return Err(Error::backend(
+                    "Laguna XS KV prefix restore requires native Metal",
+                ));
+            }
+        }
+        session.position()?;
+        Ok(())
+    }
+
     pub fn forward_next_token<B: Backend>(
         &self,
         session: &mut LagunaGgufSession,
@@ -248,7 +304,10 @@ impl LagunaGgufModel {
         backend: &B,
     ) -> Result<()> {
         let hidden = self.forward_hidden_states(session, token_ids, backend)?;
-        backend.device_submit()?;
+        // A prefill chunk is also a memory-reclamation boundary. Waiting here
+        // releases the command buffers and transient activations retained by
+        // this chunk before Codex submits the next one.
+        backend.device_flush()?;
         drop(hidden);
         Ok(())
     }
@@ -296,13 +355,19 @@ impl LagunaGgufModel {
                 .get_mut(layer_index)
                 .ok_or_else(|| Error::cache(format!("missing Laguna GGUF cache {layer_index}")))?;
             hidden = self.forward_layer(&hidden, layer, prepared, cache, backend)?;
-            if row_is_prefill(&hidden)?
-                && tracing::enabled!(
-                    target: "inferno::metal::profile",
-                    tracing::Level::TRACE
-                )
+            let is_prefill = row_is_prefill(&hidden)?;
+            if is_prefill {
+                profile_prefill_boundary(
+                    backend,
+                    hidden.element_count()? / self.config.hidden_size,
+                    "laguna.prefill.mlp_tail",
+                )?;
+            }
+            if self.flavor() == LagunaGgufFlavor::Xs21Q4KM
+                && is_prefill
+                && should_flush_xs_prefill_after_layer(layer_index, self.config.num_hidden_layers)
             {
-                backend.device_profile_boundary("laguna.prefill.mlp_tail")?;
+                backend.device_flush()?;
             } else if should_submit_after_layer(layer_index, self.config.num_hidden_layers) {
                 backend.device_submit()?;
             }
@@ -1336,9 +1401,15 @@ fn should_submit_after_layer(layer_index: usize, layer_count: usize) -> bool {
     completed_layers < layer_count && completed_layers.is_multiple_of(LAYER_SUBMISSION_CHUNK)
 }
 
+fn should_flush_xs_prefill_after_layer(layer_index: usize, layer_count: usize) -> bool {
+    let completed_layers = layer_index + 1;
+    completed_layers < layer_count
+        && completed_layers.is_multiple_of(LAGUNA_XS_PREFILL_LAYERS_IN_FLIGHT)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_submit_after_layer;
+    use super::{should_flush_xs_prefill_after_layer, should_submit_after_layer};
 
     #[test]
     fn submits_complete_laguna_layer_chunks_but_not_the_final_layer() {
@@ -1354,5 +1425,15 @@ mod tests {
                 .step_by(super::LAYER_SUBMISSION_CHUNK)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn bounds_laguna_xs_prefill_to_eight_in_flight_layers() {
+        let flush_layers = (0..48)
+            .filter(|layer_index| should_flush_xs_prefill_after_layer(*layer_index, 48))
+            .collect::<Vec<_>>();
+
+        assert_eq!(flush_layers, vec![7, 15, 23, 31, 39]);
+        assert!(!should_flush_xs_prefill_after_layer(47, 48));
     }
 }

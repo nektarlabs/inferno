@@ -79,9 +79,105 @@ impl MetalF16Attention {
             stored_tokens: 0,
             total_tokens: 0,
             retention,
+            checkpoint_stored_tokens: None,
+            checkpoint_total_tokens: None,
             key: empty_f16_buffer(device, values)?,
             value: empty_f16_buffer(device, values)?,
+            checkpoint_key: None,
+            checkpoint_value: None,
         })
+    }
+
+    pub(crate) fn checkpoint_cache(
+        &self,
+        device: &Device,
+        command_buffer: &CommandBufferRef,
+        cache: &mut LagunaF16KvCache,
+    ) -> Result<()> {
+        validate_cache_configuration(cache.batch, cache.capacity_tokens, cache.retention)?;
+        if cache.retention == LagunaKvRetention::Sliding {
+            let values = cache_value_count(cache.batch, cache.capacity_tokens)?;
+            if cache.checkpoint_key.is_none() || cache.checkpoint_value.is_none() {
+                let checkpoint_key = empty_f16_buffer(device, values)?;
+                let checkpoint_value = empty_f16_buffer(device, values)?;
+                cache.checkpoint_key = Some(checkpoint_key);
+                cache.checkpoint_value = Some(checkpoint_value);
+            }
+            let checkpoint_key = cache
+                .checkpoint_key
+                .as_ref()
+                .ok_or_else(|| Error::cache("Laguna F16 KV checkpoint key is missing"))?;
+            let checkpoint_value = cache
+                .checkpoint_value
+                .as_ref()
+                .ok_or_else(|| Error::cache("Laguna F16 KV checkpoint value is missing"))?;
+            encode_element_copy(
+                command_buffer,
+                &cache.key,
+                0,
+                checkpoint_key,
+                0,
+                values,
+                std::mem::size_of::<u16>(),
+            )?;
+            encode_element_copy(
+                command_buffer,
+                &cache.value,
+                0,
+                checkpoint_value,
+                0,
+                values,
+                std::mem::size_of::<u16>(),
+            )?;
+        }
+        cache.checkpoint_stored_tokens = Some(cache.stored_tokens);
+        cache.checkpoint_total_tokens = Some(cache.total_tokens);
+        Ok(())
+    }
+
+    pub(crate) fn restore_cache_checkpoint(
+        &self,
+        command_buffer: &CommandBufferRef,
+        cache: &mut LagunaF16KvCache,
+    ) -> Result<()> {
+        let checkpoint_stored_tokens = cache
+            .checkpoint_stored_tokens
+            .ok_or_else(|| Error::cache("Laguna F16 KV cache has no checkpoint"))?;
+        let checkpoint_total_tokens = cache
+            .checkpoint_total_tokens
+            .ok_or_else(|| Error::cache("Laguna F16 KV cache has no checkpoint"))?;
+        if cache.retention == LagunaKvRetention::Sliding {
+            let values = cache_value_count(cache.batch, cache.capacity_tokens)?;
+            let checkpoint_key = cache
+                .checkpoint_key
+                .as_ref()
+                .ok_or_else(|| Error::cache("Laguna F16 KV checkpoint key is missing"))?;
+            let checkpoint_value = cache
+                .checkpoint_value
+                .as_ref()
+                .ok_or_else(|| Error::cache("Laguna F16 KV checkpoint value is missing"))?;
+            encode_element_copy(
+                command_buffer,
+                checkpoint_key,
+                0,
+                &cache.key,
+                0,
+                values,
+                std::mem::size_of::<u16>(),
+            )?;
+            encode_element_copy(
+                command_buffer,
+                checkpoint_value,
+                0,
+                &cache.value,
+                0,
+                values,
+                std::mem::size_of::<u16>(),
+            )?;
+        }
+        cache.stored_tokens = checkpoint_stored_tokens;
+        cache.total_tokens = checkpoint_total_tokens;
+        Ok(())
     }
 
     pub(crate) fn grow_cache(
@@ -128,6 +224,8 @@ impl MetalF16Attention {
         }
         grown.stored_tokens = cache.stored_tokens;
         grown.total_tokens = cache.total_tokens;
+        grown.checkpoint_stored_tokens = cache.checkpoint_stored_tokens;
+        grown.checkpoint_total_tokens = cache.checkpoint_total_tokens;
         *cache = grown;
         Ok(())
     }
@@ -532,6 +630,113 @@ mod tests {
                 "Laguna F16 attention mismatch at {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
             );
         }
+    }
+
+    #[test]
+    fn sliding_f16_cache_checkpoint_restores_overwritten_rows() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let mut cache = backend
+            .prepare_laguna_f16_kv_cache(1, SLIDING_WINDOW, LagunaKvRetention::Sliding)
+            .unwrap()
+            .unwrap();
+        let zeros_query = upload(
+            &backend,
+            vec![0.0; SLIDING_WINDOW * LAGUNA_XS_SLIDING_QUERY_HEADS * HEAD_DIM],
+            [1, SLIDING_WINDOW, LAGUNA_XS_SLIDING_QUERY_HEADS, HEAD_DIM],
+        );
+        let zeros_key = upload(
+            &backend,
+            vec![0.0; SLIDING_WINDOW * KV_HEADS * HEAD_DIM],
+            [1, SLIDING_WINDOW, KV_HEADS, HEAD_DIM],
+        );
+        let ones_value = upload(
+            &backend,
+            vec![1.0; SLIDING_WINDOW * KV_HEADS * HEAD_DIM],
+            [1, SLIDING_WINDOW, KV_HEADS, HEAD_DIM],
+        );
+        let zeros_gate = upload(
+            &backend,
+            vec![0.0; SLIDING_WINDOW * LAGUNA_XS_SLIDING_QUERY_HEADS],
+            [1, SLIDING_WINDOW, LAGUNA_XS_SLIDING_QUERY_HEADS],
+        );
+        drop(
+            backend
+                .laguna_gated_gqa_f16_attention_device(
+                    &zeros_query,
+                    &zeros_key,
+                    &ones_value,
+                    &zeros_gate,
+                    &mut cache,
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(backend.checkpoint_laguna_f16_kv_cache(&mut cache).unwrap());
+
+        drop(
+            backend
+                .laguna_gated_gqa_f16_attention_device(
+                    &upload(
+                        &backend,
+                        vec![0.0; LAGUNA_XS_SLIDING_QUERY_HEADS * HEAD_DIM],
+                        [1, 1, LAGUNA_XS_SLIDING_QUERY_HEADS, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        vec![0.0; KV_HEADS * HEAD_DIM],
+                        [1, 1, KV_HEADS, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        vec![100.0; KV_HEADS * HEAD_DIM],
+                        [1, 1, KV_HEADS, HEAD_DIM],
+                    ),
+                    &upload(
+                        &backend,
+                        vec![0.0; LAGUNA_XS_SLIDING_QUERY_HEADS],
+                        [1, 1, LAGUNA_XS_SLIDING_QUERY_HEADS],
+                    ),
+                    &mut cache,
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(backend
+            .restore_laguna_f16_kv_cache_checkpoint(&mut cache)
+            .unwrap());
+        assert_eq!(cache.total_tokens(), SLIDING_WINDOW);
+        assert_eq!(cache.stored_tokens(), SLIDING_WINDOW);
+
+        let output = backend
+            .laguna_gated_gqa_f16_attention_device(
+                &upload(
+                    &backend,
+                    vec![0.0; LAGUNA_XS_SLIDING_QUERY_HEADS * HEAD_DIM],
+                    [1, 1, LAGUNA_XS_SLIDING_QUERY_HEADS, HEAD_DIM],
+                ),
+                &upload(
+                    &backend,
+                    vec![0.0; KV_HEADS * HEAD_DIM],
+                    [1, 1, KV_HEADS, HEAD_DIM],
+                ),
+                &upload(
+                    &backend,
+                    vec![1.0; KV_HEADS * HEAD_DIM],
+                    [1, 1, KV_HEADS, HEAD_DIM],
+                ),
+                &upload(
+                    &backend,
+                    vec![0.0; LAGUNA_XS_SLIDING_QUERY_HEADS],
+                    [1, 1, LAGUNA_XS_SLIDING_QUERY_HEADS],
+                ),
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        let output = backend.device_download_f32_tensor(&output).unwrap();
+        assert!((output.values()[0] - 2.0_f32.ln()).abs() <= 1e-4);
     }
 
     /// The sliding case runs past the 512-token window on purpose: that is the

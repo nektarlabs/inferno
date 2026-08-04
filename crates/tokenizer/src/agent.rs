@@ -7,6 +7,7 @@ use crate::{ChatPrompt, LagunaThinkingMode};
 const PROMPT_PREFIX: &str = "[gMASK]<sop><|system|>Reasoning Effort: Max";
 const LAGUNA_PROMPT_PREFIX: &str = "〈|EOS|〉";
 const LAGUNA_DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
@@ -165,8 +166,11 @@ fn render_laguna_codex_prompt_inner(
     )?;
     rendered.push_str("<assistant>");
     match thinking_mode {
-        LagunaThinkingMode::Enabled => rendered.push_str("<think>"),
-        LagunaThinkingMode::Disabled => rendered.push_str(THINK_END),
+        LagunaThinkingMode::Enabled => rendered.push_str(THINK_START),
+        LagunaThinkingMode::Disabled => {
+            rendered.push_str(THINK_START);
+            rendered.push_str(THINK_END);
+        }
     }
     Ok(ChatPrompt { rendered })
 }
@@ -175,18 +179,39 @@ fn render_laguna_codex_prompt_inner(
 /// output items. Both checkpoints use the same reasoning and tool-call tags.
 pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
     let output = complete_terminated_apply_patch(output);
+    parse_agent_output_inner(&output)
+}
+
+/// Parses an agent turn only when its reasoning and tool-call protocol is
+/// structurally complete.
+///
+/// Generation can legitimately stop at an output limit or EOS while a tag is
+/// still open. That state is retryable, not malformed. A fully closed but
+/// invalid tool call remains an error so it can never be executed.
+pub fn parse_agent_output_if_complete(output: &str) -> Result<Option<AgentOutput>> {
+    let output = complete_terminated_apply_patch(output);
+    let Some((_, visible)) = output.rsplit_once(THINK_END) else {
+        return Ok(None);
+    };
+    if !agent_protocol_is_complete(visible) {
+        return Ok(None);
+    }
+    parse_agent_output_inner(&output).map(Some)
+}
+
+fn parse_agent_output_inner(output: &str) -> Result<AgentOutput> {
     let (reasoning, visible) = output
         .rsplit_once(THINK_END)
-        .ok_or_else(|| Error::tokenizer("GLM agent output ended before the </think> boundary"))?;
+        .ok_or_else(|| Error::tokenizer("agent output ended before the </think> boundary"))?;
     let mut items = Vec::new();
     let mut remaining = visible;
     while let Some(start) = remaining.find(TOOL_CALL_OPEN) {
         push_text_item(&mut items, &remaining[..start]);
         let tool_body_start = start + TOOL_CALL_OPEN.len();
         let after_open = &remaining[tool_body_start..];
-        let close = after_open.find(TOOL_CALL_CLOSE).ok_or_else(|| {
-            Error::tokenizer("GLM agent output contains an unterminated <tool_call>")
-        })?;
+        let close = after_open
+            .find(TOOL_CALL_CLOSE)
+            .ok_or_else(|| Error::tokenizer("agent output contains an unterminated <tool_call>"))?;
         let call = parse_tool_call(&after_open[..close])?;
         items.push(AgentOutputItem::FunctionCall(call));
         remaining = &after_open[close + TOOL_CALL_CLOSE.len()..];
@@ -199,6 +224,18 @@ pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
         reasoning: reasoning.trim().to_string(),
         items,
     })
+}
+
+fn agent_protocol_is_complete(mut visible: &str) -> bool {
+    while let Some(start) = visible.find(TOOL_CALL_OPEN) {
+        let after_open = &visible[start + TOOL_CALL_OPEN.len()..];
+        let Some(close) = after_open.find(TOOL_CALL_CLOSE) else {
+            return false;
+        };
+        visible = &after_open[close + TOOL_CALL_CLOSE.len()..];
+    }
+
+    stable_text_end(visible, TOOL_CALL_OPEN) == visible.len()
 }
 
 fn complete_terminated_apply_patch(output: &str) -> Cow<'_, str> {
@@ -1008,7 +1045,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(prompt.rendered.ends_with("<assistant></think>"));
+        assert!(prompt.rendered.ends_with("<assistant><think></think>"));
     }
 
     #[test]
@@ -1182,6 +1219,70 @@ mod tests {
         assert!(matches!(
             parsed.items.as_slice(),
             [AgentOutputItem::FunctionCall(_)]
+        ));
+    }
+
+    #[test]
+    fn classifies_truncated_agent_protocol_as_incomplete() {
+        assert_eq!(
+            parse_agent_output_if_complete("still thinking").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_agent_output_if_complete(
+                "done</think><tool_call>exec_command<arg_key>cmd</arg_key>"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_agent_output_if_complete("done</think>Creating the file.<tool").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_complete_direct_and_tool_agent_outputs() {
+        let direct = parse_agent_output_if_complete("done</think>The answer is Rome.")
+            .unwrap()
+            .expect("expected complete direct output");
+        assert_eq!(
+            direct.items,
+            vec![AgentOutputItem::Text("The answer is Rome.".to_string())]
+        );
+
+        let tool = parse_agent_output_if_complete(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap()
+        .expect("expected complete tool output");
+        assert!(matches!(
+            tool.items.as_slice(),
+            [AgentOutputItem::FunctionCall(_)]
+        ));
+    }
+
+    #[test]
+    fn complete_but_malformed_agent_protocol_remains_an_error() {
+        let error = parse_agent_output_if_complete(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key></tool_call>",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("<arg_value>"));
+    }
+
+    #[test]
+    fn complete_apply_patch_body_remains_recoverable_at_generation_end() {
+        let output = parse_agent_output_if_complete(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch",
+        )
+        .unwrap()
+        .expect("expected recoverable apply_patch output");
+
+        assert!(matches!(
+            output.items.as_slice(),
+            [AgentOutputItem::FunctionCall(call)] if call.name == "apply_patch"
         ));
     }
 

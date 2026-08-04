@@ -178,6 +178,40 @@ impl LagunaModel {
         }
     }
 
+    pub fn checkpoint_session<B: Backend>(
+        &self,
+        session: &mut LagunaSession,
+        backend: &B,
+    ) -> Result<()> {
+        match (self, session) {
+            (Self::Gguf(model), LagunaSession::Gguf(session))
+                if model.flavor() == super::LagunaGgufFlavor::Xs21Q4KM =>
+            {
+                model.checkpoint_session(session, backend)
+            }
+            _ => Err(Error::runtime(
+                "KV prefix checkpoints require matching Laguna XS GGUF model state",
+            )),
+        }
+    }
+
+    pub fn restore_session_checkpoint<B: Backend>(
+        &self,
+        session: &mut LagunaSession,
+        backend: &B,
+    ) -> Result<()> {
+        match (self, session) {
+            (Self::Gguf(model), LagunaSession::Gguf(session))
+                if model.flavor() == super::LagunaGgufFlavor::Xs21Q4KM =>
+            {
+                model.restore_session_checkpoint(session, backend)
+            }
+            _ => Err(Error::runtime(
+                "KV prefix restore requires matching Laguna XS GGUF model state",
+            )),
+        }
+    }
+
     pub fn forward_next_token<B: Backend>(
         &self,
         session: &mut LagunaSession,

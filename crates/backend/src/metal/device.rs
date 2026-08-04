@@ -2243,6 +2243,26 @@ impl Metal {
         })
     }
 
+    pub(crate) fn checkpoint_laguna_f16_kv_cache(
+        &self,
+        cache: &mut LagunaF16KvCache,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.f16_attention
+                .checkpoint_cache(&self.device, command_buffer, cache)
+        })
+    }
+
+    pub(crate) fn restore_laguna_f16_kv_cache_checkpoint(
+        &self,
+        cache: &mut LagunaF16KvCache,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.f16_attention
+                .restore_cache_checkpoint(command_buffer, cache)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_laguna_gated_gqa_f16_attention(
         &self,

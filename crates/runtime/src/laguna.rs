@@ -6,6 +6,7 @@ use std::{
 use backend::Backend;
 use common::{Error, Result};
 use model::{LagunaArtifactKind, LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
+use tracing::debug;
 
 use crate::{
     laguna_memory::LagunaMemoryController,
@@ -131,14 +132,15 @@ impl LagunaGenerationReport {
 
 /// Persistent Laguna generation state for chat and serving.
 ///
-/// Each request starts a fresh KV sequence, while routed experts remain in the
-/// same cache across requests. This preserves correctness and avoids turning
-/// every chat turn into a cold expert-cache start.
+/// Laguna XS can reuse an exact token prefix from the previous request. Other
+/// artifacts start a fresh KV sequence, while routed experts remain cached.
 #[derive(Debug)]
 pub struct LagunaRuntime {
     expert_cache_capacity: Option<usize>,
     memory_controller: Option<LagunaMemoryController>,
     session: Option<LagunaSession>,
+    sequence_token_ids: Vec<u32>,
+    prefix_checkpoint_token_ids: Vec<u32>,
 }
 
 impl LagunaRuntime {
@@ -169,6 +171,8 @@ impl LagunaRuntime {
             expert_cache_capacity: options.expert_cache_capacity,
             memory_controller,
             session: None,
+            sequence_token_ids: Vec::new(),
+            prefix_checkpoint_token_ids: Vec::new(),
         })
     }
 
@@ -270,33 +274,58 @@ impl LagunaRuntime {
             generated_limit,
             config.max_position_embeddings,
         )?;
-        self.prepare_session(model, backend, required_context_capacity)?;
+        let reused_prefix_tokens =
+            self.prepare_session(model, backend, required_context_capacity, prompt_token_ids)?;
+        let prompt_suffix = &prompt_token_ids[reused_prefix_tokens..];
+        debug!(
+            artifact = ?model.artifact_kind(),
+            prompt_tokens = prompt_token_ids.len(),
+            reused_prefix_tokens,
+            new_prompt_tokens = prompt_suffix.len(),
+            "prepared Laguna prompt state"
+        );
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::runtime("Laguna runtime session was not prepared"))?;
+        let sequence_token_ids = &mut self.sequence_token_ids;
+        let prefix_checkpoint_token_ids = &mut self.prefix_checkpoint_token_ids;
 
         let started_at = Instant::now();
         let mut time_to_first_token = None;
         let mut generated_tokens = 0_usize;
         let prefill_chunk_tokens = prefill_chunk_tokens(model.artifact_kind());
         let final_prompt_chunk_start = for_each_prefill_prefix_chunk(
-            prompt_token_ids,
+            prompt_suffix,
             prefill_chunk_tokens,
             |chunk, processed_tokens| {
                 model.prefill_chunk(session, chunk, backend)?;
+                sequence_token_ids.extend_from_slice(chunk);
                 on_prefill_progress(LagunaPrefillProgress {
-                    processed_tokens,
+                    processed_tokens: reused_prefix_tokens + processed_tokens,
                     prompt_tokens: prompt_token_ids.len(),
                 })
             },
         )?;
+        if model.artifact_kind() == LagunaArtifactKind::PoolsideXsGguf
+            && final_prompt_chunk_start > 0
+        {
+            model.checkpoint_session(session, backend)?;
+            let checkpoint_tokens = reused_prefix_tokens + final_prompt_chunk_start;
+            prefix_checkpoint_token_ids.clear();
+            prefix_checkpoint_token_ids.extend_from_slice(&prompt_token_ids[..checkpoint_tokens]);
+            debug!(
+                artifact = ?model.artifact_kind(),
+                checkpoint_tokens,
+                "checkpointed reusable Laguna prompt prefix"
+            );
+        }
         let mut decode_token = [0_u32; 1];
 
         let generation_result = (|| -> Result<()> {
             while generated_tokens < generated_limit {
                 let input: &[u32] = if generated_tokens == 0 {
-                    &prompt_token_ids[final_prompt_chunk_start..]
+                    &prompt_suffix[final_prompt_chunk_start..]
                 } else {
                     &decode_token
                 };
@@ -314,6 +343,7 @@ impl LagunaRuntime {
                 }
                 let model_started_at = self.memory_controller.as_ref().map(|_| Instant::now());
                 let output = model.forward_next_token(session, input, backend)?;
+                sequence_token_ids.extend_from_slice(input);
                 let model_elapsed = model_started_at.map(|started_at| started_at.elapsed());
                 if time_to_first_token.is_none() {
                     time_to_first_token = Some(started_at.elapsed());
@@ -404,7 +434,8 @@ impl LagunaRuntime {
         model: &LagunaModel,
         backend: &B,
         required_context_capacity: usize,
-    ) -> Result<()> {
+        prompt_token_ids: &[u32],
+    ) -> Result<usize> {
         let Some(session) = self.session.as_mut() else {
             self.session = Some(model.new_session(
                 1,
@@ -412,7 +443,9 @@ impl LagunaRuntime {
                 self.expert_cache_capacity,
                 backend,
             )?);
-            return Ok(());
+            self.sequence_token_ids.clear();
+            self.prefix_checkpoint_token_ids.clear();
+            return Ok(0);
         };
 
         let allocated_capacity = session.context_capacity();
@@ -424,8 +457,67 @@ impl LagunaRuntime {
         } else {
             allocated_capacity
         };
-        model.prepare_session(session, 1, target_capacity, backend)
+        let reusable_prefix_tokens = reusable_prompt_prefix_tokens(
+            model.artifact_kind(),
+            &self.prefix_checkpoint_token_ids,
+            prompt_token_ids,
+        );
+        debug!(
+            artifact = ?model.artifact_kind(),
+            cached_sequence_tokens = self.sequence_token_ids.len(),
+            common_prefix_tokens = common_prefix_tokens(&self.sequence_token_ids, prompt_token_ids),
+            checkpoint_tokens = self.prefix_checkpoint_token_ids.len(),
+            checkpoint_common_prefix_tokens = common_prefix_tokens(
+                &self.prefix_checkpoint_token_ids,
+                prompt_token_ids
+            ),
+            "compared Laguna request with the active KV sequence"
+        );
+        if reusable_prefix_tokens > 0 {
+            model.restore_session_checkpoint(session, backend)?;
+            let restored_position = session.position()?;
+            if restored_position != reusable_prefix_tokens {
+                return Err(Error::cache(format!(
+                    "Laguna XS restored KV position {restored_position} does not match its {reusable_prefix_tokens}-token checkpoint"
+                )));
+            }
+            self.sequence_token_ids.clear();
+            self.sequence_token_ids
+                .extend_from_slice(&self.prefix_checkpoint_token_ids);
+            if target_capacity > allocated_capacity {
+                model.grow_session_capacity(session, target_capacity, backend)?;
+            }
+            return Ok(reusable_prefix_tokens);
+        }
+
+        model.prepare_session(session, 1, target_capacity, backend)?;
+        self.sequence_token_ids.clear();
+        self.prefix_checkpoint_token_ids.clear();
+        Ok(0)
     }
+}
+
+fn reusable_prompt_prefix_tokens(
+    artifact: LagunaArtifactKind,
+    cached_token_ids: &[u32],
+    prompt_token_ids: &[u32],
+) -> usize {
+    if artifact == LagunaArtifactKind::PoolsideXsGguf
+        && !cached_token_ids.is_empty()
+        && cached_token_ids.len() < prompt_token_ids.len()
+        && prompt_token_ids.starts_with(cached_token_ids)
+    {
+        cached_token_ids.len()
+    } else {
+        0
+    }
+}
+
+fn common_prefix_tokens(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn prefill_chunk_tokens(artifact: LagunaArtifactKind) -> usize {
@@ -514,11 +606,11 @@ fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
 mod tests {
     use super::{
         final_chunk_start, for_each_prefill_prefix_chunk, initial_context_capacity,
-        next_context_capacity, prefill_chunk_tokens, LagunaGenerationOptions, LagunaRuntime,
-        LagunaThinkingGuard, LagunaThinkingGuardReason, LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
-        LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS, LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
-        LAGUNA_THINKING_END_TOKEN_ID, LAGUNA_THINKING_TOKEN_BUDGET,
-        LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
+        next_context_capacity, prefill_chunk_tokens, reusable_prompt_prefix_tokens,
+        LagunaGenerationOptions, LagunaRuntime, LagunaThinkingGuard, LagunaThinkingGuardReason,
+        LAGUNA_GGUF_PREFILL_CHUNK_TOKENS, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
+        LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS, LAGUNA_THINKING_END_TOKEN_ID,
+        LAGUNA_THINKING_TOKEN_BUDGET, LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
     };
     use crate::LagunaMemoryControllerSpec;
     use model::LagunaArtifactKind;
@@ -616,6 +708,47 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mapped_runtime.expert_cache_capacity(), None);
+    }
+
+    #[test]
+    fn laguna_xs_reuses_only_an_exact_strict_prompt_prefix() {
+        let cached = [10_u32, 20, 30];
+
+        assert_eq!(
+            reusable_prompt_prefix_tokens(
+                LagunaArtifactKind::PoolsideXsGguf,
+                &cached,
+                &[10, 20, 30, 40, 50]
+            ),
+            cached.len()
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(
+                LagunaArtifactKind::PoolsideXsGguf,
+                &cached,
+                &[10, 20, 31, 40]
+            ),
+            0
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::PoolsideXsGguf, &cached, &cached),
+            0
+        );
+    }
+
+    #[test]
+    fn prompt_prefix_reuse_does_not_change_other_laguna_artifacts() {
+        let cached = [10_u32, 20, 30];
+        let extended = [10_u32, 20, 30, 40];
+
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::AntirezGguf, &cached, &extended),
+            0
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::SafetensorsInt4, &cached, &extended),
+            0
+        );
     }
 
     #[test]

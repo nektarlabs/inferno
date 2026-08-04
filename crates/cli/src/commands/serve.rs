@@ -31,9 +31,9 @@ use server::{
 };
 use tokenizer::{
     is_supported_codex_function, map_laguna_function_call_to_codex, parse_agent_output,
-    parse_complete_agent_tool_call, render_codex_prompt, render_laguna_codex_prompt,
-    render_laguna_xs_codex_prompt, AgentFunctionCall, AgentOutput, AgentOutputItem,
-    LagunaThinkingMode, Tokenizer,
+    parse_agent_output_if_complete, parse_complete_agent_tool_call, render_codex_prompt,
+    render_laguna_codex_prompt, render_laguna_xs_codex_prompt, AgentFunctionCall, AgentOutput,
+    AgentOutputItem, LagunaThinkingMode, Tokenizer,
 };
 use tracing::{debug, info};
 
@@ -421,14 +421,44 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 thinking_mode,
                 stream,
             )?;
+            let LagunaAgentTurn {
+                output,
+                input_tokens,
+                output_tokens,
+                hit_output_limit,
+            } = turn;
             total_input_tokens = total_input_tokens
-                .checked_add(turn.input_tokens)
+                .checked_add(input_tokens)
                 .ok_or_else(|| Error::runtime("Codex input token count overflow"))?;
             total_output_tokens = total_output_tokens
-                .checked_add(turn.output_tokens)
+                .checked_add(output_tokens)
                 .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
 
-            if let Some(duplicate) = duplicate_tool_call(&turn.output, &completed_calls)? {
+            let Some(output) = output else {
+                if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
+                    return Err(Error::runtime(format!(
+                        "Laguna ended inside an incomplete agent protocol after {} internal retries",
+                        LAGUNA_CODEX_DUPLICATE_RETRIES
+                    )));
+                }
+                let tool_required =
+                    tool_phase != LagunaToolPhase::Complete && !prompt_allowed_tools.is_empty();
+                debug!(
+                    attempt = attempt + 1,
+                    hit_output_limit,
+                    tool_required,
+                    "retrying Laguna Codex turn after incomplete agent protocol"
+                );
+                input.push(incomplete_agent_retry_message(
+                    hit_output_limit,
+                    tool_required,
+                ));
+                require_new_tool_call = tool_required;
+                stream.heartbeat()?;
+                continue;
+            };
+
+            if let Some(duplicate) = duplicate_tool_call(&output, &completed_calls)? {
                 if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
                     return Err(Error::runtime(format!(
                         "Laguna repeated completed Codex tool {:?} after {} internal retries",
@@ -446,7 +476,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 continue;
             }
             if inspection_limit_reached {
-                if let Some(inspection) = first_read_only_shell_call(&turn.output)? {
+                if let Some(inspection) = first_read_only_shell_call(&output)? {
                     if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
                         return Err(Error::runtime(format!(
                             "Laguna repeated workspace inspection with {:?} after {} internal retries",
@@ -459,9 +489,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                     continue;
                 }
             }
-            if let Some(disallowed) =
-                first_tool_outside_contract(&turn.output, &prompt_allowed_tools)
-            {
+            if let Some(disallowed) = first_tool_outside_contract(&output, &prompt_allowed_tools) {
                 if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
                     return Err(Error::runtime(format!(
                         "Laguna requested unavailable Codex tool {:?} after {} internal retries",
@@ -473,22 +501,20 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 stream.heartbeat()?;
                 continue;
             }
-            if turn.hit_output_limit
-                || (require_new_tool_call && !agent_output_has_tool(&turn.output))
-            {
+            if hit_output_limit || (require_new_tool_call && !agent_output_has_tool(&output)) {
                 if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
                     return Err(Error::runtime(
                         "Laguna did not produce the required new Codex tool call before the internal retry limit",
                     ));
                 }
-                input.push(required_tool_retry_message(turn.hit_output_limit));
+                input.push(required_tool_retry_message(hit_output_limit));
                 require_new_tool_call = true;
                 stream.heartbeat()?;
                 continue;
             }
 
             emit_laguna_agent_output(
-                turn.output,
+                output,
                 "",
                 &prompt_allowed_tools,
                 "Laguna",
@@ -508,7 +534,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
 }
 
 struct LagunaAgentTurn {
-    output: AgentOutput,
+    output: Option<AgentOutput>,
     input_tokens: usize,
     output_tokens: usize,
     hit_output_limit: bool,
@@ -616,7 +642,10 @@ impl LagunaCodexHandler<'_> {
                     Ok(control)
                 },
             )?;
-        let output = completed_output.unwrap_or(parse_agent_output(&generated_text)?);
+        let output = match completed_output {
+            Some(output) => Some(output),
+            None => parse_agent_output_if_complete(&generated_text)?,
+        };
         Ok(LagunaAgentTurn {
             output,
             input_tokens: encoded.token_ids.len(),
@@ -1031,6 +1060,30 @@ fn required_tool_retry_message(hit_output_limit: bool) -> serde_json::Value {
             "text": format!(
                 "{reason} Do not repeat the plan or print repository contents as prose. Call a tool immediately with a different action that advances the user's unfinished request."
             ),
+        }],
+    })
+}
+
+fn incomplete_agent_retry_message(
+    hit_output_limit: bool,
+    tool_required: bool,
+) -> serde_json::Value {
+    let reason = if hit_output_limit {
+        "The previous response reached the output limit inside an incomplete agent action."
+    } else {
+        "The previous response ended inside an incomplete agent action."
+    };
+    let next_action = if tool_required {
+        "Discard that partial action and emit one complete allowed tool call. Include every required argument and the closing </tool_call> tag."
+    } else {
+        "Discard that partial action and return a complete direct answer without a tool call."
+    };
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("{reason} {next_action}"),
         }],
     })
 }
@@ -1628,6 +1681,29 @@ mod tests {
             output.items.get(1),
             Some(AgentOutputItem::FunctionCall(call)) if call.name == "exec_command"
         ));
+    }
+
+    #[test]
+    fn incomplete_agent_retry_requires_a_complete_tool_when_actions_remain() {
+        let message = incomplete_agent_retry_message(true, true);
+        let text = message["content"][0]["text"]
+            .as_str()
+            .expect("expected retry text");
+
+        assert!(text.contains("output limit"));
+        assert!(text.contains("complete allowed tool call"));
+        assert!(text.contains("</tool_call>"));
+    }
+
+    #[test]
+    fn incomplete_agent_retry_requests_direct_text_after_tools_are_complete() {
+        let message = incomplete_agent_retry_message(false, false);
+        let text = message["content"][0]["text"]
+            .as_str()
+            .expect("expected retry text");
+
+        assert!(text.contains("ended inside"));
+        assert!(text.contains("complete direct answer without a tool call"));
     }
 
     #[test]

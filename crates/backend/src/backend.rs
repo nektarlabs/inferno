@@ -288,10 +288,16 @@ pub struct LagunaF16KvCache {
     pub(crate) stored_tokens: usize,
     pub(crate) total_tokens: usize,
     pub(crate) retention: LagunaKvRetention,
+    pub(crate) checkpoint_stored_tokens: Option<usize>,
+    pub(crate) checkpoint_total_tokens: Option<usize>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) key: ::metal::Buffer,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) value: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) checkpoint_key: Option<::metal::Buffer>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) checkpoint_value: Option<::metal::Buffer>,
 }
 
 impl LagunaF16KvCache {
@@ -328,6 +334,8 @@ impl LagunaF16KvCache {
     pub fn reset(&mut self) {
         self.stored_tokens = 0;
         self.total_tokens = 0;
+        self.checkpoint_stored_tokens = None;
+        self.checkpoint_total_tokens = None;
     }
 
     fn commit_append(&mut self, token_count: usize) -> Result<()> {
@@ -1307,6 +1315,17 @@ pub trait Backend: Sync {
         &self,
         _cache: &mut LagunaF16KvCache,
         _capacity_tokens: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn checkpoint_laguna_f16_kv_cache(&self, _cache: &mut LagunaF16KvCache) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn restore_laguna_f16_kv_cache_checkpoint(
+        &self,
+        _cache: &mut LagunaF16KvCache,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -5220,6 +5239,40 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (cache, capacity_tokens);
+            Ok(false)
+        }
+    }
+
+    fn checkpoint_laguna_f16_kv_cache(&self, cache: &mut LagunaF16KvCache) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            native_metal.checkpoint_laguna_f16_kv_cache(cache)?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = cache;
+            Ok(false)
+        }
+    }
+
+    fn restore_laguna_f16_kv_cache_checkpoint(&self, cache: &mut LagunaF16KvCache) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            native_metal.restore_laguna_f16_kv_cache_checkpoint(cache)?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = cache;
             Ok(false)
         }
     }
