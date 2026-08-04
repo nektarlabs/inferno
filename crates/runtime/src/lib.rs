@@ -3,6 +3,8 @@
 //! GLM-5.2 production runtime orchestration.
 
 mod cache_budget;
+mod laguna;
+mod laguna_memory;
 mod telemetry;
 
 pub use cache_budget::{
@@ -12,6 +14,18 @@ pub use cache_budget::{
     DEFAULT_HARD_HEADROOM_BYTES, DEFAULT_HOT_KV_CACHE_BUDGET_BYTES,
     DEFAULT_MAX_EXPERT_CACHE_SLOTS_PER_LAYER, DEFAULT_MIN_EXPERT_CACHE_SLOTS_PER_LAYER,
     DEFAULT_TARGET_HEADROOM_BYTES,
+};
+pub use laguna::{
+    GenerationControl, LagunaGenerationOptions, LagunaGenerationReport, LagunaPrefillProgress,
+    LagunaRuntime, LagunaThinkingGuard, LagunaThinkingGuardReason, LAGUNA_THINKING_END_TOKEN_ID,
+    LAGUNA_THINKING_TOKEN_BUDGET,
+};
+pub use laguna_memory::{
+    enable_laguna_memory_controller_log, LagunaMemoryAction, LagunaMemoryControllerReport,
+    LagunaMemoryControllerSpec, LagunaMemoryDecision, LagunaMemoryPressure,
+    DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS, DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS, DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
+    DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
 };
 
 use std::{

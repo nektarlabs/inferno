@@ -754,7 +754,10 @@ impl<'a> QuantizedLinear<'a> {
                 self.in_features,
                 self.out_features,
             )?,
-            GgufQuantBlockKind::Q8_0 => {
+            GgufQuantBlockKind::Q3K
+            | GgufQuantBlockKind::Q4K
+            | GgufQuantBlockKind::Q6K
+            | GgufQuantBlockKind::Q8_0 => {
                 storage.matmul_rows_f32(&input_values, 1, self.in_features, self.out_features)?
             }
         };
@@ -875,7 +878,10 @@ impl<'a> QuantizedLinear<'a> {
                 self.in_features,
                 self.out_features,
             )?,
-            GgufQuantBlockKind::Q8_0 => storage.matmul_rows_f32(
+            GgufQuantBlockKind::Q3K
+            | GgufQuantBlockKind::Q4K
+            | GgufQuantBlockKind::Q6K
+            | GgufQuantBlockKind::Q8_0 => storage.matmul_rows_f32(
                 input.values(),
                 input_rows,
                 self.in_features,

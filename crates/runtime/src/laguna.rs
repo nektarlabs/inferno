@@ -1,0 +1,858 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use backend::Backend;
+use common::{Error, Result};
+use model::{LagunaArtifactKind, LagunaExpertCacheMetrics, LagunaModel, LagunaSession};
+use tracing::debug;
+
+use crate::{
+    laguna_memory::LagunaMemoryController,
+    telemetry::{capture_memory_snapshot, RuntimeKvMemoryBytes},
+    LagunaMemoryControllerReport, LagunaMemoryControllerSpec,
+};
+
+const LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS: usize = 4_096;
+const LAGUNA_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
+const LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS: usize = 1_024;
+const LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS: usize = 512;
+const LAGUNA_THINKING_NGRAM_TOKENS: usize = 8;
+const LAGUNA_THINKING_NGRAM_LIMIT: u8 = 4;
+pub const LAGUNA_THINKING_END_TOKEN_ID: u32 = 19;
+pub const LAGUNA_THINKING_TOKEN_BUDGET: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationControl {
+    Continue,
+    InjectNextToken(u32),
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagunaThinkingGuardReason {
+    PrematureStopToken,
+    RepeatedNgram,
+    TokenBudget,
+}
+
+#[derive(Debug)]
+pub struct LagunaThinkingGuard {
+    token_count: usize,
+    token_ids: Vec<u32>,
+    ngram_counts: HashMap<[u32; LAGUNA_THINKING_NGRAM_TOKENS], u8>,
+    complete: bool,
+}
+
+impl Default for LagunaThinkingGuard {
+    fn default() -> Self {
+        Self {
+            token_count: 0,
+            token_ids: Vec::with_capacity(LAGUNA_THINKING_TOKEN_BUDGET),
+            ngram_counts: HashMap::new(),
+            complete: false,
+        }
+    }
+}
+
+impl LagunaThinkingGuard {
+    pub fn observe(
+        &mut self,
+        token_id: u32,
+        is_stop_token: bool,
+    ) -> Option<LagunaThinkingGuardReason> {
+        if self.complete {
+            return None;
+        }
+        if token_id == LAGUNA_THINKING_END_TOKEN_ID {
+            self.complete = true;
+            return None;
+        }
+        if is_stop_token {
+            self.complete = true;
+            return Some(LagunaThinkingGuardReason::PrematureStopToken);
+        }
+
+        self.token_count = self.token_count.saturating_add(1);
+        self.token_ids.push(token_id);
+
+        if self.token_ids.len() >= LAGUNA_THINKING_NGRAM_TOKENS {
+            let start = self.token_ids.len() - LAGUNA_THINKING_NGRAM_TOKENS;
+            let mut ngram = [0_u32; LAGUNA_THINKING_NGRAM_TOKENS];
+            ngram.copy_from_slice(&self.token_ids[start..]);
+            let count = self.ngram_counts.entry(ngram).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= LAGUNA_THINKING_NGRAM_LIMIT {
+                self.complete = true;
+                return Some(LagunaThinkingGuardReason::RepeatedNgram);
+            }
+        }
+
+        if self.token_count >= LAGUNA_THINKING_TOKEN_BUDGET {
+            self.complete = true;
+            return Some(LagunaThinkingGuardReason::TokenBudget);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagunaPrefillProgress {
+    pub processed_tokens: usize,
+    pub prompt_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagunaGenerationOptions {
+    pub expert_cache_capacity: Option<usize>,
+    pub memory_controller: Option<LagunaMemoryControllerSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LagunaGenerationReport {
+    pub generated_tokens: usize,
+    pub final_context_tokens: usize,
+    pub total_duration: Duration,
+    pub time_to_first_token: Option<Duration>,
+    pub expert_cache: LagunaExpertCacheMetrics,
+    pub memory_controller: Option<LagunaMemoryControllerReport>,
+}
+
+impl LagunaGenerationReport {
+    pub fn tokens_per_second(self) -> f64 {
+        let seconds = self.total_duration.as_secs_f64();
+        if seconds == 0.0 {
+            0.0
+        } else {
+            self.generated_tokens as f64 / seconds
+        }
+    }
+}
+
+/// Persistent Laguna generation state for chat and serving.
+///
+/// Laguna XS can reuse an exact token prefix from the previous request. Other
+/// artifacts start a fresh KV sequence, while routed experts remain cached.
+#[derive(Debug)]
+pub struct LagunaRuntime {
+    expert_cache_capacity: Option<usize>,
+    memory_controller: Option<LagunaMemoryController>,
+    session: Option<LagunaSession>,
+    sequence_token_ids: Vec<u32>,
+    prefix_checkpoint_token_ids: Vec<u32>,
+}
+
+impl LagunaRuntime {
+    pub fn new(options: LagunaGenerationOptions) -> Result<Self> {
+        if options.expert_cache_capacity == Some(0) {
+            return Err(Error::cache(
+                "Laguna runtime expert-cache capacity must be positive",
+            ));
+        }
+        if options.memory_controller.is_some() && options.expert_cache_capacity.is_none() {
+            return Err(Error::runtime(
+                "Laguna memory controller requires a configurable expert cache",
+            ));
+        }
+        let memory_controller = options
+            .memory_controller
+            .map(|spec| {
+                if Some(spec.initial_expert_capacity) != options.expert_cache_capacity {
+                    return Err(Error::runtime(format!(
+                        "Laguna memory controller initial capacity {} does not match runtime capacity {:?}",
+                        spec.initial_expert_capacity, options.expert_cache_capacity
+                    )));
+                }
+                LagunaMemoryController::new(spec)
+            })
+            .transpose()?;
+        Ok(Self {
+            expert_cache_capacity: options.expert_cache_capacity,
+            memory_controller,
+            session: None,
+            sequence_token_ids: Vec::new(),
+            prefix_checkpoint_token_ids: Vec::new(),
+        })
+    }
+
+    pub fn expert_cache_capacity(&self) -> Option<usize> {
+        self.expert_cache_capacity
+    }
+
+    /// Generates tokens until EOS, the configured limit, or the callback
+    /// reports that a complete higher-level response is ready.
+    pub fn generate_streaming_controlled<B, F>(
+        &mut self,
+        model: &LagunaModel,
+        backend: &B,
+        prompt_token_ids: &[u32],
+        max_new_tokens: Option<usize>,
+        stop_token_ids: &[u32],
+        on_token: F,
+    ) -> Result<LagunaGenerationReport>
+    where
+        B: Backend,
+        F: FnMut(u32) -> Result<GenerationControl>,
+    {
+        self.generate_streaming_controlled_with_prefill_progress(
+            model,
+            backend,
+            prompt_token_ids,
+            max_new_tokens,
+            stop_token_ids,
+            |_| Ok(()),
+            on_token,
+        )
+    }
+
+    /// Generates tokens while reporting completed prefill chunks.
+    ///
+    /// The progress callback runs only between command-buffer submissions. It
+    /// is therefore a safe place for a server to send an SSE heartbeat and
+    /// detect that its client disconnected before encoding more model work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_controlled_with_prefill_progress<B, P, F>(
+        &mut self,
+        model: &LagunaModel,
+        backend: &B,
+        prompt_token_ids: &[u32],
+        max_new_tokens: Option<usize>,
+        stop_token_ids: &[u32],
+        mut on_prefill_progress: P,
+        mut on_token: F,
+    ) -> Result<LagunaGenerationReport>
+    where
+        B: Backend,
+        P: FnMut(LagunaPrefillProgress) -> Result<()>,
+        F: FnMut(u32) -> Result<GenerationControl>,
+    {
+        let uses_expert_cache = model.artifact_kind().uses_expert_cache();
+        if uses_expert_cache != self.expert_cache_capacity.is_some() {
+            return Err(Error::runtime(format!(
+                "Laguna {:?} model requires expert-cache capacity presence={uses_expert_cache}, runtime has {:?}",
+                model.artifact_kind(),
+                self.expert_cache_capacity
+            )));
+        }
+        if prompt_token_ids.is_empty() {
+            return Err(Error::runtime(
+                "Laguna generation requires at least one prompt token",
+            ));
+        }
+        let config = model.config();
+        if prompt_token_ids.len() >= config.max_position_embeddings {
+            return Err(Error::runtime(format!(
+                "Laguna prompt length {} leaves no generation room in context {}",
+                prompt_token_ids.len(),
+                config.max_position_embeddings
+            )));
+        }
+        let available_tokens = config.max_position_embeddings - prompt_token_ids.len();
+        let generated_limit = max_new_tokens.unwrap_or(available_tokens);
+        if generated_limit > available_tokens {
+            return Err(Error::runtime(format!(
+                "Laguna requested {generated_limit} generated tokens, but only {available_tokens} fit after the prompt"
+            )));
+        }
+        if generated_limit == 0 {
+            return Ok(LagunaGenerationReport {
+                generated_tokens: 0,
+                final_context_tokens: 0,
+                total_duration: Duration::ZERO,
+                time_to_first_token: None,
+                expert_cache: LagunaExpertCacheMetrics::default(),
+                memory_controller: self
+                    .memory_controller
+                    .as_ref()
+                    .map(LagunaMemoryController::report),
+            });
+        }
+
+        let required_context_capacity = initial_context_capacity(
+            prompt_token_ids.len(),
+            generated_limit,
+            config.max_position_embeddings,
+        )?;
+        let reused_prefix_tokens =
+            self.prepare_session(model, backend, required_context_capacity, prompt_token_ids)?;
+        let prompt_suffix = &prompt_token_ids[reused_prefix_tokens..];
+        debug!(
+            artifact = ?model.artifact_kind(),
+            prompt_tokens = prompt_token_ids.len(),
+            reused_prefix_tokens,
+            new_prompt_tokens = prompt_suffix.len(),
+            "prepared Laguna prompt state"
+        );
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::runtime("Laguna runtime session was not prepared"))?;
+        let sequence_token_ids = &mut self.sequence_token_ids;
+        let prefix_checkpoint_token_ids = &mut self.prefix_checkpoint_token_ids;
+
+        let started_at = Instant::now();
+        let mut time_to_first_token = None;
+        let mut generated_tokens = 0_usize;
+        let prefill_chunk_tokens = prefill_chunk_tokens(model.artifact_kind());
+        let final_prompt_chunk_start = for_each_prefill_prefix_chunk(
+            prompt_suffix,
+            prefill_chunk_tokens,
+            |chunk, processed_tokens| {
+                model.prefill_chunk(session, chunk, backend)?;
+                sequence_token_ids.extend_from_slice(chunk);
+                on_prefill_progress(LagunaPrefillProgress {
+                    processed_tokens: reused_prefix_tokens + processed_tokens,
+                    prompt_tokens: prompt_token_ids.len(),
+                })
+            },
+        )?;
+        if model.artifact_kind() == LagunaArtifactKind::PoolsideXsGguf
+            && final_prompt_chunk_start > 0
+        {
+            model.checkpoint_session(session, backend)?;
+            let checkpoint_tokens = reused_prefix_tokens + final_prompt_chunk_start;
+            prefix_checkpoint_token_ids.clear();
+            prefix_checkpoint_token_ids.extend_from_slice(&prompt_token_ids[..checkpoint_tokens]);
+            debug!(
+                artifact = ?model.artifact_kind(),
+                checkpoint_tokens,
+                "checkpointed reusable Laguna prompt prefix"
+            );
+        }
+        let mut decode_token = [0_u32; 1];
+
+        let generation_result = (|| -> Result<()> {
+            while generated_tokens < generated_limit {
+                let input: &[u32] = if generated_tokens == 0 {
+                    &prompt_suffix[final_prompt_chunk_start..]
+                } else {
+                    &decode_token
+                };
+                let required_end = session
+                    .position()?
+                    .checked_add(input.len())
+                    .ok_or_else(|| Error::runtime("Laguna sequence capacity overflow"))?;
+                if required_end > session.context_capacity() {
+                    let next_capacity = next_context_capacity(
+                        session.context_capacity(),
+                        required_end,
+                        config.max_position_embeddings,
+                    )?;
+                    model.grow_session_capacity(session, next_capacity, backend)?;
+                }
+                let model_started_at = self.memory_controller.as_ref().map(|_| Instant::now());
+                let output = model.forward_next_token(session, input, backend)?;
+                sequence_token_ids.extend_from_slice(input);
+                let model_elapsed = model_started_at.map(|started_at| started_at.elapsed());
+                if time_to_first_token.is_none() {
+                    time_to_first_token = Some(started_at.elapsed());
+                }
+
+                if let Some(controller) = self.memory_controller.as_mut() {
+                    if generated_tokens == 0 {
+                        controller.begin_decode(
+                            session.expert_cache_metrics(),
+                            capture_memory_snapshot(backend, RuntimeKvMemoryBytes::default()),
+                        );
+                    } else {
+                        controller.record_decode_step(model_elapsed.ok_or_else(|| {
+                            Error::runtime("Laguna controller decode timer was not started")
+                        })?);
+                        if controller.observation_due() {
+                            let memory =
+                                capture_memory_snapshot(backend, RuntimeKvMemoryBytes::default());
+                            let decision = controller.observe(
+                                session.position()?,
+                                session.expert_cache_metrics(),
+                                memory,
+                            )?;
+                            if decision.changes_capacity() {
+                                session
+                                    .resize_expert_cache_capacity(decision.next_expert_capacity)?;
+                                self.expert_cache_capacity = Some(decision.next_expert_capacity);
+                            }
+                            controller.record_decision(decision, memory)?;
+                        }
+                    }
+                }
+
+                let control = on_token(output.token_id)?;
+                generated_tokens = generated_tokens
+                    .checked_add(1)
+                    .ok_or_else(|| Error::runtime("Laguna generated-token count overflow"))?;
+                let next_token_id = match control {
+                    GenerationControl::Continue => Some(output.token_id),
+                    GenerationControl::InjectNextToken(token_id) => {
+                        if token_id as usize >= config.vocab_size {
+                            return Err(Error::runtime(format!(
+                                "Laguna injected token ID {token_id} is outside vocabulary size {}",
+                                config.vocab_size
+                            )));
+                        }
+                        Some(token_id)
+                    }
+                    GenerationControl::Stop => None,
+                };
+                if generation_should_stop(
+                    control,
+                    stop_token_ids.contains(&output.token_id),
+                    generated_tokens == generated_limit,
+                ) {
+                    break;
+                }
+                let Some(next_token_id) = next_token_id else {
+                    break;
+                };
+                decode_token[0] = next_token_id;
+            }
+            Ok(())
+        })();
+
+        if let Some(controller) = self.memory_controller.as_mut() {
+            controller.pause_decode(session.expert_cache_metrics());
+        }
+        generation_result?;
+
+        let expert_cache = session.expert_cache_metrics();
+        expert_cache.validate()?;
+        Ok(LagunaGenerationReport {
+            generated_tokens,
+            final_context_tokens: session.position()?,
+            total_duration: started_at.elapsed(),
+            time_to_first_token,
+            expert_cache,
+            memory_controller: self
+                .memory_controller
+                .as_ref()
+                .map(LagunaMemoryController::report),
+        })
+    }
+
+    fn prepare_session<B: Backend>(
+        &mut self,
+        model: &LagunaModel,
+        backend: &B,
+        required_context_capacity: usize,
+        prompt_token_ids: &[u32],
+    ) -> Result<usize> {
+        let Some(session) = self.session.as_mut() else {
+            self.session = Some(model.new_session(
+                1,
+                required_context_capacity,
+                self.expert_cache_capacity,
+                backend,
+            )?);
+            self.sequence_token_ids.clear();
+            self.prefix_checkpoint_token_ids.clear();
+            return Ok(0);
+        };
+
+        let allocated_capacity = session.context_capacity();
+        let target_capacity = if required_context_capacity > allocated_capacity {
+            allocated_capacity
+                .saturating_mul(2)
+                .max(required_context_capacity)
+                .min(model.config().max_position_embeddings)
+        } else {
+            allocated_capacity
+        };
+        let reusable_prefix_tokens = reusable_prompt_prefix_tokens(
+            model.artifact_kind(),
+            &self.prefix_checkpoint_token_ids,
+            prompt_token_ids,
+        );
+        debug!(
+            artifact = ?model.artifact_kind(),
+            cached_sequence_tokens = self.sequence_token_ids.len(),
+            common_prefix_tokens = common_prefix_tokens(&self.sequence_token_ids, prompt_token_ids),
+            checkpoint_tokens = self.prefix_checkpoint_token_ids.len(),
+            checkpoint_common_prefix_tokens = common_prefix_tokens(
+                &self.prefix_checkpoint_token_ids,
+                prompt_token_ids
+            ),
+            "compared Laguna request with the active KV sequence"
+        );
+        if reusable_prefix_tokens > 0 {
+            model.restore_session_checkpoint(session, backend)?;
+            let restored_position = session.position()?;
+            if restored_position != reusable_prefix_tokens {
+                return Err(Error::cache(format!(
+                    "Laguna XS restored KV position {restored_position} does not match its {reusable_prefix_tokens}-token checkpoint"
+                )));
+            }
+            self.sequence_token_ids.clear();
+            self.sequence_token_ids
+                .extend_from_slice(&self.prefix_checkpoint_token_ids);
+            if target_capacity > allocated_capacity {
+                model.grow_session_capacity(session, target_capacity, backend)?;
+            }
+            return Ok(reusable_prefix_tokens);
+        }
+
+        model.prepare_session(session, 1, target_capacity, backend)?;
+        self.sequence_token_ids.clear();
+        self.prefix_checkpoint_token_ids.clear();
+        Ok(0)
+    }
+}
+
+fn reusable_prompt_prefix_tokens(
+    artifact: LagunaArtifactKind,
+    cached_token_ids: &[u32],
+    prompt_token_ids: &[u32],
+) -> usize {
+    if artifact == LagunaArtifactKind::PoolsideXsGguf
+        && !cached_token_ids.is_empty()
+        && cached_token_ids.len() < prompt_token_ids.len()
+        && prompt_token_ids.starts_with(cached_token_ids)
+    {
+        cached_token_ids.len()
+    } else {
+        0
+    }
+}
+
+fn common_prefix_tokens(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn prefill_chunk_tokens(artifact: LagunaArtifactKind) -> usize {
+    match artifact {
+        LagunaArtifactKind::SafetensorsInt4 => LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS,
+        LagunaArtifactKind::AntirezGguf => LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+        LagunaArtifactKind::PoolsideXsGguf => LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
+    }
+}
+
+fn for_each_prefill_prefix_chunk<F>(
+    prompt_token_ids: &[u32],
+    chunk_size: usize,
+    mut process: F,
+) -> Result<usize>
+where
+    F: FnMut(&[u32], usize) -> Result<()>,
+{
+    let final_prompt_chunk_start = final_chunk_start(prompt_token_ids.len(), chunk_size)?;
+    let mut processed_tokens = 0_usize;
+    for chunk in prompt_token_ids[..final_prompt_chunk_start].chunks(chunk_size) {
+        processed_tokens = processed_tokens
+            .checked_add(chunk.len())
+            .ok_or_else(|| Error::runtime("Laguna prefill progress overflow"))?;
+        process(chunk, processed_tokens)?;
+    }
+    Ok(final_prompt_chunk_start)
+}
+
+fn initial_context_capacity(
+    prompt_tokens: usize,
+    generated_limit: usize,
+    max_context_tokens: usize,
+) -> Result<usize> {
+    let reserved_outputs = generated_limit.min(LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS);
+    let capacity = prompt_tokens
+        .checked_add(reserved_outputs.saturating_sub(1))
+        .ok_or_else(|| Error::runtime("Laguna initial context capacity overflow"))?;
+    if capacity == 0 || capacity > max_context_tokens {
+        return Err(Error::runtime(format!(
+            "Laguna initial context capacity must be within 1..={max_context_tokens}, got {capacity}"
+        )));
+    }
+    Ok(capacity)
+}
+
+fn next_context_capacity(
+    current_capacity: usize,
+    required_capacity: usize,
+    max_context_tokens: usize,
+) -> Result<usize> {
+    if required_capacity <= current_capacity {
+        return Ok(current_capacity);
+    }
+    if required_capacity > max_context_tokens {
+        return Err(Error::runtime(format!(
+            "Laguna sequence requires {required_capacity} context tokens, maximum is {max_context_tokens}"
+        )));
+    }
+    Ok(current_capacity
+        .saturating_mul(2)
+        .max(required_capacity)
+        .min(max_context_tokens))
+}
+
+fn generation_should_stop(
+    control: GenerationControl,
+    emitted_stop_token: bool,
+    reached_generation_limit: bool,
+) -> bool {
+    reached_generation_limit
+        || control == GenerationControl::Stop
+        || (emitted_stop_token && !matches!(control, GenerationControl::InjectNextToken(_)))
+}
+
+fn final_chunk_start(token_count: usize, chunk_size: usize) -> Result<usize> {
+    if token_count == 0 || chunk_size == 0 {
+        return Err(Error::runtime(
+            "Laguna prefill token count and chunk size must be positive",
+        ));
+    }
+    Ok(((token_count - 1) / chunk_size) * chunk_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        final_chunk_start, for_each_prefill_prefix_chunk, initial_context_capacity,
+        next_context_capacity, prefill_chunk_tokens, reusable_prompt_prefix_tokens,
+        LagunaGenerationOptions, LagunaRuntime, LagunaThinkingGuard, LagunaThinkingGuardReason,
+        LAGUNA_GGUF_PREFILL_CHUNK_TOKENS, LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS,
+        LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS, LAGUNA_THINKING_END_TOKEN_ID,
+        LAGUNA_THINKING_TOKEN_BUDGET, LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS,
+    };
+    use crate::LagunaMemoryControllerSpec;
+    use model::LagunaArtifactKind;
+
+    #[test]
+    fn thinking_guard_closes_after_a_repeated_ngram() {
+        let mut guard = LagunaThinkingGuard::default();
+        let pattern = [10_u32, 11, 12, 13, 14, 15, 16, 17];
+        let mut reason = None;
+
+        for token_id in pattern.into_iter().cycle().take(pattern.len() * 4) {
+            reason = guard.observe(token_id, false).or(reason);
+        }
+
+        assert_eq!(reason, Some(LagunaThinkingGuardReason::RepeatedNgram));
+    }
+
+    #[test]
+    fn thinking_guard_closes_at_the_reasoning_budget() {
+        let mut guard = LagunaThinkingGuard::default();
+        let mut reason = None;
+
+        for token_id in 1_000..1_000 + LAGUNA_THINKING_TOKEN_BUDGET as u32 {
+            reason = guard.observe(token_id, false).or(reason);
+        }
+
+        assert_eq!(reason, Some(LagunaThinkingGuardReason::TokenBudget));
+    }
+
+    #[test]
+    fn thinking_guard_disables_itself_after_the_natural_boundary() {
+        let mut guard = LagunaThinkingGuard::default();
+
+        assert_eq!(guard.observe(42, false), None);
+        assert_eq!(guard.observe(LAGUNA_THINKING_END_TOKEN_ID, false), None);
+        for token_id in [10_u32, 11, 12, 13, 14, 15, 16, 17]
+            .into_iter()
+            .cycle()
+            .take(64)
+        {
+            assert_eq!(guard.observe(token_id, false), None);
+        }
+    }
+
+    #[test]
+    fn thinking_guard_replaces_a_stop_token_before_the_reasoning_boundary() {
+        let mut guard = LagunaThinkingGuard::default();
+
+        assert_eq!(guard.observe(42, false), None);
+        assert_eq!(
+            guard.observe(24, true),
+            Some(LagunaThinkingGuardReason::PrematureStopToken)
+        );
+        assert_eq!(guard.observe(24, true), None);
+    }
+
+    #[test]
+    fn injected_token_overrides_model_stop_but_not_the_generation_limit() {
+        assert!(!super::generation_should_stop(
+            super::GenerationControl::InjectNextToken(LAGUNA_THINKING_END_TOKEN_ID),
+            true,
+            false,
+        ));
+        assert!(super::generation_should_stop(
+            super::GenerationControl::Continue,
+            true,
+            false,
+        ));
+        assert!(super::generation_should_stop(
+            super::GenerationControl::InjectNextToken(LAGUNA_THINKING_END_TOKEN_ID),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn persistent_runtime_requires_a_real_expert_cache() {
+        let error = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: Some(0),
+            memory_controller: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("must be positive"));
+
+        let runtime = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: Some(10),
+            memory_controller: None,
+        })
+        .unwrap();
+        assert_eq!(runtime.expert_cache_capacity(), Some(10));
+
+        let mapped_runtime = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: None,
+            memory_controller: None,
+        })
+        .unwrap();
+        assert_eq!(mapped_runtime.expert_cache_capacity(), None);
+    }
+
+    #[test]
+    fn laguna_xs_reuses_only_an_exact_strict_prompt_prefix() {
+        let cached = [10_u32, 20, 30];
+
+        assert_eq!(
+            reusable_prompt_prefix_tokens(
+                LagunaArtifactKind::PoolsideXsGguf,
+                &cached,
+                &[10, 20, 30, 40, 50]
+            ),
+            cached.len()
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(
+                LagunaArtifactKind::PoolsideXsGguf,
+                &cached,
+                &[10, 20, 31, 40]
+            ),
+            0
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::PoolsideXsGguf, &cached, &cached),
+            0
+        );
+    }
+
+    #[test]
+    fn prompt_prefix_reuse_does_not_change_other_laguna_artifacts() {
+        let cached = [10_u32, 20, 30];
+        let extended = [10_u32, 20, 30, 40];
+
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::AntirezGguf, &cached, &extended),
+            0
+        );
+        assert_eq!(
+            reusable_prompt_prefix_tokens(LagunaArtifactKind::SafetensorsInt4, &cached, &extended),
+            0
+        );
+    }
+
+    #[test]
+    fn controller_and_runtime_must_start_with_the_same_capacity() {
+        let error = LagunaRuntime::new(LagunaGenerationOptions {
+            expert_cache_capacity: Some(10),
+            memory_controller: Some(LagunaMemoryControllerSpec {
+                initial_expert_capacity: 11,
+                minimum_expert_capacity: 10,
+                maximum_expert_capacity: 12,
+                expert_capacity_step: 1,
+                bytes_per_expert: 1,
+                decision_window_tokens: 2,
+                trial_warmup_tokens: 1,
+                stabilization_windows: 0,
+                target_headroom_bytes: 2,
+                hard_headroom_bytes: 1,
+            }),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn prefill_keeps_one_non_empty_final_chunk_for_next_token_projection() {
+        assert_eq!(
+            final_chunk_start(1, LAGUNA_GGUF_PREFILL_CHUNK_TOKENS).unwrap(),
+            0
+        );
+        assert_eq!(
+            final_chunk_start(
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            final_chunk_start(
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS + 1,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+        );
+        assert_eq!(
+            final_chunk_start(
+                2 * LAGUNA_GGUF_PREFILL_CHUNK_TOKENS,
+                LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+            )
+            .unwrap(),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+        );
+    }
+
+    #[test]
+    fn gguf_prefill_uses_bounded_cancellable_submissions() {
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::AntirezGguf),
+            LAGUNA_GGUF_PREFILL_CHUNK_TOKENS
+        );
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::SafetensorsInt4),
+            4_096
+        );
+        assert_eq!(
+            prefill_chunk_tokens(LagunaArtifactKind::PoolsideXsGguf),
+            LAGUNA_XS_GGUF_PREFILL_CHUNK_TOKENS
+        );
+        assert!(LAGUNA_GGUF_PREFILL_CHUNK_TOKENS < LAGUNA_SAFETENSORS_PREFILL_CHUNK_TOKENS);
+    }
+
+    #[test]
+    fn prefill_disconnect_stops_before_the_next_chunk() {
+        let prompt = vec![1_u32; 700];
+        let mut completed_chunks = Vec::new();
+
+        let error = for_each_prefill_prefix_chunk(&prompt, 256, |chunk, processed_tokens| {
+            completed_chunks.push((chunk.len(), processed_tokens));
+            Err(common::Error::runtime("Codex disconnected"))
+        })
+        .unwrap_err();
+
+        assert_eq!(completed_chunks, vec![(256, 256)]);
+        assert!(error.to_string().contains("disconnected"));
+    }
+
+    #[test]
+    fn unlimited_generation_reserves_a_small_initial_decode_window() {
+        let capacity =
+            initial_context_capacity(1_000, 200_000, 262_144).expect("valid context capacity");
+        assert_eq!(capacity, 1_000 + LAGUNA_INITIAL_DECODE_CAPACITY_TOKENS - 1);
+
+        assert_eq!(initial_context_capacity(1_000, 8, 262_144).unwrap(), 1_007);
+    }
+
+    #[test]
+    fn context_growth_doubles_without_exceeding_the_model_limit() {
+        assert_eq!(next_context_capacity(1_511, 1_512, 262_144).unwrap(), 3_022);
+        assert_eq!(
+            next_context_capacity(200_000, 200_001, 262_144).unwrap(),
+            262_144
+        );
+        assert!(next_context_capacity(262_144, 262_145, 262_144).is_err());
+    }
+}

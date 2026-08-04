@@ -573,7 +573,7 @@ mod tests {
 
         assert!(err.to_string().contains("Q2 GGUF"));
         assert!(err.to_string().contains("token_embd.weight"));
-        assert!(err.to_string().contains("UNSUPPORTED_GGML_TYPE_12"));
+        assert!(err.to_string().contains("Q4_K"));
     }
 
     #[test]

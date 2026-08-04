@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 common = { path = "../common" }
 memmap2.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -27,6 +27,29 @@ kernel void moe_gather_tokens_f32_kernel(
     output[gid] = flat_tokens[(token * hidden_size) + hidden];
 }
 
+kernel void moe_scatter_rows_f32_kernel(
+    const device float* rows [[buffer(0)]],
+    const device uint* destination_rows [[buffer(1)]],
+    device float* destination [[buffer(2)]],
+    constant uint& source_row_count [[buffer(3)]],
+    constant uint& destination_row_count [[buffer(4)]],
+    constant uint& hidden_size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint value_count = source_row_count * hidden_size;
+    if (gid >= value_count) {
+        return;
+    }
+
+    uint source_row = gid / hidden_size;
+    uint hidden = gid - (source_row * hidden_size);
+    uint destination_row = destination_rows[source_row];
+    if (destination_row >= destination_row_count) {
+        return;
+    }
+    destination[(destination_row * hidden_size) + hidden] = rows[gid];
+}
+
 kernel void moe_weighted_index_add_combine_f32_kernel(
     const device float* accumulator [[buffer(0)]],
     const device uint* token_indices [[buffer(1)]],
@@ -104,16 +127,17 @@ kernel void moe_router_topk_f32_kernel(
     uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint simd_lanes = 32;
-    constexpr uint max_top_k = 8;
+    constexpr uint max_local_experts = 8;
+    constexpr uint max_top_k = 16;
     uint token = gid / simd_lanes;
     if (token >= token_count) {
         return;
     }
 
-    float local_corrected[max_top_k];
-    float local_scores[max_top_k];
-    uint local_ids[max_top_k];
-    bool local_selected[max_top_k];
+    float local_corrected[max_local_experts];
+    float local_scores[max_local_experts];
+    uint local_ids[max_local_experts];
+    bool local_selected[max_local_experts];
     uint local_count = 0;
     for (uint expert = simd_lane; expert < expert_count; expert += simd_lanes) {
         float logit = router_logits[(token * expert_count) + expert];
@@ -131,7 +155,7 @@ kernel void moe_router_topk_f32_kernel(
         float lane_corrected = -3.402823466e+38F;
         float lane_score = 0.0f;
         uint lane_id = 0xffffffffu;
-        uint lane_local_index = max_top_k;
+        uint lane_local_index = max_local_experts;
         for (uint local = 0; local < local_count; local++) {
             if (local_selected[local]) {
                 continue;

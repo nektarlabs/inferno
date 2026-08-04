@@ -14,8 +14,9 @@ static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
 /// The subset of a Codex Responses request consumed by Inferno.
 ///
 /// Input items and tool specifications stay as JSON because Codex can add new
-/// item variants without changing the core Responses envelope. The GLM adapter
-/// validates and translates only the item kinds needed for a coding turn.
+/// item variants without changing the core Responses envelope. The loaded
+/// model adapter validates and translates only the item kinds needed for a
+/// coding turn.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
@@ -25,6 +26,10 @@ pub struct ResponsesRequest {
     pub input: Vec<Value>,
     #[serde(default)]
     pub tools: Vec<Value>,
+    #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
 }
@@ -38,6 +43,11 @@ impl ResponsesRequest {
         if !request.stream {
             return Err(Error::runtime(
                 "Inferno requires stream=true for Codex Responses requests",
+            ));
+        }
+        if request.max_output_tokens == Some(0) {
+            return Err(Error::runtime(
+                "Responses max_output_tokens must be positive when provided",
             ));
         }
         Ok(request)
@@ -145,6 +155,58 @@ impl<'a> ResponsesStream<'a> {
         Ok(())
     }
 
+    /// Emits one completed raw reasoning item so a Responses client can replay
+    /// it on the next turn without displaying it as assistant text.
+    pub fn reasoning_done(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let item_id = format!("rs_{}_{}", self.response_id, self.output_index);
+        self.event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                    "content": []
+                }
+            }),
+        )?;
+        self.event(
+            "response.reasoning_text.done",
+            json!({
+                "type": "response.reasoning_text.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item_id": item_id,
+                "content_index": 0,
+                "text": text
+            }),
+        )?;
+        self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": text}]
+                }
+            }),
+        )?;
+        self.output_index += 1;
+        Ok(())
+    }
+
     pub fn function_call_done(&mut self, call_id: &str, name: &str, arguments: &str) -> Result<()> {
         if call_id.is_empty() || name.is_empty() {
             return Err(Error::runtime(
@@ -165,6 +227,33 @@ impl<'a> ResponsesStream<'a> {
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments
+                }
+            }),
+        )?;
+        self.output_index += 1;
+        Ok(())
+    }
+
+    pub fn custom_tool_call_done(&mut self, call_id: &str, name: &str, input: &str) -> Result<()> {
+        if call_id.is_empty() || name.is_empty() {
+            return Err(Error::runtime(
+                "Responses custom tool call requires non-empty call_id and name",
+            ));
+        }
+        let item_id = format!("ctc_{}_{}", self.response_id, self.output_index);
+        self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id,
+                "output_index": self.output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input
                 }
             }),
         )?;
@@ -265,7 +354,9 @@ mod tests {
                 "instructions": "Use tools.",
                 "input": [{"type": "message", "role": "user", "content": []}],
                 "tools": [{"type": "function", "name": "exec_command"}],
+                "reasoning": {"effort": "high"},
                 "stream": true,
+                "max_output_tokens": 64,
                 "store": false,
                 "parallel_tool_calls": false,
                 "include": []
@@ -277,6 +368,8 @@ mod tests {
         assert_eq!(request.model, "glm-5.2-q2");
         assert_eq!(request.input.len(), 1);
         assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.reasoning, Some(json!({"effort": "high"})));
+        assert_eq!(request.max_output_tokens, Some(64));
     }
 
     #[test]
@@ -290,6 +383,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_max_output_tokens() {
+        let error = ResponsesRequest::parse(
+            &json!({
+                "model": "glm-5.2-q2",
+                "input": [],
+                "stream": true,
+                "max_output_tokens": 0
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be positive"));
+    }
+
+    #[test]
     fn emits_codex_text_and_function_call_items() {
         let mut bytes = Vec::new();
         let mut stream = ResponsesStream::begin(&mut bytes, "glm-5.2-q2").unwrap();
@@ -297,6 +406,9 @@ mod tests {
         stream.message_done("done").unwrap();
         stream
             .function_call_done("call_1", "exec_command", r#"{"cmd":"pwd"}"#)
+            .unwrap();
+        stream
+            .custom_tool_call_done("call_2", "apply_patch", "*** Begin Patch\n*** End Patch\n")
             .unwrap();
         stream
             .completed(ResponseUsage {
@@ -311,7 +423,23 @@ mod tests {
         assert!(rendered.contains("response.output_item.added"));
         assert!(rendered.contains("\"type\":\"message\""));
         assert!(rendered.contains("\"type\":\"function_call\""));
+        assert!(rendered.contains("\"type\":\"custom_tool_call\""));
+        assert!(rendered.contains("\"name\":\"apply_patch\""));
         assert!(rendered.contains("\\\"cmd\\\":\\\"pwd\\\""));
         assert!(rendered.contains("\"total_tokens\":12"));
+    }
+
+    #[test]
+    fn emits_completed_reasoning_for_client_replay() {
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, "laguna-xs-2.1-gguf").unwrap();
+        stream.reasoning_done("Inspect the repository.").unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+
+        assert!(rendered.contains("event: response.reasoning_text.done"));
+        assert!(rendered.contains("\"type\":\"reasoning\""));
+        assert!(rendered.contains("\"type\":\"reasoning_text\""));
+        assert!(rendered.contains("Inspect the repository."));
+        assert!(rendered.contains("\"output_index\":0"));
     }
 }

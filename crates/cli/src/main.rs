@@ -9,13 +9,13 @@ use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "inferno")]
-#[command(about = "Lightweight GLM-5.2 inference engine for Apple Silicon")]
+#[command(about = "Lightweight MoE inference engine for Apple Silicon")]
 struct Cli {
-    /// Enable opt-in MTP speculative decoding.
+    /// Enable opt-in GLM MTP speculative decoding.
     #[arg(long, global = true, default_value_t = false)]
     speculative_mtp: bool,
 
-    /// Enable adaptive expert-cache and hot-KV memory rebalancing.
+    /// Enable the model-specific adaptive unified-memory controller.
     #[arg(long, global = true, default_value_t = false)]
     enable_unified_memory_controller: bool,
 
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate text from a quantized GLM-5.2 model.
+    /// Generate text with a supported quantized model.
     Generate {
         /// Model directory. config.json and tokenizer.json are discovered from this directory unless overridden.
         #[arg(long)]
@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -51,6 +51,10 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
+        /// Enable Laguna reasoning before the visible answer.
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
+
         /// Ask the tokenizer post-processor to add model special tokens.
         #[arg(long, default_value_t = false)]
         add_special_tokens: bool,
@@ -59,17 +63,25 @@ enum Command {
         #[arg(long, default_value_t = true, action = ArgAction::Set)]
         skip_special_tokens: bool,
 
-        /// Optional TSV output path for Q2 runtime timings.
+        /// Optional TSV output path for GLM Q2 runtime timings.
         #[arg(long)]
         profile_runtime: Option<PathBuf>,
 
-        /// Optional TSV output path for Q2 model-layer timings.
+        /// Optional TSV output path for GLM Q2 model-layer timings.
         #[arg(long)]
         profile_layers: Option<PathBuf>,
 
         /// Write generated-token throughput metrics to stderr after generation.
         #[arg(long, default_value_t = false)]
         measure_tokens_per_second: bool,
+
+        /// Print only prefill and decode throughput on one stderr line.
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "measure_tokens_per_second"
+        )]
+        throughput_summary: bool,
 
         /// Append generated-token throughput metrics to a TSV file.
         #[arg(long)]
@@ -79,11 +91,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         profile_token_costs: bool,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 
@@ -100,9 +112,9 @@ enum Command {
         memory_controller_log: Option<PathBuf>,
     },
 
-    /// Start a persistent local GLM-5.2 chat session.
+    /// Start a persistent local chat session.
     Chat {
-        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        /// Directory containing a supported model.
         #[arg(long)]
         model: PathBuf,
 
@@ -114,7 +126,7 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -122,11 +134,19 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Enable Laguna reasoning before each visible answer.
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
+
+        /// Print only prefill and decode throughput after each answer.
+        #[arg(long, default_value_t = false)]
+        throughput_summary: bool,
+
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 
@@ -143,9 +163,9 @@ enum Command {
         memory_controller_log: Option<PathBuf>,
     },
 
-    /// Serve GLM-5.2 to Codex through the local Responses API.
+    /// Serve a supported model through the local Responses API.
     Serve {
-        /// Model directory containing the GLM-5.2 Q2 artifacts.
+        /// Directory containing a supported model.
         #[arg(long, default_value = "models/glm-5.2")]
         model: PathBuf,
 
@@ -161,7 +181,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:11435")]
         bind: SocketAddr,
 
-        /// Page size for the paged KV cache.
+        /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
 
@@ -169,11 +189,15 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Total RAM budget in decimal GB for routed Q2 expert weights.
+        /// Enable Laguna reasoning before each server response.
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
+
+        /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
 
-        /// Total RAM budget in decimal GB for the hot Metal KV tier.
+        /// Total RAM budget in decimal GB for GLM's hot Metal KV tier.
         #[arg(long)]
         hot_kv_cache_gb: Option<f64>,
 
@@ -208,11 +232,13 @@ fn main() -> Result<()> {
             page_size,
             prompt,
             max_new_tokens,
+            thinking,
             add_special_tokens,
             skip_special_tokens,
             profile_runtime,
             profile_layers,
             measure_tokens_per_second,
+            throughput_summary,
             throughput_file,
             profile_token_costs,
             expert_cache_gb,
@@ -227,11 +253,13 @@ fn main() -> Result<()> {
             page_size,
             &prompt,
             max_new_tokens,
+            thinking,
             add_special_tokens,
             skip_special_tokens,
             profile_runtime.as_deref(),
             profile_layers.as_deref(),
             measure_tokens_per_second,
+            throughput_summary,
             throughput_file.as_deref(),
             profile_token_costs,
             speculative_mtp,
@@ -248,6 +276,8 @@ fn main() -> Result<()> {
             tokenizer,
             page_size,
             max_new_tokens,
+            thinking,
+            throughput_summary,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
@@ -259,6 +289,8 @@ fn main() -> Result<()> {
             tokenizer.as_deref(),
             page_size,
             max_new_tokens,
+            thinking,
+            throughput_summary,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -274,6 +306,7 @@ fn main() -> Result<()> {
             bind,
             page_size,
             max_new_tokens,
+            thinking,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
@@ -286,6 +319,7 @@ fn main() -> Result<()> {
             bind,
             page_size,
             max_new_tokens,
+            thinking,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -307,6 +341,8 @@ impl Command {
             tokenizer: None,
             page_size: runtime::DEFAULT_KV_PAGE_SIZE,
             max_new_tokens: None,
+            thinking: false,
+            throughput_summary: false,
             expert_cache_gb: None,
             hot_kv_cache_gb: None,
             enable_telemetry: false,
@@ -383,6 +419,7 @@ mod tests {
             model,
             bind,
             max_new_tokens,
+            thinking,
             ..
         } = cli.command.expect("expected command")
         else {
@@ -391,6 +428,17 @@ mod tests {
         assert_eq!(model, PathBuf::from("models/glm-5.2"));
         assert_eq!(bind, "127.0.0.1:11435".parse::<SocketAddr>().unwrap());
         assert_eq!(max_new_tokens, None);
+        assert!(!thinking);
+    }
+
+    #[test]
+    fn laguna_thinking_is_explicitly_opt_in_for_serve() {
+        let cli = Cli::try_parse_from(["inferno", "serve", "--thinking"]).unwrap();
+
+        let Command::Serve { thinking, .. } = cli.command.expect("expected serve command") else {
+            panic!("expected serve command");
+        };
+        assert!(thinking);
     }
 
     #[test]
@@ -471,6 +519,42 @@ mod tests {
             panic!("expected generate command");
         };
         assert_eq!(max_new_tokens, Some(16));
+    }
+
+    #[test]
+    fn laguna_thinking_is_explicitly_opt_in_for_generate() {
+        let default_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello Laguna",
+        ])
+        .unwrap();
+        let Command::Generate { thinking, .. } =
+            default_cli.command.expect("expected generate command")
+        else {
+            panic!("expected generate command");
+        };
+        assert!(!thinking);
+
+        let enabled_cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello Laguna",
+            "--thinking",
+        ])
+        .unwrap();
+        let Command::Generate { thinking, .. } =
+            enabled_cli.command.expect("expected generate command")
+        else {
+            panic!("expected generate command");
+        };
+        assert!(thinking);
     }
 
     #[test]
@@ -561,6 +645,45 @@ mod tests {
     }
 
     #[test]
+    fn generate_accepts_compact_throughput_summary_flag() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--throughput-summary",
+        ])
+        .unwrap();
+
+        let Command::Generate {
+            throughput_summary, ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected generate command");
+        };
+        assert!(throughput_summary);
+    }
+
+    #[test]
+    fn compact_and_detailed_throughput_flags_conflict() {
+        let error = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/model",
+            "--prompt",
+            "Hello GLM",
+            "--throughput-summary",
+            "--measure-tokens-per-second",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn generate_accepts_synchronized_token_cost_profile() {
         let cli = Cli::try_parse_from([
             "inferno",
@@ -638,6 +761,26 @@ mod tests {
         ])
         .unwrap();
         assert!(enabled_cli.enable_unified_memory_controller);
+
+        let chat_cli = Cli::try_parse_from([
+            "inferno",
+            "chat",
+            "--model",
+            "/tmp/model",
+            "--enable-unified-memory-controller",
+        ])
+        .unwrap();
+        assert!(chat_cli.enable_unified_memory_controller);
+
+        let serve_cli = Cli::try_parse_from([
+            "inferno",
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--enable-unified-memory-controller",
+        ])
+        .unwrap();
+        assert!(serve_cli.enable_unified_memory_controller);
     }
 
     #[test]
@@ -820,6 +963,7 @@ mod tests {
             model,
             page_size,
             max_new_tokens,
+            thinking,
             ..
         } = cli.command.expect("expected command")
         else {
@@ -828,6 +972,18 @@ mod tests {
         assert_eq!(model, PathBuf::from("/tmp/model"));
         assert_eq!(page_size, runtime::DEFAULT_KV_PAGE_SIZE);
         assert_eq!(max_new_tokens, None);
+        assert!(!thinking);
+    }
+
+    #[test]
+    fn laguna_thinking_is_explicitly_opt_in_for_chat() {
+        let cli = Cli::try_parse_from(["inferno", "chat", "--model", "/tmp/model", "--thinking"])
+            .unwrap();
+
+        let Command::Chat { thinking, .. } = cli.command.expect("expected chat command") else {
+            panic!("expected chat command");
+        };
+        assert!(thinking);
     }
 
     #[test]
@@ -863,5 +1019,25 @@ mod tests {
         assert_eq!(expert_cache_gb, Some(10.5));
         assert_eq!(hot_kv_cache_gb, Some(1.0));
         assert!(enable_telemetry);
+    }
+
+    #[test]
+    fn chat_accepts_compact_throughput_summary_flag() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "chat",
+            "--model",
+            "/tmp/model",
+            "--throughput-summary",
+        ])
+        .unwrap();
+
+        let Command::Chat {
+            throughput_summary, ..
+        } = cli.command.expect("expected command")
+        else {
+            panic!("expected chat command");
+        };
+        assert!(throughput_summary);
     }
 }

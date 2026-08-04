@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use ::metal::{CommandBuffer, CommandBufferRef, CommandQueue, MTLCommandBufferStatus};
 use common::{Error, Result};
+use objc::{msg_send, sel, sel_impl};
 use tracing::trace;
 
 /// Holds the command buffer that accumulates batched kernel dispatches between
@@ -22,7 +23,12 @@ use tracing::trace;
 #[derive(Default)]
 struct BatchState {
     open: Option<CommandBuffer>,
-    submitted: Vec<CommandBuffer>,
+    submitted: Vec<SubmittedBatch>,
+}
+
+struct SubmittedBatch {
+    command_buffer: CommandBuffer,
+    profile_label: Option<String>,
 }
 
 pub(crate) struct BatchSlot {
@@ -63,6 +69,18 @@ impl BatchSlot {
     /// command buffer can therefore be opened immediately while queue order
     /// preserves dependencies between the two submissions.
     pub(crate) fn submit(&self) -> Result<()> {
+        self.submit_with_profile_label(None)
+    }
+
+    /// Ends the current profiling segment without waiting for the GPU.
+    ///
+    /// Callers invoke this only when the Metal profile trace is enabled, so
+    /// normal inference keeps its production command-buffer boundaries.
+    pub(crate) fn submit_profile_segment(&self, label: &str) -> Result<()> {
+        self.submit_with_profile_label(Some(label.to_owned()))
+    }
+
+    fn submit_with_profile_label(&self, profile_label: Option<String>) -> Result<()> {
         let mut guard = self
             .inner
             .lock()
@@ -73,7 +91,10 @@ impl BatchSlot {
 
         trace!(target: "inferno::metal", "submitting batched command buffer");
         command_buffer.commit();
-        guard.submitted.push(command_buffer);
+        guard.submitted.push(SubmittedBatch {
+            command_buffer,
+            profile_label,
+        });
         Ok(())
     }
 
@@ -88,7 +109,10 @@ impl BatchSlot {
             if let Some(command_buffer) = guard.open.take() {
                 trace!(target: "inferno::metal", "submitting final batched command buffer");
                 command_buffer.commit();
-                guard.submitted.push(command_buffer);
+                guard.submitted.push(SubmittedBatch {
+                    command_buffer,
+                    profile_label: None,
+                });
             }
             std::mem::take(&mut guard.submitted)
         };
@@ -101,17 +125,49 @@ impl BatchSlot {
             submission_count = command_buffers.len(),
             "waiting for submitted Metal batches"
         );
-        last.wait_until_completed();
-        for (index, command_buffer) in command_buffers.iter().enumerate() {
+        last.command_buffer.wait_until_completed();
+        for (index, submitted) in command_buffers.iter().enumerate() {
+            let command_buffer = &submitted.command_buffer;
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(Error::backend(format!(
                     "Metal batched command buffer {index} did not complete: {:?}",
                     command_buffer.status()
                 )));
             }
+            if tracing::enabled!(
+                target: "inferno::metal::batch",
+                tracing::Level::TRACE
+            ) {
+                trace!(
+                    target: "inferno::metal::batch",
+                    submission_index = index,
+                    gpu_duration_ms = command_buffer_gpu_milliseconds(command_buffer),
+                    "completed Metal batch"
+                );
+            }
+            if let Some(label) = &submitted.profile_label {
+                trace!(
+                    target: "inferno::metal::profile",
+                    stage = label,
+                    gpu_duration_ms = command_buffer_gpu_milliseconds(command_buffer),
+                    "completed Metal profile segment"
+                );
+            }
         }
         Ok(())
     }
+}
+
+#[allow(unexpected_cfgs)]
+fn command_buffer_gpu_milliseconds(command_buffer: &CommandBufferRef) -> f64 {
+    // SAFETY: GPUStartTime and GPUEndTime are read-only MTLCommandBuffer
+    // properties, and `flush` calls this only after completion.
+    let start: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+    let end: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return 0.0;
+    }
+    (end - start) * 1_000.0
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]

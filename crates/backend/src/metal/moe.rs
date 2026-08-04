@@ -15,15 +15,18 @@ use super::{
 };
 
 const MOE_GATHER_TOKENS_KERNEL: &str = "moe_gather_tokens_f32_kernel";
+const MOE_SCATTER_ROWS_KERNEL: &str = "moe_scatter_rows_f32_kernel";
 const MOE_WEIGHTED_INDEX_ADD_COMBINE_KERNEL: &str = "moe_weighted_index_add_combine_f32_kernel";
 const MOE_WEIGHTED_TOKEN_MAJOR_COMBINE_KERNEL: &str = "moe_weighted_token_major_combine_f32_kernel";
 const MOE_TOPK_COMBINE_RESIDUAL_KERNEL: &str = "moe_topk_combine_residual_f32_kernel";
 const MOE_ROUTER_TOPK_KERNEL: &str = "moe_router_topk_f32_kernel";
 const ROUTER_TOPK_SIMD_LANES: usize = 32;
+const ROUTER_MAX_TOP_K: usize = 16;
 
 pub(crate) struct MetalMoe {
     arena: MetalArena,
     gather_pipeline: ComputePipelineState,
+    scatter_pipeline: ComputePipelineState,
     combine_pipeline: ComputePipelineState,
     token_major_combine_pipeline: ComputePipelineState,
     topk_combine_residual_pipeline: ComputePipelineState,
@@ -60,6 +63,7 @@ impl MetalMoe {
         Ok(Self {
             arena,
             gather_pipeline: compute_pipeline(device, library, MOE_GATHER_TOKENS_KERNEL)?,
+            scatter_pipeline: compute_pipeline(device, library, MOE_SCATTER_ROWS_KERNEL)?,
             combine_pipeline: compute_pipeline(
                 device,
                 library,
@@ -77,6 +81,134 @@ impl MetalMoe {
             )?,
             router_topk_pipeline: compute_pipeline(device, library, MOE_ROUTER_TOPK_KERNEL)?,
         })
+    }
+
+    pub(crate) fn encode_gather_tokens(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        flat_tokens: &Buffer,
+        flat_tokens_len: usize,
+        token_indices: &[u32],
+        token_count: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        let assignment_count = token_indices.len();
+        if token_count == 0 || hidden_size == 0 || assignment_count == 0 {
+            return Err(Error::backend(
+                "device MoE gather dimensions and indices must be non-empty",
+            ));
+        }
+        let expected_input_len = token_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("device MoE gather input length overflow"))?;
+        if flat_tokens_len != expected_input_len {
+            return Err(Error::backend(format!(
+                "device MoE gather input length mismatch: expected {expected_input_len}, got {flat_tokens_len}"
+            )));
+        }
+        if let Some(index) = token_indices
+            .iter()
+            .copied()
+            .find(|index| *index as usize >= token_count)
+        {
+            return Err(Error::backend(format!(
+                "device MoE gather token index {index} exceeds token count {token_count}"
+            )));
+        }
+        require_f32_capacity(flat_tokens, flat_tokens_len, "device MoE gather input")?;
+        let output_len = assignment_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("device MoE gather output length overflow"))?;
+        let token_indices = u32_buffer(device, token_indices)?;
+        let output = self.arena.empty_f32(output_len)?;
+        let token_count = self.arena.u32(as_u32(token_count, "token count")?)?;
+        let hidden_size = self.arena.u32(as_u32(hidden_size, "hidden size")?)?;
+        let assignment_count = self
+            .arena
+            .u32(as_u32(assignment_count, "assignment count")?)?;
+        encode_1d(
+            command_buffer,
+            &self.gather_pipeline,
+            &[
+                flat_tokens,
+                &token_indices,
+                &output,
+                &token_count,
+                &hidden_size,
+                &assignment_count,
+            ],
+            output_len,
+        )?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_scatter_rows(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        rows: &Buffer,
+        rows_len: usize,
+        destination_rows: &[u32],
+        destination: &Buffer,
+        destination_len: usize,
+        destination_row_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        let source_row_count = destination_rows.len();
+        if source_row_count == 0 || destination_row_count == 0 || hidden_size == 0 {
+            return Err(Error::backend(
+                "device MoE scatter dimensions and indices must be non-empty",
+            ));
+        }
+        let expected_rows_len = source_row_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("device MoE scatter source length overflow"))?;
+        let expected_destination_len = destination_row_count
+            .checked_mul(hidden_size)
+            .ok_or_else(|| Error::backend("device MoE scatter destination length overflow"))?;
+        if rows_len != expected_rows_len || destination_len != expected_destination_len {
+            return Err(Error::backend(format!(
+                "device MoE scatter length mismatch: expected source={expected_rows_len}, destination={expected_destination_len}; got source={rows_len}, destination={destination_len}"
+            )));
+        }
+        if let Some(index) = destination_rows
+            .iter()
+            .copied()
+            .find(|index| *index as usize >= destination_row_count)
+        {
+            return Err(Error::backend(format!(
+                "device MoE scatter row {index} exceeds destination rows {destination_row_count}"
+            )));
+        }
+        require_f32_capacity(rows, rows_len, "device MoE scatter source")?;
+        require_f32_capacity(
+            destination,
+            destination_len,
+            "device MoE scatter destination",
+        )?;
+        let destination_rows = u32_buffer(device, destination_rows)?;
+        let source_row_count = self
+            .arena
+            .u32(as_u32(source_row_count, "source row count")?)?;
+        let destination_row_count = self
+            .arena
+            .u32(as_u32(destination_row_count, "destination row count")?)?;
+        let hidden_size = self.arena.u32(as_u32(hidden_size, "hidden size")?)?;
+        encode_1d(
+            command_buffer,
+            &self.scatter_pipeline,
+            &[
+                rows,
+                &destination_rows,
+                destination,
+                &source_row_count,
+                &destination_row_count,
+                &hidden_size,
+            ],
+            expected_rows_len,
+        )
     }
 
     pub(crate) fn gather_tokens(
@@ -452,9 +584,9 @@ impl MetalMoe {
                 "MoE router top-k requires non-zero token_count and expert_count",
             ));
         }
-        if top_k == 0 || top_k > 8 {
+        if top_k == 0 || top_k > ROUTER_MAX_TOP_K {
             return Err(Error::backend(format!(
-                "MoE router top-k supports 1..=8 selected experts, got {top_k}"
+                "MoE router top-k supports 1..={ROUTER_MAX_TOP_K} selected experts, got {top_k}"
             )));
         }
         if top_k > expert_count {
@@ -566,6 +698,11 @@ fn token_major_assignments_per_token(
     Some(assignments_per_token)
 }
 
+fn as_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| Error::backend(format!("device MoE {label} exceeds Metal u32 limit")))
+}
+
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod tests {
     use super::token_major_assignments_per_token;
@@ -608,6 +745,38 @@ mod tests {
                 1.0, 2.0, 3.0, //
                 7.0, 8.0, 9.0,
             ]
+        );
+    }
+
+    #[test]
+    fn batched_gather_and_scatter_restore_assignment_order_without_host_sync() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let input = vec![
+            1.0_f32, 2.0, // token 0
+            3.0, 4.0, // token 1
+            5.0, 6.0, // token 2
+        ];
+        let input = metal.batch_upload_f32(&input).unwrap();
+        let destination = metal.batched_alloc_f32(6).unwrap();
+
+        let expert_a = metal
+            .batched_moe_gather_rows(&input, 6, &[2, 0], 3, 2)
+            .unwrap();
+        metal
+            .batched_moe_scatter_rows(&expert_a, 4, &[0, 2], &destination, 6, 3, 2)
+            .unwrap();
+        let expert_b = metal
+            .batched_moe_gather_rows(&input, 6, &[1], 3, 2)
+            .unwrap();
+        metal
+            .batched_moe_scatter_rows(&expert_b, 2, &[1], &destination, 6, 3, 2)
+            .unwrap();
+
+        assert_eq!(
+            metal.batch_read_f32(&destination, 6).unwrap(),
+            vec![5.0, 6.0, 3.0, 4.0, 1.0, 2.0]
         );
     }
 
@@ -800,6 +969,53 @@ mod tests {
         assert!(expert_weights
             .iter()
             .all(|weight| (*weight - 0.3125).abs() <= 1e-6));
+    }
+
+    #[test]
+    fn router_topk_supports_laguna_top_ten() {
+        let Some(metal) = native_metal_or_skip() else {
+            return;
+        };
+        let token_count = 2;
+        let expert_count = 256;
+        let top_k = 10;
+        let logits = (0..token_count * expert_count)
+            .map(|index| ((index * 37 % 211) as f32 - 105.0) / 19.0)
+            .collect::<Vec<_>>();
+        let correction = (0..expert_count)
+            .map(|index| ((index * 13 % 31) as f32 - 15.0) / 100.0)
+            .collect::<Vec<_>>();
+        let logits_buffer = metal.batch_upload_f32(&logits).unwrap();
+        let routing = metal
+            .batched_moe_router_topk_resident(
+                &logits_buffer,
+                token_count * expert_count,
+                &correction,
+                token_count,
+                expert_count,
+                top_k,
+                true,
+                2.5,
+            )
+            .unwrap();
+        let expert_ids = metal.batched_moe_router_expert_ids(&routing).unwrap();
+        let expert_weights = metal
+            .batch_read_f32(&routing.expert_weights, token_count * top_k)
+            .unwrap();
+        let (expected_ids, expected_weights) = cpu_router_topk(
+            &logits,
+            &correction,
+            token_count,
+            expert_count,
+            top_k,
+            true,
+            2.5,
+        );
+
+        assert_eq!(expert_ids, expected_ids);
+        for (actual, expected) in expert_weights.iter().zip(expected_weights) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
     }
 
     #[test]

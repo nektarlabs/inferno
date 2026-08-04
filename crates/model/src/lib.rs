@@ -35,6 +35,7 @@ mod expert_pack;
 mod index;
 mod indexer;
 mod kv_types;
+mod laguna;
 mod layer_kind;
 mod layer_stack;
 mod linear;
@@ -69,6 +70,22 @@ pub use index::{
 pub(crate) use indexer::DsaIndexer;
 pub use indexer::DsaIndexerLoadReport;
 pub use kv_types::{LayerDeviceKvCacheTensors, LayerKvCacheReport, LayerKvCacheTensors};
+pub use laguna::{
+    forward_attention as forward_laguna_attention, forward_dense_mlp_residual,
+    forward_layer as forward_laguna_layer, forward_sparse_mlp_residual, LagunaArtifactKind,
+    LagunaAttentionCache, LagunaAttentionWeights, LagunaDenseWeights, LagunaDeviceAttentionWeights,
+    LagunaDeviceDenseWeights, LagunaDeviceExpertWeights, LagunaDeviceLayerMlpWeights,
+    LagunaDeviceLayerWeights, LagunaDeviceMoeWeights, LagunaDeviceRootWeights,
+    LagunaDeviceRopeTables, LagunaDeviceWeights, LagunaExpertCache, LagunaExpertCacheMetrics,
+    LagunaExpertWeights, LagunaGgufAttention, LagunaGgufDense, LagunaGgufFlavor, LagunaGgufIndex,
+    LagunaGgufLayer, LagunaGgufMlp, LagunaGgufModel, LagunaGgufMoe, LagunaGgufRoot,
+    LagunaGgufSession, LagunaLayerMlpWeights, LagunaLayerWeights, LagunaModel, LagunaMoeWeights,
+    LagunaRootWeights, LagunaSession, LagunaTokenOutput, LagunaWeightIndex, LagunaWeightSummary,
+    LAGUNA_GGUF_FILE_BYTES, LAGUNA_GGUF_FILE_NAME, LAGUNA_GGUF_REPO_ID, LAGUNA_GGUF_REPO_URL,
+    LAGUNA_GGUF_SHA256, LAGUNA_INT4_REPO_ID, LAGUNA_INT4_REPO_URL, LAGUNA_INT4_TOTAL_BYTES,
+    LAGUNA_XS_GGUF_FILE_BYTES, LAGUNA_XS_GGUF_FILE_NAME, LAGUNA_XS_GGUF_REPO_ID,
+    LAGUNA_XS_GGUF_REPO_URL, LAGUNA_XS_GGUF_SHA256,
+};
 pub use layer_kind::LayerKind;
 pub(crate) use layer_stack::LayerStack;
 pub use layer_stack::{

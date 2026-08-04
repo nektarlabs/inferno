@@ -12,6 +12,13 @@ pub(crate) struct Dispatch1d<'a> {
     pub(crate) threads: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Dispatch1dWithOffsets<'a> {
+    pub(crate) pipeline: &'a ComputePipelineState,
+    pub(crate) buffers: &'a [(&'a Buffer, usize)],
+    pub(crate) threads: usize,
+}
+
 pub(crate) fn dispatch_1d(
     queue: &CommandQueue,
     pipeline: &ComputePipelineState,
@@ -28,6 +35,25 @@ pub(crate) fn dispatch_1d(
     )
 }
 
+pub(crate) fn dispatch_1d_with_offsets(
+    queue: &CommandQueue,
+    pipeline: &ComputePipelineState,
+    buffers: &[(&Buffer, usize)],
+    threads: usize,
+) -> Result<()> {
+    let command_buffer = queue.new_command_buffer();
+    encode_1d_with_offsets(command_buffer, pipeline, buffers, threads)?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    match command_buffer.status() {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        status => Err(Error::backend(format!(
+            "Metal command buffer did not complete: {status:?}"
+        ))),
+    }
+}
+
 pub(crate) fn dispatch_1d_many(queue: &CommandQueue, dispatches: &[Dispatch1d<'_>]) -> Result<()> {
     if dispatches.is_empty() {
         return Err(Error::backend(
@@ -38,6 +64,36 @@ pub(crate) fn dispatch_1d_many(queue: &CommandQueue, dispatches: &[Dispatch1d<'_
     let command_buffer = queue.new_command_buffer();
     for dispatch in dispatches {
         encode_1d(
+            command_buffer,
+            dispatch.pipeline,
+            dispatch.buffers,
+            dispatch.threads,
+        )?;
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    match command_buffer.status() {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        status => Err(Error::backend(format!(
+            "Metal command buffer did not complete: {status:?}"
+        ))),
+    }
+}
+
+pub(crate) fn dispatch_1d_many_with_offsets(
+    queue: &CommandQueue,
+    dispatches: &[Dispatch1dWithOffsets<'_>],
+) -> Result<()> {
+    if dispatches.is_empty() {
+        return Err(Error::backend(
+            "Metal command buffer requires at least one dispatch",
+        ));
+    }
+
+    let command_buffer = queue.new_command_buffer();
+    for dispatch in dispatches {
+        encode_1d_with_offsets(
             command_buffer,
             dispatch.pipeline,
             dispatch.buffers,
@@ -188,6 +244,179 @@ pub(crate) fn encode_element_copy(
     Ok(())
 }
 
+/// One argument of a compute kernel.
+///
+/// Scalars are bound with `setBytes`, which copies the value straight into the
+/// command buffer. Passing them as arena buffers instead costs a real
+/// `MTLBuffer` allocation plus hazard-tracking registration — measured at about
+/// 3.9µs each on an M4 Max. Laguna decode binds roughly fifty scalars per layer
+/// across forty-eight layers, so that allocation alone accounted for most of the
+/// CPU time spent encoding a token.
+#[derive(Clone, Copy)]
+pub(crate) enum KernelArg<'a> {
+    Buffer(&'a Buffer),
+    BufferOffset(&'a Buffer, usize),
+    U32(u32),
+    F32(f32),
+}
+
+fn bind_args(encoder: &::metal::ComputeCommandEncoderRef, args: &[KernelArg<'_>]) -> Result<()> {
+    for (index, arg) in args.iter().enumerate() {
+        let slot = index as NSUInteger;
+        match arg {
+            KernelArg::Buffer(buffer) => encoder.set_buffer(slot, Some(buffer), 0),
+            KernelArg::BufferOffset(buffer, offset) => {
+                if *offset > buffer.length() as usize {
+                    return Err(Error::backend(format!(
+                        "Metal buffer {index} offset {offset} exceeds buffer length {}",
+                        buffer.length()
+                    )));
+                }
+                encoder.set_buffer(slot, Some(buffer), *offset as NSUInteger);
+            }
+            // `setBytes` copies before returning, so pointing at the slice
+            // element is sound for the duration of this call.
+            KernelArg::U32(value) => encoder.set_bytes(
+                slot,
+                std::mem::size_of::<u32>() as NSUInteger,
+                value as *const u32 as *const std::ffi::c_void,
+            ),
+            KernelArg::F32(value) => encoder.set_bytes(
+                slot,
+                std::mem::size_of::<f32>() as NSUInteger,
+                value as *const f32 as *const std::ffi::c_void,
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_threadgroup_shape(
+    pipeline: &ComputePipelineState,
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    if threadgroup_count == 0 || threads_per_group == 0 {
+        return Err(Error::backend(
+            "Metal threadgroup dispatch dimensions must be positive",
+        ));
+    }
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1) as usize;
+    if threads_per_group > max_threads {
+        return Err(Error::backend(format!(
+            "Metal threadgroup requires {threads_per_group} threads but pipeline allows {max_threads}"
+        )));
+    }
+    let execution_width = pipeline.thread_execution_width().max(1) as usize;
+    if !threads_per_group.is_multiple_of(execution_width) {
+        return Err(Error::backend(format!(
+            "Metal threadgroup size {threads_per_group} must be divisible by SIMD width {execution_width}"
+        )));
+    }
+    Ok(())
+}
+
+/// Dispatches a fixed number of threadgroups with mixed buffer and scalar
+/// arguments.
+pub(crate) fn encode_1d_threadgroups_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    validate_threadgroup_shape(pipeline, threadgroup_count, threads_per_group)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(threadgroup_count as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// Dispatches a fixed 3D grid for prompt-time tiled kernels.
+///
+/// This is intentionally separate from the one-dimensional decode helpers:
+/// prefill tiles the routed assignment, output-row, and expert dimensions.
+pub(crate) fn encode_3d_threadgroups_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threadgroups: [usize; 3],
+    threads_per_group: usize,
+    threadgroup_memory_bytes: usize,
+) -> Result<()> {
+    if threadgroups.contains(&0) {
+        return Err(Error::backend(format!(
+            "Metal 3D threadgroup dimensions must be positive, got {threadgroups:?}"
+        )));
+    }
+    validate_threadgroup_shape(pipeline, 1, threads_per_group)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    if threadgroup_memory_bytes > 0 {
+        encoder.set_threadgroup_memory_length(0, threadgroup_memory_bytes as NSUInteger);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            threadgroups[0] as NSUInteger,
+            threadgroups[1] as NSUInteger,
+            threadgroups[2] as NSUInteger,
+        ),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+/// Dispatches a GPU-sized threadgroup grid with mixed buffer and scalar
+/// arguments.
+///
+/// The indirect buffer contains three consecutive `u32` values:
+/// `[threadgroups_x, threadgroups_y, threadgroups_z]`. A prior kernel in the
+/// same command buffer may write those values, which lets prefill compact its
+/// routed expert work without synchronizing with the CPU.
+pub(crate) fn encode_threadgroups_indirect_args(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    indirect_buffer: &Buffer,
+    indirect_offset: usize,
+    threads_per_group: usize,
+    threadgroup_memory_bytes: usize,
+) -> Result<()> {
+    validate_threadgroup_shape(pipeline, 1, threads_per_group)?;
+    let required_bytes = indirect_offset
+        .checked_add(3 * std::mem::size_of::<u32>())
+        .ok_or_else(|| Error::backend("Metal indirect dispatch offset overflow"))?;
+    if required_bytes > indirect_buffer.length() as usize {
+        return Err(Error::backend(format!(
+            "Metal indirect dispatch needs {required_bytes} bytes but buffer contains {}",
+            indirect_buffer.length()
+        )));
+    }
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    bind_args(encoder, args)?;
+    if threadgroup_memory_bytes > 0 {
+        encoder.set_threadgroup_memory_length(0, threadgroup_memory_bytes as NSUInteger);
+    }
+    encoder.dispatch_thread_groups_indirect(
+        indirect_buffer,
+        indirect_offset as NSUInteger,
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
 pub(crate) fn encode_1d(
     command_buffer: &CommandBufferRef,
     pipeline: &ComputePipelineState,
@@ -224,6 +453,52 @@ pub(crate) fn encode_1d(
     Ok(())
 }
 
+pub(crate) fn encode_1d_with_offsets(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    buffers: &[(&Buffer, usize)],
+    threads: usize,
+) -> Result<()> {
+    if threads == 0 {
+        return Err(Error::backend(
+            "Metal dispatch requires at least one thread",
+        ));
+    }
+    validate_buffer_offsets(buffers)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    for (index, (buffer, offset)) in buffers.iter().enumerate() {
+        encoder.set_buffer(index as NSUInteger, Some(buffer), *offset as NSUInteger);
+    }
+
+    let threads_per_group = preferred_1d_threadgroup_size(pipeline);
+    trace!(
+        target: "inferno::metal",
+        threads,
+        threads_per_group,
+        "dispatching native Metal kernel with buffer offsets"
+    );
+    encoder.dispatch_threads(
+        MTLSize::new(threads as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+fn validate_buffer_offsets(buffers: &[(&Buffer, usize)]) -> Result<()> {
+    for (index, (buffer, offset)) in buffers.iter().enumerate() {
+        if *offset > buffer.length() as usize {
+            return Err(Error::backend(format!(
+                "Metal buffer {index} offset {offset} exceeds buffer length {}",
+                buffer.length()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_1d_threadgroups(
     command_buffer: &CommandBufferRef,
     pipeline: &ComputePipelineState,
@@ -253,6 +528,45 @@ pub(crate) fn encode_1d_threadgroups(
     encoder.set_compute_pipeline_state(pipeline);
     for (index, buffer) in buffers.iter().enumerate() {
         encoder.set_buffer(index as NSUInteger, Some(buffer), 0);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(threadgroup_count as NSUInteger, 1, 1),
+        MTLSize::new(threads_per_group as NSUInteger, 1, 1),
+    );
+    encoder.end_encoding();
+    Ok(())
+}
+
+pub(crate) fn encode_1d_threadgroups_with_offsets(
+    command_buffer: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    buffers: &[(&Buffer, usize)],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    if threadgroup_count == 0 || threads_per_group == 0 {
+        return Err(Error::backend(
+            "Metal threadgroup dispatch dimensions must be positive",
+        ));
+    }
+    let max_threads = pipeline.max_total_threads_per_threadgroup().max(1) as usize;
+    if threads_per_group > max_threads {
+        return Err(Error::backend(format!(
+            "Metal threadgroup requires {threads_per_group} threads but pipeline allows {max_threads}"
+        )));
+    }
+    let execution_width = pipeline.thread_execution_width().max(1) as usize;
+    if !threads_per_group.is_multiple_of(execution_width) {
+        return Err(Error::backend(format!(
+            "Metal threadgroup size {threads_per_group} must be divisible by SIMD width {execution_width}"
+        )));
+    }
+    validate_buffer_offsets(buffers)?;
+
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    for (index, (buffer, offset)) in buffers.iter().enumerate() {
+        encoder.set_buffer(index as NSUInteger, Some(buffer), *offset as NSUInteger);
     }
     encoder.dispatch_thread_groups(
         MTLSize::new(threadgroup_count as NSUInteger, 1, 1),

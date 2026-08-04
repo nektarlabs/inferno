@@ -237,7 +237,7 @@ impl Config {
         }
         self.indexer_types.get(layer_index).copied().or_else(|| {
             if layer_index < self.dense_layers
-                || (layer_index - self.dense_layers) % self.index_topk_freq == 0
+                || (layer_index - self.dense_layers).is_multiple_of(self.index_topk_freq)
             {
                 Some(IndexerLayerKind::Full)
             } else {
@@ -310,7 +310,7 @@ fn default_indexer_types_for_dense_layers(
     (0..num_layers)
         .map(|layer_index| {
             if layer_index < dense_layers
-                || (layer_index - dense_layers) % default_index_topk_freq() == 0
+                || (layer_index - dense_layers).is_multiple_of(default_index_topk_freq())
             {
                 IndexerLayerKind::Full
             } else {

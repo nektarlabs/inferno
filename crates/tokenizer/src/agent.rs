@@ -1,9 +1,13 @@
 use common::{Error, Result};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
-use crate::ChatPrompt;
+use crate::{ChatPrompt, LagunaThinkingMode};
 
 const PROMPT_PREFIX: &str = "[gMASK]<sop><|system|>Reasoning Effort: Max";
+const LAGUNA_PROMPT_PREFIX: &str = "〈|EOS|〉";
+const LAGUNA_DEFAULT_SYSTEM: &str = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
@@ -11,6 +15,9 @@ const ARG_KEY_OPEN: &str = "<arg_key>";
 const ARG_KEY_CLOSE: &str = "</arg_key>";
 const ARG_VALUE_OPEN: &str = "<arg_value>";
 const ARG_VALUE_CLOSE: &str = "</arg_value>";
+const CODEX_EXEC_COMMAND: &str = "exec_command";
+const LAGUNA_SHELL: &str = "shell";
+const CODEX_APPLY_PATCH: &str = "apply_patch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentFunctionCall {
@@ -31,9 +38,52 @@ pub struct AgentOutput {
     pub items: Vec<AgentOutputItem>,
 }
 
+pub fn map_laguna_function_call_to_codex(mut call: AgentFunctionCall) -> AgentFunctionCall {
+    if call.name == LAGUNA_SHELL {
+        call.name = CODEX_EXEC_COMMAND.to_string();
+    }
+    if call.name == CODEX_EXEC_COMMAND {
+        call.arguments = normalize_exec_command_arguments(&call.arguments);
+    }
+    call
+}
+
+fn normalize_exec_command_arguments(arguments: &str) -> String {
+    let Ok(mut arguments_json) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let Some(arguments_object) = arguments_json.as_object_mut() else {
+        return arguments.to_string();
+    };
+    if arguments_object
+        .get("workdir")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return arguments.to_string();
+    }
+    let Some(command) = arguments_object.get("cmd").and_then(Value::as_str) else {
+        return arguments.to_string();
+    };
+    let command = command.trim_start();
+    let Some(after_cd) = command.strip_prefix("cd ") else {
+        return arguments.to_string();
+    };
+    let Some(separator) = after_cd.find("&&") else {
+        return arguments.to_string();
+    };
+    let target = after_cd[..separator].trim();
+    if !target.starts_with('/') && !target.starts_with("'/") && !target.starts_with("\"/") {
+        return arguments.to_string();
+    }
+    let normalized_command = after_cd[separator + 2..].trim_start().to_string();
+    arguments_object.insert("cmd".to_string(), Value::String(normalized_command));
+    serde_json::to_string(&arguments_json).unwrap_or_else(|_| arguments.to_string())
+}
+
 /// Direct Codex functions represented by GLM-5.2's native tool grammar.
 pub fn is_supported_codex_function(name: &str) -> bool {
-    matches!(name, "exec_command" | "write_stdin")
+    matches!(name, "exec_command" | "write_stdin" | "apply_patch")
 }
 
 /// Renders the Codex Responses input using GLM-5.2's native chat contract.
@@ -56,20 +106,112 @@ pub fn render_codex_prompt(
     Ok(ChatPrompt { rendered })
 }
 
-/// Parses one complete GLM generation into Responses-compatible output items.
+/// Renders a Codex Responses turn using Laguna S 2.1's published chat and
+/// direct-function tool grammar.
+pub fn render_laguna_codex_prompt(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
+) -> Result<ChatPrompt> {
+    render_laguna_codex_prompt_inner(instructions, input, tools, thinking_mode, false)
+}
+
+/// Renders a Codex Responses turn using Laguna XS 2.1's published chat
+/// contract, including preserved reasoning from earlier assistant turns.
+pub fn render_laguna_xs_codex_prompt(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
+) -> Result<ChatPrompt> {
+    render_laguna_codex_prompt_inner(instructions, input, tools, thinking_mode, true)
+}
+
+fn render_laguna_codex_prompt_inner(
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    thinking_mode: LagunaThinkingMode,
+    preserve_reasoning: bool,
+) -> Result<ChatPrompt> {
+    let normalized_tools = normalize_laguna_tools(tools)?;
+    let system = if instructions.trim().is_empty() {
+        LAGUNA_DEFAULT_SYSTEM
+    } else {
+        instructions.trim()
+    };
+    let mut rendered = String::with_capacity(
+        LAGUNA_PROMPT_PREFIX.len()
+            + system.len()
+            + input
+                .iter()
+                .map(|value| value.to_string().len())
+                .sum::<usize>()
+            + normalized_tools
+                .iter()
+                .map(|value| value.to_string().len())
+                .sum::<usize>()
+            + 1_024,
+    );
+    rendered.push_str(LAGUNA_PROMPT_PREFIX);
+    rendered.push_str("<system>");
+    rendered.push_str(system);
+    render_laguna_tools(&mut rendered, &normalized_tools)?;
+    rendered.push_str("</system>\n");
+    render_laguna_input_items(
+        &mut rendered,
+        input,
+        preserve_reasoning && thinking_mode == LagunaThinkingMode::Enabled,
+    )?;
+    rendered.push_str("<assistant>");
+    match thinking_mode {
+        LagunaThinkingMode::Enabled => rendered.push_str(THINK_START),
+        LagunaThinkingMode::Disabled => {
+            rendered.push_str(THINK_START);
+            rendered.push_str(THINK_END);
+        }
+    }
+    Ok(ChatPrompt { rendered })
+}
+
+/// Parses one complete GLM or Laguna generation into Responses-compatible
+/// output items. Both checkpoints use the same reasoning and tool-call tags.
 pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
+    let output = complete_terminated_apply_patch(output);
+    parse_agent_output_inner(&output)
+}
+
+/// Parses an agent turn only when its reasoning and tool-call protocol is
+/// structurally complete.
+///
+/// Generation can legitimately stop at an output limit or EOS while a tag is
+/// still open. That state is retryable, not malformed. A fully closed but
+/// invalid tool call remains an error so it can never be executed.
+pub fn parse_agent_output_if_complete(output: &str) -> Result<Option<AgentOutput>> {
+    let output = complete_terminated_apply_patch(output);
+    let Some((_, visible)) = output.rsplit_once(THINK_END) else {
+        return Ok(None);
+    };
+    if !agent_protocol_is_complete(visible) {
+        return Ok(None);
+    }
+    parse_agent_output_inner(&output).map(Some)
+}
+
+fn parse_agent_output_inner(output: &str) -> Result<AgentOutput> {
     let (reasoning, visible) = output
-        .split_once(THINK_END)
-        .ok_or_else(|| Error::tokenizer("GLM agent output ended before the </think> boundary"))?;
+        .rsplit_once(THINK_END)
+        .ok_or_else(|| Error::tokenizer("agent output ended before the </think> boundary"))?;
     let mut items = Vec::new();
     let mut remaining = visible;
     while let Some(start) = remaining.find(TOOL_CALL_OPEN) {
         push_text_item(&mut items, &remaining[..start]);
         let tool_body_start = start + TOOL_CALL_OPEN.len();
         let after_open = &remaining[tool_body_start..];
-        let close = after_open.find(TOOL_CALL_CLOSE).ok_or_else(|| {
-            Error::tokenizer("GLM agent output contains an unterminated <tool_call>")
-        })?;
+        let close = after_open
+            .find(TOOL_CALL_CLOSE)
+            .ok_or_else(|| Error::tokenizer("agent output contains an unterminated <tool_call>"))?;
         let call = parse_tool_call(&after_open[..close])?;
         items.push(AgentOutputItem::FunctionCall(call));
         remaining = &after_open[close + TOOL_CALL_CLOSE.len()..];
@@ -84,11 +226,92 @@ pub fn parse_agent_output(output: &str) -> Result<AgentOutput> {
     })
 }
 
-fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
-    let normalized = tools
+fn agent_protocol_is_complete(mut visible: &str) -> bool {
+    while let Some(start) = visible.find(TOOL_CALL_OPEN) {
+        let after_open = &visible[start + TOOL_CALL_OPEN.len()..];
+        let Some(close) = after_open.find(TOOL_CALL_CLOSE) else {
+            return false;
+        };
+        visible = &after_open[close + TOOL_CALL_CLOSE.len()..];
+    }
+
+    stable_text_end(visible, TOOL_CALL_OPEN) == visible.len()
+}
+
+fn complete_terminated_apply_patch(output: &str) -> Cow<'_, str> {
+    const APPLY_PATCH_CALL: &str = "<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>";
+    const PATCH_END: &str = "*** End Patch";
+
+    if output.contains(TOOL_CALL_CLOSE) {
+        return Cow::Borrowed(output);
+    }
+    let Some(call_start) = output.rfind(APPLY_PATCH_CALL) else {
+        return Cow::Borrowed(output);
+    };
+    let call = &output[call_start..];
+    let Some(patch_end) = call.rfind(PATCH_END) else {
+        return Cow::Borrowed(output);
+    };
+    let after_patch = &call[patch_end + PATCH_END.len()..];
+    if !after_patch.trim().is_empty() && after_patch.trim() != ARG_VALUE_CLOSE {
+        return Cow::Borrowed(output);
+    }
+
+    let mut completed = output.to_string();
+    if after_patch.trim().is_empty() {
+        completed.push_str(ARG_VALUE_CLOSE);
+    }
+    completed.push_str(TOOL_CALL_CLOSE);
+    Cow::Owned(completed)
+}
+
+/// Returns a parsed agent turn as soon as one complete function call exists.
+///
+/// An incomplete reasoning boundary or function-call closing tag means the
+/// model is still generating. Once the closing tag exists, malformed output is
+/// reported immediately instead of being mistaken for a usable tool call.
+pub fn parse_complete_agent_tool_call(output: &str) -> Result<Option<AgentOutput>> {
+    let Some((_, visible)) = output.split_once(THINK_END) else {
+        return Ok(None);
+    };
+    if !visible.contains(TOOL_CALL_CLOSE) {
+        return Ok(None);
+    }
+
+    let parsed = parse_agent_output(output)?;
+    if parsed
+        .items
         .iter()
-        .filter_map(normalize_function_tool)
-        .collect::<Result<Vec<_>>>()?;
+        .any(|item| matches!(item, AgentOutputItem::FunctionCall(_)))
+    {
+        Ok(Some(parsed))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Returns the stable visible-text prefix that can be streamed before the
+/// first function call. A partial `<tool_call>` marker is withheld until the
+/// next token resolves whether it is text or protocol syntax.
+pub fn streamable_agent_text(output: &str) -> Option<&str> {
+    let (_, visible) = output.split_once(THINK_END)?;
+    let end = visible
+        .find(TOOL_CALL_OPEN)
+        .unwrap_or_else(|| stable_text_end(visible, TOOL_CALL_OPEN));
+    Some(visible[..end].trim_start())
+}
+
+fn stable_text_end(text: &str, marker: &str) -> usize {
+    for prefix_len in (1..marker.len()).rev() {
+        if text.ends_with(&marker[..prefix_len]) {
+            return text.len() - prefix_len;
+        }
+    }
+    text.len()
+}
+
+fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
+    let normalized = normalize_tools(tools)?;
     if normalized.is_empty() {
         return Ok(());
     }
@@ -101,6 +324,95 @@ fn render_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
     }
     rendered.push_str(
         "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>",
+    );
+    Ok(())
+}
+
+fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>> {
+    tools
+        .iter()
+        .filter_map(normalize_function_tool)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_laguna_tools(tools: &[Value]) -> Result<Vec<Value>> {
+    let mut normalized = normalize_tools(tools)?;
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) != Some("custom")
+            || tool.get("name").and_then(Value::as_str) != Some(CODEX_APPLY_PATCH)
+        {
+            continue;
+        }
+        normalized.push(serde_json::json!({
+            "type": "function",
+            "name": CODEX_APPLY_PATCH,
+            "description": tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Apply a patch to files in the workspace."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "Complete apply_patch payload."
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        }));
+    }
+    normalized
+        .into_iter()
+        .map(|tool| {
+            let mut function = tool
+                .as_object()
+                .cloned()
+                .ok_or_else(|| Error::tokenizer("normalized Laguna tool must be an object"))?;
+            function.remove("type");
+            if function.get("name").and_then(Value::as_str) == Some(CODEX_EXEC_COMMAND) {
+                function.insert("name".to_string(), Value::String(LAGUNA_SHELL.to_string()));
+            }
+            Ok(serde_json::json!({
+                "type": "function",
+                "function": function,
+            }))
+        })
+        .collect()
+}
+
+fn render_laguna_tools(rendered: &mut String, tools: &[Value]) -> Result<()> {
+    if tools.is_empty() {
+        return Ok(());
+    }
+    rendered.push_str(
+        "\n\n### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n",
+    );
+    for tool in tools {
+        rendered.push_str(&serde_json::to_string(tool)?);
+        rendered.push('\n');
+    }
+    let has_apply_patch = tools.iter().any(|tool| {
+        tool.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            == Some(CODEX_APPLY_PATCH)
+    });
+    rendered.push_str(
+        "</available_tools>\n\nWhen repository work requires a tool, call it immediately. Do not describe the planned command, repeat the task, or print file contents as assistant text before the call.\n\nUse exactly this function-call format:\n<tool_call>{function-name}<arg_key>{argument-name}</arg_key><arg_value>{argument-value}</arg_value></tool_call>\n",
+    );
+    if has_apply_patch {
+        rendered.push_str(
+            "\nExample:\n<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch</arg_value></tool_call>\n\nThe patch must start with `*** Begin Patch`, end with `*** End Patch`, and prefix every added content line with `+`. Batch workspace inspection into as few shell calls as practical, then use apply_patch for file changes.",
+        );
+    } else {
+        rendered.push_str(
+            "\nExample:\n<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>",
+        );
+    }
+    rendered.push_str(
+        "\n\nUse the exact tool and argument names from the schemas. Finish the current response after emitting one complete tool call. After receiving a <tool_response>, use that result and continue the task instead of repeating the completed call.",
     );
     Ok(())
 }
@@ -164,6 +476,139 @@ fn render_input_item(rendered: &mut String, item: &Value) -> Result<()> {
     }
 }
 
+fn render_laguna_input_items(
+    rendered: &mut String,
+    items: &[Value],
+    preserve_reasoning: bool,
+) -> Result<()> {
+    let mut assistant_open = false;
+    let mut pending_reasoning = String::new();
+    for (index, item) in items.iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex Responses input item is missing a string type")
+        })?;
+        match item_type {
+            "reasoning" if preserve_reasoning => {
+                pending_reasoning.push_str(&reasoning_content(item)?);
+            }
+            "reasoning" => {}
+            "message" if item.get("role").and_then(Value::as_str) == Some("assistant") => {
+                close_laguna_assistant(rendered, &mut assistant_open);
+                let content =
+                    visible_content(item.get("content").ok_or_else(|| {
+                        Error::tokenizer("Codex message input is missing content")
+                    })?)?;
+                open_laguna_assistant(rendered, &mut pending_reasoning, preserve_reasoning);
+                if !next_non_reasoning_item_is_tool_call(items, index + 1) {
+                    rendered.push_str(&content);
+                }
+                assistant_open = true;
+            }
+            "function_call" | "custom_tool_call" => {
+                if !assistant_open {
+                    open_laguna_assistant(rendered, &mut pending_reasoning, preserve_reasoning);
+                    assistant_open = true;
+                }
+                render_laguna_tool_call(rendered, item)?;
+            }
+            "message" => {
+                reject_orphaned_reasoning(&pending_reasoning)?;
+                close_laguna_assistant(rendered, &mut assistant_open);
+                render_laguna_message(rendered, item)?;
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                reject_orphaned_reasoning(&pending_reasoning)?;
+                close_laguna_assistant(rendered, &mut assistant_open);
+                render_laguna_tool_output(rendered, item)?;
+            }
+            other => {
+                return Err(Error::tokenizer(format!(
+                    "unsupported Codex Responses input item type {other:?}"
+                )));
+            }
+        }
+    }
+    reject_orphaned_reasoning(&pending_reasoning)?;
+    close_laguna_assistant(rendered, &mut assistant_open);
+    Ok(())
+}
+
+fn open_laguna_assistant(
+    rendered: &mut String,
+    pending_reasoning: &mut String,
+    preserve_reasoning: bool,
+) {
+    rendered.push_str("<assistant>");
+    if preserve_reasoning {
+        rendered.push_str("<think>");
+        rendered.push_str(pending_reasoning);
+        rendered.push_str(THINK_END);
+        pending_reasoning.clear();
+    } else {
+        rendered.push_str(THINK_END);
+    }
+}
+
+fn reasoning_content(item: &Value) -> Result<String> {
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| reasoning_parts(parts, "reasoning_text"))
+        .transpose()?
+        .unwrap_or_default();
+    if !content.is_empty() {
+        return Ok(content);
+    }
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| reasoning_parts(parts, "summary_text"))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn reasoning_parts(parts: &[Value], expected_type: &str) -> Result<String> {
+    let mut text = String::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex reasoning content part is missing a string type")
+        })?;
+        if part_type != expected_type {
+            continue;
+        }
+        let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex reasoning content part is missing string text")
+        })?;
+        text.push_str(part_text);
+    }
+    Ok(text)
+}
+
+fn reject_orphaned_reasoning(reasoning: &str) -> Result<()> {
+    if reasoning.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::tokenizer(
+            "Codex reasoning item is not followed by an assistant message or tool call",
+        ))
+    }
+}
+
+fn next_non_reasoning_item_is_tool_call(items: &[Value], start: usize) -> bool {
+    items[start..]
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"))
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| matches!(item_type, "function_call" | "custom_tool_call"))
+}
+
+fn close_laguna_assistant(rendered: &mut String, assistant_open: &mut bool) {
+    if *assistant_open {
+        rendered.push_str("</assistant>\n");
+        *assistant_open = false;
+    }
+}
+
 fn render_message(rendered: &mut String, item: &Value) -> Result<()> {
     let role = item
         .get("role")
@@ -187,14 +632,72 @@ fn render_message(rendered: &mut String, item: &Value) -> Result<()> {
     Ok(())
 }
 
+fn render_laguna_message(rendered: &mut String, item: &Value) -> Result<()> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::tokenizer("Codex message input is missing a string role"))?;
+    let content = visible_content(
+        item.get("content")
+            .ok_or_else(|| Error::tokenizer("Codex message input is missing content"))?,
+    )?;
+    match role {
+        "user" => {
+            rendered.push_str("<user>");
+            rendered.push_str(&content);
+            rendered.push_str("</user>\n");
+        }
+        "system" | "developer" => {
+            rendered.push_str("<system>");
+            rendered.push_str(&content);
+            rendered.push_str("</system>\n");
+        }
+        "assistant" => {
+            return Err(Error::tokenizer(
+                "Laguna assistant message reached the non-assistant renderer",
+            ));
+        }
+        other => {
+            return Err(Error::tokenizer(format!(
+                "unsupported Codex message role {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn render_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
+    let (name, arguments) = historical_tool_call(item)?;
+    rendered.push_str("<|assistant|><think></think>");
+    render_tool_call(rendered, name, &arguments)
+}
+
+fn render_laguna_tool_call(rendered: &mut String, item: &Value) -> Result<()> {
+    let (name, arguments) = historical_tool_call(item)?;
+    let name = if name == CODEX_EXEC_COMMAND {
+        LAGUNA_SHELL
+    } else {
+        name
+    };
+    render_tool_call(rendered, name, &arguments)
+}
+
+fn historical_tool_call(item: &Value) -> Result<(&str, Map<String, Value>)> {
     let name = item
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::tokenizer("Codex function_call input is missing a string name"))?;
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        let input = item.get("input").and_then(Value::as_str).ok_or_else(|| {
+            Error::tokenizer("Codex custom_tool_call input is missing string input")
+        })?;
+        return Ok((
+            name,
+            Map::from_iter([("patch".to_string(), Value::String(input.to_string()))]),
+        ));
+    }
     let arguments = item
         .get("arguments")
-        .or_else(|| item.get("input"))
         .and_then(Value::as_str)
         .ok_or_else(|| Error::tokenizer("Codex function_call input is missing string arguments"))?;
     let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
@@ -205,8 +708,15 @@ fn render_historical_tool_call(rendered: &mut String, item: &Value) -> Result<()
     let arguments = arguments.as_object().ok_or_else(|| {
         Error::tokenizer("Codex function_call arguments must encode a JSON object")
     })?;
+    Ok((name, arguments.clone()))
+}
 
-    rendered.push_str("<|assistant|><think></think><tool_call>");
+fn render_tool_call(
+    rendered: &mut String,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<()> {
+    rendered.push_str("<tool_call>");
     rendered.push_str(name);
     for (key, value) in arguments {
         rendered.push_str(ARG_KEY_OPEN);
@@ -231,6 +741,19 @@ fn render_tool_output(rendered: &mut String, item: &Value) -> Result<()> {
     rendered.push_str("<|observation|><tool_response>");
     rendered.push_str(&output);
     rendered.push_str("</tool_response>");
+    Ok(())
+}
+
+fn render_laguna_tool_output(rendered: &mut String, item: &Value) -> Result<()> {
+    let output = item
+        .get("output")
+        .ok_or_else(|| Error::tokenizer("Codex function_call_output is missing output"))?;
+    let output = visible_content(output)?;
+    rendered.push_str("<tool_response>");
+    rendered.push_str(&output);
+    rendered.push_str(
+        "</tool_response>\n<system>The tool call above has already run. Its output and exit code are the result, including when the exit code is non-zero. Never repeat the same call or an equivalent inspection. Use the result and perform a different action that advances the next unfinished requirement.</system>\n",
+    );
     Ok(())
 }
 
@@ -376,6 +899,229 @@ mod tests {
     }
 
     #[test]
+    fn renders_codex_tools_messages_and_observations_for_laguna() {
+        let prompt = render_laguna_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List files"}]}),
+                json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Inspecting."}]}),
+                json!({"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_1"}),
+                json!({"type": "function_call_output", "call_id": "call_1", "output": "README.md"}),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                "strict": false
+            })],
+            LagunaThinkingMode::Enabled,
+        )
+        .unwrap();
+
+        assert!(prompt
+            .rendered
+            .starts_with("〈|EOS|〉<system>Work carefully."));
+        assert!(prompt.rendered.contains("### Tools"));
+        assert!(prompt.rendered.contains("<available_tools>"));
+        assert!(prompt.rendered.contains("\"name\":\"shell\""));
+        assert!(!prompt.rendered.contains("\"name\":\"exec_command\""));
+        assert!(prompt.rendered.contains(
+            "<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        ));
+        assert!(prompt
+            .rendered
+            .contains("\"function\":{\"description\":\"Run a command\""));
+        assert!(!prompt.rendered.contains("\"strict\""));
+        assert!(prompt.rendered.contains("<user>List files</user>"));
+        assert!(prompt.rendered.contains(
+            "<assistant></think><tool_call>shell<arg_key>cmd</arg_key><arg_value>ls</arg_value></tool_call></assistant>"
+        ));
+        assert!(!prompt.rendered.contains("Inspecting."));
+        assert_eq!(prompt.rendered.matches("<assistant></think>").count(), 1);
+        assert!(prompt
+            .rendered
+            .contains("<tool_response>README.md</tool_response>"));
+        assert!(prompt
+            .rendered
+            .contains("Never repeat the same call or an equivalent inspection"));
+        assert!(prompt.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn maps_laguna_shell_calls_back_to_codex_exec_command() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: r#"{"cmd":"pwd"}"#.to_string(),
+        };
+
+        assert_eq!(
+            map_laguna_function_call_to_codex(call),
+            AgentFunctionCall {
+                name: CODEX_EXEC_COMMAND.to_string(),
+                arguments: r#"{"cmd":"pwd"}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn removes_a_redundant_absolute_cd_when_codex_already_has_workdir() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: json!({
+                "cmd": "cd /tmp/misspelled-path && mkdir -p src",
+                "workdir": "/tmp/correct-path"
+            })
+            .to_string(),
+        };
+
+        let mapped = map_laguna_function_call_to_codex(call);
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapped.arguments).unwrap(),
+            json!({"cmd": "mkdir -p src", "workdir": "/tmp/correct-path"})
+        );
+    }
+
+    #[test]
+    fn preserves_relative_cd_commands_inside_the_codex_workdir() {
+        let call = AgentFunctionCall {
+            name: LAGUNA_SHELL.to_string(),
+            arguments: json!({
+                "cmd": "cd crates/core && cargo test",
+                "workdir": "/tmp/project"
+            })
+            .to_string(),
+        };
+
+        let mapped = map_laguna_function_call_to_codex(call);
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapped.arguments).unwrap(),
+            json!({"cmd": "cd crates/core && cargo test", "workdir": "/tmp/project"})
+        );
+    }
+
+    #[test]
+    fn renders_codex_freeform_apply_patch_as_a_laguna_function() {
+        let patch = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+        let prompt = render_laguna_codex_prompt(
+            "Edit the workspace.",
+            &[
+                json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Create hello.txt"}]}),
+                json!({"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "call_1"}),
+                json!({"type": "custom_tool_call_output", "call_id": "call_1", "output": "Done!"}),
+            ],
+            &[json!({
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch"
+            })],
+            LagunaThinkingMode::Disabled,
+        )
+        .unwrap();
+
+        assert!(prompt.rendered.contains("\"name\":\"apply_patch\""));
+        assert!(prompt.rendered.contains("\"patch\":{\"description\""));
+        assert!(prompt
+            .rendered
+            .contains("<tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch"));
+        assert!(!prompt.rendered.contains(
+            "<tool_call>shell<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        ));
+        assert!(prompt
+            .rendered
+            .contains("<tool_response>Done!</tool_response>"));
+        assert!(prompt
+            .rendered
+            .contains("Batch workspace inspection into as few shell calls as practical"));
+    }
+
+    #[test]
+    fn renders_laguna_codex_prompt_without_reasoning_when_disabled() {
+        let prompt = render_laguna_codex_prompt(
+            "Answer directly.",
+            &[json!({"type": "message", "role": "user", "content": "Hello"})],
+            &[],
+            LagunaThinkingMode::Disabled,
+        )
+        .unwrap();
+
+        assert!(prompt.rendered.ends_with("<assistant><think></think>"));
+    }
+
+    #[test]
+    fn preserves_xs_reasoning_before_a_historical_tool_call() {
+        let prompt = render_laguna_xs_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "message", "role": "user", "content": "Inspect the workspace"}),
+                json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": "I should list the files first."
+                    }],
+                    "summary": []
+                }),
+                json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "call_id": "call_1"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "README.md"
+                }),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type": "object"}
+            })],
+            LagunaThinkingMode::Enabled,
+        )
+        .unwrap();
+
+        assert!(prompt
+            .rendered
+            .contains("<assistant><think>I should list the files first.</think><tool_call>shell"));
+        assert!(prompt.rendered.ends_with("<assistant><think>"));
+    }
+
+    #[test]
+    fn keeps_laguna_s_reasoning_history_omitted() {
+        let prompt = render_laguna_codex_prompt(
+            "Work carefully.",
+            &[
+                json!({"type": "reasoning", "content": [{
+                    "type": "reasoning_text",
+                    "text": "Do not replay this."
+                }]}),
+                json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                    "call_id": "call_1"
+                }),
+            ],
+            &[json!({
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {"type": "object"}
+            })],
+            LagunaThinkingMode::Enabled,
+        )
+        .unwrap();
+
+        assert!(!prompt.rendered.contains("Do not replay this."));
+        assert!(prompt
+            .rendered
+            .contains("<assistant></think><tool_call>shell"));
+    }
+
+    #[test]
     fn omits_codex_tools_outside_glms_direct_function_contract() {
         let prompt = render_codex_prompt(
             "",
@@ -420,6 +1166,16 @@ mod tests {
     }
 
     #[test]
+    fn uses_the_final_reasoning_boundary_when_laguna_repeats_it() {
+        let output = parse_agent_output("</think>draft answer</think>The final answer.").unwrap();
+
+        assert_eq!(
+            output.items,
+            vec![AgentOutputItem::Text("The final answer.".to_string())]
+        );
+    }
+
+    #[test]
     fn parses_glm_tool_arguments_into_responses_json() {
         let output = parse_agent_output(
             "inspect files</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>cargo test</arg_value><arg_key>yield_time_ms</arg_key><arg_value>30000</arg_value></tool_call>",
@@ -435,6 +1191,155 @@ mod tests {
             serde_json::from_str::<Value>(&call.arguments).unwrap(),
             json!({"cmd": "cargo test", "yield_time_ms": 30000})
         );
+    }
+
+    #[test]
+    fn detects_only_complete_valid_agent_tool_calls() {
+        assert_eq!(
+            parse_complete_agent_tool_call("still thinking").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_complete_agent_tool_call(
+                "done</think><tool_call>exec_command<arg_key>cmd</arg_key>"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_complete_agent_tool_call("done</think>Visible text only.").unwrap(),
+            None
+        );
+
+        let parsed = parse_complete_agent_tool_call(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap()
+        .expect("expected a complete function call");
+        assert!(matches!(
+            parsed.items.as_slice(),
+            [AgentOutputItem::FunctionCall(_)]
+        ));
+    }
+
+    #[test]
+    fn classifies_truncated_agent_protocol_as_incomplete() {
+        assert_eq!(
+            parse_agent_output_if_complete("still thinking").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_agent_output_if_complete(
+                "done</think><tool_call>exec_command<arg_key>cmd</arg_key>"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_agent_output_if_complete("done</think>Creating the file.<tool").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_complete_direct_and_tool_agent_outputs() {
+        let direct = parse_agent_output_if_complete("done</think>The answer is Rome.")
+            .unwrap()
+            .expect("expected complete direct output");
+        assert_eq!(
+            direct.items,
+            vec![AgentOutputItem::Text("The answer is Rome.".to_string())]
+        );
+
+        let tool = parse_agent_output_if_complete(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pwd</arg_value></tool_call>",
+        )
+        .unwrap()
+        .expect("expected complete tool output");
+        assert!(matches!(
+            tool.items.as_slice(),
+            [AgentOutputItem::FunctionCall(_)]
+        ));
+    }
+
+    #[test]
+    fn complete_but_malformed_agent_protocol_remains_an_error() {
+        let error = parse_agent_output_if_complete(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key></tool_call>",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("<arg_value>"));
+    }
+
+    #[test]
+    fn complete_apply_patch_body_remains_recoverable_at_generation_end() {
+        let output = parse_agent_output_if_complete(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch",
+        )
+        .unwrap()
+        .expect("expected recoverable apply_patch output");
+
+        assert!(matches!(
+            output.items.as_slice(),
+            [AgentOutputItem::FunctionCall(call)] if call.name == "apply_patch"
+        ));
+    }
+
+    #[test]
+    fn streams_visible_text_without_exposing_protocol_prefixes() {
+        assert_eq!(streamable_agent_text("still thinking"), None);
+        assert_eq!(
+            streamable_agent_text("done</think>Creating the file."),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text("done</think>\n\nCreating the file."),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text("done</think>Creating the file.<tool"),
+            Some("Creating the file.")
+        );
+        assert_eq!(
+            streamable_agent_text(
+                "done</think>Creating the file.<tool_call>exec_command<arg_key>cmd"
+            ),
+            Some("Creating the file.")
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_completed_agent_tool_call() {
+        let error = parse_complete_agent_tool_call(
+            "done</think><tool_call>exec_command<arg_key>cmd</arg_key></tool_call>",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("<arg_value>"));
+    }
+
+    #[test]
+    fn recovers_a_complete_apply_patch_with_only_the_xml_suffix_missing() {
+        let output = parse_agent_output(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch",
+        )
+        .unwrap();
+        let AgentOutputItem::FunctionCall(call) = &output.items[0] else {
+            panic!("expected function call");
+        };
+        assert_eq!(call.name, "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"patch": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"})
+        );
+    }
+
+    #[test]
+    fn rejects_an_apply_patch_whose_patch_body_is_incomplete() {
+        assert!(parse_agent_output(
+            "done</think><tool_call>apply_patch<arg_key>patch</arg_key><arg_value>*** Begin Patch\n*** Add File: hello.txt\n+hello"
+        )
+        .is_err());
     }
 
     #[test]
