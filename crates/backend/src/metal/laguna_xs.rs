@@ -29,6 +29,8 @@ const EXPERT_GATE_UP_ROWS_PER_SIMDGROUP: usize = 1;
 // Top-8 down already carries eight dot products; one row preserves occupancy.
 const EXPERT_DOWN_ROWS_PER_SIMDGROUP: usize = 1;
 const EXPERT_DOWN_PARALLEL_SIMDGROUPS: usize = 4;
+const MOE_SHARED_DOWN_SIMDGROUPS: usize = 5;
+const OUTPUT_ARGMAX_ROWS_PER_THREADGROUP: usize = SIMDGROUPS_PER_THREADGROUP * 2;
 const KERNEL_SOURCE: &str = include_str!("kernels/laguna_xs_kernels.metal");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +57,8 @@ struct LagunaXsPipelines {
     q6_matvec: ComputePipelineState,
     q4_decode_matvec: ComputePipelineState,
     q6_decode_matvec: ComputePipelineState,
+    q4_output_argmax_candidates: ComputePipelineState,
+    q6_output_argmax_candidates: ComputePipelineState,
     q4_decode_matvec_residuals: ComputePipelineState,
     q6_decode_matvec_residuals: ComputePipelineState,
     q4_gate_up_swiglu_decode: ComputePipelineState,
@@ -70,6 +74,9 @@ struct LagunaXsPipelines {
     q6_expert_down: ComputePipelineState,
     q4_expert_down_parallel: ComputePipelineState,
     q6_expert_down_parallel: ComputePipelineState,
+    q4_moe_shared_gate_up: ComputePipelineState,
+    q4_moe_shared_down: ComputePipelineState,
+    q6_moe_shared_down: ComputePipelineState,
 }
 
 impl MetalLagunaXs {
@@ -102,6 +109,16 @@ impl MetalLagunaXs {
                     device,
                     &library,
                     "laguna_xs_q6_k_decode_matvec_f32_kernel",
+                )?,
+                q4_output_argmax_candidates: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_q4_k_output_argmax_candidates_f32_kernel",
+                )?,
+                q6_output_argmax_candidates: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_q6_k_output_argmax_candidates_f32_kernel",
                 )?,
                 q4_decode_matvec_residuals: compute_pipeline(
                     device,
@@ -178,6 +195,21 @@ impl MetalLagunaXs {
                     &library,
                     "laguna_xs_q6_expert_down_parallel_f32_kernel",
                 )?,
+                q4_moe_shared_gate_up: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_q4_moe_shared_gate_up_f32_kernel",
+                )?,
+                q4_moe_shared_down: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_q4_moe_shared_down_f32_kernel",
+                )?,
+                q6_moe_shared_down: compute_pipeline(
+                    device,
+                    &library,
+                    "laguna_xs_q6_moe_shared_down_f32_kernel",
+                )?,
             });
         }
         Ok(pipelines)
@@ -249,6 +281,61 @@ impl MetalLagunaXs {
             SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
         )?;
         Ok(output)
+    }
+
+    pub(crate) fn encode_matvec_argmax_candidates(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        quant: GgufKQuant,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(Buffer, Buffer, usize)> {
+        validate_k_dimensions(1, in_features, out_features)?;
+        if !out_features.is_multiple_of(2) {
+            return Err(Error::backend(format!(
+                "Laguna XS output-head vocabulary must be even, got {out_features}"
+            )));
+        }
+        if input_len != in_features {
+            return Err(Error::backend(format!(
+                "Laguna XS output head expected {in_features} input values, got {input_len}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Laguna XS output-head input")?;
+        validate_weight_len(quant, weights, in_features, out_features)?;
+
+        let candidate_count = out_features.div_ceil(OUTPUT_ARGMAX_ROWS_PER_THREADGROUP);
+        let candidate_ids = self.arena.empty_u32(candidate_count)?;
+        let candidate_scores = self.arena.empty_f32(candidate_count)?;
+        let weight = self.weight_buffer(device, weights)?;
+        let pipelines = self.pipelines(device)?;
+        let pipelines = pipelines
+            .as_ref()
+            .ok_or_else(|| Error::backend("Laguna XS Metal pipelines were not initialized"))?;
+        let pipeline = match quant {
+            GgufKQuant::Q4K => &pipelines.q4_output_argmax_candidates,
+            GgufKQuant::Q6K => &pipelines.q6_output_argmax_candidates,
+        };
+        let args = [
+            KernelArg::BufferOffset(&weight.storage, weight.byte_offset),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(&candidate_ids),
+            KernelArg::Buffer(&candidate_scores),
+            KernelArg::U32(as_u32(in_features, "input feature count")?),
+            KernelArg::U32(as_u32(out_features, "output feature count")?),
+        ];
+        encode_1d_threadgroups_args(
+            command_buffer,
+            pipeline,
+            &args,
+            candidate_count,
+            SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
+        )?;
+        Ok((candidate_ids, candidate_scores, candidate_count))
     }
 
     pub(crate) fn encode_router_topk(
@@ -907,6 +994,152 @@ impl MetalLagunaXs {
                 SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
             )?;
         }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_moe_shared(
+        &self,
+        command_buffer: &CommandBufferRef,
+        device: &Device,
+        routed_gate_weights: &[u8],
+        routed_up_weights: &[u8],
+        routed_down_weights: &[u8],
+        shared_gate_weights: &[u8],
+        shared_up_weights: &[u8],
+        shared_down_weights: &[u8],
+        down_quant: GgufKQuant,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        residual: &Buffer,
+        residual_len: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        const TOP_K: usize = 8;
+        const ASSIGNMENT_COUNT: usize = TOP_K + 1;
+        if routing.token_count != 1 || routing.top_k != TOP_K {
+            return Err(Error::backend(format!(
+                "Laguna XS fused MoE requires one token and top-{TOP_K}, got tokens={} top-k={}",
+                routing.token_count, routing.top_k
+            )));
+        }
+        if !out_features.is_multiple_of(2) {
+            return Err(Error::backend(format!(
+                "Laguna XS fused MoE output width must be even, got {out_features}"
+            )));
+        }
+        if input_len != in_features || residual_len != out_features {
+            return Err(Error::backend(format!(
+                "Laguna XS fused MoE expected input/residual lengths {in_features}/{out_features}, got {input_len}/{residual_len}"
+            )));
+        }
+        require_f32_capacity(input, input_len, "Laguna XS fused MoE input")?;
+        require_f32_capacity(residual, residual_len, "Laguna XS fused MoE residual")?;
+        let routed_rows = intermediate_features
+            .checked_mul(routing.expert_count)
+            .ok_or_else(|| Error::backend("Laguna XS routed expert row count overflow"))?;
+        let routed_down_rows = out_features
+            .checked_mul(routing.expert_count)
+            .ok_or_else(|| Error::backend("Laguna XS routed down row count overflow"))?;
+        validate_weight_len(
+            GgufKQuant::Q4K,
+            routed_gate_weights,
+            in_features,
+            routed_rows,
+        )?;
+        validate_weight_len(GgufKQuant::Q4K, routed_up_weights, in_features, routed_rows)?;
+        validate_weight_len(
+            down_quant,
+            routed_down_weights,
+            intermediate_features,
+            routed_down_rows,
+        )?;
+        validate_weight_len(
+            GgufKQuant::Q4K,
+            shared_gate_weights,
+            in_features,
+            intermediate_features,
+        )?;
+        validate_weight_len(
+            GgufKQuant::Q4K,
+            shared_up_weights,
+            in_features,
+            intermediate_features,
+        )?;
+        validate_weight_len(
+            down_quant,
+            shared_down_weights,
+            intermediate_features,
+            out_features,
+        )?;
+
+        let intermediate_len = ASSIGNMENT_COUNT
+            .checked_mul(intermediate_features)
+            .ok_or_else(|| Error::backend("Laguna XS fused MoE intermediate overflow"))?;
+        let intermediate = self.arena.empty_f32(intermediate_len)?;
+        let output = self.arena.empty_f32(out_features)?;
+        let routed_gate = self.weight_buffer(device, routed_gate_weights)?;
+        let routed_up = self.weight_buffer(device, routed_up_weights)?;
+        let routed_down = self.weight_buffer(device, routed_down_weights)?;
+        let shared_gate = self.weight_buffer(device, shared_gate_weights)?;
+        let shared_up = self.weight_buffer(device, shared_up_weights)?;
+        let shared_down = self.weight_buffer(device, shared_down_weights)?;
+        let pipelines = self.pipelines(device)?;
+        let pipelines = pipelines
+            .as_ref()
+            .ok_or_else(|| Error::backend("Laguna XS Metal pipelines were not initialized"))?;
+
+        let gate_args = [
+            KernelArg::BufferOffset(&routed_gate.storage, routed_gate.byte_offset),
+            KernelArg::BufferOffset(&routed_up.storage, routed_up.byte_offset),
+            KernelArg::BufferOffset(&shared_gate.storage, shared_gate.byte_offset),
+            KernelArg::BufferOffset(&shared_up.storage, shared_up.byte_offset),
+            KernelArg::Buffer(input),
+            KernelArg::Buffer(&routing.expert_ids),
+            KernelArg::Buffer(&routing.expert_weights),
+            KernelArg::Buffer(&intermediate),
+            KernelArg::U32(TOP_K as u32),
+            KernelArg::U32(as_u32(routing.expert_count, "expert count")?),
+            KernelArg::U32(as_u32(in_features, "input width")?),
+            KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+        ];
+        let gate_simdgroups = ASSIGNMENT_COUNT
+            .checked_mul(intermediate_features)
+            .ok_or_else(|| Error::backend("Laguna XS fused gate/up grid overflow"))?;
+        encode_1d_threadgroups_args(
+            command_buffer,
+            &pipelines.q4_moe_shared_gate_up,
+            &gate_args,
+            gate_simdgroups.div_ceil(SIMDGROUPS_PER_THREADGROUP),
+            SIMDGROUPS_PER_THREADGROUP * SIMD_LANES,
+        )?;
+
+        let down_args = [
+            KernelArg::BufferOffset(&routed_down.storage, routed_down.byte_offset),
+            KernelArg::BufferOffset(&shared_down.storage, shared_down.byte_offset),
+            KernelArg::Buffer(&routing.expert_ids),
+            KernelArg::Buffer(&intermediate),
+            KernelArg::Buffer(residual),
+            KernelArg::Buffer(&output),
+            KernelArg::U32(TOP_K as u32),
+            KernelArg::U32(as_u32(routing.expert_count, "expert count")?),
+            KernelArg::U32(as_u32(intermediate_features, "intermediate width")?),
+            KernelArg::U32(as_u32(out_features, "output width")?),
+        ];
+        let down_pipeline = match down_quant {
+            GgufKQuant::Q4K => &pipelines.q4_moe_shared_down,
+            GgufKQuant::Q6K => &pipelines.q6_moe_shared_down,
+        };
+        encode_1d_threadgroups_args(
+            command_buffer,
+            down_pipeline,
+            &down_args,
+            out_features / 2,
+            MOE_SHARED_DOWN_SIMDGROUPS * SIMD_LANES,
+        )?;
         Ok(output)
     }
 
@@ -1586,6 +1819,32 @@ mod tests {
     }
 
     #[test]
+    fn fused_output_argmax_matches_q4_and_q6_scores_and_ties() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let width = K_BLOCK_VALUES;
+        let row_values = [1_u8, 3, 2, 3, 0, 2, 1, 0];
+        let input = F32Tensor::new(vec![1.0 / width as f32; width], [1, width]).unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+
+        for (weights, quant) in [
+            (q4_expert_matrix(&row_values, width, 1), GgufKQuant::Q4K),
+            (q6_expert_matrix(&row_values, width, 1), GgufKQuant::Q6K),
+        ] {
+            let (token_id, token_score) = backend
+                .laguna_xs_k_matvec_argmax_device(quant, &weights, &input, width, row_values.len())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                token_id, 1,
+                "{quant:?} must keep the lowest token id on ties"
+            );
+            assert_close(token_score, 3.0, "fused output-head score");
+        }
+    }
+
+    #[test]
     fn q4_gate_up_routed_moe_supports_q4_and_q6_down_projections() {
         let Ok(backend) = MetalBackend::new() else {
             return;
@@ -1694,6 +1953,85 @@ mod tests {
                 assert!(
                     (value - expected).abs() <= tolerance,
                     "top-8 MoE {down_quant:?} value={value}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_top8_shared_moe_matches_the_known_sum() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let expert_count = 8;
+        let top_k = 8;
+        let width = K_BLOCK_VALUES;
+        let input = F32Tensor::new(vec![1.0 / width as f32; width], [1, width]).unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+        let residual = F32Tensor::new(vec![0.25_f32; width], [1, width]).unwrap();
+        let residual = backend
+            .device_upload_f32_tensor(&residual)
+            .unwrap()
+            .unwrap();
+        let logits = F32Tensor::new(vec![0.0_f32; expert_count], [1, expert_count]).unwrap();
+        let logits = backend.device_upload_f32_tensor(&logits).unwrap().unwrap();
+        let routing = backend
+            .moe_router_topk_resident_device(&logits, &vec![0.0; expert_count], top_k, true, 1.0)
+            .unwrap()
+            .unwrap();
+        let expert_values = (1_u8..=expert_count as u8).collect::<Vec<_>>();
+        let routed_gate = q4_expert_matrix(&expert_values, width, width);
+        let routed_up = q4_expert_matrix(&expert_values, width, width);
+        let shared_gate = q4_expert_matrix(&[2], width, width);
+        let shared_up = q4_expert_matrix(&[3], width, width);
+        let expected_routed = expert_values
+            .iter()
+            .map(|value| {
+                let value = f32::from(*value);
+                (width as f32 / top_k as f32) * value * value / (1.0 + (-value).exp())
+            })
+            .sum::<f32>();
+        let expected_shared = width as f32 * 6.0 / (1.0 + (-2.0_f32).exp());
+        let expected = 0.25 + expected_routed + expected_shared;
+
+        for (routed_down, shared_down, down_quant) in [
+            (
+                q4_expert_matrix(&vec![1; expert_count], width, width),
+                q4_expert_matrix(&[1], width, width),
+                GgufKQuant::Q4K,
+            ),
+            (
+                q6_expert_matrix(&vec![1; expert_count], width, width),
+                q6_expert_matrix(&[1], width, width),
+                GgufKQuant::Q6K,
+            ),
+        ] {
+            let output = backend
+                .laguna_xs_gguf_moe_shared_device(
+                    &routed_gate,
+                    &routed_up,
+                    &routed_down,
+                    &shared_gate,
+                    &shared_up,
+                    &shared_down,
+                    down_quant,
+                    &input,
+                    &routing,
+                    &residual,
+                    width,
+                    width,
+                    width,
+                )
+                .unwrap()
+                .unwrap();
+            let output = backend.device_download_f32_tensor(&output).unwrap();
+
+            assert_eq!(output.dims(), &[1, width]);
+            for value in output.values() {
+                let tolerance = expected.abs() * 1e-5;
+                assert!(
+                    (value - expected).abs() <= tolerance,
+                    "fused MoE {down_quant:?} value={value}, expected={expected}"
                 );
             }
         }

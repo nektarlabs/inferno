@@ -1874,6 +1874,48 @@ impl Metal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_laguna_xs_gguf_moe_shared(
+        &self,
+        routed_gate_weights: &[u8],
+        routed_up_weights: &[u8],
+        routed_down_weights: &[u8],
+        shared_gate_weights: &[u8],
+        shared_up_weights: &[u8],
+        shared_down_weights: &[u8],
+        down_quant: GgufKQuant,
+        input: &Buffer,
+        input_len: usize,
+        routing: &DeviceRouterTopK,
+        residual: &Buffer,
+        residual_len: usize,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.laguna_xs.encode_moe_shared(
+                command_buffer,
+                &self.device,
+                routed_gate_weights,
+                routed_up_weights,
+                routed_down_weights,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_down_weights,
+                down_quant,
+                input,
+                input_len,
+                routing,
+                residual,
+                residual_len,
+                in_features,
+                intermediate_features,
+                out_features,
+            )
+        })
+    }
+
     pub(crate) fn prepare_w4_groupwise_weight(
         &self,
         packed: &[u8],
@@ -2739,6 +2781,47 @@ impl Metal {
             .into_iter()
             .next()
             .ok_or_else(|| Error::backend("Laguna Q8_0 argmax produced no token score"))?;
+        Ok((token_id, token_score))
+    }
+
+    pub(crate) fn batched_laguna_xs_k_matvec_argmax(
+        &self,
+        quant: GgufKQuant,
+        weights: &[u8],
+        input: &Buffer,
+        input_len: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(u32, f32)> {
+        let (token_id_buffer, token_score_buffer) =
+            self.batch.encode(&self.queue, |command_buffer| {
+                let (candidate_ids, candidate_scores, candidate_count) =
+                    self.laguna_xs.encode_matvec_argmax_candidates(
+                        command_buffer,
+                        &self.device,
+                        quant,
+                        weights,
+                        input,
+                        input_len,
+                        in_features,
+                        out_features,
+                    )?;
+                self.q2_matvec.encode_candidate_argmax(
+                    command_buffer,
+                    &candidate_ids,
+                    &candidate_scores,
+                    candidate_count,
+                )
+            })?;
+        self.batch_flush()?;
+        let token_id = read_u32_buffer(&token_id_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("Laguna XS argmax produced no token id"))?;
+        let token_score = read_f32_buffer(&token_score_buffer, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::backend("Laguna XS argmax produced no token score"))?;
         Ok((token_id, token_score))
     }
 

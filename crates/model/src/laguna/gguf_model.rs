@@ -30,8 +30,12 @@ const LAYER_SUBMISSION_CHUNK: usize = 1;
 /// memory on long Codex prompts. Eight layers preserve CPU/GPU overlap while
 /// bounding that transient working set. Decode remains fully asynchronous.
 const LAGUNA_XS_PREFILL_LAYERS_IN_FLIGHT: usize = 8;
-const LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT: usize = 6_144;
-const LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS: usize = 512;
+const LAGUNA_XS_GROUPED_KV_MEDIUM_MIN_CONTEXT: usize = 1_536;
+const LAGUNA_XS_GROUPED_KV_MEDIUM_SEGMENT_TOKENS: usize = 128;
+const LAGUNA_XS_GROUPED_KV_LONG_MIN_CONTEXT: usize = 6_144;
+const LAGUNA_XS_GROUPED_KV_LONG_SEGMENT_TOKENS: usize = 512;
+const LAGUNA_XS_SLIDING_GROUPED_KV_MIN_CONTEXT: usize = 384;
+const LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS: usize = 32;
 
 #[derive(Debug)]
 pub struct LagunaGgufModel {
@@ -277,18 +281,15 @@ impl LagunaGgufModel {
                     })?
             }
             LagunaGgufFlavor::Xs21Q4KM => {
-                let scores = self
-                    .xs_matvec(
-                        &self.index.root.output,
+                let (quant, output) = self.k_bytes(&self.index.root.output)?;
+                backend
+                    .laguna_xs_k_matvec_argmax_device(
+                        quant,
+                        output,
                         &normalized,
-                        1,
                         self.config.hidden_size,
                         self.config.vocab_size,
-                        backend,
                     )?
-                    .reshape(vec![self.config.vocab_size])?;
-                backend
-                    .argmax_f32_device(&scores)?
                     .ok_or_else(|| Error::backend("Laguna XS argmax requires native Metal"))?
             }
         };
@@ -837,6 +838,49 @@ impl LagunaGgufModel {
                     )));
                 }
                 let down_quant = k_quant(routed_down.block)?;
+                let shared_gate = self.index.quantized_storage(&moe.shared.gate)?;
+                let shared_up = self.index.quantized_storage(&moe.shared.up)?;
+                let shared_down = self.index.quantized_storage(&moe.shared.down)?;
+                if shared_gate.block != GgufQuantBlockKind::Q4K
+                    || shared_up.block != GgufQuantBlockKind::Q4K
+                {
+                    return Err(Error::weights(format!(
+                        "Laguna XS shared gate/up must be Q4_K, got {}/{}",
+                        shared_gate.block, shared_up.block
+                    )));
+                }
+                let shared_down_quant = k_quant(shared_down.block)?;
+                if shared_down_quant != down_quant {
+                    return Err(Error::weights(format!(
+                        "Laguna XS routed/shared down quantization must match, got {down_quant:?}/{shared_down_quant:?}"
+                    )));
+                }
+                if row_count == 1 {
+                    let flat_residual =
+                        residual.reshape(vec![row_count, self.config.hidden_size])?;
+                    if let Some(output) = backend.laguna_xs_gguf_moe_shared_device(
+                        routed_gate.bytes,
+                        routed_up.bytes,
+                        routed_down.bytes,
+                        shared_gate.bytes,
+                        shared_up.bytes,
+                        shared_down.bytes,
+                        down_quant,
+                        &flat_input,
+                        &routing,
+                        &flat_residual,
+                        self.config.hidden_size,
+                        self.config.moe_intermediate_size,
+                        self.config.hidden_size,
+                    )? {
+                        profile_prefill_boundary(
+                            backend,
+                            row_count,
+                            "laguna.prefill.routed_experts",
+                        )?;
+                        return output.reshape(residual.dims().to_vec());
+                    }
+                }
                 let routed = required(
                     "Laguna XS GGUF routed experts",
                     backend.laguna_xs_gguf_moe_device(
@@ -1416,9 +1460,19 @@ const fn attention_decode_strategy(
 ) -> LagunaF16DecodeStrategy {
     match (flavor, retention) {
         (LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Full) => {
-            LagunaF16DecodeStrategy::SegmentedGroupedKv {
-                min_context_tokens: LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
-                segment_tokens: LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+            LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                medium_min_context_tokens: LAGUNA_XS_GROUPED_KV_MEDIUM_MIN_CONTEXT,
+                medium_segment_tokens: LAGUNA_XS_GROUPED_KV_MEDIUM_SEGMENT_TOKENS,
+                long_min_context_tokens: LAGUNA_XS_GROUPED_KV_LONG_MIN_CONTEXT,
+                long_segment_tokens: LAGUNA_XS_GROUPED_KV_LONG_SEGMENT_TOKENS,
+            }
+        }
+        (LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Sliding) => {
+            LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                medium_min_context_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_MIN_CONTEXT,
+                medium_segment_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS,
+                long_min_context_tokens: usize::MAX,
+                long_segment_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS,
             }
         }
         _ => LagunaF16DecodeStrategy::QueryParallel,
@@ -1431,22 +1485,31 @@ mod tests {
 
     use super::{
         attention_decode_strategy, should_flush_xs_prefill_after_layer, should_submit_after_layer,
-        LagunaGgufFlavor, LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
-        LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+        LagunaGgufFlavor, LAGUNA_XS_GROUPED_KV_LONG_MIN_CONTEXT,
+        LAGUNA_XS_GROUPED_KV_LONG_SEGMENT_TOKENS, LAGUNA_XS_GROUPED_KV_MEDIUM_MIN_CONTEXT,
+        LAGUNA_XS_GROUPED_KV_MEDIUM_SEGMENT_TOKENS, LAGUNA_XS_SLIDING_GROUPED_KV_MIN_CONTEXT,
+        LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS,
     };
 
     #[test]
     fn grouped_kv_decode_is_isolated_to_laguna_xs_full_attention() {
         assert_eq!(
             attention_decode_strategy(LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Full),
-            LagunaF16DecodeStrategy::SegmentedGroupedKv {
-                min_context_tokens: LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
-                segment_tokens: LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+            LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                medium_min_context_tokens: LAGUNA_XS_GROUPED_KV_MEDIUM_MIN_CONTEXT,
+                medium_segment_tokens: LAGUNA_XS_GROUPED_KV_MEDIUM_SEGMENT_TOKENS,
+                long_min_context_tokens: LAGUNA_XS_GROUPED_KV_LONG_MIN_CONTEXT,
+                long_segment_tokens: LAGUNA_XS_GROUPED_KV_LONG_SEGMENT_TOKENS,
             }
         );
         assert_eq!(
             attention_decode_strategy(LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Sliding),
-            LagunaF16DecodeStrategy::QueryParallel
+            LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                medium_min_context_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_MIN_CONTEXT,
+                medium_segment_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS,
+                long_min_context_tokens: usize::MAX,
+                long_segment_tokens: LAGUNA_XS_SLIDING_GROUPED_KV_SEGMENT_TOKENS,
+            }
         );
         assert_eq!(
             attention_decode_strategy(LagunaGgufFlavor::S21Q2Q3, LagunaKvRetention::Full),

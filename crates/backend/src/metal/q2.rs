@@ -3176,14 +3176,8 @@ impl MetalQ2Matvec {
 
         let candidate_count = out_features.div_ceil(LAGUNA_Q8_0_ARGMAX_ROWS);
         let simdgroups_per_output = LAGUNA_Q8_0_SIMDGROUPS_PER_OUTPUT.min(blocks_per_row);
-        let argmax_threads = argmax_threads(
-            &self.argmax_candidates_pipeline,
-            "Laguna Q8_0 output-head candidate argmax",
-        )?;
         let candidate_ids = self.arena.empty_u32(candidate_count)?;
         let candidate_scores = self.arena.empty_f32(candidate_count)?;
-        let token_id = self.arena.empty_u32(1)?;
-        let token_score = self.arena.empty_f32(1)?;
         let in_features_buffer = self.arena.u32(matvec_u32(in_features, "in_features")?)?;
         let out_features_buffer = self.arena.u32(matvec_u32(out_features, "out_features")?)?;
         let blocks_per_row_buffer = self
@@ -3192,9 +3186,6 @@ impl MetalQ2Matvec {
         let simdgroups_per_output_buffer = self
             .arena
             .u32(matvec_u32(simdgroups_per_output, "simdgroups_per_output")?)?;
-        let candidate_count_buffer = self
-            .arena
-            .u32(matvec_u32(candidate_count, "candidate_count")?)?;
 
         encode_1d_threadgroups_with_offsets(
             command_buffer,
@@ -3212,12 +3203,46 @@ impl MetalQ2Matvec {
             candidate_count,
             simdgroups_per_output * Q2_K_SIMD_LANES,
         )?;
+        self.encode_candidate_argmax(
+            command_buffer,
+            &candidate_ids,
+            &candidate_scores,
+            candidate_count,
+        )
+    }
+
+    pub(crate) fn encode_candidate_argmax(
+        &self,
+        command_buffer: &CommandBufferRef,
+        candidate_ids: &Buffer,
+        candidate_scores: &Buffer,
+        candidate_count: usize,
+    ) -> Result<(Buffer, Buffer)> {
+        if candidate_count == 0 {
+            return Err(Error::backend(
+                "candidate argmax requires at least one candidate",
+            ));
+        }
+        let candidate_id_bytes = candidate_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| Error::backend("argmax candidate id byte count overflow"))?;
+        require_byte_capacity(candidate_ids, candidate_id_bytes, "argmax candidate ids")?;
+        require_f32_capacity(candidate_scores, candidate_count, "argmax candidate scores")?;
+        let argmax_threads = argmax_threads(
+            &self.argmax_candidates_pipeline,
+            "candidate argmax reduction",
+        )?;
+        let token_id = self.arena.empty_u32(1)?;
+        let token_score = self.arena.empty_f32(1)?;
+        let candidate_count_buffer = self
+            .arena
+            .u32(matvec_u32(candidate_count, "candidate_count")?)?;
         encode_1d(
             command_buffer,
             &self.argmax_candidates_pipeline,
             &[
-                &candidate_ids,
-                &candidate_scores,
+                candidate_ids,
+                candidate_scores,
                 &token_id,
                 &token_score,
                 &candidate_count_buffer,

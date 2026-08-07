@@ -15,6 +15,7 @@ constant uint LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP = 4u;
 constant uint LAGUNA_XS_EXPERT_GATE_UP_ROWS_PER_SIMDGROUP = 1u;
 constant uint LAGUNA_XS_EXPERT_DOWN_ROWS_PER_SIMDGROUP = 1u;
 constant uint LAGUNA_XS_EXPERT_DOWN_PARALLEL_SIMDGROUPS = 4u;
+constant uint LAGUNA_XS_MOE_SHARED_DOWN_SIMDGROUPS = 5u;
 
 struct LagunaXsQ4KBlock {
     half d;
@@ -700,6 +701,157 @@ kernel void laguna_xs_q6_k_decode_matvec_f32_kernel(
         output[first_output_row] = first_sum;
         output[first_output_row + 1u] = second_sum;
     }
+}
+
+struct LagunaXsQ4DecodePairOperations {
+    static inline float2 lane_dot(
+        const device LagunaXsQ4KBlock* weights,
+        const device float* input,
+        uint blocks_per_row,
+        uint first_output_row,
+        ushort simd_lane
+    ) {
+        return laguna_xs_q4_decode_row_pair_dot(
+            weights,
+            input,
+            blocks_per_row,
+            first_output_row,
+            simd_lane);
+    }
+};
+
+struct LagunaXsQ6DecodePairOperations {
+    static inline float2 lane_dot(
+        const device LagunaXsQ6KBlock* weights,
+        const device float* input,
+        uint blocks_per_row,
+        uint first_output_row,
+        ushort simd_lane
+    ) {
+        return laguna_xs_q6_decode_row_pair(
+            weights,
+            input,
+            blocks_per_row,
+            first_output_row,
+            simd_lane);
+    }
+};
+
+template <typename Block, typename Operations>
+static inline void laguna_xs_output_argmax_candidates(
+    const device Block* weights,
+    const device float* input,
+    device uint* candidate_ids,
+    device float* candidate_scores,
+    threadgroup float* group_scores,
+    uint in_features,
+    uint out_features,
+    uint3 threadgroup_position,
+    ushort simd_lane,
+    ushort simdgroup_index
+) {
+    uint first_output_row = (threadgroup_position.x
+        * LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP
+        + uint(simdgroup_index)) * 2u;
+    uint blocks_per_row = in_features / LAGUNA_XS_K_BLOCK_VALUES;
+    float2 scores = float2(-INFINITY);
+    if (first_output_row < out_features) {
+        float2 lane_dot = Operations::lane_dot(
+            weights,
+            input,
+            blocks_per_row,
+            first_output_row,
+            simd_lane);
+        scores = float2(simd_sum(lane_dot.x), simd_sum(lane_dot.y));
+    }
+
+    if (simd_lane == 0u) {
+        uint score_index = uint(simdgroup_index) * 2u;
+        group_scores[score_index] = scores.x;
+        group_scores[score_index + 1u] = scores.y;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u && simd_lane == 0u) {
+        uint group_first_row = threadgroup_position.x
+            * LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP * 2u;
+        float best_score = -INFINITY;
+        uint best_id = 0xffffffffu;
+        for (uint local_row = 0u;
+             local_row < LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP * 2u;
+             local_row++) {
+            uint token_id = group_first_row + local_row;
+            float score = group_scores[local_row];
+            if (token_id < out_features
+                && (score > best_score
+                    || (score == best_score && token_id < best_id))) {
+                best_score = score;
+                best_id = token_id;
+            }
+        }
+        candidate_ids[threadgroup_position.x] = best_id;
+        candidate_scores[threadgroup_position.x] = best_score;
+    }
+}
+
+kernel void laguna_xs_q4_k_output_argmax_candidates_f32_kernel(
+    const device LagunaXsQ4KBlock* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device uint* candidate_ids [[buffer(2)]],
+    device float* candidate_scores [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float group_scores[
+        LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP * 2u
+    ];
+    laguna_xs_output_argmax_candidates<
+        LagunaXsQ4KBlock,
+        LagunaXsQ4DecodePairOperations
+    >(
+        weights,
+        input,
+        candidate_ids,
+        candidate_scores,
+        group_scores,
+        in_features,
+        out_features,
+        threadgroup_position,
+        simd_lane,
+        simdgroup_index);
+}
+
+kernel void laguna_xs_q6_k_output_argmax_candidates_f32_kernel(
+    const device LagunaXsQ6KBlock* weights [[buffer(0)]],
+    const device float* input [[buffer(1)]],
+    device uint* candidate_ids [[buffer(2)]],
+    device float* candidate_scores [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float group_scores[
+        LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP * 2u
+    ];
+    laguna_xs_output_argmax_candidates<
+        LagunaXsQ6KBlock,
+        LagunaXsQ6DecodePairOperations
+    >(
+        weights,
+        input,
+        candidate_ids,
+        candidate_scores,
+        group_scores,
+        in_features,
+        out_features,
+        threadgroup_position,
+        simd_lane,
+        simdgroup_index);
 }
 
 static inline float2 laguna_xs_decode_value_row_pair(
@@ -1762,6 +1914,218 @@ kernel void laguna_xs_q6_expert_down_parallel_f32_kernel(
         intermediate_features,
         out_features,
         simdgroup_partials,
+        threadgroup_position,
+        simd_lane,
+        simdgroup_index);
+}
+
+kernel void laguna_xs_q4_moe_shared_gate_up_f32_kernel(
+    const device LagunaXsQ4KBlock* routed_gate_weights [[buffer(0)]],
+    const device LagunaXsQ4KBlock* routed_up_weights [[buffer(1)]],
+    const device LagunaXsQ4KBlock* shared_gate_weights [[buffer(2)]],
+    const device LagunaXsQ4KBlock* shared_up_weights [[buffer(3)]],
+    const device float* input [[buffer(4)]],
+    const device uint* expert_ids [[buffer(5)]],
+    const device float* expert_weights [[buffer(6)]],
+    device float* intermediate [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
+    constant uint& expert_count [[buffer(9)]],
+    constant uint& in_features [[buffer(10)]],
+    constant uint& intermediate_features [[buffer(11)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    uint simdgroup = threadgroup_position.x
+        * LAGUNA_XS_SIMDGROUPS_PER_THREADGROUP
+        + uint(simdgroup_index);
+    uint assignment = simdgroup / intermediate_features;
+    uint row = simdgroup - assignment * intermediate_features;
+    if (assignment > top_k || row >= intermediate_features) {
+        return;
+    }
+
+    uint blocks_per_row = in_features / LAGUNA_XS_K_BLOCK_VALUES;
+    const device LagunaXsQ4KBlock* gate_row;
+    const device LagunaXsQ4KBlock* up_row;
+    float routing_weight = 1.0f;
+    if (assignment < top_k) {
+        uint expert = expert_ids[assignment];
+        if (expert >= expert_count) {
+            return;
+        }
+        uint blocks_per_expert = intermediate_features * blocks_per_row;
+        gate_row = routed_gate_weights
+            + expert * blocks_per_expert + row * blocks_per_row;
+        up_row = routed_up_weights
+            + expert * blocks_per_expert + row * blocks_per_row;
+        routing_weight = expert_weights[assignment];
+    } else {
+        gate_row = shared_gate_weights + row * blocks_per_row;
+        up_row = shared_up_weights + row * blocks_per_row;
+    }
+
+    float2 gate_up = blocks_per_row == LAGUNA_XS_HIDDEN_BLOCKS
+        ? laguna_xs_q4_decode_hidden_two_rows_dot(
+            gate_row,
+            up_row,
+            input,
+            simd_lane)
+        : laguna_xs_q4_decode_two_rows_dot(
+            gate_row,
+            up_row,
+            input,
+            blocks_per_row,
+            simd_lane);
+    float gate = simd_sum(gate_up.x);
+    float up = simd_sum(gate_up.y);
+    if (simd_lane == 0u) {
+        intermediate[assignment * intermediate_features + row] =
+            gate / (1.0f + exp(-gate)) * up * routing_weight;
+    }
+}
+
+template <typename Block, typename Operations>
+static inline void laguna_xs_moe_shared_down(
+    const device Block* routed_down_weights,
+    const device Block* shared_down_weights,
+    const device uint* expert_ids,
+    const device float* intermediate,
+    const device float* residual,
+    device float* output,
+    uint top_k,
+    uint expert_count,
+    uint intermediate_features,
+    uint out_features,
+    threadgroup float2* simdgroup_partials,
+    uint3 threadgroup_position,
+    ushort simd_lane,
+    ushort simdgroup_index
+) {
+    uint first_row = threadgroup_position.x * 2u;
+    if (first_row >= out_features
+        || simdgroup_index >= LAGUNA_XS_MOE_SHARED_DOWN_SIMDGROUPS) {
+        return;
+    }
+    uint blocks_per_row = intermediate_features
+        / LAGUNA_XS_K_BLOCK_VALUES;
+    uint blocks_per_expert = out_features * blocks_per_row;
+    float2 partial = float2(0.0f);
+    if (simdgroup_index < LAGUNA_XS_EXPERT_DOWN_PARALLEL_SIMDGROUPS) {
+        for (uint slot = uint(simdgroup_index);
+             slot < top_k;
+             slot += LAGUNA_XS_EXPERT_DOWN_PARALLEL_SIMDGROUPS) {
+            uint expert = expert_ids[slot];
+            if (expert >= expert_count) {
+                continue;
+            }
+            const device Block* expert_weights = routed_down_weights
+                + expert * blocks_per_expert;
+            const device float* assignment_input = intermediate
+                + slot * intermediate_features;
+            partial += Operations::lane_dot(
+                expert_weights,
+                assignment_input,
+                blocks_per_row,
+                first_row,
+                simd_lane);
+        }
+    } else {
+        const device float* shared_input = intermediate
+            + top_k * intermediate_features;
+        partial += Operations::lane_dot(
+            shared_down_weights,
+            shared_input,
+            blocks_per_row,
+            first_row,
+            simd_lane);
+    }
+
+    float2 simdgroup_sum = float2(simd_sum(partial.x), simd_sum(partial.y));
+    if (simd_lane == 0u) {
+        simdgroup_partials[simdgroup_index] = simdgroup_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_index == 0u) {
+        float2 lane_value = simd_lane < LAGUNA_XS_MOE_SHARED_DOWN_SIMDGROUPS
+            ? simdgroup_partials[simd_lane]
+            : float2(0.0f);
+        float2 sum = float2(simd_sum(lane_value.x), simd_sum(lane_value.y));
+        if (simd_lane == 0u) {
+            output[first_row] = residual[first_row] + sum.x;
+            output[first_row + 1u] = residual[first_row + 1u] + sum.y;
+        }
+    }
+}
+
+kernel void laguna_xs_q4_moe_shared_down_f32_kernel(
+    const device LagunaXsQ4KBlock* routed_down_weights [[buffer(0)]],
+    const device LagunaXsQ4KBlock* shared_down_weights [[buffer(1)]],
+    const device uint* expert_ids [[buffer(2)]],
+    const device float* intermediate [[buffer(3)]],
+    const device float* residual [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    constant uint& expert_count [[buffer(7)]],
+    constant uint& intermediate_features [[buffer(8)]],
+    constant uint& out_features [[buffer(9)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float2 partials[LAGUNA_XS_MOE_SHARED_DOWN_SIMDGROUPS];
+    laguna_xs_moe_shared_down<
+        LagunaXsQ4KBlock,
+        LagunaXsQ4DecodePairOperations
+    >(
+        routed_down_weights,
+        shared_down_weights,
+        expert_ids,
+        intermediate,
+        residual,
+        output,
+        top_k,
+        expert_count,
+        intermediate_features,
+        out_features,
+        partials,
+        threadgroup_position,
+        simd_lane,
+        simdgroup_index);
+}
+
+kernel void laguna_xs_q6_moe_shared_down_f32_kernel(
+    const device LagunaXsQ6KBlock* routed_down_weights [[buffer(0)]],
+    const device LagunaXsQ6KBlock* shared_down_weights [[buffer(1)]],
+    const device uint* expert_ids [[buffer(2)]],
+    const device float* intermediate [[buffer(3)]],
+    const device float* residual [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    constant uint& expert_count [[buffer(7)]],
+    constant uint& intermediate_features [[buffer(8)]],
+    constant uint& out_features [[buffer(9)]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float2 partials[LAGUNA_XS_MOE_SHARED_DOWN_SIMDGROUPS];
+    laguna_xs_moe_shared_down<
+        LagunaXsQ6KBlock,
+        LagunaXsQ6DecodePairOperations
+    >(
+        routed_down_weights,
+        shared_down_weights,
+        expert_ids,
+        intermediate,
+        residual,
+        output,
+        top_k,
+        expert_count,
+        intermediate_features,
+        out_features,
+        partials,
         threadgroup_position,
         simd_lane,
         simdgroup_index);

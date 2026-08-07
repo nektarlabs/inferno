@@ -24,7 +24,7 @@ const SEGMENTED_DECODE_MERGE_KERNEL: &str =
 const APPEND_KERNEL: &str = "laguna_f16_kv_append_f32_kernel";
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
-const SEGMENTED_DECODE_QUERY_HEADS: usize = 48;
+const SEGMENTED_DECODE_MAX_QUERY_HEADS: usize = 64;
 const SLIDING_QUERY_HEADS: usize = 72;
 const MAX_QUERY_HEADS: usize = SLIDING_QUERY_HEADS;
 const SLIDING_WINDOW: usize = 512;
@@ -66,10 +66,10 @@ impl MetalF16Attention {
             compute_pipeline(device, library, SEGMENTED_DECODE_PARTIAL_KERNEL)?;
         if segmented_decode_partial_pipeline.thread_execution_width() as usize != 32
             || (segmented_decode_partial_pipeline.max_total_threads_per_threadgroup() as usize)
-                < 6 * 32
+                < SEGMENTED_DECODE_MAX_QUERY_HEADS / KV_HEADS * 32
         {
             return Err(Error::backend(
-                "Laguna segmented F16 decode requires 32-lane SIMD groups and at least 192 threads per group",
+                "Laguna segmented F16 decode requires 32-lane SIMD groups and at least 256 threads per group",
             ));
         }
         let segmented_decode_merge_pipeline =
@@ -299,24 +299,29 @@ impl MetalF16Attention {
                 .checked_add(query_tokens)
                 .is_some_and(|total| total <= cache.capacity_tokens);
         let segmented_decode = match cache.decode_strategy {
-            LagunaF16DecodeStrategy::SegmentedGroupedKv {
-                min_context_tokens,
-                segment_tokens,
-            } if query_tokens == 1
-                && cache.retention == LagunaKvRetention::Full
-                && cache.total_tokens >= min_context_tokens =>
-            {
-                Some(segment_tokens)
+            LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                medium_min_context_tokens,
+                medium_segment_tokens,
+                long_min_context_tokens,
+                long_segment_tokens,
+            } if query_tokens == 1 => {
+                if cache.total_tokens >= long_min_context_tokens {
+                    Some(long_segment_tokens)
+                } else if cache.total_tokens >= medium_min_context_tokens {
+                    Some(medium_segment_tokens)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
         if let Some(segment_tokens) = segmented_decode {
-            if query_heads != SEGMENTED_DECODE_QUERY_HEADS {
+            if !matches!(query_heads, 48 | 64) {
                 return Err(Error::backend(format!(
-                    "Laguna segmented F16 decode requires {SEGMENTED_DECODE_QUERY_HEADS} query heads, got {query_heads}"
+                    "Laguna segmented F16 decode requires 48 or 64 query heads, got {query_heads}"
                 )));
             }
-            if !fuse_append {
+            if cache.retention == LagunaKvRetention::Full && !fuse_append {
                 return Err(Error::cache(
                     "Laguna segmented full-attention decode requires fused KV append",
                 ));
@@ -478,8 +483,17 @@ impl MetalF16Attention {
                 "Laguna segmented F16 decode segment size must be positive",
             ));
         }
-        let key_count = cache
+        let cached_count = match cache.retention {
+            LagunaKvRetention::Full => cache.total_tokens,
+            LagunaKvRetention::Sliding => cache
+                .total_tokens
+                .min(cache.capacity_tokens.saturating_sub(1)),
+        };
+        let cached_start = cache
             .total_tokens
+            .checked_sub(cached_count)
+            .ok_or_else(|| Error::backend("Laguna segmented decode cache start underflow"))?;
+        let key_count = cached_count
             .checked_add(1)
             .ok_or_else(|| Error::backend("Laguna segmented decode key count overflow"))?;
         let segment_count = key_count.div_ceil(segment_tokens);
@@ -505,6 +519,8 @@ impl MetalF16Attention {
             batch,
             query_heads,
             past_tokens = cache.total_tokens,
+            cached_start,
+            cached_count,
             segment_tokens,
             segment_count,
             "encoding segmented grouped-KV Laguna F16 decode"
@@ -521,8 +537,9 @@ impl MetalF16Attention {
             KernelArg::Buffer(&partial_accumulator),
             KernelArg::U32(as_u32(batch, "batch")?),
             KernelArg::U32(as_u32(query_heads, "query head count")?),
-            KernelArg::U32(as_u32(cache.total_tokens, "past token count")?),
             KernelArg::U32(as_u32(cache.capacity_tokens, "cache capacity")?),
+            KernelArg::U32(as_u32(cached_start, "cached start position")?),
+            KernelArg::U32(as_u32(cached_count, "cached token count")?),
             KernelArg::U32(as_u32(segment_tokens, "segment token count")?),
             KernelArg::U32(as_u32(segment_count, "segment count")?),
         ];
@@ -754,9 +771,11 @@ mod tests {
         let Ok(backend) = MetalBackend::new() else {
             return;
         };
-        let strategy = LagunaF16DecodeStrategy::SegmentedGroupedKv {
-            min_context_tokens: 6_144,
-            segment_tokens: 512,
+        let strategy = LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+            medium_min_context_tokens: 1_536,
+            medium_segment_tokens: 128,
+            long_min_context_tokens: 6_144,
+            long_segment_tokens: 512,
         };
         let mut cache = backend
             .prepare_laguna_f16_kv_cache(1, 8, LagunaKvRetention::Full)
@@ -943,8 +962,8 @@ mod tests {
             (
                 LagunaKvRetention::Sliding,
                 LAGUNA_XS_SLIDING_QUERY_HEADS,
-                37,
-                false,
+                600,
+                true,
             ),
             (LagunaKvRetention::Sliding, SLIDING_QUERY_HEADS, 600, false),
         ] {
@@ -965,9 +984,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if grouped_decode {
-                cache.set_decode_strategy(LagunaF16DecodeStrategy::SegmentedGroupedKv {
-                    min_context_tokens: 0,
-                    segment_tokens: 16,
+                cache.set_decode_strategy(LagunaF16DecodeStrategy::AdaptiveSegmentedGroupedKv {
+                    medium_min_context_tokens: 0,
+                    medium_segment_tokens: 16,
+                    long_min_context_tokens: usize::MAX,
+                    long_segment_tokens: 32,
                 });
             }
 
@@ -1067,7 +1088,7 @@ mod tests {
         let token = tokens - 1;
         let heads_per_kv = query_heads / KV_HEADS;
         let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
-        let first_key = if sliding_window == 0 || token + 1 <= sliding_window {
+        let first_key = if sliding_window == 0 || token < sliding_window {
             0
         } else {
             token + 1 - sliding_window

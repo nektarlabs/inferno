@@ -333,10 +333,11 @@ kernel void laguna_segmented_grouped_gqa_f16_decode_partial_f32_kernel(
     device float* partial_accumulator [[buffer(7)]],
     constant uint& batch_count [[buffer(8)]],
     constant uint& query_heads [[buffer(9)]],
-    constant uint& past_tokens [[buffer(10)]],
-    constant uint& cache_capacity [[buffer(11)]],
-    constant uint& segment_tokens [[buffer(12)]],
-    constant uint& segment_count [[buffer(13)]],
+    constant uint& cache_capacity [[buffer(10)]],
+    constant uint& cached_start [[buffer(11)]],
+    constant uint& cached_count [[buffer(12)]],
+    constant uint& segment_tokens [[buffer(13)]],
+    constant uint& segment_count [[buffer(14)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -356,7 +357,7 @@ kernel void laguna_segmented_grouped_gqa_f16_decode_partial_f32_kernel(
         return;
     }
     uint query_head = kv_head * heads_per_kv + simd_group;
-    uint key_count = past_tokens + 1u;
+    uint key_count = cached_count + 1u;
     uint segment_start = segment * segment_tokens;
     uint segment_end = min(key_count, segment_start + segment_tokens);
     uint query_base = ((batch * query_heads + query_head) * LAGUNA_HEAD_DIM);
@@ -386,8 +387,9 @@ kernel void laguna_segmented_grouped_gqa_f16_decode_partial_f32_kernel(
             uint logical_key = tile_start + local_key;
             float4 key_vector;
             float4 value_vector;
-            if (logical_key < past_tokens) {
-                uint cache_slot = logical_key % cache_capacity;
+            if (logical_key < cached_count) {
+                uint absolute_key = cached_start + logical_key;
+                uint cache_slot = absolute_key % cache_capacity;
                 uint cache_index = (((batch * cache_capacity + cache_slot)
                     * LAGUNA_KV_HEADS + kv_head) * LAGUNA_HEAD_DIM)
                     + lane * 4u;

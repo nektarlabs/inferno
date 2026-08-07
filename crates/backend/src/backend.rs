@@ -260,9 +260,11 @@ pub enum LagunaKvRetention {
 pub enum LagunaF16DecodeStrategy {
     #[default]
     QueryParallel,
-    SegmentedGroupedKv {
-        min_context_tokens: usize,
-        segment_tokens: usize,
+    AdaptiveSegmentedGroupedKv {
+        medium_min_context_tokens: usize,
+        medium_segment_tokens: usize,
+        long_min_context_tokens: usize,
+        long_segment_tokens: usize,
     },
 }
 
@@ -1748,6 +1750,26 @@ pub trait Backend: Sync {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_xs_gguf_moe_shared_device(
+        &self,
+        _routed_gate_weights: &[u8],
+        _routed_up_weights: &[u8],
+        _routed_down_weights: &[u8],
+        _shared_gate_weights: &[u8],
+        _shared_up_weights: &[u8],
+        _shared_down_weights: &[u8],
+        _down_quant: GgufKQuant,
+        _input: &DeviceValue,
+        _routing: &DeviceRouterTopK,
+        _residual: &DeviceValue,
+        _in_features: usize,
+        _intermediate_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
     /// Streams selected Q2 experts through a per-layer cache and executes
     /// ready groups without waiting for every SSD miss to complete.
     #[allow(clippy::too_many_arguments)]
@@ -1804,6 +1826,19 @@ pub trait Backend: Sync {
     /// only one candidate per four vocabulary rows instead of full logits.
     fn laguna_q8_0_matvec_argmax_device(
         &self,
+        _weights: &[u8],
+        _input: &DeviceValue,
+        _in_features: usize,
+        _out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        Ok(None)
+    }
+
+    /// Laguna XS Q4_K/Q6_K output projection plus greedy argmax. The native
+    /// path emits one candidate per output-row tile instead of full logits.
+    fn laguna_xs_k_matvec_argmax_device(
+        &self,
+        _quant: GgufKQuant,
         _weights: &[u8],
         _input: &DeviceValue,
         _in_features: usize,
@@ -6744,6 +6779,85 @@ impl Backend for MetalBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn laguna_xs_gguf_moe_shared_device(
+        &self,
+        routed_gate_weights: &[u8],
+        routed_up_weights: &[u8],
+        routed_down_weights: &[u8],
+        shared_gate_weights: &[u8],
+        shared_up_weights: &[u8],
+        shared_down_weights: &[u8],
+        down_quant: GgufKQuant,
+        input: &DeviceValue,
+        routing: &DeviceRouterTopK,
+        residual: &DeviceValue,
+        in_features: usize,
+        intermediate_features: usize,
+        out_features: usize,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::F32 || residual.dtype() != DType::F32 {
+            return Err(Error::backend(format!(
+                "Laguna XS fused MoE input/residual must be F32, got {:?}/{:?}",
+                input.dtype(),
+                residual.dtype()
+            )));
+        }
+        let (row_count, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+        validate_exact_shape("Laguna XS fused MoE input rows", &[row_count], &[1])?;
+        validate_exact_shape(
+            "Laguna XS fused MoE routing token count",
+            &[routing.token_count],
+            &[1],
+        )?;
+        validate_exact_shape(
+            "Laguna XS fused MoE residual values",
+            &[residual.element_count()?],
+            &[out_features],
+        )?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_laguna_xs_gguf_moe_shared(
+                routed_gate_weights,
+                routed_up_weights,
+                routed_down_weights,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_down_weights,
+                down_quant,
+                &input.buffer,
+                input.element_count()?,
+                routing,
+                &residual.buffer,
+                residual.element_count()?,
+                in_features,
+                intermediate_features,
+                out_features,
+            )?;
+            return Ok(Some(DeviceValue::new(residual.dims().to_vec(), output)));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                routed_gate_weights,
+                routed_up_weights,
+                routed_down_weights,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_down_weights,
+                down_quant,
+                routing,
+                intermediate_features,
+            );
+            Ok(None)
+        }
+    }
+
     fn ready_routed_experts_device(
         &self,
         layer_index: usize,
@@ -6926,6 +7040,43 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (weights, input, in_features, out_features);
+            Ok(None)
+        }
+    }
+
+    fn laguna_xs_k_matvec_argmax_device(
+        &self,
+        quant: GgufKQuant,
+        weights: &[u8],
+        input: &DeviceValue,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Option<(u32, f32)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (actual_rows, _) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+            validate_exact_shape(
+                "device_laguna_xs_k_matvec_argmax_rows",
+                &[actual_rows],
+                &[1],
+            )?;
+            let result = native_metal.batched_laguna_xs_k_matvec_argmax(
+                quant,
+                weights,
+                &input.buffer,
+                input.element_count()?,
+                in_features,
+                out_features,
+            )?;
+            return Ok(Some(result));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (quant, weights, input, in_features, out_features);
             Ok(None)
         }
     }
