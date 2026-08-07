@@ -193,6 +193,10 @@ enum Command {
         #[arg(long, default_value_t = false)]
         thinking: bool,
 
+        /// Show live prefill and decode throughput while serving each response.
+        #[arg(long, default_value_t = false)]
+        throughput_summary: bool,
+
         /// Expert-cache working-set budget in decimal GB.
         #[arg(long)]
         expert_cache_gb: Option<f64>,
@@ -307,6 +311,7 @@ fn main() -> Result<()> {
             page_size,
             max_new_tokens,
             thinking,
+            throughput_summary,
             expert_cache_gb,
             hot_kv_cache_gb,
             enable_telemetry,
@@ -320,6 +325,7 @@ fn main() -> Result<()> {
             page_size,
             max_new_tokens,
             thinking,
+            throughput_summary,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -420,6 +426,7 @@ mod tests {
             bind,
             max_new_tokens,
             thinking,
+            throughput_summary,
             ..
         } = cli.command.expect("expected command")
         else {
@@ -429,6 +436,7 @@ mod tests {
         assert_eq!(bind, "127.0.0.1:11435".parse::<SocketAddr>().unwrap());
         assert_eq!(max_new_tokens, None);
         assert!(!thinking);
+        assert!(!throughput_summary);
     }
 
     #[test]
@@ -439,6 +447,19 @@ mod tests {
             panic!("expected serve command");
         };
         assert!(thinking);
+    }
+
+    #[test]
+    fn serve_accepts_compact_throughput_summary_flag() {
+        let cli = Cli::try_parse_from(["inferno", "serve", "--throughput-summary"]).unwrap();
+
+        let Command::Serve {
+            throughput_summary, ..
+        } = cli.command.expect("expected serve command")
+        else {
+            panic!("expected serve command");
+        };
+        assert!(throughput_summary);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     net::{SocketAddr, TcpListener},
     path::Path,
@@ -20,9 +21,9 @@ use model::{
 };
 use runtime::{
     enable_laguna_memory_controller_log, enable_memory_controller_log, enable_memory_telemetry,
-    enable_memory_telemetry_file, q2_memory_controller_spec, run_generate_streaming_with_options,
-    CacheBudgetSpec, GenerationControl, GenerationOptions, LagunaRuntime, LagunaThinkingGuard,
-    LAGUNA_THINKING_END_TOKEN_ID,
+    enable_memory_telemetry_file, q2_memory_controller_spec,
+    run_generate_streaming_with_options_and_prefill_progress, CacheBudgetSpec, GenerationControl,
+    GenerationOptions, LagunaRuntime, LagunaThinkingGuard, LAGUNA_THINKING_END_TOKEN_ID,
 };
 use server::{
     ResponseUsage, ResponsesHandler, ResponsesRequest, ResponsesStream, ServerAdmission,
@@ -43,17 +44,16 @@ use super::generate::{
     validate_generation_request, validate_laguna_prompt, validate_laguna_service_options,
     validate_laguna_tokenizer, validate_memory_controller_options, DecodedTextStream,
 };
+use super::throughput::LiveThroughputDisplay;
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 const LAGUNA_GGUF_SERVICE_CONTEXT_TOKENS: usize = 32_768;
 const LAGUNA_GGUF_DEFAULT_MAX_OUTPUT_TOKENS: usize = 8_192;
 const LAGUNA_GGUF_MAX_INSTRUCTION_BYTES: usize = 8 * 1_024;
 const LAGUNA_CODEX_DUPLICATE_RETRIES: usize = 2;
-const LAGUNA_CODEX_MAX_INSPECTIONS_BEFORE_EDIT: usize = 3;
 const LAGUNA_CODEX_MAX_IDENTICAL_TOOL_EXECUTIONS: usize = 2;
 const CODEX_FALLBACK_INSTRUCTION_PREFIX: &str = "You are a coding agent running in the Codex CLI";
 const CLOSED_THINKING_BOUNDARY: &str = "</think>";
-
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     model_path: &Path,
@@ -63,6 +63,7 @@ pub fn run(
     page_size: usize,
     max_new_tokens: Option<usize>,
     thinking: bool,
+    throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -87,6 +88,7 @@ pub fn run(
                 bind,
                 page_size,
                 max_new_tokens,
+                throughput_summary,
                 speculative_mtp,
                 enable_unified_memory_controller,
                 expert_cache_gb,
@@ -104,6 +106,7 @@ pub fn run(
             page_size,
             max_new_tokens,
             thinking,
+            throughput_summary,
             speculative_mtp,
             enable_unified_memory_controller,
             expert_cache_gb,
@@ -123,6 +126,7 @@ fn run_glm(
     bind: SocketAddr,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -199,6 +203,7 @@ fn run_glm(
         artifact_file_name: &readiness.artifact_file_name,
         page_size,
         max_new_tokens,
+        throughput_summary,
         speculative_mtp,
         hot_kv_cache_budget_bytes,
         dynamic_cache_budget,
@@ -217,6 +222,7 @@ fn run_laguna(
     page_size: usize,
     max_new_tokens: Option<usize>,
     thinking: bool,
+    throughput_summary: bool,
     speculative_mtp: bool,
     enable_unified_memory_controller: bool,
     expert_cache_gb: Option<f64>,
@@ -270,6 +276,7 @@ fn run_laguna(
         runtime,
         max_new_tokens,
         thinking_mode: laguna_thinking_mode(thinking),
+        throughput_summary,
         model_id,
     };
     info!(%bind, model = model_id, "Inferno model loaded for Codex");
@@ -286,6 +293,7 @@ struct GlmCodexHandler<'runtime, 'weights> {
     artifact_file_name: &'runtime str,
     page_size: usize,
     max_new_tokens: Option<usize>,
+    throughput_summary: bool,
     speculative_mtp: bool,
     hot_kv_cache_budget_bytes: Option<usize>,
     dynamic_cache_budget: Option<CacheBudgetSpec>,
@@ -316,7 +324,11 @@ impl ResponsesHandler for GlmCodexHandler<'_, '_> {
         let mut decoded = DecodedTextStream::new(self.tokenizer, true);
         let mut generated_text = String::new();
         let mut output_tokens = 0_usize;
-        run_generate_streaming_with_options(
+        let mut throughput = LiveThroughputDisplay::new(self.throughput_summary);
+        throughput.begin_turn(encoded.token_ids.len())?;
+        let stream_cell = RefCell::new(&mut *stream);
+        let throughput_cell = RefCell::new(&mut throughput);
+        run_generate_streaming_with_options_and_prefill_progress(
             self.model,
             self.config,
             self.backend,
@@ -330,18 +342,28 @@ impl ResponsesHandler for GlmCodexHandler<'_, '_> {
                 profile_token_costs: false,
                 speculative_mtp: self.speculative_mtp,
             },
+            |progress| {
+                throughput_cell
+                    .borrow_mut()
+                    .record_prefill(progress.processed_tokens)?;
+                stream_cell.borrow_mut().heartbeat()
+            },
             |token_id| {
+                throughput_cell.borrow_mut().record_token()?;
                 output_tokens = output_tokens
                     .checked_add(1)
                     .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
                 if let Some(text) = decoded.push(token_id)? {
                     generated_text.push_str(&text);
                 }
-                stream.heartbeat()
+                stream_cell.borrow_mut().heartbeat()
             },
         )?;
+        drop(throughput_cell);
+        drop(stream_cell);
 
         emit_agent_output(&generated_text, &allowed_tools, "GLM", stream)?;
+        throughput.finish_request()?;
 
         Ok(ResponseUsage {
             input_tokens: encoded.token_ids.len(),
@@ -358,6 +380,7 @@ struct LagunaCodexHandler<'runtime> {
     runtime: LagunaRuntime,
     max_new_tokens: Option<usize>,
     thinking_mode: LagunaThinkingMode,
+    throughput_summary: bool,
     model_id: &'static str,
 }
 
@@ -394,19 +417,16 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
             "accepted Codex tool contract"
         );
         let completed_calls = historical_tool_call_fingerprints(&request.input)?;
-        let inspection_limit_reached = tool_phase == LagunaToolPhase::Edit
-            && historical_read_only_shell_calls_since_last_mutation(&request.input)
-                >= LAGUNA_CODEX_MAX_INSPECTIONS_BEFORE_EDIT;
         let thinking_mode = self.thinking_mode;
         let mut input = request.input.clone();
         let mut total_input_tokens = 0_usize;
         let mut total_output_tokens = 0_usize;
         let mut require_new_tool_call = false;
+        let mut throughput = LiveThroughputDisplay::new(self.throughput_summary);
 
         for attempt in 0..=LAGUNA_CODEX_DUPLICATE_RETRIES {
-            let suppress_exec_replay = inspection_limit_reached
-                || require_new_tool_call
-                || tool_phase == LagunaToolPhase::Complete;
+            let suppress_exec_replay =
+                require_new_tool_call || tool_phase == LagunaToolPhase::Complete;
             let prompt_input = laguna_prompt_input(
                 &input,
                 &prompt_allowed_tools,
@@ -420,6 +440,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 request.max_output_tokens,
                 thinking_mode,
                 stream,
+                &mut throughput,
             )?;
             let LagunaAgentTurn {
                 output,
@@ -475,20 +496,6 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                 stream.heartbeat()?;
                 continue;
             }
-            if inspection_limit_reached {
-                if let Some(inspection) = first_read_only_shell_call(&output)? {
-                    if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
-                        return Err(Error::runtime(format!(
-                            "Laguna repeated workspace inspection with {:?} after {} internal retries",
-                            inspection.name, LAGUNA_CODEX_DUPLICATE_RETRIES
-                        )));
-                    }
-                    input.push(repeated_inspection_retry_message());
-                    require_new_tool_call = true;
-                    stream.heartbeat()?;
-                    continue;
-                }
-            }
             if let Some(disallowed) = first_tool_outside_contract(&output, &prompt_allowed_tools) {
                 if attempt == LAGUNA_CODEX_DUPLICATE_RETRIES {
                     return Err(Error::runtime(format!(
@@ -522,6 +529,7 @@ impl ResponsesHandler for LagunaCodexHandler<'_> {
                     && thinking_mode == LagunaThinkingMode::Enabled,
                 stream,
             )?;
+            throughput.finish_request()?;
             return Ok(ResponseUsage {
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
@@ -549,6 +557,7 @@ impl LagunaCodexHandler<'_> {
         requested_max_output_tokens: Option<usize>,
         thinking_mode: LagunaThinkingMode,
         stream: &mut ResponsesStream<'_>,
+        throughput: &mut LiveThroughputDisplay,
     ) -> InfernoResult<LagunaAgentTurn> {
         let prompt = if self.model_id == LAGUNA_XS_GGUF_CODEX_MODEL_ID {
             render_laguna_xs_codex_prompt(instructions, input, tools, thinking_mode)?
@@ -582,10 +591,12 @@ impl LagunaCodexHandler<'_> {
         };
         let mut completed_output = None;
         let mut output_tokens = 0_usize;
+        throughput.begin_turn(encoded.token_ids.len())?;
         let mut thinking_guard =
             (thinking_mode == LagunaThinkingMode::Enabled).then(LagunaThinkingGuard::default);
         let heartbeat_during_prefill = is_laguna_gguf_model_id(self.model_id);
-        let stream_cell = std::cell::RefCell::new(stream);
+        let stream_cell = RefCell::new(stream);
+        let throughput_cell = RefCell::new(throughput);
         let generation = self
             .runtime
             .generate_streaming_controlled_with_prefill_progress(
@@ -601,12 +612,16 @@ impl LagunaCodexHandler<'_> {
                         prompt_tokens = progress.prompt_tokens,
                         "Laguna Codex prefill progress"
                     );
+                    throughput_cell
+                        .borrow_mut()
+                        .record_prefill(progress.processed_tokens)?;
                     if heartbeat_during_prefill {
                         stream_cell.borrow_mut().heartbeat()?;
                     }
                     Ok(())
                 },
                 |token_id| {
+                    throughput_cell.borrow_mut().record_token()?;
                     output_tokens = output_tokens
                         .checked_add(1)
                         .ok_or_else(|| Error::runtime("Codex output token count overflow"))?;
@@ -822,28 +837,6 @@ fn historical_tool_call_succeeded(
         .any(|marker| normalized.contains(marker))
 }
 
-fn historical_read_only_shell_calls_since_last_mutation(input: &[serde_json::Value]) -> usize {
-    let start = input
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, call)| {
-            let name = call.get("name").and_then(serde_json::Value::as_str);
-            let changes_files = name == Some("apply_patch")
-                || (name == Some("exec_command") && exec_command_changes_files(call));
-            changes_files && historical_tool_call_succeeded(input, *index, call)
-        })
-        .map_or(0, |(index, _)| index + 1);
-    input[start..]
-        .iter()
-        .filter(|call| {
-            call.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
-                && call.get("name").and_then(serde_json::Value::as_str) == Some("exec_command")
-                && !exec_command_changes_files(call)
-        })
-        .count()
-}
-
 fn exec_command_changes_files(call: &serde_json::Value) -> bool {
     let Some(arguments) = call
         .get("arguments")
@@ -955,27 +948,6 @@ fn first_tool_outside_contract(
     })
 }
 
-fn first_read_only_shell_call(output: &AgentOutput) -> InfernoResult<Option<AgentFunctionCall>> {
-    for item in &output.items {
-        let AgentOutputItem::FunctionCall(call) = item else {
-            continue;
-        };
-        let normalized = map_laguna_function_call_to_codex(call.clone());
-        if normalized.name != "exec_command" {
-            continue;
-        }
-        let arguments: serde_json::Value = serde_json::from_str(&normalized.arguments)?;
-        let command = arguments
-            .get("cmd")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::runtime("Laguna shell call requires a string cmd argument"))?;
-        if !shell_command_changes_files(command) {
-            return Ok(Some(normalized));
-        }
-    }
-    Ok(None)
-}
-
 fn tool_call_fingerprint(call: &AgentFunctionCall) -> InfernoResult<String> {
     let normalized = map_laguna_function_call_to_codex(call.clone());
     let arguments: serde_json::Value = serde_json::from_str(&normalized.arguments)?;
@@ -1024,17 +996,6 @@ fn unavailable_tool_retry_message(call: &AgentFunctionCall) -> serde_json::Value
                 "The {name} tool is unavailable in this turn because the inspection step already completed. Do not inspect again. Use apply_patch now if files still need changes, or provide the final answer if the task is complete.",
                 name = call.name,
             ),
-        }],
-    })
-}
-
-fn repeated_inspection_retry_message() -> serde_json::Value {
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": "Workspace inspection already completed and Inferno did not run another read-only command. Do not describe the plan. Create or update files now with apply_patch, or emit a mutating shell call in exactly this shape: <tool_call>shell<arg_key>cmd</arg_key><arg_value>mkdir -p src</arg_value></tool_call>. Adapt the command to the task. Do not call ls, find, pwd, cat, head, or another inspection command.",
         }],
     })
 }
@@ -1332,10 +1293,6 @@ mod tests {
 
         let inspection_phase = laguna_tool_phase(&after_inspection);
         assert_eq!(inspection_phase, LagunaToolPhase::Edit);
-        assert_eq!(
-            historical_read_only_shell_calls_since_last_mutation(&after_inspection),
-            1
-        );
         let inspection_names = tool_names(&laguna_prompt_tools(inspection_phase, &tools)).unwrap();
         assert!(inspection_names.contains("exec_command"));
         assert!(inspection_names.contains("write_stdin"));
@@ -1370,10 +1327,6 @@ mod tests {
         }));
         let edit_phase = laguna_tool_phase(&after_edit);
         assert_eq!(edit_phase, LagunaToolPhase::Validate);
-        assert_eq!(
-            historical_read_only_shell_calls_since_last_mutation(&after_edit),
-            0
-        );
         let edit_names = tool_names(&laguna_prompt_tools(edit_phase, &tools)).unwrap();
         assert!(edit_names.contains("exec_command"));
 
@@ -1403,24 +1356,39 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_repeated_inspection_from_shell_file_changes() {
-        let inspection = AgentOutput {
+    fn permits_distinct_workspace_inspections_after_existing_inspections() {
+        let completed = historical_tool_call_fingerprints(&[
+            json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"pwd\"}",
+                "call_id": "call_1"
+            }),
+            json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"rg --files\"}",
+                "call_id": "call_2"
+            }),
+            json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"sed -n '1,120p' Cargo.toml\"}",
+                "call_id": "call_3"
+            }),
+        ])
+        .unwrap();
+        let next_inspection = AgentOutput {
             reasoning: String::new(),
             items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
                 name: "shell".to_string(),
-                arguments: json!({"cmd": "find . -maxdepth 2 -type f"}).to_string(),
+                arguments: json!({"cmd": "cargo test --workspace"}).to_string(),
             })],
         };
-        assert!(first_read_only_shell_call(&inspection).unwrap().is_some());
 
-        let mutation = AgentOutput {
-            reasoning: String::new(),
-            items: vec![AgentOutputItem::FunctionCall(AgentFunctionCall {
-                name: "shell".to_string(),
-                arguments: json!({"cmd": "mkdir -p src"}).to_string(),
-            })],
-        };
-        assert!(first_read_only_shell_call(&mutation).unwrap().is_none());
+        assert!(duplicate_tool_call(&next_inspection, &completed)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

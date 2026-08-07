@@ -243,6 +243,12 @@ pub struct StreamingGenerationReport {
     pub cache_budget: Option<CacheBudgetRuntimeReport>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingPrefillProgress {
+    pub processed_tokens: usize,
+    pub prompt_tokens: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MtpMetrics {
     pub enabled: bool,
@@ -1654,10 +1660,42 @@ pub fn run_generate_streaming_with_options<B, F>(
     page_size: usize,
     stop_token_ids: &[u32],
     options: GenerationOptions,
+    on_token: F,
+) -> Result<StreamingGenerationReport>
+where
+    B: Backend,
+    F: FnMut(u32) -> Result<()>,
+{
+    run_generate_streaming_with_options_and_prefill_progress(
+        model,
+        config,
+        backend,
+        prompt_token_ids,
+        max_new_tokens,
+        page_size,
+        stop_token_ids,
+        options,
+        |_| Ok(()),
+        on_token,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_generate_streaming_with_options_and_prefill_progress<B, P, F>(
+    model: &Model<'_>,
+    config: &Config,
+    backend: &B,
+    prompt_token_ids: &[u32],
+    max_new_tokens: Option<usize>,
+    page_size: usize,
+    stop_token_ids: &[u32],
+    options: GenerationOptions,
+    mut on_prefill_progress: P,
     mut on_token: F,
 ) -> Result<StreamingGenerationReport>
 where
     B: Backend,
+    P: FnMut(StreamingPrefillProgress) -> Result<()>,
     F: FnMut(u32) -> Result<()>,
 {
     let generate_started_at = Instant::now();
@@ -1814,6 +1852,10 @@ where
     {
         controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
     }
+    on_prefill_progress(StreamingPrefillProgress {
+        processed_tokens: seed_input_ids.len(),
+        prompt_tokens: prompt_token_ids.len(),
+    })?;
 
     let mut mtp_device_cache = None;
 
@@ -1888,6 +1930,10 @@ where
                 if let Some(controller) = cache_budget_controller.as_mut() {
                     controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
                 }
+                on_prefill_progress(StreamingPrefillProgress {
+                    processed_tokens: chunk_end,
+                    prompt_tokens: prompt_token_ids.len(),
+                })?;
                 chunk_start = chunk_end;
             }
         } else {
@@ -1945,6 +1991,10 @@ where
                 {
                     controller.observe_prefill(cache.cached_tokens()?, backend, cache)?;
                 }
+                on_prefill_progress(StreamingPrefillProgress {
+                    processed_tokens: prefill_index + 1,
+                    prompt_tokens: prompt_token_ids.len(),
+                })?;
             }
         }
     }

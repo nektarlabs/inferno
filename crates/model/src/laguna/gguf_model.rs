@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use backend::{
-    Backend, DeviceRopeTable, DeviceValue, GgufExpertQuant, GgufKQuant, LagunaF16KvCache,
-    LagunaKvRetention,
+    Backend, DeviceRopeTable, DeviceValue, GgufExpertQuant, GgufKQuant, LagunaF16DecodeStrategy,
+    LagunaF16KvCache, LagunaKvRetention,
 };
 use common::{Error, F32Tensor, Result};
 use config::{LagunaAttentionKind, LagunaConfig};
@@ -30,6 +30,8 @@ const LAYER_SUBMISSION_CHUNK: usize = 1;
 /// memory on long Codex prompts. Eight layers preserve CPU/GPU overlap while
 /// bounding that transient working set. Decode remains fully asynchronous.
 const LAGUNA_XS_PREFILL_LAYERS_IN_FLIGHT: usize = 8;
+const LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT: usize = 6_144;
+const LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS: usize = 512;
 
 #[derive(Debug)]
 pub struct LagunaGgufModel {
@@ -1039,11 +1041,12 @@ impl LagunaGgufModel {
                         )))
                     }
                 };
-                let inner = backend
+                let mut inner = backend
                     .prepare_laguna_f16_kv_cache(batch, capacity, retention)?
                     .ok_or_else(|| {
                         Error::backend("Laguna GGUF F16 KV cache requires native Metal")
                     })?;
+                inner.set_decode_strategy(attention_decode_strategy(self.flavor(), retention));
                 Ok(AttentionCache { layer_index, inner })
             })
             .collect()
@@ -1407,9 +1410,49 @@ fn should_flush_xs_prefill_after_layer(layer_index: usize, layer_count: usize) -
         && completed_layers.is_multiple_of(LAGUNA_XS_PREFILL_LAYERS_IN_FLIGHT)
 }
 
+const fn attention_decode_strategy(
+    flavor: LagunaGgufFlavor,
+    retention: LagunaKvRetention,
+) -> LagunaF16DecodeStrategy {
+    match (flavor, retention) {
+        (LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Full) => {
+            LagunaF16DecodeStrategy::SegmentedGroupedKv {
+                min_context_tokens: LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
+                segment_tokens: LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+            }
+        }
+        _ => LagunaF16DecodeStrategy::QueryParallel,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_flush_xs_prefill_after_layer, should_submit_after_layer};
+    use backend::{LagunaF16DecodeStrategy, LagunaKvRetention};
+
+    use super::{
+        attention_decode_strategy, should_flush_xs_prefill_after_layer, should_submit_after_layer,
+        LagunaGgufFlavor, LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
+        LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+    };
+
+    #[test]
+    fn grouped_kv_decode_is_isolated_to_laguna_xs_full_attention() {
+        assert_eq!(
+            attention_decode_strategy(LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Full),
+            LagunaF16DecodeStrategy::SegmentedGroupedKv {
+                min_context_tokens: LAGUNA_XS_GROUPED_KV_DECODE_MIN_CONTEXT,
+                segment_tokens: LAGUNA_XS_GROUPED_KV_DECODE_SEGMENT_TOKENS,
+            }
+        );
+        assert_eq!(
+            attention_decode_strategy(LagunaGgufFlavor::Xs21Q4KM, LagunaKvRetention::Sliding),
+            LagunaF16DecodeStrategy::QueryParallel
+        );
+        assert_eq!(
+            attention_decode_strategy(LagunaGgufFlavor::S21Q2Q3, LagunaKvRetention::Full),
+            LagunaF16DecodeStrategy::QueryParallel
+        );
+    }
 
     #[test]
     fn submits_complete_laguna_layer_chunks_but_not_the_final_layer() {

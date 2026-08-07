@@ -1,6 +1,7 @@
 use std::{
     io::Write,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use common::{Error, Result};
@@ -10,6 +11,7 @@ use serde_json::{json, Value};
 use crate::http::write_sse_headers;
 
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The subset of a Codex Responses request consumed by Inferno.
 ///
@@ -67,11 +69,13 @@ pub struct ResponsesStream<'a> {
     model: String,
     output_index: usize,
     active_message_id: Option<String>,
+    last_heartbeat_at: Instant,
 }
 
 impl<'a> ResponsesStream<'a> {
     pub fn begin(writer: &'a mut dyn Write, model: &str) -> Result<Self> {
         write_sse_headers(writer)?;
+        let now = Instant::now();
         let response_id = format!(
             "resp_inferno_{}",
             NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed)
@@ -82,6 +86,7 @@ impl<'a> ResponsesStream<'a> {
             model: model.to_string(),
             output_index: 0,
             active_message_id: None,
+            last_heartbeat_at: now,
         };
         stream.event(
             "response.created",
@@ -104,15 +109,24 @@ impl<'a> ResponsesStream<'a> {
     }
 
     /// Keeps a long local inference request alive and detects a disconnected
-    /// Codex client at generated-token boundaries.
+    /// Codex client without making every generated token wait for socket I/O.
     pub fn heartbeat(&mut self) -> Result<()> {
+        self.heartbeat_at(Instant::now())
+    }
+
+    fn heartbeat_at(&mut self, now: Instant) -> Result<()> {
+        if now.saturating_duration_since(self.last_heartbeat_at) < HEARTBEAT_INTERVAL {
+            return Ok(());
+        }
         self.writer
             .write_all(b": inferno\n\n")
             .and_then(|()| self.writer.flush())
             .map_err(|source| Error::Io {
                 path: "inferno-sse-response".into(),
                 source,
-            })
+            })?;
+        self.last_heartbeat_at = now;
+        Ok(())
     }
 
     pub fn text_delta(&mut self, delta: &str) -> Result<()> {
@@ -441,5 +455,29 @@ mod tests {
         assert!(rendered.contains("\"type\":\"reasoning_text\""));
         assert!(rendered.contains("Inspect the repository."));
         assert!(rendered.contains("\"output_index\":0"));
+    }
+
+    #[test]
+    fn rate_limits_heartbeats_without_losing_periodic_keepalives() {
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, "laguna-xs-2.1-gguf").unwrap();
+        let started_at = stream.last_heartbeat_at;
+
+        stream
+            .heartbeat_at(started_at + HEARTBEAT_INTERVAL - Duration::from_millis(1))
+            .unwrap();
+        stream
+            .heartbeat_at(started_at + HEARTBEAT_INTERVAL)
+            .unwrap();
+        stream
+            .heartbeat_at(started_at + HEARTBEAT_INTERVAL + Duration::from_millis(1))
+            .unwrap();
+        stream
+            .heartbeat_at(started_at + HEARTBEAT_INTERVAL * 2)
+            .unwrap();
+        drop(stream);
+
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert_eq!(rendered.matches(": inferno\n\n").count(), 2);
     }
 }

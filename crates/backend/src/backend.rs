@@ -256,6 +256,16 @@ pub enum LagunaKvRetention {
     Sliding,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LagunaF16DecodeStrategy {
+    #[default]
+    QueryParallel,
+    SegmentedGroupedKv {
+        min_context_tokens: usize,
+        segment_tokens: usize,
+    },
+}
+
 /// Device-resident E4M3FN K/V cache for one Laguna attention layer.
 ///
 /// The buffers contain one byte per K/V value. `total_tokens` is the absolute
@@ -288,6 +298,7 @@ pub struct LagunaF16KvCache {
     pub(crate) stored_tokens: usize,
     pub(crate) total_tokens: usize,
     pub(crate) retention: LagunaKvRetention,
+    pub(crate) decode_strategy: LagunaF16DecodeStrategy,
     pub(crate) checkpoint_stored_tokens: Option<usize>,
     pub(crate) checkpoint_total_tokens: Option<usize>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -319,6 +330,10 @@ impl LagunaF16KvCache {
 
     pub fn retention(&self) -> LagunaKvRetention {
         self.retention
+    }
+
+    pub fn set_decode_strategy(&mut self, strategy: LagunaF16DecodeStrategy) {
+        self.decode_strategy = strategy;
     }
 
     pub fn storage_bytes(&self) -> Result<usize> {

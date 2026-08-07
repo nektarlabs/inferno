@@ -283,8 +283,9 @@ target/release/inferno
 ```
 
 Use `/clear` to reset the conversation and `/exit` to close the session. The
-model and expert cache stay alive across turns, but each turn currently
-re-prefills the accumulated conversation into a new request KV cache.
+model and expert cache stay alive across turns. GLM and Laguna S start a fresh
+sequence KV cache for each turn. Laguna XS restores an exact matching prompt
+checkpoint from Metal and prefills only the new suffix.
 
 Start Laguna chat explicitly:
 
@@ -301,10 +302,10 @@ target/release/inferno chat \
 ```
 
 Inferno detects the architecture from `config.json` and the weight container
-from the exact files in the model directory. The GGUF path reuses its mapped
-weights and resets only sequence-specific F16 KV state before re-prefilling the
-conversation. The Safetensors path also keeps its global expert cache alive
-across turns.
+from the exact files in the model directory. Both GGUF paths reuse their mapped
+weights. Laguna S resets sequence-specific F16 KV before each turn, while
+Laguna XS reuses a validated prompt-prefix checkpoint. The Safetensors path
+also keeps its global expert cache alive across turns.
 
 ### One-Shot Generation
 
@@ -411,7 +412,10 @@ Codex sends each turn through the streaming Responses API. Inferno translates
 the conversation and direct function tools into the loaded model's native
 prompt, generates either text or a tool call, and returns that action to Codex.
 The model, Metal backend, and model-specific expert cache remain alive between
-requests.
+requests. Laguna XS additionally restores the last exact prompt-prefix KV
+checkpoint and computes only the suffix added by Codex after a tool result. A
+prefix mismatch safely falls back to a fresh sequence instead of reusing
+incorrect attention state.
 
 Requests are processed one at a time because they share one Metal runtime.
 While Laguna GGUF is generating, additional inference requests receive HTTP
@@ -463,7 +467,7 @@ target/release/inferno generate \
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--thinking` | Enables Laguna reasoning for `generate`, `chat`, or `serve`; direct answers are the default. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
-| `--throughput-summary` | Prints only prefill and decode throughput after `generate` or each `chat` answer. |
+| `--throughput-summary` | Prints compact prefill/decode throughput after `generate` and `chat`, or updates it live while `serve` is processing a response. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget for cache-backed artifacts. |
 | `--hot-kv-cache-gb <GB>` | Pins the GLM hot Metal KV budget. |
 | `--enable-unified-memory-controller` | Enables the model-specific adaptive memory controller; disabled by default. |
@@ -533,6 +537,13 @@ layers retain only their 512-token window. The Safetensors path stores FP8 KV;
 both GGUF paths store F16 KV because those artifacts have no published FP8 KV
 scales. The cache stays on Metal. Bounded sliding state lowers KV pressure and
 leaves more unified memory available for model pages.
+
+Persistent Laguna XS sessions checkpoint stable prompt prefixes at 1,024-token
+prefill boundaries. Full-attention layers retain their append-only rows and
+rewind their logical position. Sliding layers copy their bounded 512-token F16
+ring into a persistent Metal checkpoint so later decode writes cannot destroy
+the reusable prefix. Inferno restores a checkpoint only after exact token
+validation; otherwise it resets the sequence and performs a full prefill.
 
 For GLM, the expert cache and hot KV window compete for the same physical
 unified memory. Its fixed default starts from 30 expert slots per routed layer
