@@ -1819,28 +1819,42 @@ mod tests {
     }
 
     #[test]
-    fn fused_output_argmax_matches_q4_and_q6_scores_and_ties() {
+    fn fused_output_argmax_matches_full_projection_across_candidate_groups() {
         let Ok(backend) = MetalBackend::new() else {
             return;
         };
         let width = K_BLOCK_VALUES;
-        let row_values = [1_u8, 3, 2, 3, 0, 2, 1, 0];
+        let mut row_values = (0..40)
+            .map(|row| ((row * 7 + 3) % 13) as u8)
+            .collect::<Vec<_>>();
+        row_values[27] = 15;
+        row_values[35] = 15;
         let input = F32Tensor::new(vec![1.0 / width as f32; width], [1, width]).unwrap();
         let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
 
         for (weights, quant) in [
-            (q4_expert_matrix(&row_values, width, 1), GgufKQuant::Q4K),
-            (q6_expert_matrix(&row_values, width, 1), GgufKQuant::Q6K),
+            (q4_row_matrix(&row_values, width), GgufKQuant::Q4K),
+            (q6_row_matrix(&row_values, width), GgufKQuant::Q6K),
         ] {
+            let logits = backend
+                .gguf_k_matvec_device(quant, &weights, &input, 1, width, row_values.len())
+                .unwrap()
+                .unwrap();
+            let logits = backend.device_download_f32_tensor(&logits).unwrap();
+            let (expected_id, expected_score) = stable_argmax(logits.values());
             let (token_id, token_score) = backend
                 .laguna_xs_k_matvec_argmax_device(quant, &weights, &input, width, row_values.len())
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                token_id, 1,
-                "{quant:?} must keep the lowest token id on ties"
+                token_id, expected_id,
+                "{quant:?} fused output argmax changed the selected token"
             );
-            assert_close(token_score, 3.0, "fused output-head score");
+            assert_eq!(
+                expected_id, 27,
+                "reference argmax must exercise stable ties"
+            );
+            assert_close(token_score, expected_score, "fused output-head score");
         }
     }
 
@@ -2032,6 +2046,148 @@ mod tests {
                 assert!(
                     (value - expected).abs() <= tolerance,
                     "fused MoE {down_quant:?} value={value}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_top8_shared_moe_matches_unfused_nonuniform_pipeline() {
+        let Ok(backend) = MetalBackend::new() else {
+            return;
+        };
+        let expert_count = 16;
+        let top_k = 8;
+        let width = K_BLOCK_VALUES;
+        let input = F32Tensor::new(vec![1.0 / width as f32; width], [1, width]).unwrap();
+        let input = backend.device_upload_f32_tensor(&input).unwrap().unwrap();
+        let residual_values = (0..width)
+            .map(|index| ((index % 13) as f32 - 6.0) / 20.0)
+            .collect::<Vec<_>>();
+        let residual = F32Tensor::new(residual_values, [1, width]).unwrap();
+        let residual = backend
+            .device_upload_f32_tensor(&residual)
+            .unwrap()
+            .unwrap();
+        let logits = F32Tensor::new(
+            (0..expert_count)
+                .map(|expert| ((expert * 7) % 17) as f32 / 4.0 - 2.0)
+                .collect(),
+            [1, expert_count],
+        )
+        .unwrap();
+        let logits = backend.device_upload_f32_tensor(&logits).unwrap().unwrap();
+        let correction_bias = (0..expert_count)
+            .map(|expert| ((expert * 11) % 9) as f32 / 50.0)
+            .collect::<Vec<_>>();
+        let routing = backend
+            .moe_router_topk_resident_device(&logits, &correction_bias, top_k, true, 1.0)
+            .unwrap()
+            .unwrap();
+
+        let routed_rows = expert_count * width;
+        let routed_gate_values = (0..routed_rows)
+            .map(|row| ((row * 3 + row / width) % 5 + 1) as u8)
+            .collect::<Vec<_>>();
+        let routed_up_values = (0..routed_rows)
+            .map(|row| ((row * 2 + 3 * (row / width)) % 7 + 1) as u8)
+            .collect::<Vec<_>>();
+        let routed_down_values = (0..routed_rows)
+            .map(|row| ((row * 5 + 2 * (row / width)) % 4 + 1) as u8)
+            .collect::<Vec<_>>();
+        let shared_gate_values = (0..width)
+            .map(|row| ((row * 3) % 5 + 1) as u8)
+            .collect::<Vec<_>>();
+        let shared_up_values = (0..width)
+            .map(|row| ((row * 5) % 7 + 1) as u8)
+            .collect::<Vec<_>>();
+        let shared_down_values = (0..width)
+            .map(|row| ((row * 7) % 4 + 1) as u8)
+            .collect::<Vec<_>>();
+        let routed_gate = q4_row_matrix(&routed_gate_values, width);
+        let routed_up = q4_row_matrix(&routed_up_values, width);
+        let shared_gate = q4_row_matrix(&shared_gate_values, width);
+        let shared_up = q4_row_matrix(&shared_up_values, width);
+
+        for (routed_down, shared_down, down_quant) in [
+            (
+                q4_row_matrix(&routed_down_values, width),
+                q4_row_matrix(&shared_down_values, width),
+                GgufKQuant::Q4K,
+            ),
+            (
+                q6_row_matrix(&routed_down_values, width),
+                q6_row_matrix(&shared_down_values, width),
+                GgufKQuant::Q6K,
+            ),
+        ] {
+            let routed = backend
+                .laguna_xs_gguf_moe_device(
+                    &routed_gate,
+                    &routed_up,
+                    &routed_down,
+                    down_quant,
+                    &input,
+                    &routing,
+                    width,
+                    width,
+                    width,
+                )
+                .unwrap()
+                .unwrap();
+            let shared_activated = backend
+                .laguna_xs_q4_gate_up_swiglu_device(
+                    &shared_gate,
+                    &shared_up,
+                    &input,
+                    1,
+                    width,
+                    width,
+                )
+                .unwrap()
+                .unwrap();
+            let expected = backend
+                .laguna_xs_k_matvec_add2_device(
+                    down_quant,
+                    &shared_down,
+                    &shared_activated,
+                    &routed,
+                    &residual,
+                    1,
+                    width,
+                    width,
+                )
+                .unwrap()
+                .unwrap();
+            let actual = backend
+                .laguna_xs_gguf_moe_shared_device(
+                    &routed_gate,
+                    &routed_up,
+                    &routed_down,
+                    &shared_gate,
+                    &shared_up,
+                    &shared_down,
+                    down_quant,
+                    &input,
+                    &routing,
+                    &residual,
+                    width,
+                    width,
+                    width,
+                )
+                .unwrap()
+                .unwrap();
+            let expected = backend.device_download_f32_tensor(&expected).unwrap();
+            let actual = backend.device_download_f32_tensor(&actual).unwrap();
+
+            assert_eq!(actual.dims(), expected.dims());
+            for (index, (actual, expected)) in
+                actual.values().iter().zip(expected.values()).enumerate()
+            {
+                let tolerance = 1e-3_f32.max(expected.abs() * 2e-5);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "fused MoE {down_quant:?} mismatch at {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
                 );
             }
         }
@@ -2377,6 +2533,19 @@ mod tests {
         weights
     }
 
+    fn q4_row_matrix(row_quants: &[u8], in_features: usize) -> Vec<u8> {
+        assert!(in_features.is_multiple_of(K_BLOCK_VALUES));
+        let blocks_per_row = in_features / K_BLOCK_VALUES;
+        let mut weights = Vec::with_capacity(row_quants.len() * blocks_per_row * Q4_K_BLOCK_BYTES);
+        for quant in row_quants {
+            let block = q4_block(*quant);
+            for _ in 0..blocks_per_row {
+                weights.extend_from_slice(&block);
+            }
+        }
+        weights
+    }
+
     fn q6_block(value: u8) -> Vec<u8> {
         assert!(value <= 31);
         let quant = value + 32;
@@ -2398,6 +2567,19 @@ mod tests {
         for value in expert_values {
             let block = q6_block(*value);
             for _ in 0..blocks_per_expert {
+                weights.extend_from_slice(&block);
+            }
+        }
+        weights
+    }
+
+    fn q6_row_matrix(row_values: &[u8], in_features: usize) -> Vec<u8> {
+        assert!(in_features.is_multiple_of(K_BLOCK_VALUES));
+        let blocks_per_row = in_features / K_BLOCK_VALUES;
+        let mut weights = Vec::with_capacity(row_values.len() * blocks_per_row * Q6_K_BLOCK_BYTES);
+        for value in row_values {
+            let block = q6_block(*value);
+            for _ in 0..blocks_per_row {
                 weights.extend_from_slice(&block);
             }
         }
@@ -2458,6 +2640,20 @@ mod tests {
             .zip(right)
             .map(|(left, right)| left * right)
             .sum()
+    }
+
+    fn stable_argmax(values: &[f32]) -> (u32, f32) {
+        values.iter().copied().enumerate().fold(
+            (u32::MAX, f32::NEG_INFINITY),
+            |best, (index, score)| {
+                let index = index as u32;
+                if score > best.1 || (score == best.1 && index < best.0) {
+                    (index, score)
+                } else {
+                    best
+                }
+            },
+        )
     }
 
     fn assert_close(actual: f32, expected: f32, label: &str) {
