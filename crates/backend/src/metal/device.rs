@@ -1119,6 +1119,27 @@ impl Metal {
         })
     }
 
+    pub(crate) fn reset_qwen_linear_attention_cache(
+        &self,
+        cache: &QwenLinearAttentionCache,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command| {
+            let encoder = command.new_blit_command_encoder();
+            for buffer in [&cache.conv_state, &cache.recurrent_state] {
+                encoder.fill_buffer(
+                    buffer,
+                    ::metal::NSRange {
+                        location: 0,
+                        length: buffer.length(),
+                    },
+                    0,
+                );
+            }
+            encoder.end_encoding();
+            Ok(())
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn batched_qwen_mlx_w4_linear_attention(
         &self,

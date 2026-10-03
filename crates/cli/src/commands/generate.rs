@@ -432,7 +432,7 @@ fn run_qwen(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_qwen_options(
+pub(super) fn validate_qwen_options(
     page_size: usize,
     profile_runtime: Option<&Path>,
     profile_layers: Option<&Path>,

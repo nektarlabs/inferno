@@ -54,8 +54,12 @@ const LAGUNA_CODEX_DUPLICATE_RETRIES: usize = 2;
 const LAGUNA_CODEX_MAX_IDENTICAL_TOOL_EXECUTIONS: usize = 2;
 const CODEX_FALLBACK_INSTRUCTION_PREFIX: &str = "You are a coding agent running in the Codex CLI";
 const CLOSED_THINKING_BOUNDARY: &str = "</think>";
+#[path = "qwen_serve.rs"]
+mod qwen_serve;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    qwen: &super::qwen::QwenOptions,
     model_path: &Path,
     config_path: Option<&Path>,
     tokenizer_path: Option<&Path>,
@@ -74,7 +78,11 @@ pub fn run(
 ) -> Result<()> {
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
-    match detect_model_architecture(&discovered_config)? {
+    let architecture = detect_model_architecture(&discovered_config)?;
+    if architecture != ModelArchitecture::Qwen38 {
+        qwen.reject_for_other_models()?;
+    }
+    match architecture {
         ModelArchitecture::GlmMoeDsa => {
             if thinking {
                 return Err(
@@ -115,10 +123,31 @@ pub fn run(
             telemetry_file,
             memory_controller_log,
         ),
-        ModelArchitecture::Qwen38 => Err(Error::runtime(
-            "Qwen3.8 configuration is recognized, but its Metal runtime is not complete",
-        )
-        .into()),
+        ModelArchitecture::Qwen38 => {
+            super::generate::validate_qwen_options(
+                page_size,
+                None,
+                None,
+                false,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            )?;
+            qwen_serve::run(
+                qwen,
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                bind,
+                max_new_tokens,
+                thinking,
+                throughput_summary,
+            )
+        }
     }
 }
 

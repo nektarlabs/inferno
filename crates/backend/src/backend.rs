@@ -231,6 +231,11 @@ pub struct DFlashAttentionCache {
 }
 
 impl DFlashAttentionCache {
+    pub fn reset(&mut self) {
+        self.length = 0;
+        self.next_position = 0;
+    }
+
     pub fn length(&self) -> usize {
         self.length
     }
@@ -1693,6 +1698,13 @@ pub trait Backend: Sync {
         _batch: usize,
     ) -> Result<Option<QwenLinearAttentionCache>> {
         Ok(None)
+    }
+
+    fn reset_qwen_linear_attention_cache(
+        &self,
+        _cache: &mut QwenLinearAttentionCache,
+    ) -> Result<()> {
+        Err(Error::backend("Qwen state reset requires native Metal"))
     }
 
     fn restore_qwen_linear_attention_checkpoint(
@@ -6177,6 +6189,27 @@ impl Backend for MetalBackend {
         {
             let _ = (cache, checkpoint_index, rejected_rows);
             Ok(false)
+        }
+    }
+
+    fn reset_qwen_linear_attention_cache(
+        &self,
+        cache: &mut QwenLinearAttentionCache,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let native = self
+                .native_metal()
+                .ok_or_else(|| Error::backend("Qwen state reset requires native Metal"))?;
+            native.reset_qwen_linear_attention_cache(cache)?;
+            cache.processed_tokens = 0;
+            cache.clear_checkpoint();
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = cache;
+            Err(Error::backend("Qwen state reset requires native Metal"))
         }
     }
 

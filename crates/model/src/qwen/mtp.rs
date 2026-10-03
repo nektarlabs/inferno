@@ -14,6 +14,10 @@ pub struct QwenMtpState {
 }
 
 impl QwenMtpState {
+    pub fn reset(&mut self) {
+        self.attention.reset();
+    }
+
     pub fn create<B: Backend>(backend: &B, batch: usize, capacity_tokens: usize) -> Result<Self> {
         let attention = backend
             .create_qwen_full_attention_cache(batch, capacity_tokens)?

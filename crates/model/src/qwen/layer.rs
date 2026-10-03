@@ -35,6 +35,19 @@ pub struct QwenModelState {
 }
 
 impl QwenModelState {
+    /// Starts an independent sequence without reallocating device storage.
+    pub fn reset<B: Backend>(&mut self, backend: &B) -> Result<()> {
+        for layer in &mut self.layers {
+            match layer {
+                QwenLayerState::Linear(cache) => {
+                    backend.reset_qwen_linear_attention_cache(cache)?
+                }
+                QwenLayerState::Full(cache) => cache.reset(),
+            }
+        }
+        Ok(())
+    }
+
     pub fn create<B: Backend>(
         backend: &B,
         config: &QwenConfig,

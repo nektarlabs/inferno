@@ -70,6 +70,7 @@ pub struct ResponsesStream<'a> {
     output_index: usize,
     active_message_id: Option<String>,
     last_heartbeat_at: Instant,
+    output_limit_reached: bool,
 }
 
 impl<'a> ResponsesStream<'a> {
@@ -87,6 +88,7 @@ impl<'a> ResponsesStream<'a> {
             output_index: 0,
             active_message_id: None,
             last_heartbeat_at: now,
+            output_limit_reached: false,
         };
         stream.event(
             "response.created",
@@ -275,31 +277,42 @@ impl<'a> ResponsesStream<'a> {
         Ok(())
     }
 
+    pub fn mark_output_limit_reached(&mut self) {
+        self.output_limit_reached = true;
+    }
+
     pub fn completed(&mut self, usage: ResponseUsage) -> Result<()> {
         let total_tokens = usage
             .input_tokens
             .checked_add(usage.output_tokens)
             .ok_or_else(|| Error::runtime("Responses token usage overflow"))?;
-        self.event(
-            "response.completed",
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": self.response_id,
-                    "object": "response",
-                    "status": "completed",
-                    "model": self.model,
-                    "end_turn": true,
-                    "usage": {
-                        "input_tokens": usage.input_tokens,
-                        "input_tokens_details": {"cached_tokens": 0},
-                        "output_tokens": usage.output_tokens,
-                        "output_tokens_details": {"reasoning_tokens": 0},
-                        "total_tokens": total_tokens
-                    }
+        let event = if self.output_limit_reached {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        let mut payload = json!({
+            "type": event,
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": "completed",
+                "model": self.model,
+                "end_turn": true,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": usage.output_tokens,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": total_tokens
                 }
-            }),
-        )
+            }
+        });
+        if self.output_limit_reached {
+            payload["response"]["status"] = json!("incomplete");
+            payload["response"]["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        self.event(event, payload)
     }
 
     pub fn failed(&mut self, message: &str) -> Result<()> {
@@ -394,6 +407,24 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("stream=true"));
+    }
+
+    #[test]
+    fn output_limit_emits_incomplete_instead_of_completed() {
+        let mut bytes = Vec::new();
+        let mut stream = ResponsesStream::begin(&mut bytes, "qwen3.8-27b-4bit").unwrap();
+        stream.mark_output_limit_reached();
+        stream
+            .completed(ResponseUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+            })
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("event: response.incomplete"));
+        assert!(text.contains("\"reason\":\"max_output_tokens\""));
+        assert!(text.contains("\"total_tokens\":12"));
+        assert!(!text.contains("event: response.completed"));
     }
 
     #[test]

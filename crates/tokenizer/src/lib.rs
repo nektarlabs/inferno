@@ -3,6 +3,8 @@
 //! Tokenizer loading, encoding, decoding, and streaming decode support.
 
 mod agent;
+mod qwen_agent;
+pub use qwen_agent::{parse_qwen_tool_calls, render_qwen_responses_prompt};
 
 use std::{
     fs,
@@ -259,12 +261,36 @@ pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
 /// Renders one text-only Qwen3.8 user turn using the checkpoint's published
 /// chat template.
 pub fn render_qwen_user_prompt(prompt: &str, thinking: bool) -> ChatPrompt {
+    render_qwen_chat_prompt(&[], prompt, thinking)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QwenChatTurn {
+    pub user: String,
+    pub reasoning: String,
+    pub assistant: String,
+}
+
+pub fn render_qwen_chat_prompt(
+    history: &[QwenChatTurn],
+    prompt: &str,
+    thinking: bool,
+) -> ChatPrompt {
     const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 
     let mut rendered = String::with_capacity(prompt.len() + XHIGH.len() + 128);
     if thinking {
         rendered.push_str("<|im_start|>system\n");
         rendered.push_str(XHIGH);
+        rendered.push_str("<|im_end|>\n");
+    }
+    for turn in history {
+        rendered.push_str("<|im_start|>user\n");
+        rendered.push_str(turn.user.trim());
+        rendered.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n");
+        rendered.push_str(turn.reasoning.trim());
+        rendered.push_str("\n</think>\n\n");
+        rendered.push_str(turn.assistant.trim());
         rendered.push_str("<|im_end|>\n");
     }
     rendered.push_str("<|im_start|>user\n");

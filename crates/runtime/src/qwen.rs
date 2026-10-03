@@ -23,6 +23,7 @@ const DFLASH_ACCEPTANCE_WINDOW: usize = 4;
 const DFLASH_PROMOTION_ACCEPTANCE_NUMERATOR: usize = 9;
 const DFLASH_PROMOTION_ACCEPTANCE_DENOMINATOR: usize = 10;
 const DEFAULT_MTP_DRAFT_DEPTH: usize = 2;
+const PREFILL_CHUNK_TOKENS: usize = 2_048;
 
 #[cfg(test)]
 #[path = "qwen/benchmarks.rs"]
@@ -195,6 +196,16 @@ impl<'a, B: Backend> QwenRuntime<'a, B> {
         &self.config
     }
 
+    /// Clears sequence state while retaining target/draft weights and buffer capacity.
+    pub fn reset_sequence(&mut self) -> Result<()> {
+        self.state.reset(self.backend)?;
+        match &mut self.drafter {
+            QwenDrafter::Mtp { state, .. } => state.reset(),
+            QwenDrafter::DFlash2 { state, .. } => state.reset(),
+        }
+        Ok(())
+    }
+
     pub fn summary(&self) -> Result<QwenRuntimeSummary> {
         Ok(QwenRuntimeSummary {
             artifact: self.weights.artifact,
@@ -206,11 +217,30 @@ impl<'a, B: Backend> QwenRuntime<'a, B> {
         })
     }
 
+    /// Generates one sequence. Call `reset_sequence` before reusing this runtime
+    /// for a new prompt, including after a callback cancels generation.
     pub fn generate(
         &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: Option<usize>,
         eos_token_ids: &[u32],
+        on_token: impl FnMut(u32) -> Result<()>,
+    ) -> Result<QwenGenerationReport> {
+        self.generate_with_prefill_progress(
+            prompt_tokens,
+            max_new_tokens,
+            eos_token_ids,
+            |_| Ok(()),
+            on_token,
+        )
+    }
+
+    pub fn generate_with_prefill_progress(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: Option<usize>,
+        eos_token_ids: &[u32],
+        mut on_prefill: impl FnMut(usize) -> Result<()>,
         on_token: impl FnMut(u32) -> Result<()>,
     ) -> Result<QwenGenerationReport> {
         let generation_limit = validate_generation_inputs(
@@ -244,6 +274,7 @@ impl<'a, B: Backend> QwenRuntime<'a, B> {
                 prompt_tokens,
                 generation_limit,
                 eos_token_ids,
+                &mut on_prefill,
                 on_token,
             ),
             QwenDrafter::DFlash2 {
@@ -261,6 +292,7 @@ impl<'a, B: Backend> QwenRuntime<'a, B> {
                 prompt_tokens,
                 generation_limit,
                 eos_token_ids,
+                &mut on_prefill,
                 on_token,
             ),
         }
@@ -305,23 +337,49 @@ fn generate_mtp<B: Backend>(
     prompt_tokens: &[u32],
     generation_limit: usize,
     eos_token_ids: &[u32],
+    on_prefill: &mut impl FnMut(usize) -> Result<()>,
     mut on_token: impl FnMut(u32) -> Result<()>,
 ) -> Result<QwenGenerationReport> {
+    let prefix_len = prompt_tokens.len().saturating_sub(PREFILL_CHUNK_TOKENS)
+        / PREFILL_CHUNK_TOKENS
+        * PREFILL_CHUNK_TOKENS;
+    for (chunk_index, chunk) in prompt_tokens[..prefix_len]
+        .chunks(PREFILL_CHUNK_TOKENS)
+        .enumerate()
+    {
+        let start = chunk_index * PREFILL_CHUNK_TOKENS;
+        let hidden =
+            forward_qwen_hidden_device(backend, config, weights, state, chunk, &[1, chunk.len()])?;
+        // The MTP head sees the shifted, known prompt tokens for this prefix.
+        forward_qwen_mtp_hidden_device(
+            backend,
+            config,
+            &weights.root,
+            mtp_weights,
+            mtp_state,
+            &hidden,
+            &prompt_tokens[start + 1..start + chunk.len() + 1],
+        )?;
+        backend.device_flush()?;
+        on_prefill(start + chunk.len())?;
+    }
+    let last_chunk = &prompt_tokens[prefix_len..];
     let prompt_hidden = forward_qwen_hidden_device(
         backend,
         config,
         weights,
         state,
-        prompt_tokens,
-        &[1, prompt_tokens.len()],
+        last_chunk,
+        &[1, last_chunk.len()],
     )?;
     let mut primary = one_batch_token(greedy_qwen_next_tokens_device(
         backend,
         weights,
         &prompt_hidden,
     )?)?;
+    on_prefill(prompt_tokens.len())?;
     let mut pending_mtp_hidden = prompt_hidden;
-    let mut pending_mtp_tokens = prompt_tokens[1..].to_vec();
+    let mut pending_mtp_tokens = last_chunk[1..].to_vec();
     pending_mtp_tokens.push(primary);
     let mut stats = DraftStats::default();
     let mut generated = 0_usize;
@@ -449,22 +507,44 @@ fn generate_dflash<B: Backend>(
     prompt_tokens: &[u32],
     generation_limit: usize,
     eos_token_ids: &[u32],
+    on_prefill: &mut impl FnMut(usize) -> Result<()>,
     mut on_token: impl FnMut(u32) -> Result<()>,
 ) -> Result<QwenGenerationReport> {
+    // Keep the complete DFlash context window in the final feature capture.
+    let final_rows = PREFILL_CHUNK_TOKENS.max(dflash_config.sliding_window - 1);
+    let prefix_len = prompt_tokens.len().saturating_sub(final_rows) / PREFILL_CHUNK_TOKENS
+        * PREFILL_CHUNK_TOKENS;
+    for (chunk_index, chunk) in prompt_tokens[..prefix_len]
+        .chunks(PREFILL_CHUNK_TOKENS)
+        .enumerate()
+    {
+        forward_qwen_hidden_device(
+            backend,
+            target_config,
+            target_weights,
+            target_state,
+            chunk,
+            &[1, chunk.len()],
+        )?;
+        backend.device_flush()?;
+        on_prefill(chunk_index * PREFILL_CHUNK_TOKENS + chunk.len())?;
+    }
+    let last_chunk = &prompt_tokens[prefix_len..];
     let (prompt_hidden, prompt_features) = forward_qwen_hidden_with_dflash_features_device(
         backend,
         target_config,
         dflash_config,
         target_weights,
         target_state,
-        prompt_tokens,
-        &[1, prompt_tokens.len()],
+        last_chunk,
+        &[1, last_chunk.len()],
     )?;
     let mut primary = one_batch_token(greedy_qwen_next_tokens_device(
         backend,
         target_weights,
         &prompt_hidden,
     )?)?;
+    on_prefill(prompt_tokens.len())?;
     let mut pending_features = prompt_features;
     let mut pending_feature_start = prompt_tokens.len() - pending_features.dims()[1];
     let mut target_context_length = prompt_tokens.len();
@@ -887,6 +967,146 @@ mod tests {
     fn mtp_is_enabled_by_default_for_qwen() {
         assert_eq!(DEFAULT_MTP_DRAFT_DEPTH, 2);
         assert_eq!(QwenDraftMethod::Mtp.as_str(), "mtp");
+    }
+
+    #[test]
+    #[ignore = "requires native Metal and local Qwen Q4, MTP and DFlash2 weights"]
+    fn real_qwen_sequence_reset_after_completion_and_cancellation() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let model = workspace.join("models/qwen3.8-27b-4bit");
+        let draft = workspace.join("models/qwen3.8-27b-dflash2");
+        let backend = MetalBackend::new().unwrap();
+        let prompt = [
+            248_045, 846, 198, 39_113, 728, 279, 6_511, 314, 14_898, 13, 248_046, 198, 248_045,
+            74_455, 198, 248_068, 271, 248_069, 271,
+        ];
+        let eos = [248_044, 248_046];
+        for dflash in [false, true] {
+            let mut runtime = if dflash {
+                QwenRuntime::open_with_dflash(
+                    &model,
+                    &model.join("config.json"),
+                    &draft,
+                    &backend,
+                    1,
+                    128,
+                )
+            } else {
+                QwenRuntime::open(&model, &model.join("config.json"), &backend, 1, 128)
+            }
+            .unwrap();
+            let storage_bytes = runtime.summary().unwrap().state_bytes;
+            let mut expected = Vec::new();
+            runtime
+                .generate(&prompt, Some(12), &eos, |id| {
+                    expected.push(id);
+                    Ok(())
+                })
+                .unwrap();
+            for cancel in [false, true] {
+                runtime.reset_sequence().unwrap();
+                if cancel {
+                    let error = runtime
+                        .generate(&prompt, Some(12), &eos, |_| {
+                            Err(Error::runtime("test cancellation"))
+                        })
+                        .unwrap_err();
+                    assert!(error.to_string().contains("test cancellation"));
+                    runtime.reset_sequence().unwrap();
+                }
+                let mut actual = Vec::new();
+                runtime
+                    .generate(&prompt, Some(12), &eos, |id| {
+                        actual.push(id);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected, "dflash={dflash}, cancel={cancel}");
+                assert_eq!(runtime.summary().unwrap().state_bytes, storage_bytes);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native Metal and local Qwen Q4, MTP and DFlash2 weights"]
+    fn real_qwen_chunked_prefill_matches_target_next_token() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let model = workspace.join("models/qwen3.8-27b-4bit");
+        let draft = workspace.join("models/qwen3.8-27b-dflash2");
+        let backend = MetalBackend::new().unwrap();
+        // Cross the chunk boundary with a partial last chunk, then verify decode as well.
+        let prompt = vec![198; 4097];
+        for dflash in [false, true] {
+            let mut runtime = if dflash {
+                QwenRuntime::open_with_dflash(
+                    &model,
+                    &model.join("config.json"),
+                    &draft,
+                    &backend,
+                    1,
+                    4120,
+                )
+            } else {
+                QwenRuntime::open(&model, &model.join("config.json"), &backend, 1, 4120)
+            }
+            .unwrap();
+            let mut reference = QwenModelState::create(&backend, &runtime.config, 1, 4120).unwrap();
+            let hidden = forward_qwen_hidden_device(
+                &backend,
+                &runtime.config,
+                &runtime.weights,
+                &mut reference,
+                &prompt,
+                &[1, prompt.len()],
+            )
+            .unwrap();
+            let mut token = one_batch_token(
+                greedy_qwen_next_tokens_device(&backend, &runtime.weights, &hidden).unwrap(),
+            )
+            .unwrap();
+            let mut expected = vec![token];
+            for _ in 0..3 {
+                let hidden = forward_qwen_hidden_device(
+                    &backend,
+                    &runtime.config,
+                    &runtime.weights,
+                    &mut reference,
+                    &[token],
+                    &[1, 1],
+                )
+                .unwrap();
+                token = one_batch_token(
+                    greedy_qwen_next_tokens_device(&backend, &runtime.weights, &hidden).unwrap(),
+                )
+                .unwrap();
+                expected.push(token);
+            }
+            let mut progress = Vec::new();
+            let mut actual = Vec::new();
+            runtime
+                .generate_with_prefill_progress(
+                    &prompt,
+                    Some(4),
+                    &[248_044, 248_046],
+                    |count| {
+                        progress.push(count);
+                        Ok(())
+                    },
+                    |id| {
+                        actual.push(id);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            if let Some(end) = expected
+                .iter()
+                .position(|id| [248_044, 248_046].contains(id))
+            {
+                expected.truncate(end + 1);
+            }
+            assert_eq!(progress, [2048, 4097]);
+            assert_eq!(actual, expected, "dflash={dflash}");
+        }
     }
 
     #[test]

@@ -45,8 +45,12 @@ const THINKING_COLOR: &[u8] = b"\x1b[90m";
 const ANSWER_COLOR: &[u8] = b"\x1b[97m";
 const RESET_COLOR: &[u8] = b"\x1b[0m";
 
+#[path = "qwen_chat.rs"]
+mod qwen_chat;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    qwen: &super::qwen::QwenOptions,
     model_path: &Path,
     config_path: Option<&Path>,
     tokenizer_path: Option<&Path>,
@@ -64,7 +68,11 @@ pub fn run(
 ) -> Result<()> {
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
-    match detect_model_architecture(&discovered_config)? {
+    let architecture = detect_model_architecture(&discovered_config)?;
+    if architecture != ModelArchitecture::Qwen38 {
+        qwen.reject_for_other_models()?;
+    }
+    match architecture {
         ModelArchitecture::Laguna => {
             return run_laguna(
                 model_path,
@@ -84,10 +92,28 @@ pub fn run(
             );
         }
         ModelArchitecture::Qwen38 => {
-            return Err(Error::runtime(
-                "Qwen3.8 configuration is recognized, but its Metal runtime is not complete",
-            )
-            .into());
+            super::generate::validate_qwen_options(
+                page_size,
+                None,
+                None,
+                false,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            )?;
+            return qwen_chat::run(
+                qwen,
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                max_new_tokens,
+                thinking,
+                throughput_summary,
+            );
         }
         ModelArchitecture::GlmMoeDsa => {}
     }

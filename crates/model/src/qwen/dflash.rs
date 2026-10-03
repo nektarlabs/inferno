@@ -16,6 +16,12 @@ pub struct DFlashState {
 }
 
 impl DFlashState {
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset();
+        }
+    }
+
     pub fn create<B: Backend>(backend: &B, config: &DFlashConfig, batch: usize) -> Result<Self> {
         let capacity = config
             .sliding_window

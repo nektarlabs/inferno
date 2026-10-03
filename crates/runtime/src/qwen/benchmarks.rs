@@ -161,6 +161,7 @@ fn benchmark_real_qwen_dflash_vs_autoregressive() {
                         &prompt,
                         TOKEN_LIMIT,
                         &generation.eos_token_ids,
+                        &mut |_| Ok(()),
                         |token| {
                             sample.push(token);
                             Ok(())

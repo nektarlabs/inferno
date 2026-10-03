@@ -55,7 +55,7 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Enable Laguna reasoning before the visible answer.
+        /// Enable Laguna or Qwen reasoning before the visible answer.
         #[arg(long, default_value_t = false)]
         thinking: bool,
 
@@ -118,6 +118,8 @@ enum Command {
 
     /// Start a persistent local chat session.
     Chat {
+        #[command(flatten)]
+        qwen: commands::qwen::QwenOptions,
         /// Directory containing a supported model.
         #[arg(long)]
         model: PathBuf,
@@ -138,7 +140,7 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Enable Laguna reasoning before each visible answer.
+        /// Enable Laguna or Qwen reasoning before each visible answer.
         #[arg(long, default_value_t = false)]
         thinking: bool,
 
@@ -169,6 +171,8 @@ enum Command {
 
     /// Serve a supported model through the local Responses API.
     Serve {
+        #[command(flatten)]
+        qwen: commands::qwen::QwenOptions,
         /// Directory containing a supported model.
         #[arg(long, default_value = "models/glm-5.2")]
         model: PathBuf,
@@ -193,7 +197,7 @@ enum Command {
         #[arg(long)]
         max_new_tokens: Option<usize>,
 
-        /// Enable Laguna reasoning before each server response.
+        /// Enable Laguna or Qwen reasoning before each server response.
         #[arg(long, default_value_t = false)]
         thinking: bool,
 
@@ -281,6 +285,7 @@ fn main() -> Result<()> {
             memory_controller_log.as_deref(),
         )?,
         Command::Chat {
+            qwen,
             model,
             config,
             tokenizer,
@@ -294,6 +299,7 @@ fn main() -> Result<()> {
             telemetry_file,
             memory_controller_log,
         } => commands::chat::run(
+            &qwen,
             model.as_path(),
             config.as_deref(),
             tokenizer.as_deref(),
@@ -310,6 +316,7 @@ fn main() -> Result<()> {
             memory_controller_log.as_deref(),
         )?,
         Command::Serve {
+            qwen,
             model,
             config,
             tokenizer,
@@ -324,6 +331,7 @@ fn main() -> Result<()> {
             telemetry_file,
             memory_controller_log,
         } => commands::serve::run(
+            &qwen,
             model.as_path(),
             config.as_deref(),
             tokenizer.as_deref(),
@@ -348,6 +356,7 @@ fn main() -> Result<()> {
 impl Command {
     fn default_chat() -> Self {
         Self::Chat {
+            qwen: commands::qwen::QwenOptions::default(),
             model: PathBuf::from("models/glm-5.2"),
             config: None,
             tokenizer: None,
@@ -530,6 +539,29 @@ mod tests {
             panic!("expected generate command");
         };
         assert_eq!(dflash_model, Some(PathBuf::from("/tmp/dflash")));
+    }
+
+    #[test]
+    fn qwen_chat_and_serve_accept_dflash_and_context_override() {
+        for mode in ["chat", "serve"] {
+            let cli = Cli::try_parse_from([
+                "inferno",
+                mode,
+                "--model",
+                "/tmp/qwen",
+                "--dflash-model",
+                "/tmp/dflash",
+                "--context-tokens",
+                "8192",
+            ])
+            .unwrap();
+            let qwen = match cli.command.unwrap() {
+                Command::Chat { qwen, .. } | Command::Serve { qwen, .. } => qwen,
+                _ => panic!("expected chat or serve"),
+            };
+            assert_eq!(qwen.context_tokens, 8192);
+            assert_eq!(qwen.dflash_model, Some(PathBuf::from("/tmp/dflash")));
+        }
     }
 
     #[test]

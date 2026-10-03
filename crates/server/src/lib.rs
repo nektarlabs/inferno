@@ -31,6 +31,7 @@ pub const GLM_CODEX_MODEL_ID: &str = "glm-5.2-q2";
 pub const LAGUNA_CODEX_MODEL_ID: &str = "laguna-s-2.1-int4";
 pub const LAGUNA_GGUF_CODEX_MODEL_ID: &str = "laguna-s-2.1-gguf";
 pub const LAGUNA_XS_GGUF_CODEX_MODEL_ID: &str = "laguna-xs-2.1-gguf";
+pub const QWEN_CODEX_MODEL_ID: &str = "qwen3.8-27b-4bit";
 const CODEX_MODEL_CATALOG: &str = include_str!("../../../examples/inferno.models.json");
 const EXCLUSIVE_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -47,6 +48,11 @@ pub enum ServerAdmission {
 /// prevents concurrent requests from competing for Inferno's Metal buffers and
 /// routed-expert cache.
 pub trait ResponsesHandler {
+    /// A runtime capacity override for the model advertised to clients.
+    fn context_window(&self) -> Option<usize> {
+        None
+    }
+
     fn admission(&self) -> ServerAdmission {
         ServerAdmission::Queue
     }
@@ -68,7 +74,10 @@ pub fn serve(
         path: "inferno-listener".into(),
         source,
     })?;
-    let model_catalog = codex_model_catalog(model_id)?;
+    let mut model_catalog = codex_model_catalog(model_id)?;
+    if let Some(capacity) = handler.context_window() {
+        set_catalog_context(&mut model_catalog, capacity)?;
+    }
     info!(addr = %bound_addr, "Inferno Responses server ready");
 
     let admission = handler.admission();
@@ -209,7 +218,7 @@ fn write_busy_response(socket: &mut TcpStream) -> Result<()> {
         socket,
         429,
         "server_busy",
-        "Inferno is already processing a Laguna GGUF request",
+        "Inferno is already processing an inference request",
     )
 }
 
@@ -307,6 +316,20 @@ fn codex_model_catalog(model_id: &str) -> Result<serde_json::Value> {
         )));
     }
     Ok(catalog)
+}
+
+fn set_catalog_context(catalog: &mut serde_json::Value, capacity: usize) -> Result<()> {
+    let model = &mut catalog["models"][0];
+    let maximum = model["max_context_window"].as_u64().unwrap_or(0);
+    if capacity < 2 || capacity as u64 > maximum {
+        return Err(Error::runtime(
+            "runtime context capacity exceeds model catalog limits",
+        ));
+    }
+    model["context_window"] = serde_json::json!(capacity);
+    model["max_context_window"] = serde_json::json!(capacity);
+    model["auto_compact_token_limit"] = serde_json::json!(capacity - capacity.div_ceil(8));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,5 +509,26 @@ mod tests {
     fn model_catalog_rejects_unknown_runtime_model() {
         let error = codex_model_catalog("unknown").unwrap_err();
         assert!(error.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn qwen_catalog_is_text_only_with_native_context() {
+        let catalog = codex_model_catalog(QWEN_CODEX_MODEL_ID).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["slug"], QWEN_CODEX_MODEL_ID);
+        assert_eq!(models[0]["context_window"], 262144);
+        assert_eq!(models[0]["input_modalities"], serde_json::json!(["text"]));
+        assert!(models[0]["apply_patch_tool_type"].is_null());
+    }
+
+    #[test]
+    fn qwen_catalog_uses_configured_runtime_capacity() {
+        let mut catalog = codex_model_catalog(QWEN_CODEX_MODEL_ID).unwrap();
+        set_catalog_context(&mut catalog, 4096).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 4096);
+        assert_eq!(catalog["models"][0]["max_context_window"], 4096);
+        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 3584);
+        assert!(set_catalog_context(&mut catalog, 262145).is_err());
     }
 }

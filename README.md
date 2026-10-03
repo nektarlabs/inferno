@@ -7,10 +7,10 @@
 Inferno is a lightweight Rust inference engine for running selected language
 models on Apple Silicon through native Metal kernels. It currently supports
 GLM-5.2 Q2, two exact Laguna S 2.1 artifacts, the official Laguna XS 2.1
-Q4_K_M GGUF, and the official Qwen3.8 27B MLX 4-bit checkpoint. Its primary
+Q4_K_M GGUF, and the Qwen3.8 27B MLX-community 4-bit checkpoint. Its primary
 target is a MacBook Pro with 64 GB of unified memory.
 
-The name reflects the engineering challenge: these models are larger than the
+The name reflects the engineering challenge: some targets exceed the
 available memory, so useful local inference requires careful coordination of
 Metal, unified memory, caching, and SSD streaming. Inferno stays deliberately
 narrow. It supports a small set of exact model layouts and optimizes each path
@@ -28,8 +28,9 @@ independently instead of becoming a general inference framework.
 - Laguna S 2.1 through either its official INT4 Safetensors checkpoint or
   `laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf`.
 - Laguna XS 2.1 through the official `Laguna-XS-2.1-Q4_K_M.gguf`.
-- Qwen3.8 27B through the official MLX 4-bit target and Q4 MTP companion;
-  DFlash2 can replace MTP explicitly.
+- Qwen3.8 27B through the MLX-community 4-bit target and Q4 MTP companion;
+  MTP is enabled by default, with optional DFlash2. Text-only inference is
+  available in `generate`, `chat`, and `serve`.
 - Exact top-8 routing for GLM and Laguna XS; exact top-10 routing for Laguna S.
 - Native Metal execution with no CPU compute fallback.
 - Interactive chat, one-shot generation, and a streaming Responses API.
@@ -51,12 +52,20 @@ or Safetensors architectures and quantization formats.
 | Laguna S 2.1 mixed Q2_K/Q3_K GGUF | **494.48 tokens/s** | **54.53 tokens/s** |
 | Laguna XS 2.1 Q4_K_M GGUF | **145.79 tokens/s** | **136.11 tokens/s** |
 | Qwen3.8 27B MLX 4-bit + MTP Q4 | — | **17.29 tokens/s** |
-| Qwen3.8 27B MLX 4-bit + DFlash2 | — | **52.82 tokens/s** |
+| Qwen3.8 27B MLX 4-bit + DFlash2 | **212.5 tokens/s** | **56.9 tokens/s** |
 
-Best observed results on a 64 GB Apple Silicon MacBook Pro using release builds
-and exact routing. A dash means that a comparable prefill result has not been
-recorded. Results depend on prompt length, expert-cache state, SSD activity,
-thermal state, and memory pressure.
+Measured on a 64 GB Apple Silicon MacBook Pro using release builds. GLM and
+Laguna retain their previously reported results. A dash means that a comparable
+prefill result has not been recorded. Results depend on the prompt, cache state,
+SSD activity, thermal state, and memory pressure.
+
+The latest Qwen Q4 + DFlash2 tests used an M4 Max: prefill medians over three
+runs were **212.5 tokens/s at 511 input tokens** and **199.6 tokens/s at 1,975**.
+Prefill and decode were measured separately. Final decode checks reached
+**56.8-56.9 tokens/s** for a JavaScript Fibonacci function and **35.0-35.1
+tokens/s** for a hash-table explanation. DFlash speed depends on draft-token
+acceptance; these are prompt-specific results, not a guaranteed throughput
+range. The MTP result predates these tests and was not remeasured.
 
 ## Requirements
 
@@ -269,10 +278,10 @@ kernel libraries.
 
 ### Qwen3.8 27B
 
-Inferno supports the official
+Inferno supports the
 [Qwen3.8 27B MLX 4-bit target](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit)
 with affine group-64 W4 Metal kernels. MTP is enabled by default through the
-official standalone
+standalone
 [Qwen3.8 27B MTP 4-bit companion](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-4bit).
 The companion contains only the one-layer proposal head; the target model
 still verifies every accepted token.
@@ -310,7 +319,9 @@ weights or allocate MTP state:
 target/release/inferno generate \
   --model models/qwen3.8-27b-4bit \
   --dflash-model models/qwen3.8-27b-dflash2 \
-  --prompt "Tell me the capital of Italy."
+  --prompt "Write a JavaScript function to calculate the Fibonacci sequence." \
+  --max-new-tokens 128 \
+  --measure-tokens-per-second
 ```
 
 The DFlash2 path uses dedicated five-row and eight-row W4 verification kernels.
@@ -318,8 +329,45 @@ Generation starts with a five-token block. It promotes to eight only after four
 consecutive blocks reach at least 90% aggregate draft acceptance, then returns
 to five when two eight-token blocks fall below 50%. This keeps five as the
 stable quantized-target path and uses eight only for highly predictable text.
-DFlash2 support is currently limited to greedy `generate`; Qwen `chat` and
-`serve` are not exposed yet.
+Both Qwen modes use text-only, greedy generation. Start an interactive session
+with DFlash2:
+
+```bash
+target/release/inferno chat \
+  --model models/qwen3.8-27b-4bit \
+  --dflash-model models/qwen3.8-27b-dflash2 \
+  --throughput-summary
+```
+
+Serve the same model through the streaming Responses API:
+
+```bash
+target/release/inferno serve \
+  --model models/qwen3.8-27b-4bit \
+  --dflash-model models/qwen3.8-27b-dflash2 \
+  --throughput-summary
+```
+
+Omit `--dflash-model` to use MTP. Chat and server default to a **262,144-token**
+context, including output; use `--context-tokens <N>` to lower it. Chat keeps
+conversation history; `/clear` starts a new conversation and `/exit` quits.
+Weights remain loaded, but each turn currently reprocesses its full history.
+
+The server advertises `qwen3.8-27b-4bit`. It accepts text and function tools on
+`POST /v1/responses` with `stream: true`; custom tools and multimodal input are
+not supported. Reasoning is off by default: use `--thinking` or request effort
+`xhigh` to enable it (`none` disables it). Truncated responses are reported as
+incomplete, and truncated tool calls are never dispatched.
+
+Use `--throughput-summary` for a single-line prefill/decode report in chat or
+generate, or a live display in serve. The new chat/server adapters have protocol
+tests; real-model multi-turn validation and full 256K-context validation remain
+pending.
+
+Qwen uses dedicated prefill kernels to process prompt tokens in batches,
+reuse intermediate buffers, and fuse gate/up projections with activation.
+These optimizations are separate from its decode kernels and the GLM and
+Laguna paths.
 
 ## Build
 
@@ -526,8 +574,9 @@ target/release/inferno generate \
 | Option | Purpose |
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
-| `--thinking` | Enables Laguna reasoning for `generate`, `chat`, or `serve`; direct answers are the default. |
-| `--dflash-model <DIR>` | Replaces default Qwen3.8 Q4 MTP drafting with the external DFlash2 drafter for `generate`. |
+| `--thinking` | Enables Laguna or Qwen reasoning for `generate`, `chat`, or `serve`; direct answers are the default. |
+| `--dflash-model <DIR>` | Replaces default Qwen3.8 Q4 MTP drafting with DFlash2 in `generate`, `chat`, or `serve`. |
+| `--context-tokens <N>` | Qwen chat/server context capacity, including output; defaults to 262,144. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
 | `--throughput-summary` | Prints compact prefill/decode throughput after `generate` and `chat`, or updates it live while `serve` is processing a response. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget for cache-backed artifacts. |
@@ -552,6 +601,14 @@ target/release/inferno serve --help
 Inferno uses the SSD as a large, slower storage tier and unified memory as a
 smaller, faster tier. Cache policy is model-specific because GLM and Laguna
 show different expert-locality and attention behavior.
+
+**Qwen weights and state.** Qwen3.8 27B is dense, so it has no routed-expert
+cache. Packed Q4 weights are loaded into persistent Metal buffers once.
+Recurrent attention state and full-attention KV stay on Metal; they do not use
+GLM's SSD KV store. At 262,144 tokens, the target's full-attention KV capacity
+alone is 16 GiB, excluding weights, draft state and temporary buffers. Reducing
+`--context-tokens` lowers this reservation. Long prompts use bounded prefill
+chunks and reusable GPU scratch buffers rather than whole-prompt intermediates.
 
 **Expert cache.** GLM selects eight experts and uses a per-layer SLRU cache.
 Keeping layer budgets separate matches GLM's measured locality and prevents one
