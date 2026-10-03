@@ -10,8 +10,8 @@ use anyhow::Result;
 use backend::{Backend, ExpertCacheMetrics, MetalBackend};
 use common::{Error, Result as InfernoResult};
 use config::{
-    detect_model_architecture, load_config, load_generation_config, load_laguna_config, Config,
-    LagunaConfig, ModelArchitecture,
+    detect_model_architecture, load_config, load_generation_config, load_laguna_config,
+    load_qwen_config, Config, LagunaConfig, ModelArchitecture,
 };
 use gguf::GgufFile;
 use inferno_io::EXPERT_PACK_FILE_NAME;
@@ -25,17 +25,19 @@ use runtime::{
     enable_memory_telemetry_file, enable_q2_runtime_profile, q2_memory_controller_spec,
     run_generate_streaming_with_options, GenerationControl, GenerationOptions, KvCacheMetrics,
     LagunaGenerationOptions, LagunaMemoryControllerSpec, LagunaRuntime, LagunaThinkingGuard,
-    MtpMetrics, DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS,
+    MtpMetrics, QwenRuntime, DEFAULT_LAGUNA_MEMORY_DECISION_WINDOW_TOKENS,
     DEFAULT_LAGUNA_MEMORY_HARD_HEADROOM_BYTES, DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS,
     DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES, DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
     LAGUNA_THINKING_END_TOKEN_ID,
 };
 use tokenizer::{
-    render_laguna_user_prompt, render_user_prompt, LagunaThinkingMode, TokenDecoder, Tokenizer,
+    render_laguna_user_prompt, render_qwen_user_prompt, render_user_prompt, LagunaThinkingMode,
+    TokenDecoder, Tokenizer,
 };
 use tracing::debug;
 
 const LAGUNA_AUTO_CACHE_HEADROOM_BYTES: u64 = 6_000_000_000;
+const QWEN_TOKENIZER_VOCAB_SIZE: usize = 248_077;
 const LAGUNA_DEFAULT_EXPERT_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
 const LAGUNA_MINIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 16_000_000_000;
 const LAGUNA_MAXIMUM_ADAPTIVE_EXPERT_CACHE_BYTES: u64 = 32_000_000_000;
@@ -61,6 +63,7 @@ pub fn run(
     model_path: &Path,
     config_path: Option<&Path>,
     tokenizer_path: Option<&Path>,
+    dflash_model_path: Option<&Path>,
     page_size: usize,
     prompt: &str,
     max_new_tokens: Option<usize>,
@@ -85,32 +88,64 @@ pub fn run(
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
     let architecture = detect_model_architecture(&discovered_config)?;
-    if architecture == ModelArchitecture::Laguna {
-        return run_laguna(
-            model_path,
-            &discovered_config,
-            &discovered_tokenizer,
-            page_size,
-            prompt,
-            max_new_tokens,
-            thinking,
-            add_special_tokens,
-            skip_special_tokens,
-            profile_runtime,
-            profile_layers,
-            measure_tokens_per_second,
-            throughput_summary,
-            throughput_file,
-            profile_token_costs,
-            speculative_mtp,
-            enable_unified_memory_controller,
-            expert_cache_gb,
-            hot_kv_cache_gb,
-            enable_telemetry,
-            telemetry_file,
-            memory_controller_log,
-        );
+    match architecture {
+        ModelArchitecture::Laguna => {
+            reject_dflash_for_non_qwen(dflash_model_path)?;
+            return run_laguna(
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                page_size,
+                prompt,
+                max_new_tokens,
+                thinking,
+                add_special_tokens,
+                skip_special_tokens,
+                profile_runtime,
+                profile_layers,
+                measure_tokens_per_second,
+                throughput_summary,
+                throughput_file,
+                profile_token_costs,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            );
+        }
+        ModelArchitecture::Qwen38 => {
+            return run_qwen(
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                dflash_model_path,
+                page_size,
+                prompt,
+                max_new_tokens,
+                thinking,
+                add_special_tokens,
+                skip_special_tokens,
+                profile_runtime,
+                profile_layers,
+                measure_tokens_per_second,
+                throughput_summary,
+                throughput_file,
+                profile_token_costs,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            );
+        }
+        ModelArchitecture::GlmMoeDsa => {}
     }
+    reject_dflash_for_non_qwen(dflash_model_path)?;
     if thinking {
         return Err(Error::runtime("--thinking currently applies only to Laguna models").into());
     }
@@ -246,6 +281,198 @@ pub fn run(
         if let Some(path) = throughput_file {
             append_tokens_per_second_report(path, &throughput_report)?;
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qwen(
+    model_path: &Path,
+    config_path: &Path,
+    tokenizer_path: &Path,
+    dflash_model_path: Option<&Path>,
+    page_size: usize,
+    prompt: &str,
+    max_new_tokens: Option<usize>,
+    thinking: bool,
+    add_special_tokens: bool,
+    skip_special_tokens: bool,
+    profile_runtime: Option<&Path>,
+    profile_layers: Option<&Path>,
+    measure_tokens_per_second: bool,
+    throughput_summary: bool,
+    throughput_file: Option<&Path>,
+    profile_token_costs: bool,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> Result<()> {
+    validate_qwen_options(
+        page_size,
+        profile_runtime,
+        profile_layers,
+        profile_token_costs,
+        speculative_mtp,
+        enable_unified_memory_controller,
+        expert_cache_gb,
+        hot_kv_cache_gb,
+        enable_telemetry,
+        telemetry_file,
+        memory_controller_log,
+    )?;
+    let config = load_qwen_config(config_path)?;
+    let generation_config = load_generation_config(&model_path.join("generation_config.json"))?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    let tokenizer_vocab_size = tokenizer.metadata().vocab_size_with_added_tokens;
+    tokenizer.validate_contract(
+        QWEN_TOKENIZER_VOCAB_SIZE,
+        &[
+            ("<|endoftext|>", 248_044),
+            ("<|im_start|>", 248_045),
+            ("<|im_end|>", 248_046),
+        ],
+    )?;
+    if tokenizer_vocab_size > config.text_config.vocab_size {
+        return Err(Error::tokenizer(format!(
+            "Qwen tokenizer vocabulary {} exceeds embedding rows {}",
+            tokenizer_vocab_size, config.text_config.vocab_size
+        ))
+        .into());
+    }
+    let rendered = render_qwen_user_prompt(prompt, thinking);
+    let encoded = tokenizer.encode(&rendered.rendered, add_special_tokens)?;
+    let capacity_tokens = match max_new_tokens {
+        Some(max_new_tokens) => encoded
+            .token_ids
+            .len()
+            .checked_add(max_new_tokens)
+            .ok_or_else(|| Error::runtime("Qwen generation length overflow"))?,
+        None => config.text_config.max_position_embeddings,
+    };
+    if capacity_tokens > config.text_config.max_position_embeddings {
+        return Err(Error::runtime(format!(
+            "Qwen prompt plus generation requires {capacity_tokens} tokens, maximum is {}",
+            config.text_config.max_position_embeddings
+        ))
+        .into());
+    }
+
+    let backend = MetalBackend::new()?;
+    let mut runtime = match dflash_model_path {
+        Some(dflash_model_path) => QwenRuntime::open_with_dflash(
+            model_path,
+            config_path,
+            dflash_model_path,
+            &backend,
+            1,
+            capacity_tokens,
+        )?,
+        None => QwenRuntime::open(model_path, config_path, &backend, 1, capacity_tokens)?,
+    };
+    let mut stdout = io::stdout().lock();
+    let mut stream = DecodedTextStream::new(&tokenizer, skip_special_tokens);
+    let mut throughput = ThroughputRecorder::start();
+    let generation_report = runtime.generate(
+        &encoded.token_ids,
+        max_new_tokens,
+        &generation_config.eos_token_ids,
+        |token_id| {
+            throughput.record_token();
+            if !generation_config.eos_token_ids.contains(&token_id) {
+                if let Some(text) = stream.push(token_id)? {
+                    stdout
+                        .write_all(text.as_bytes())
+                        .map_err(|source| Error::Io {
+                            path: PathBuf::from("<stdout>"),
+                            source,
+                        })?;
+                    stdout.flush().map_err(|source| Error::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    })?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let throughput_report = throughput
+        .finish(encoded.token_ids.len(), 0)
+        .with_runtime_metrics(
+            ExpertCacheMetrics::default(),
+            ExpertCacheMetrics::default(),
+            KvCacheMetrics::default(),
+            MtpMetrics {
+                enabled: true,
+                verification_passes: u64::try_from(generation_report.verification_passes)
+                    .unwrap_or(u64::MAX),
+                target_tokens: u64::try_from(generation_report.target_tokens).unwrap_or(u64::MAX),
+                draft_tokens: u64::try_from(generation_report.draft_tokens).unwrap_or(u64::MAX),
+                accepted_draft_tokens: u64::try_from(generation_report.accepted_draft_tokens)
+                    .unwrap_or(u64::MAX),
+            },
+        );
+    stdout.write_all(b"\n")?;
+    if generation_report.generated_tokens != throughput_report.generated_tokens {
+        return Err(Error::runtime("Qwen generated-token accounting mismatch").into());
+    }
+    if measure_tokens_per_second {
+        write_qwen_tokens_per_second_report(&throughput_report, &generation_report)?;
+    }
+    if throughput_summary {
+        write_throughput_summary(&throughput_report)?;
+    }
+    if let Some(path) = throughput_file {
+        append_tokens_per_second_report(path, &throughput_report)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qwen_options(
+    page_size: usize,
+    profile_runtime: Option<&Path>,
+    profile_layers: Option<&Path>,
+    profile_token_costs: bool,
+    speculative_mtp: bool,
+    enable_unified_memory_controller: bool,
+    expert_cache_gb: Option<f64>,
+    hot_kv_cache_gb: Option<f64>,
+    enable_telemetry: bool,
+    telemetry_file: Option<&Path>,
+    memory_controller_log: Option<&Path>,
+) -> InfernoResult<()> {
+    let unsupported = profile_runtime.is_some()
+        || profile_layers.is_some()
+        || profile_token_costs
+        || speculative_mtp
+        || enable_unified_memory_controller
+        || expert_cache_gb.is_some()
+        || hot_kv_cache_gb.is_some()
+        || enable_telemetry
+        || telemetry_file.is_some()
+        || memory_controller_log.is_some();
+    if unsupported {
+        return Err(Error::runtime(
+            "Qwen3.8 currently supports generation and throughput flags only",
+        ));
+    }
+    if page_size != runtime::DEFAULT_KV_PAGE_SIZE {
+        return Err(Error::runtime(
+            "Qwen3.8 uses its native recurrent/full-attention state and does not accept --page-size",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_dflash_for_non_qwen(dflash_model_path: Option<&Path>) -> InfernoResult<()> {
+    if dflash_model_path.is_some() {
+        return Err(Error::runtime(
+            "--dflash-model is supported only by the Qwen3.8 generate runtime",
+        ));
     }
     Ok(())
 }
@@ -773,6 +1000,44 @@ fn write_laguna_tokens_per_second_report(
         generation.expert_cache.capacity_experts,
         bytes_to_gb(generation.expert_cache.resident_bytes),
         bytes_to_gb(generation.expert_cache.capacity_bytes),
+    )
+    .map_err(|source| Error::Io {
+        path: PathBuf::from("<stderr>"),
+        source,
+    })
+}
+
+fn write_qwen_tokens_per_second_report(
+    throughput: &ThroughputReport,
+    generation: &runtime::QwenGenerationReport,
+) -> InfernoResult<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "inferno qwen throughput: prompt_tokens={} generated_tokens={} total_tokens_per_second={:.3} time_to_first_token_seconds={:.3} prefill_tokens_per_second={:.3} decode_tokens_per_second={:.3} draft_method={} max_draft_depth={} dflash_m5_passes={} dflash_m8_passes={} dflash_depth_switches={} verification_passes={} target_rows={} drafts={} accepted={} acceptance_rate={:.4} draft_seconds={:.3} target_seconds={:.3} rollback_seconds={:.3}",
+        throughput.prompt_tokens,
+        throughput.generated_tokens,
+        throughput.total_tokens_per_second,
+        throughput.time_to_first_token_seconds,
+        throughput.prefill_tokens_per_second(),
+        throughput.decode_tokens_per_second,
+        generation.draft_method.as_str(),
+        generation.max_draft_depth,
+        generation.dflash_m5_passes,
+        generation.dflash_m8_passes,
+        generation.dflash_depth_switches,
+        generation.verification_passes,
+        generation.target_tokens,
+        generation.draft_tokens,
+        generation.accepted_draft_tokens,
+        if generation.draft_tokens == 0 {
+            0.0
+        } else {
+            generation.accepted_draft_tokens as f64 / generation.draft_tokens as f64
+        },
+        generation.draft_seconds,
+        generation.target_seconds,
+        generation.rollback_seconds,
     )
     .map_err(|source| Error::Io {
         path: PathBuf::from("<stderr>"),

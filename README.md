@@ -4,11 +4,11 @@
   <img src="assets/logo.svg" alt="Inferno logo" width="150">
 </p>
 
-Inferno is a lightweight Rust inference engine for running selected
-Mixture-of-Experts models on Apple Silicon through native Metal kernels. It
-currently supports GLM-5.2 Q2, two exact Laguna S 2.1 artifacts, and the
-official Laguna XS 2.1 Q4_K_M GGUF. Its primary target is a MacBook Pro with
-64 GB of unified memory.
+Inferno is a lightweight Rust inference engine for running selected language
+models on Apple Silicon through native Metal kernels. It currently supports
+GLM-5.2 Q2, two exact Laguna S 2.1 artifacts, the official Laguna XS 2.1
+Q4_K_M GGUF, and the official Qwen3.8 27B MLX 4-bit checkpoint. Its primary
+target is a MacBook Pro with 64 GB of unified memory.
 
 The name reflects the engineering challenge: these models are larger than the
 available memory, so useful local inference requires careful coordination of
@@ -28,6 +28,8 @@ independently instead of becoming a general inference framework.
 - Laguna S 2.1 through either its official INT4 Safetensors checkpoint or
   `laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf`.
 - Laguna XS 2.1 through the official `Laguna-XS-2.1-Q4_K_M.gguf`.
+- Qwen3.8 27B through the official MLX 4-bit target and Q4 MTP companion;
+  DFlash2 can replace MTP explicitly.
 - Exact top-8 routing for GLM and Laguna XS; exact top-10 routing for Laguna S.
 - Native Metal execution with no CPU compute fallback.
 - Interactive chat, one-shot generation, and a streaming Responses API.
@@ -48,6 +50,8 @@ or Safetensors architectures and quantization formats.
 | Laguna S 2.1 INT4 Safetensors | — | **4.680 tokens/s** |
 | Laguna S 2.1 mixed Q2_K/Q3_K GGUF | **494.48 tokens/s** | **54.53 tokens/s** |
 | Laguna XS 2.1 Q4_K_M GGUF | **145.79 tokens/s** | **136.11 tokens/s** |
+| Qwen3.8 27B MLX 4-bit + MTP Q4 | — | **17.29 tokens/s** |
+| Qwen3.8 27B MLX 4-bit + DFlash2 | — | **52.82 tokens/s** |
 
 Best observed results on a 64 GB Apple Silicon MacBook Pro using release builds
 and exact routing. A dash means that a comparable prefill result has not been
@@ -67,6 +71,9 @@ thermal state, and memory pressure.
   outputs and normal system operation.
 - Laguna XS Q4_K_M requires approximately 21 GB, plus build outputs and normal
   system headroom.
+- Qwen3.8 MLX 4-bit plus its MTP Q4 companion requires approximately 17 GB.
+  Adding the optional DFlash2 artifact requires approximately 20 GB total,
+  excluding build outputs and normal system headroom.
 
 Install the Hugging Face CLI with Homebrew if needed:
 
@@ -259,6 +266,60 @@ models differ: its exact 40-layer config, top-8 routing, Q4_K/Q6_K tensor
 contract, native K-quant Metal projections and MoE, and preserved reasoning
 history. XS kernels are compiled lazily and do not enter the Laguna S or GLM
 kernel libraries.
+
+### Qwen3.8 27B
+
+Inferno supports the official
+[Qwen3.8 27B MLX 4-bit target](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit)
+with affine group-64 W4 Metal kernels. MTP is enabled by default through the
+official standalone
+[Qwen3.8 27B MTP 4-bit companion](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-4bit).
+The companion contains only the one-layer proposal head; the target model
+still verifies every accepted token.
+
+Download the target and place the MTP companion in its `mtp` subdirectory:
+
+```bash
+hf download mlx-community/Qwen3.8-27B-4bit \
+  --local-dir models/qwen3.8-27b-4bit
+hf download mlx-community/Qwen3.8-27B-MTP-4bit \
+  --local-dir models/qwen3.8-27b-4bit/mtp
+```
+
+Download the optional
+[DFlash2 draft model](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+only when that mode is required:
+
+```bash
+hf download incoai/Qwen3.8-27B-DFlash2 \
+  --local-dir models/qwen3.8-27b-dflash2
+```
+
+Run the Q4 target with default MTP drafting:
+
+```bash
+target/release/inferno generate \
+  --model models/qwen3.8-27b-4bit \
+  --prompt "Tell me the capital of Italy."
+```
+
+Pass `--dflash-model` to select DFlash2 instead. This path does not load MTP
+weights or allocate MTP state:
+
+```bash
+target/release/inferno generate \
+  --model models/qwen3.8-27b-4bit \
+  --dflash-model models/qwen3.8-27b-dflash2 \
+  --prompt "Tell me the capital of Italy."
+```
+
+The DFlash2 path uses dedicated five-row and eight-row W4 verification kernels.
+Generation starts with a five-token block. It promotes to eight only after four
+consecutive blocks reach at least 90% aggregate draft acceptance, then returns
+to five when two eight-token blocks fall below 50%. This keeps five as the
+stable quantized-target path and uses eight only for highly predictable text.
+DFlash2 support is currently limited to greedy `generate`; Qwen `chat` and
+`serve` are not exposed yet.
 
 ## Build
 
@@ -466,6 +527,7 @@ target/release/inferno generate \
 | --- | --- |
 | `--max-new-tokens <N>` | Limits the number of generated tokens. |
 | `--thinking` | Enables Laguna reasoning for `generate`, `chat`, or `serve`; direct answers are the default. |
+| `--dflash-model <DIR>` | Replaces default Qwen3.8 Q4 MTP drafting with the external DFlash2 drafter for `generate`. |
 | `--measure-tokens-per-second` | Reports time to first token and decode throughput. |
 | `--throughput-summary` | Prints compact prefill/decode throughput after `generate` and `chat`, or updates it live while `serve` is processing a response. |
 | `--expert-cache-gb <GB>` | Pins the routed-expert working-set budget for cache-backed artifacts. |

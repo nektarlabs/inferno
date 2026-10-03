@@ -12,7 +12,7 @@ use common::{
     PagedKvView, Result,
 };
 use common::{Device, Tensor};
-use inferno_io::{ExpertPackHeader, MappedBytes};
+use inferno_io::{ExpertPackHeader, MappedBytes, SafeTensorHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendCapabilities {
@@ -145,6 +145,324 @@ pub struct DeviceBf16Matrix {
     pub(crate) storage_bytes: usize,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) buffer: ::metal::Buffer,
+}
+
+/// One MLX affine 4-bit matrix exposed to Metal without dequantizing it.
+///
+/// Eight logical values are packed in each row-major U32 word. One BF16
+/// scale and bias pair covers 64 consecutive input columns.
+#[derive(Debug, Clone)]
+pub struct DeviceQwenMlxW4Matrix {
+    pub(crate) rows: usize,
+    pub(crate) columns: usize,
+    pub(crate) groups_per_row: usize,
+    pub(crate) weight_byte_offset: usize,
+    pub(crate) scale_byte_offset: usize,
+    pub(crate) bias_byte_offset: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) weight: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) scales: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) biases: ::metal::Buffer,
+    pub(crate) _weight_owner: SafeTensorHandle,
+    pub(crate) _scale_owner: SafeTensorHandle,
+    pub(crate) _bias_owner: SafeTensorHandle,
+}
+
+pub type DeviceQwenMatrix = DeviceQwenMlxW4Matrix;
+
+/// One Qwen3.8 BF16 tensor exposed through its original Safetensors mapping.
+#[derive(Debug, Clone)]
+pub struct DeviceQwenBf16Tensor {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) byte_offset: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) buffer: ::metal::Buffer,
+    pub(crate) _owner: SafeTensorHandle,
+}
+
+/// One DFlash2 matrix quantized once at startup to symmetric groupwise INT4.
+///
+/// Values are packed two per byte in row-major order. One BF16 scale covers
+/// 64 consecutive input columns. These buffers are owned by Metal and remain
+/// resident independently from the original BF16 Safetensors mapping.
+#[derive(Debug, Clone)]
+pub struct DeviceDFlashW4Matrix {
+    pub(crate) rows: usize,
+    pub(crate) columns: usize,
+    pub(crate) group_size: usize,
+    pub(crate) packed_bytes: usize,
+    pub(crate) scale_bytes: usize,
+    pub(crate) bias_bytes: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) packed: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) scales: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) biases: ::metal::Buffer,
+}
+
+/// Qwen token IDs produced and consumed without leaving the Metal command stream.
+#[derive(Debug, Clone)]
+pub struct DeviceQwenTokenIds {
+    pub(crate) len: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) buffer: ::metal::Buffer,
+}
+
+/// Sliding BF16 K/V state for one DFlash2 draft layer.
+///
+/// The cache stores only accepted target features. Proposal-token K/V is
+/// temporary and never committed, so target rejection does not require a
+/// draft-cache rollback.
+#[derive(Debug)]
+pub struct DFlashAttentionCache {
+    pub(crate) batch: usize,
+    pub(crate) capacity_tokens: usize,
+    pub(crate) length: usize,
+    pub(crate) next_position: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) key: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) value: ::metal::Buffer,
+}
+
+impl DFlashAttentionCache {
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn next_position(&self) -> usize {
+        self.next_position
+    }
+
+    pub fn storage_bytes(&self) -> Result<usize> {
+        self.batch
+            .checked_mul(self.capacity_tokens)
+            .and_then(|values| values.checked_mul(self.kv_heads))
+            .and_then(|values| values.checked_mul(self.head_dim))
+            .and_then(|values| values.checked_mul(2))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| Error::cache("DFlash2 attention cache size overflow"))
+    }
+
+    fn commit_context(&mut self, position_start: usize, token_count: usize) -> Result<()> {
+        if token_count == 0 {
+            return Err(Error::cache("DFlash2 context append requires tokens"));
+        }
+        if self.length > 0 && position_start != self.next_position {
+            return Err(Error::cache(format!(
+                "DFlash2 context starts at {position_start}, expected {}",
+                self.next_position
+            )));
+        }
+        self.next_position = position_start
+            .checked_add(token_count)
+            .ok_or_else(|| Error::cache("DFlash2 context position overflow"))?;
+        self.length = self
+            .length
+            .saturating_add(token_count)
+            .min(self.capacity_tokens);
+        Ok(())
+    }
+}
+
+impl DeviceQwenTokenIds {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Device-resident BF16 K/V storage for one Qwen3.8 full-attention layer.
+///
+/// Both buffers use token-major `[B, capacity, 4, 256]` layout. Qwen's other
+/// 48 decoder layers use recurrent Gated DeltaNet state and do not allocate
+/// this cache.
+#[derive(Debug)]
+pub struct QwenFullAttentionCache {
+    pub(crate) batch: usize,
+    pub(crate) capacity_tokens: usize,
+    pub(crate) length: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) key: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) value: ::metal::Buffer,
+}
+
+/// Persistent state for one Qwen3.8 Gated DeltaNet layer.
+#[derive(Debug)]
+pub struct QwenLinearAttentionCache {
+    pub(crate) batch: usize,
+    pub(crate) processed_tokens: usize,
+    pub(crate) conv_channels: usize,
+    pub(crate) conv_history: usize,
+    pub(crate) value_heads: usize,
+    pub(crate) key_head_dim: usize,
+    pub(crate) value_head_dim: usize,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) conv_state: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) recurrent_state: ::metal::Buffer,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) checkpoint_conv_state: Option<::metal::Buffer>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) checkpoint_recurrent_state: Option<::metal::Buffer>,
+    pub(crate) checkpoint_capacity: usize,
+    pub(crate) checkpoint_valid_rows: usize,
+}
+
+impl QwenLinearAttentionCache {
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    pub fn processed_tokens(&self) -> usize {
+        self.processed_tokens
+    }
+
+    pub fn storage_bytes(&self) -> Result<usize> {
+        let conv = self
+            .batch
+            .checked_mul(self.conv_channels)
+            .and_then(|values| values.checked_mul(self.conv_history))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| Error::cache("Qwen linear-attention conv-state size overflow"))?;
+        let recurrent = self
+            .batch
+            .checked_mul(self.value_heads)
+            .and_then(|values| values.checked_mul(self.key_head_dim))
+            .and_then(|values| values.checked_mul(self.value_head_dim))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::cache("Qwen linear-attention recurrent-state size overflow"))?;
+        let live = conv
+            .checked_add(recurrent)
+            .ok_or_else(|| Error::cache("Qwen linear-attention state size overflow"))?;
+        if self.checkpoint_capacity > 0 {
+            live.checked_mul(self.checkpoint_capacity + 1)
+                .ok_or_else(|| Error::cache("Qwen checkpoint state size overflow"))
+        } else {
+            Ok(live)
+        }
+    }
+
+    fn commit_append(&mut self, token_count: usize) -> Result<()> {
+        self.processed_tokens = self
+            .processed_tokens
+            .checked_add(token_count)
+            .ok_or_else(|| Error::cache("Qwen linear-attention token count overflow"))?;
+        self.checkpoint_valid_rows = token_count.saturating_sub(1).min(self.checkpoint_capacity);
+        Ok(())
+    }
+
+    fn commit_checkpoint_restore(
+        &mut self,
+        checkpoint_index: usize,
+        rejected_rows: usize,
+    ) -> Result<()> {
+        if checkpoint_index >= self.checkpoint_valid_rows
+            || rejected_rows == 0
+            || rejected_rows > self.processed_tokens
+        {
+            return Err(Error::cache(
+                "Qwen recurrent rollback checkpoint is unavailable",
+            ));
+        }
+        self.processed_tokens -= rejected_rows;
+        self.checkpoint_valid_rows = 0;
+        Ok(())
+    }
+
+    pub fn clear_checkpoint(&mut self) {
+        self.checkpoint_valid_rows = 0;
+    }
+}
+
+impl QwenFullAttentionCache {
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    pub fn capacity_tokens(&self) -> usize {
+        self.capacity_tokens
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn storage_bytes(&self) -> Result<usize> {
+        self.batch
+            .checked_mul(self.capacity_tokens)
+            .and_then(|values| values.checked_mul(self.kv_heads))
+            .and_then(|values| values.checked_mul(self.head_dim))
+            .and_then(|values| values.checked_mul(2))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| Error::cache("Qwen full-attention KV byte count overflow"))
+    }
+
+    pub fn reset(&mut self) {
+        self.length = 0;
+    }
+
+    fn commit_append(&mut self, token_count: usize) -> Result<()> {
+        let next = self
+            .length
+            .checked_add(token_count)
+            .ok_or_else(|| Error::cache("Qwen KV token count overflow"))?;
+        if next > self.capacity_tokens {
+            return Err(Error::cache(format!(
+                "Qwen KV capacity {} is smaller than sequence length {next}",
+                self.capacity_tokens
+            )));
+        }
+        self.length = next;
+        Ok(())
+    }
+
+    pub fn rewind(&mut self, token_count: usize) -> Result<()> {
+        self.length = self
+            .length
+            .checked_sub(token_count)
+            .ok_or_else(|| Error::cache("Qwen KV rollback exceeds committed length"))?;
+        Ok(())
+    }
+}
+
+impl DeviceQwenBf16Tensor {
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn element_count(&self) -> Result<usize> {
+        self.shape.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| Error::backend("Qwen BF16 tensor element count overflow"))
+        })
+    }
+}
+
+impl DeviceQwenMlxW4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn group_size(&self) -> usize {
+        64
+    }
 }
 
 impl DeviceBf16Matrix {
@@ -451,6 +769,27 @@ impl DeviceW4Weight {
         self.packed_bytes
             .checked_add(self.scale_bytes)
             .ok_or_else(|| Error::backend("device W4 storage byte count overflow"))
+    }
+}
+
+impl DeviceDFlashW4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn storage_bytes(&self) -> Result<usize> {
+        self.packed_bytes
+            .checked_add(self.scale_bytes)
+            .and_then(|bytes| bytes.checked_add(self.bias_bytes))
+            .ok_or_else(|| Error::backend("DFlash2 W4 storage byte count overflow"))
     }
 }
 
@@ -1176,6 +1515,591 @@ pub trait Backend: Sync {
         _columns: usize,
     ) -> Result<Option<DeviceBf16Matrix>> {
         Ok(None)
+    }
+
+    fn prepare_qwen_mlx_w4_matrix(
+        &self,
+        _weight: SafeTensorHandle,
+        _scales: SafeTensorHandle,
+        _biases: SafeTensorHandle,
+        _rows: usize,
+        _columns: usize,
+    ) -> Result<Option<DeviceQwenMlxW4Matrix>> {
+        Ok(None)
+    }
+
+    fn prepare_qwen_mlx_w4_matrix_resident(
+        &self,
+        _weight: SafeTensorHandle,
+        _scales: SafeTensorHandle,
+        _biases: SafeTensorHandle,
+        _rows: usize,
+        _columns: usize,
+    ) -> Result<Option<DeviceQwenMlxW4Matrix>> {
+        Ok(None)
+    }
+
+    /// Creates a persistent, zero-copy Metal view over one official Qwen3.8
+    /// BF16 tensor.
+    fn prepare_qwen_bf16_tensor(
+        &self,
+        _tensor: SafeTensorHandle,
+    ) -> Result<Option<DeviceQwenBf16Tensor>> {
+        Ok(None)
+    }
+
+    /// Copies one Qwen3.8 BF16 tensor into a persistent Metal-owned buffer.
+    fn prepare_qwen_bf16_tensor_resident(
+        &self,
+        _tensor: SafeTensorHandle,
+    ) -> Result<Option<DeviceQwenBf16Tensor>> {
+        Ok(None)
+    }
+
+    /// Quantizes one official BF16 DFlash2 matrix to persistent groupwise W4.
+    fn prepare_dflash_w4_matrix(
+        &self,
+        _tensor: SafeTensorHandle,
+        _rows: usize,
+        _columns: usize,
+        _group_size: usize,
+    ) -> Result<Option<DeviceDFlashW4Matrix>> {
+        Ok(None)
+    }
+
+    fn dflash_w4_linear_device(
+        &self,
+        _matrix: &DeviceDFlashW4Matrix,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn dflash_w4_gate_up_swiglu_device(
+        &self,
+        _gate: &DeviceDFlashW4Matrix,
+        _up: &DeviceDFlashW4Matrix,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_linear_device(
+        &self,
+        _matrix: &DeviceQwenMlxW4Matrix,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_linear_add_device(
+        &self,
+        _matrix: &DeviceQwenMlxW4Matrix,
+        _input: &DeviceValue,
+        _residual: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_gate_up_swiglu_device(
+        &self,
+        _gate: &DeviceQwenMlxW4Matrix,
+        _up: &DeviceQwenMlxW4Matrix,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_qkv_device(
+        &self,
+        _query: &DeviceQwenMlxW4Matrix,
+        _key: &DeviceQwenMlxW4Matrix,
+        _value: &DeviceQwenMlxW4Matrix,
+        _input: &DeviceValue,
+    ) -> Result<Option<(DeviceValue, DeviceValue, DeviceValue)>> {
+        Ok(None)
+    }
+
+    fn qwen_matrix_linear_device(
+        &self,
+        matrix: &DeviceQwenMatrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        self.qwen_mlx_w4_linear_device(matrix, input)
+    }
+
+    fn qwen_matrix_linear_add_device(
+        &self,
+        matrix: &DeviceQwenMatrix,
+        input: &DeviceValue,
+        residual: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        self.qwen_mlx_w4_linear_add_device(matrix, input, residual)
+    }
+
+    fn qwen_matrix_gate_up_swiglu_device(
+        &self,
+        gate: &DeviceQwenMatrix,
+        up: &DeviceQwenMatrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        self.qwen_mlx_w4_gate_up_swiglu_device(gate, up, input)
+    }
+
+    fn qwen_matrix_qkv_device(
+        &self,
+        query: &DeviceQwenMatrix,
+        key: &DeviceQwenMatrix,
+        value: &DeviceQwenMatrix,
+        input: &DeviceValue,
+    ) -> Result<Option<(DeviceValue, DeviceValue, DeviceValue)>> {
+        self.qwen_mlx_w4_qkv_device(query, key, value, input)
+    }
+
+    fn create_qwen_full_attention_cache(
+        &self,
+        _batch: usize,
+        _capacity_tokens: usize,
+    ) -> Result<Option<QwenFullAttentionCache>> {
+        Ok(None)
+    }
+
+    /// Normalizes Q/K, applies Qwen's 64-wide partial RoPE, appends BF16 K/V,
+    /// and evaluates causal grouped-query attention with online softmax.
+    fn qwen_full_attention_device(
+        &self,
+        _query_gate: &DeviceValue,
+        _key: &DeviceValue,
+        _value: &DeviceValue,
+        _query_norm: &DeviceQwenBf16Tensor,
+        _key_norm: &DeviceQwenBf16Tensor,
+        _cache: &mut QwenFullAttentionCache,
+        _rope_theta: f32,
+        _rotary_dim: usize,
+        _norm_weight_has_unit_offset: bool,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn create_qwen_linear_attention_cache(
+        &self,
+        _batch: usize,
+    ) -> Result<Option<QwenLinearAttentionCache>> {
+        Ok(None)
+    }
+
+    fn create_qwen_speculative_linear_attention_cache(
+        &self,
+        _batch: usize,
+    ) -> Result<Option<QwenLinearAttentionCache>> {
+        Ok(None)
+    }
+
+    fn restore_qwen_linear_attention_checkpoint(
+        &self,
+        _cache: &mut QwenLinearAttentionCache,
+        _checkpoint_index: usize,
+        _rejected_rows: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_mlx_w4_linear_attention_device(
+        &self,
+        _input: &DeviceValue,
+        _qkv: &DeviceQwenMlxW4Matrix,
+        _gate: &DeviceQwenMlxW4Matrix,
+        _input_a: &DeviceQwenMlxW4Matrix,
+        _input_b: &DeviceQwenMlxW4Matrix,
+        _conv1d: &DeviceQwenBf16Tensor,
+        _a_log: &DeviceQwenBf16Tensor,
+        _dt_bias: &DeviceQwenBf16Tensor,
+        _norm: &DeviceQwenBf16Tensor,
+        _cache: &mut QwenLinearAttentionCache,
+        _eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_bf16_embedding_device(
+        &self,
+        _embedding: &DeviceQwenBf16Tensor,
+        _token_ids: &[u32],
+        _token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_bf16_embedding_from_device_tokens(
+        &self,
+        _embedding: &DeviceQwenBf16Tensor,
+        _token_ids: &DeviceQwenTokenIds,
+        _token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_embedding_device(
+        &self,
+        _embedding: &DeviceQwenMlxW4Matrix,
+        _token_ids: &[u32],
+        _token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_embedding_from_device_tokens(
+        &self,
+        _embedding: &DeviceQwenMlxW4Matrix,
+        _token_ids: &DeviceQwenTokenIds,
+        _token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_matrix_embedding_device(
+        &self,
+        embedding: &DeviceQwenMatrix,
+        token_ids: &[u32],
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        self.qwen_mlx_w4_embedding_device(embedding, token_ids, token_shape)
+    }
+
+    fn qwen_matrix_embedding_from_device_tokens(
+        &self,
+        embedding: &DeviceQwenMatrix,
+        token_ids: &DeviceQwenTokenIds,
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        self.qwen_mlx_w4_embedding_from_device_tokens(embedding, token_ids, token_shape)
+    }
+
+    fn qwen_bf16_rms_norm_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &DeviceQwenBf16Tensor,
+        _eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_bf16_rms_norm_standard_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &DeviceQwenBf16Tensor,
+        _eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_bf16_linear_device(
+        &self,
+        _matrix: &DeviceQwenBf16Tensor,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn qwen_bf16_add_device(
+        &self,
+        _left: &DeviceValue,
+        _right: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Concatenates matching BF16 tensor prefixes along the final dimension.
+    fn qwen_bf16_concat_last_device(
+        &self,
+        _left: &DeviceValue,
+        _right: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Copies one `[H]` row from a BF16 `[1,T,H]` tensor on the device.
+    fn qwen_bf16_copy_row_device(
+        &self,
+        _input: &DeviceValue,
+        _row_index: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Returns a zero-copy view over the first rows of a BF16 `[1,T,H]`
+    /// tensor. The underlying Metal allocation remains shared.
+    fn qwen_bf16_prefix_rows_device(
+        &self,
+        _input: &DeviceValue,
+        _prefix_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Projects only the final hidden row through the official BF16 output
+    /// head and returns one greedy token ID per batch item.
+    fn qwen_bf16_last_token_argmax(
+        &self,
+        _output_weight: &DeviceQwenBf16Tensor,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Keeps the last-row greedy IDs resident on Metal.
+    fn qwen_bf16_last_token_argmax_device(
+        &self,
+        _output_weight: &DeviceQwenBf16Tensor,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        Ok(None)
+    }
+
+    /// Proposal-only Qwen output using a compact vocabulary. Target
+    /// verification still uses the complete output head.
+    fn qwen_bf16_compact_draft_argmax_device(
+        &self,
+        _output_weight: &DeviceQwenBf16Tensor,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        Ok(None)
+    }
+
+    /// Synchronizes pending Qwen work and reads token IDs at the explicit
+    /// target-verification boundary.
+    fn qwen_read_token_ids(&self, _token_ids: &DeviceQwenTokenIds) -> Result<Vec<u32>> {
+        Err(Error::backend(
+            "Qwen device token readback requires native Metal",
+        ))
+    }
+
+    /// Projects every hidden row and returns one greedy token ID per row.
+    fn qwen_bf16_all_token_argmax(
+        &self,
+        _output_weight: &DeviceQwenBf16Tensor,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_last_token_argmax(
+        &self,
+        _output_weight: &DeviceQwenMlxW4Matrix,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_compact_draft_argmax_device(
+        &self,
+        _output_weight: &DeviceQwenMlxW4Matrix,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        Ok(None)
+    }
+
+    fn qwen_mlx_w4_all_token_argmax(
+        &self,
+        _output_weight: &DeviceQwenMlxW4Matrix,
+        _hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    fn qwen_matrix_last_token_argmax(
+        &self,
+        output_weight: &DeviceQwenMatrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        self.qwen_mlx_w4_last_token_argmax(output_weight, hidden_states)
+    }
+
+    fn qwen_matrix_compact_draft_argmax_device(
+        &self,
+        output_weight: &DeviceQwenMatrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        self.qwen_mlx_w4_compact_draft_argmax_device(output_weight, hidden_states)
+    }
+
+    fn qwen_matrix_all_token_argmax(
+        &self,
+        output_weight: &DeviceQwenMatrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        self.qwen_mlx_w4_all_token_argmax(output_weight, hidden_states)
+    }
+
+    /// Packs target hidden states from the five DFlash2 tap layers into
+    /// `[B,T,5*H]` without a host round-trip.
+    fn dflash_pack_target_features_device(
+        &self,
+        _features: &[DeviceValue],
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Keeps at most the final `max_rows` from a BF16 `[1,T,H]` value. The
+    /// copy stays on Metal and is used only by DFlash2 feature capture.
+    fn dflash_bf16_suffix_rows_device(
+        &self,
+        _features: &DeviceValue,
+        _max_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// DFlash2 uses the standard Qwen3 RMSNorm weight directly. This differs
+    /// from the Qwen3.8 target's residual-style `(1 + weight)` norm.
+    fn dflash_rms_norm_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &DeviceQwenBf16Tensor,
+        _eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Normalizes only the final rows of a DFlash2 block. This avoids writing
+    /// the anchor row and then copying the proposal rows into another buffer.
+    fn dflash_rms_norm_suffix_device(
+        &self,
+        _input: &DeviceValue,
+        _weight: &DeviceQwenBf16Tensor,
+        _eps: f32,
+        _suffix_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Applies a BF16 matrix using DFlash2's row-tiled projection path. The
+    /// target Qwen and MTP projection implementations remain independent.
+    fn dflash_bf16_linear_device(
+        &self,
+        _matrix: &DeviceQwenBf16Tensor,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Applies one stage of DFlash2's grouped dynamic causal convolution.
+    fn dflash_dynamic_conv_device(
+        &self,
+        _input: &DeviceValue,
+        _dynamic: &DeviceValue,
+        _base_kernel: &DeviceQwenBf16Tensor,
+        _stage: usize,
+        _kernel_size: usize,
+        _group_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Applies the second DFlash2 dynamic convolution stage and adds the
+    /// residual without materializing the convolution output.
+    fn dflash_dynamic_conv_residual_device(
+        &self,
+        _input: &DeviceValue,
+        _dynamic: &DeviceValue,
+        _base_kernel: &DeviceQwenBf16Tensor,
+        _residual: &DeviceValue,
+        _kernel_size: usize,
+        _group_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Runs paired BF16 gate/up projections and SwiGLU for the DFlash2 MLP.
+    fn dflash_bf16_gate_up_swiglu_device(
+        &self,
+        _gate: &DeviceQwenBf16Tensor,
+        _up: &DeviceQwenBf16Tensor,
+        _input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    fn create_dflash_attention_cache(
+        &self,
+        _batch: usize,
+        _capacity_tokens: usize,
+    ) -> Result<Option<DFlashAttentionCache>> {
+        Ok(None)
+    }
+
+    /// Appends accepted target K/V and evaluates DFlash2's non-causal
+    /// sliding-window GQA over accepted context plus the complete proposal
+    /// block.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_attention_device(
+        &self,
+        _query: &DeviceValue,
+        _context_key: &DeviceValue,
+        _context_value: &DeviceValue,
+        _proposal_key: &DeviceValue,
+        _proposal_value: &DeviceValue,
+        _query_norm: &DeviceQwenBf16Tensor,
+        _key_norm: &DeviceQwenBf16Tensor,
+        _cache: &mut DFlashAttentionCache,
+        _context_position_start: usize,
+        _rope_theta: f32,
+        _sliding_window: usize,
+    ) -> Result<Option<DeviceValue>> {
+        Ok(None)
+    }
+
+    /// Computes full-vocabulary draft logits, keeps the best 16 candidates
+    /// per row, and applies the DFlash2 path selector on Metal.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_select_candidates_device(
+        &self,
+        _output_weight: &DeviceQwenBf16Tensor,
+        _hidden_states: &DeviceValue,
+        _projected_hidden: &DeviceValue,
+        _predecessor_codebook: &DeviceQwenBf16Tensor,
+        _successor_codebook: &DeviceQwenBf16Tensor,
+        _anchor_token: u32,
+        _top_k: usize,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_mlx_w4_select_candidates_device(
+        &self,
+        _output_weight: &DeviceQwenMlxW4Matrix,
+        _hidden_states: &DeviceValue,
+        _projected_hidden: &DeviceValue,
+        _predecessor_codebook: &DeviceQwenBf16Tensor,
+        _successor_codebook: &DeviceQwenBf16Tensor,
+        _anchor_token: u32,
+        _top_k: usize,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_select_candidates_for_output_device(
+        &self,
+        output_weight: &DeviceQwenMatrix,
+        hidden_states: &DeviceValue,
+        projected_hidden: &DeviceValue,
+        predecessor_codebook: &DeviceQwenBf16Tensor,
+        successor_codebook: &DeviceQwenBf16Tensor,
+        anchor_token: u32,
+        top_k: usize,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        self.dflash_mlx_w4_select_candidates_device(
+            output_weight,
+            hidden_states,
+            projected_hidden,
+            predecessor_codebook,
+            successor_codebook,
+            anchor_token,
+            top_k,
+        )
     }
 
     fn bf16_linear_device(
@@ -2368,6 +3292,98 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (mapping, tensor_data_offset, max_tensor_bytes);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_embedding_from_device_tokens(
+        &self,
+        embedding: &DeviceQwenBf16Tensor,
+        token_ids: &DeviceQwenTokenIds,
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        let token_count = token_shape.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| Error::backend("Qwen token shape element count overflow"))
+        })?;
+        if token_count == 0 || token_count != token_ids.len {
+            return Err(Error::backend(format!(
+                "Qwen token shape {token_shape:?} contains {token_count} IDs, device buffer has {}",
+                token_ids.len
+            )));
+        }
+        let hidden_size = *embedding
+            .shape
+            .get(1)
+            .ok_or_else(|| Error::backend("Qwen embedding must be rank 2"))?;
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(hidden_size);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_embedding_from_device(
+                embedding,
+                &token_ids.buffer,
+                token_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (embedding, token_ids, token_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_embedding_from_device_tokens(
+        &self,
+        embedding: &DeviceQwenMlxW4Matrix,
+        token_ids: &DeviceQwenTokenIds,
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        let token_count = token_shape.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| Error::backend("Qwen W4 token shape element count overflow"))
+        })?;
+        if token_count == 0 || token_count != token_ids.len {
+            return Err(Error::backend(format!(
+                "Qwen W4 token shape {token_shape:?} contains {token_count} IDs, device buffer has {}",
+                token_ids.len
+            )));
+        }
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(embedding.columns);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_mlx_w4_embedding_from_device(
+                embedding,
+                &token_ids.buffer,
+                token_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (embedding, token_ids, token_count, output_shape);
             Ok(None)
         }
     }
@@ -4504,17 +5520,16 @@ impl Backend for MetalBackend {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             if let Some(native_metal) = self.native_metal() {
-                let values =
-                    match value.dtype() {
-                        DType::F32 => {
-                            native_metal.batch_read_f32(&value.buffer, value.element_count()?)?
-                        }
-                        DType::F16 => native_metal
-                            .batch_read_f16_as_f32(&value.buffer, value.element_count()?)?,
-                        DType::BF16 => return Err(Error::backend(
-                            "BF16 device download is not implemented for the native Metal backend",
-                        )),
-                    };
+                let values = match value.dtype() {
+                    DType::F32 => {
+                        native_metal.batch_read_f32(&value.buffer, value.element_count()?)?
+                    }
+                    DType::F16 => {
+                        native_metal.batch_read_f16_as_f32(&value.buffer, value.element_count()?)?
+                    }
+                    DType::BF16 => native_metal
+                        .batch_read_bf16_as_f32(&value.buffer, value.element_count()?)?,
+                };
                 return F32Tensor::new(values, value.dims().to_vec());
             }
         }
@@ -4674,6 +5689,2088 @@ impl Backend for MetalBackend {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (bytes, rows, columns);
+            Ok(None)
+        }
+    }
+
+    fn prepare_qwen_mlx_w4_matrix(
+        &self,
+        weight: SafeTensorHandle,
+        scales: SafeTensorHandle,
+        biases: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Option<DeviceQwenMlxW4Matrix>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_qwen_mlx_w4_matrix(weight, scales, biases, rows, columns)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weight, scales, biases, rows, columns);
+            Ok(None)
+        }
+    }
+
+    fn prepare_qwen_mlx_w4_matrix_resident(
+        &self,
+        weight: SafeTensorHandle,
+        scales: SafeTensorHandle,
+        biases: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Option<DeviceQwenMlxW4Matrix>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_qwen_mlx_w4_matrix_resident(weight, scales, biases, rows, columns)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (weight, scales, biases, rows, columns);
+            Ok(None)
+        }
+    }
+
+    fn prepare_qwen_bf16_tensor(
+        &self,
+        tensor: SafeTensorHandle,
+    ) -> Result<Option<DeviceQwenBf16Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal.prepare_qwen_bf16_tensor(tensor).map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = tensor;
+            Ok(None)
+        }
+    }
+
+    fn prepare_qwen_bf16_tensor_resident(
+        &self,
+        tensor: SafeTensorHandle,
+    ) -> Result<Option<DeviceQwenBf16Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_qwen_bf16_tensor_resident(tensor)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = tensor;
+            Ok(None)
+        }
+    }
+
+    fn prepare_dflash_w4_matrix(
+        &self,
+        tensor: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+        group_size: usize,
+    ) -> Result<Option<DeviceDFlashW4Matrix>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .prepare_dflash_w4_matrix(tensor, rows, columns, group_size)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (tensor, rows, columns, group_size);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_linear_device(
+        &self,
+        matrix: &DeviceQwenMlxW4Matrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen MLX W4 linear input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let (row_count, output_shape) =
+            matvec_dims_shape(input.dims(), matrix.columns, matrix.rows)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_mlx_w4_linear(
+                matrix,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (matrix, input, output_shape, row_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_linear_add_device(
+        &self,
+        matrix: &DeviceQwenMlxW4Matrix,
+        input: &DeviceValue,
+        residual: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || residual.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen MLX W4 fused linear/add inputs must be BF16, got {:?} and {:?}",
+                input.dtype(),
+                residual.dtype()
+            )));
+        }
+        let (row_count, output_shape) =
+            matvec_dims_shape(input.dims(), matrix.columns, matrix.rows)?;
+        if residual.dims() != output_shape {
+            return Err(Error::backend(format!(
+                "Qwen MLX W4 fused linear/add residual shape {:?} does not match output {output_shape:?}",
+                residual.dims()
+            )));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let Some(output) = native_metal.batched_qwen_mlx_w4_linear_add(
+                matrix,
+                &input.buffer,
+                &residual.buffer,
+                input.element_count()?,
+                row_count,
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (matrix, input, residual, output_shape, row_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_gate_up_swiglu_device(
+        &self,
+        gate: &DeviceQwenMlxW4Matrix,
+        up: &DeviceQwenMlxW4Matrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || gate.rows != up.rows || gate.columns != up.columns {
+            return Err(Error::backend(
+                "Qwen MLX W4 gate/up requires BF16 input and matching matrices",
+            ));
+        }
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), gate.columns, gate.rows)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_mlx_w4_gate_up(
+                gate,
+                up,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (gate, up, input, output_shape, row_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_qkv_device(
+        &self,
+        query: &DeviceQwenMlxW4Matrix,
+        key: &DeviceQwenMlxW4Matrix,
+        value: &DeviceQwenMlxW4Matrix,
+        input: &DeviceValue,
+    ) -> Result<Option<(DeviceValue, DeviceValue, DeviceValue)>> {
+        if input.dtype() != DType::BF16
+            || query.columns != key.columns
+            || query.columns != value.columns
+        {
+            return Err(Error::backend(
+                "Qwen MLX W4 Q/K/V requires BF16 input and matching input widths",
+            ));
+        }
+        let (row_count, query_shape) = matvec_dims_shape(input.dims(), query.columns, query.rows)?;
+        let (_, key_shape) = matvec_dims_shape(input.dims(), key.columns, key.rows)?;
+        let (_, value_shape) = matvec_dims_shape(input.dims(), value.columns, value.rows)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let (query_output, key_output, value_output) = native_metal.batched_qwen_mlx_w4_qkv(
+                query,
+                key,
+                value,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some((
+                DeviceValue::new_with_dtype(query_shape, DType::BF16, query_output),
+                DeviceValue::new_with_dtype(key_shape, DType::BF16, key_output),
+                DeviceValue::new_with_dtype(value_shape, DType::BF16, value_output),
+            )));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                query,
+                key,
+                value,
+                input,
+                query_shape,
+                key_shape,
+                value_shape,
+                row_count,
+            );
+            Ok(None)
+        }
+    }
+
+    fn create_qwen_full_attention_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+    ) -> Result<Option<QwenFullAttentionCache>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .create_qwen_full_attention_cache(batch, capacity_tokens)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (batch, capacity_tokens);
+            Ok(None)
+        }
+    }
+
+    fn qwen_full_attention_device(
+        &self,
+        query_gate: &DeviceValue,
+        key: &DeviceValue,
+        value: &DeviceValue,
+        query_norm: &DeviceQwenBf16Tensor,
+        key_norm: &DeviceQwenBf16Tensor,
+        cache: &mut QwenFullAttentionCache,
+        rope_theta: f32,
+        rotary_dim: usize,
+        norm_weight_has_unit_offset: bool,
+    ) -> Result<Option<DeviceValue>> {
+        const QUERY_GATE_WIDTH: usize = 24 * 256 * 2;
+        const KEY_VALUE_WIDTH: usize = 4 * 256;
+        const OUTPUT_WIDTH: usize = 24 * 256;
+        for (tensor, label, width) in [
+            (query_gate, "query/gate", QUERY_GATE_WIDTH),
+            (key, "key", KEY_VALUE_WIDTH),
+            (value, "value", KEY_VALUE_WIDTH),
+        ] {
+            if tensor.dtype() != DType::BF16 {
+                return Err(Error::backend(format!(
+                    "Qwen {label} projection must be BF16, got {:?}",
+                    tensor.dtype()
+                )));
+            }
+            if tensor.dims().len() != 3 || tensor.dims()[2] != width {
+                return Err(Error::backend(format!(
+                    "Qwen {label} projection must have shape [B,T,{width}], got {:?}",
+                    tensor.dims()
+                )));
+            }
+        }
+        if query_gate.dims()[..2] != key.dims()[..2] || query_gate.dims()[..2] != value.dims()[..2]
+        {
+            return Err(Error::backend(format!(
+                "Qwen Q/K/V prefixes must match, got {:?}, {:?}, and {:?}",
+                query_gate.dims(),
+                key.dims(),
+                value.dims()
+            )));
+        }
+        if query_norm.shape() != [256] || key_norm.shape() != [256] {
+            return Err(Error::backend(format!(
+                "Qwen Q/K norms must have shape [256], got {:?} and {:?}",
+                query_norm.shape(),
+                key_norm.shape()
+            )));
+        }
+        let batch = query_gate.dims()[0];
+        let sequence_length = query_gate.dims()[1];
+        if batch != cache.batch {
+            return Err(Error::cache(format!(
+                "Qwen attention batch {batch} does not match KV cache batch {}",
+                cache.batch
+            )));
+        }
+        let row_count = batch
+            .checked_mul(sequence_length)
+            .ok_or_else(|| Error::backend("Qwen attention row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_full_attention(
+                &query_gate.buffer,
+                &key.buffer,
+                &value.buffer,
+                query_norm,
+                key_norm,
+                cache,
+                row_count,
+                sequence_length,
+                rope_theta,
+                rotary_dim,
+                norm_weight_has_unit_offset,
+            )?;
+            cache.commit_append(sequence_length)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![batch, sequence_length, OUTPUT_WIDTH],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                query_gate,
+                key,
+                value,
+                query_norm,
+                key_norm,
+                cache,
+                rope_theta,
+                rotary_dim,
+                norm_weight_has_unit_offset,
+                row_count,
+            );
+            Ok(None)
+        }
+    }
+
+    fn create_qwen_linear_attention_cache(
+        &self,
+        batch: usize,
+    ) -> Result<Option<QwenLinearAttentionCache>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .create_qwen_linear_attention_cache(batch)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = batch;
+            Ok(None)
+        }
+    }
+
+    fn create_qwen_speculative_linear_attention_cache(
+        &self,
+        batch: usize,
+    ) -> Result<Option<QwenLinearAttentionCache>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .create_qwen_speculative_linear_attention_cache(batch)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = batch;
+            Ok(None)
+        }
+    }
+
+    fn restore_qwen_linear_attention_checkpoint(
+        &self,
+        cache: &mut QwenLinearAttentionCache,
+        checkpoint_index: usize,
+        rejected_rows: usize,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(false);
+            };
+            if checkpoint_index >= cache.checkpoint_valid_rows {
+                return Err(Error::cache(
+                    "Qwen recurrent rollback checkpoint is unavailable",
+                ));
+            }
+            native_metal.restore_qwen_linear_attention_checkpoint(cache, checkpoint_index)?;
+            cache.commit_checkpoint_restore(checkpoint_index, rejected_rows)?;
+            return Ok(true);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, checkpoint_index, rejected_rows);
+            Ok(false)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_mlx_w4_linear_attention_device(
+        &self,
+        input: &DeviceValue,
+        qkv: &DeviceQwenMlxW4Matrix,
+        gate: &DeviceQwenMlxW4Matrix,
+        input_a: &DeviceQwenMlxW4Matrix,
+        input_b: &DeviceQwenMlxW4Matrix,
+        conv1d: &DeviceQwenBf16Tensor,
+        a_log: &DeviceQwenBf16Tensor,
+        dt_bias: &DeviceQwenBf16Tensor,
+        norm: &DeviceQwenBf16Tensor,
+        cache: &mut QwenLinearAttentionCache,
+        eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const QKV_WIDTH: usize = 10_240;
+        const VALUE_WIDTH: usize = 6_144;
+        const VALUE_HEADS: usize = 48;
+        if input.dtype() != DType::BF16 || input.dims().len() != 3 || input.dims()[2] != HIDDEN_SIZE
+        {
+            return Err(Error::backend(format!(
+                "Qwen W4 linear attention input must be BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+                input.dtype(),
+                input.dims()
+            )));
+        }
+        for (matrix, label, rows) in [(qkv, "QKV", QKV_WIDTH), (gate, "gate", VALUE_WIDTH)] {
+            if matrix.columns != HIDDEN_SIZE || matrix.rows != rows {
+                return Err(Error::backend(format!(
+                    "Qwen W4 delta {label} matrix must be [{rows},{HIDDEN_SIZE}], got [{},{}]",
+                    matrix.rows, matrix.columns
+                )));
+            }
+        }
+        for (matrix, label) in [(input_a, "input A"), (input_b, "input B")] {
+            if matrix.rows != VALUE_HEADS || matrix.columns != HIDDEN_SIZE {
+                return Err(Error::backend(format!(
+                    "Qwen W4 delta {label} matrix must be [{VALUE_HEADS},{HIDDEN_SIZE}], got [{},{}]",
+                    matrix.rows, matrix.columns
+                )));
+            }
+        }
+        for (tensor, label, shape) in [
+            (conv1d, "conv1d", &[QKV_WIDTH, 4, 1][..]),
+            (a_log, "A_log", &[VALUE_HEADS][..]),
+            (dt_bias, "dt_bias", &[VALUE_HEADS][..]),
+            (norm, "norm", &[128][..]),
+        ] {
+            if tensor.shape() != shape {
+                return Err(Error::backend(format!(
+                    "Qwen W4 delta {label} must have shape {shape:?}, got {:?}",
+                    tensor.shape()
+                )));
+            }
+        }
+        let batch = input.dims()[0];
+        let sequence_length = input.dims()[1];
+        if batch != cache.batch {
+            return Err(Error::cache(format!(
+                "Qwen W4 delta batch {batch} does not match state batch {}",
+                cache.batch
+            )));
+        }
+        let row_count = batch
+            .checked_mul(sequence_length)
+            .ok_or_else(|| Error::backend("Qwen W4 delta row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_mlx_w4_linear_attention(
+                &input.buffer,
+                input.element_count()?,
+                qkv,
+                gate,
+                input_a,
+                input_b,
+                conv1d,
+                a_log,
+                dt_bias,
+                norm,
+                cache,
+                row_count,
+                sequence_length,
+                eps,
+            )?;
+            cache.commit_append(sequence_length)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![batch, sequence_length, VALUE_WIDTH],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                input,
+                qkv,
+                gate,
+                input_a,
+                input_b,
+                conv1d,
+                a_log,
+                dt_bias,
+                norm,
+                cache,
+                eps,
+                row_count,
+                sequence_length,
+            );
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_embedding_device(
+        &self,
+        embedding: &DeviceQwenBf16Tensor,
+        token_ids: &[u32],
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        let token_count = token_shape.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| Error::backend("Qwen token shape element count overflow"))
+        })?;
+        if token_count != token_ids.len() {
+            return Err(Error::backend(format!(
+                "Qwen token shape {token_shape:?} contains {token_count} IDs, got {}",
+                token_ids.len()
+            )));
+        }
+        let hidden_size = *embedding
+            .shape
+            .get(1)
+            .ok_or_else(|| Error::backend("Qwen embedding must be rank 2"))?;
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(hidden_size);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_embedding(embedding, token_ids)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (embedding, token_ids, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_embedding_device(
+        &self,
+        embedding: &DeviceQwenMlxW4Matrix,
+        token_ids: &[u32],
+        token_shape: &[usize],
+    ) -> Result<Option<DeviceValue>> {
+        let token_count = token_shape.iter().try_fold(1_usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or_else(|| Error::backend("Qwen W4 token shape element count overflow"))
+        })?;
+        if token_count == 0 || token_count != token_ids.len() {
+            return Err(Error::backend(format!(
+                "Qwen W4 token shape {token_shape:?} contains {token_count} IDs, got {}",
+                token_ids.len()
+            )));
+        }
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(embedding.columns);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_mlx_w4_embedding(embedding, token_ids)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (embedding, token_ids, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_rms_norm_device(
+        &self,
+        input: &DeviceValue,
+        weight: &DeviceQwenBf16Tensor,
+        eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen RMSNorm input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let hidden_size = *input
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("Qwen RMSNorm input shape is empty"))?;
+        let input_len = input.element_count()?;
+        if hidden_size == 0 || !input_len.is_multiple_of(hidden_size) {
+            return Err(Error::backend("Qwen RMSNorm input shape is invalid"));
+        }
+        let rows = input_len / hidden_size;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_rms_norm(
+                &input.buffer,
+                input_len,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                input.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, weight, eps, rows);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_rms_norm_standard_device(
+        &self,
+        input: &DeviceValue,
+        weight: &DeviceQwenBf16Tensor,
+        eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen standard RMSNorm input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let hidden_size = *input
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("Qwen standard RMSNorm input shape is empty"))?;
+        let input_len = input.element_count()?;
+        if hidden_size == 0 || !input_len.is_multiple_of(hidden_size) {
+            return Err(Error::backend(
+                "Qwen standard RMSNorm input shape is invalid",
+            ));
+        }
+        let rows = input_len / hidden_size;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_rms_norm_standard(
+                &input.buffer,
+                input_len,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                input.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, weight, eps, rows);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_linear_device(
+        &self,
+        matrix: &DeviceQwenBf16Tensor,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen BF16 linear input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let [out_features, in_features]: [usize; 2] = matrix
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::backend("Qwen BF16 linear matrix must be rank 2"))?;
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_linear(
+                matrix,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (matrix, input, output_shape, row_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_add_device(
+        &self,
+        left: &DeviceValue,
+        right: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if left.dtype() != DType::BF16 || right.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen add inputs must be BF16, got {:?} and {:?}",
+                left.dtype(),
+                right.dtype()
+            )));
+        }
+        if left.dims() != right.dims() {
+            return Err(Error::backend(format!(
+                "Qwen add shapes must match, got {:?} and {:?}",
+                left.dims(),
+                right.dims()
+            )));
+        }
+        let element_count = left.element_count()?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output =
+                native_metal.batched_qwen_bf16_add(&left.buffer, &right.buffer, element_count)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                left.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (left, right, element_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_concat_last_device(
+        &self,
+        left: &DeviceValue,
+        right: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if left.dtype() != DType::BF16 || right.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "Qwen concat inputs must be BF16, got {:?} and {:?}",
+                left.dtype(),
+                right.dtype()
+            )));
+        }
+        if left.dims().len() != right.dims().len()
+            || left.dims().len() < 2
+            || left.dims()[..left.dims().len() - 1] != right.dims()[..right.dims().len() - 1]
+        {
+            return Err(Error::backend(format!(
+                "Qwen concat prefixes must match, got {:?} and {:?}",
+                left.dims(),
+                right.dims()
+            )));
+        }
+        let left_width = *left
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("Qwen concat left shape is empty"))?;
+        let right_width = *right
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("Qwen concat right shape is empty"))?;
+        let row_count = left.element_count()? / left_width;
+        let mut output_shape = left.dims().to_vec();
+        *output_shape
+            .last_mut()
+            .ok_or_else(|| Error::backend("Qwen concat output shape is empty"))? = left_width
+            .checked_add(right_width)
+            .ok_or_else(|| Error::backend("Qwen concat width overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_concat_last(
+                &left.buffer,
+                &right.buffer,
+                row_count,
+                left_width,
+                right_width,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (left, right, row_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_copy_row_device(
+        &self,
+        input: &DeviceValue,
+        row_index: usize,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || input.dims().len() != 3 || input.dims()[0] != 1 {
+            return Err(Error::backend(format!(
+                "Qwen row copy requires BF16 [1,T,H], got {:?} {:?}",
+                input.dtype(),
+                input.dims()
+            )));
+        }
+        let row_count = input.dims()[1];
+        let row_width = input.dims()[2];
+        if row_index >= row_count {
+            return Err(Error::backend(format!(
+                "Qwen row index {row_index} exceeds row count {row_count}"
+            )));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_qwen_bf16_copy_row(
+                &input.buffer,
+                row_count,
+                row_width,
+                row_index,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![1, 1, row_width],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, row_index, row_count, row_width);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_prefix_rows_device(
+        &self,
+        input: &DeviceValue,
+        prefix_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || input.dims().len() != 3 || input.dims()[0] != 1 {
+            return Err(Error::backend(format!(
+                "Qwen prefix view requires BF16 [1,T,H], got {:?} {:?}",
+                input.dtype(),
+                input.dims()
+            )));
+        }
+        let row_count = input.dims()[1];
+        let row_width = input.dims()[2];
+        if prefix_rows == 0 || prefix_rows > row_count {
+            return Err(Error::backend(format!(
+                "Qwen prefix rows {prefix_rows} must be in 1..={row_count}"
+            )));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![1, prefix_rows, row_width],
+                DType::BF16,
+                input.buffer.clone(),
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, prefix_rows, row_width);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_last_token_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const VOCAB_SIZE: usize = 248_320;
+        if hidden_states.dtype() != DType::BF16
+            || hidden_states.dims().len() != 3
+            || hidden_states.dims()[2] != HIDDEN_SIZE
+        {
+            return Err(Error::backend(format!(
+                "Qwen output hidden states must be BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+                hidden_states.dtype(),
+                hidden_states.dims()
+            )));
+        }
+        if output_weight.shape() != [VOCAB_SIZE, HIDDEN_SIZE] {
+            return Err(Error::backend(format!(
+                "Qwen output weight must be [{VOCAB_SIZE},{HIDDEN_SIZE}], got {:?}",
+                output_weight.shape()
+            )));
+        }
+        let batch = hidden_states.dims()[0];
+        let sequence_length = hidden_states.dims()[1];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .qwen_bf16_last_token_argmax(
+                    output_weight,
+                    &hidden_states.buffer,
+                    batch,
+                    sequence_length,
+                    HIDDEN_SIZE,
+                )
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, batch, sequence_length);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_last_token_argmax_device(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const VOCAB_SIZE: usize = 248_320;
+        if hidden_states.dtype() != DType::BF16
+            || hidden_states.dims().len() != 3
+            || hidden_states.dims()[2] != HIDDEN_SIZE
+        {
+            return Err(Error::backend(format!(
+                "Qwen output hidden states must be BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+                hidden_states.dtype(),
+                hidden_states.dims()
+            )));
+        }
+        if output_weight.shape() != [VOCAB_SIZE, HIDDEN_SIZE] {
+            return Err(Error::backend(format!(
+                "Qwen output weight must be [{VOCAB_SIZE},{HIDDEN_SIZE}], got {:?}",
+                output_weight.shape()
+            )));
+        }
+        let batch = hidden_states.dims()[0];
+        let sequence_length = hidden_states.dims()[1];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batched_qwen_bf16_last_token_argmax(
+                output_weight,
+                &hidden_states.buffer,
+                batch,
+                sequence_length,
+                HIDDEN_SIZE,
+            )?;
+            return Ok(Some(DeviceQwenTokenIds { len: batch, buffer }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, batch, sequence_length);
+            Ok(None)
+        }
+    }
+
+    fn qwen_bf16_compact_draft_argmax_device(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const VOCAB_SIZE: usize = 248_320;
+        if hidden_states.dtype() != DType::BF16
+            || hidden_states.dims().len() != 3
+            || hidden_states.dims()[2] != HIDDEN_SIZE
+        {
+            return Err(Error::backend(format!(
+                "Qwen draft hidden states must be BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+                hidden_states.dtype(),
+                hidden_states.dims()
+            )));
+        }
+        if output_weight.shape() != [VOCAB_SIZE, HIDDEN_SIZE] {
+            return Err(Error::backend(format!(
+                "Qwen output weight must be [{VOCAB_SIZE},{HIDDEN_SIZE}], got {:?}",
+                output_weight.shape()
+            )));
+        }
+        let batch = hidden_states.dims()[0];
+        let sequence_length = hidden_states.dims()[1];
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batched_qwen_bf16_compact_draft_argmax(
+                output_weight,
+                &hidden_states.buffer,
+                batch,
+                sequence_length,
+                HIDDEN_SIZE,
+            )?;
+            return Ok(Some(DeviceQwenTokenIds { len: batch, buffer }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, batch, sequence_length);
+            Ok(None)
+        }
+    }
+
+    fn qwen_read_token_ids(&self, token_ids: &DeviceQwenTokenIds) -> Result<Vec<u32>> {
+        if token_ids.is_empty() {
+            return Err(Error::backend("Qwen token readback requires token IDs"));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Err(Error::backend("Qwen token readback requires native Metal"));
+            };
+            return native_metal.read_qwen_token_ids(&token_ids.buffer, token_ids.len);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = token_ids;
+            Err(Error::backend("Qwen token readback requires native Metal"))
+        }
+    }
+
+    fn qwen_bf16_all_token_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const VOCAB_SIZE: usize = 248_320;
+        if hidden_states.dtype() != DType::BF16
+            || hidden_states.dims().len() != 3
+            || hidden_states.dims()[2] != HIDDEN_SIZE
+        {
+            return Err(Error::backend(format!(
+                "Qwen all-row output requires BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+                hidden_states.dtype(),
+                hidden_states.dims()
+            )));
+        }
+        if output_weight.shape() != [VOCAB_SIZE, HIDDEN_SIZE] {
+            return Err(Error::backend(format!(
+                "Qwen output weight must be [{VOCAB_SIZE},{HIDDEN_SIZE}], got {:?}",
+                output_weight.shape()
+            )));
+        }
+        let row_count = hidden_states.dims()[0]
+            .checked_mul(hidden_states.dims()[1])
+            .ok_or_else(|| Error::backend("Qwen output row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .qwen_bf16_all_token_argmax(
+                    output_weight,
+                    &hidden_states.buffer,
+                    row_count,
+                    HIDDEN_SIZE,
+                )
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, row_count);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_last_token_argmax(
+        &self,
+        output_weight: &DeviceQwenMlxW4Matrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        let (batch, sequence_length) = validate_qwen_mlx_w4_output(output_weight, hidden_states)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .qwen_mlx_w4_last_token_argmax(
+                    output_weight,
+                    &hidden_states.buffer,
+                    batch,
+                    sequence_length,
+                )
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, batch, sequence_length);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_compact_draft_argmax_device(
+        &self,
+        output_weight: &DeviceQwenMlxW4Matrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        let (batch, sequence_length) = validate_qwen_mlx_w4_output(output_weight, hidden_states)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let buffer = native_metal.batched_qwen_mlx_w4_last_token_argmax(
+                output_weight,
+                &hidden_states.buffer,
+                batch,
+                sequence_length,
+            )?;
+            return Ok(Some(DeviceQwenTokenIds { len: batch, buffer }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, batch, sequence_length);
+            Ok(None)
+        }
+    }
+
+    fn qwen_mlx_w4_all_token_argmax(
+        &self,
+        output_weight: &DeviceQwenMlxW4Matrix,
+        hidden_states: &DeviceValue,
+    ) -> Result<Option<Vec<u32>>> {
+        validate_qwen_mlx_w4_output(output_weight, hidden_states)?;
+        let row_count = hidden_states.dims()[0]
+            .checked_mul(hidden_states.dims()[1])
+            .ok_or_else(|| Error::backend("Qwen W4 output row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .qwen_mlx_w4_all_token_argmax(output_weight, &hidden_states.buffer, row_count)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (output_weight, hidden_states, row_count);
+            Ok(None)
+        }
+    }
+
+    fn dflash_pack_target_features_device(
+        &self,
+        features: &[DeviceValue],
+    ) -> Result<Option<DeviceValue>> {
+        const FEATURE_COUNT: usize = 5;
+        const HIDDEN_SIZE: usize = 5_120;
+        let [first, second, third, fourth, fifth]: &[DeviceValue; FEATURE_COUNT] =
+            features.try_into().map_err(|_| {
+                Error::backend(format!(
+                    "DFlash2 requires {FEATURE_COUNT} target features, got {}",
+                    features.len()
+                ))
+            })?;
+        let expected = first.dims();
+        if first.dtype() != DType::BF16
+            || expected.len() != 3
+            || expected[2] != HIDDEN_SIZE
+            || features
+                .iter()
+                .any(|feature| feature.dtype() != DType::BF16 || feature.dims() != expected)
+        {
+            return Err(Error::backend(format!(
+                "DFlash2 target features must be matching BF16 [B,T,{HIDDEN_SIZE}] tensors"
+            )));
+        }
+        let row_count = expected[0]
+            .checked_mul(expected[1])
+            .ok_or_else(|| Error::backend("DFlash2 feature row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_pack_target_features(
+                [
+                    &first.buffer,
+                    &second.buffer,
+                    &third.buffer,
+                    &fourth.buffer,
+                    &fifth.buffer,
+                ],
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![expected[0], expected[1], FEATURE_COUNT * HIDDEN_SIZE],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (first, second, third, fourth, fifth, row_count);
+            Ok(None)
+        }
+    }
+
+    fn dflash_bf16_suffix_rows_device(
+        &self,
+        features: &DeviceValue,
+        max_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let [batch, total_rows, width]: [usize; 3] = features
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 feature suffix must have shape [1,T,H]"))?;
+        if features.dtype() != DType::BF16
+            || batch != 1
+            || total_rows == 0
+            || width == 0
+            || max_rows == 0
+        {
+            return Err(Error::backend(format!(
+                "DFlash2 feature suffix requires BF16 [1,T,H] and max_rows > 0, got {:?} {:?}, max_rows={max_rows}",
+                features.dtype(),
+                features.dims()
+            )));
+        }
+        let row_count = total_rows.min(max_rows);
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if row_count == total_rows {
+                return Ok(Some(features.clone()));
+            }
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let row_start = total_rows - row_count;
+            let output = native_metal.batched_dflash_copy_rows(
+                &features.buffer,
+                row_start,
+                row_count,
+                width,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![1, row_count, width],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (features, row_count);
+            Ok(None)
+        }
+    }
+
+    fn dflash_rms_norm_device(
+        &self,
+        input: &DeviceValue,
+        weight: &DeviceQwenBf16Tensor,
+        eps: f32,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || input.dims().len() < 2 {
+            return Err(Error::backend(format!(
+                "DFlash2 RMSNorm input must be rank >= 2 BF16, got {:?} {:?}",
+                input.dtype(),
+                input.dims()
+            )));
+        }
+        let hidden_size = *input
+            .dims()
+            .last()
+            .ok_or_else(|| Error::backend("DFlash2 RMSNorm shape is empty"))?;
+        if weight.shape() != [hidden_size] {
+            return Err(Error::backend(format!(
+                "DFlash2 RMSNorm weight must be [{hidden_size}], got {:?}",
+                weight.shape()
+            )));
+        }
+        let rows = input.element_count()? / hidden_size;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_rms_norm(
+                &input.buffer,
+                input.element_count()?,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                input.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, weight, eps, rows);
+            Ok(None)
+        }
+    }
+
+    fn dflash_rms_norm_suffix_device(
+        &self,
+        input: &DeviceValue,
+        weight: &DeviceQwenBf16Tensor,
+        eps: f32,
+        suffix_rows: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let [batch, total_rows, hidden_size]: [usize; 3] = input
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 suffix RMSNorm input must be [1,T,H]"))?;
+        if input.dtype() != DType::BF16
+            || batch != 1
+            || suffix_rows == 0
+            || suffix_rows > total_rows
+            || weight.shape() != [hidden_size]
+        {
+            return Err(Error::backend(format!(
+                "DFlash2 suffix RMSNorm requires BF16 [1,T,H], 1..=T rows, and weight [H]; got {:?} {:?}, suffix_rows={suffix_rows}, weight={:?}",
+                input.dtype(),
+                input.dims(),
+                weight.shape()
+            )));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_rms_norm_suffix(
+                &input.buffer,
+                input.element_count()?,
+                weight,
+                total_rows,
+                suffix_rows,
+                hidden_size,
+                eps,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![1, suffix_rows, hidden_size],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, weight, eps, suffix_rows);
+            Ok(None)
+        }
+    }
+
+    fn dflash_bf16_linear_device(
+        &self,
+        matrix: &DeviceQwenBf16Tensor,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "DFlash2 linear input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let [out_features, in_features]: [usize; 2] = matrix
+            .shape()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 linear weight must be rank 2"))?;
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_linear(
+                matrix,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (matrix, input, row_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn dflash_w4_linear_device(
+        &self,
+        matrix: &DeviceDFlashW4Matrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 {
+            return Err(Error::backend(format!(
+                "DFlash2 W4 linear input must be BF16, got {:?}",
+                input.dtype()
+            )));
+        }
+        let (row_count, output_shape) =
+            matvec_dims_shape(input.dims(), matrix.columns, matrix.rows)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_w4_linear(
+                matrix,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (matrix, input, row_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn dflash_w4_gate_up_swiglu_device(
+        &self,
+        gate: &DeviceDFlashW4Matrix,
+        up: &DeviceDFlashW4Matrix,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16
+            || gate.rows != up.rows
+            || gate.columns != up.columns
+            || gate.group_size != up.group_size
+        {
+            return Err(Error::backend(
+                "DFlash2 W4 gate/up requires BF16 input and matching matrices",
+            ));
+        }
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), gate.columns, gate.rows)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_w4_gate_up_swiglu(
+                gate,
+                up,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (gate, up, input, row_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn dflash_dynamic_conv_device(
+        &self,
+        input: &DeviceValue,
+        dynamic: &DeviceValue,
+        base_kernel: &DeviceQwenBf16Tensor,
+        stage: usize,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let [batch, sequence_length, hidden_size]: [usize; 3] = input
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 convolution input must have shape [B,T,H]"))?;
+        let groups = hidden_size
+            .checked_div(group_size)
+            .filter(|_| hidden_size.is_multiple_of(group_size))
+            .ok_or_else(|| Error::backend("DFlash2 convolution group size is invalid"))?;
+        let expected_dynamic = [batch, sequence_length, 2 * kernel_size * groups];
+        if input.dtype() != DType::BF16
+            || dynamic.dtype() != DType::BF16
+            || dynamic.dims() != expected_dynamic
+        {
+            return Err(Error::backend(format!(
+                "DFlash2 dynamic convolution requires BF16 input {:?} and dynamic {expected_dynamic:?}, got {:?} {:?}",
+                input.dims(),
+                dynamic.dtype(),
+                dynamic.dims()
+            )));
+        }
+        let rows = batch
+            .checked_mul(sequence_length)
+            .ok_or_else(|| Error::backend("DFlash2 convolution row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_dynamic_conv(
+                &input.buffer,
+                &dynamic.buffer,
+                base_kernel,
+                rows,
+                sequence_length,
+                hidden_size,
+                stage,
+                kernel_size,
+                group_size,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                input.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (input, dynamic, base_kernel, stage, kernel_size, rows);
+            Ok(None)
+        }
+    }
+
+    fn dflash_dynamic_conv_residual_device(
+        &self,
+        input: &DeviceValue,
+        dynamic: &DeviceValue,
+        base_kernel: &DeviceQwenBf16Tensor,
+        residual: &DeviceValue,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> Result<Option<DeviceValue>> {
+        let [batch, sequence_length, hidden_size]: [usize; 3] = input
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 convolution input must have shape [B,T,H]"))?;
+        let groups = hidden_size
+            .checked_div(group_size)
+            .filter(|_| hidden_size.is_multiple_of(group_size))
+            .ok_or_else(|| Error::backend("DFlash2 convolution group size is invalid"))?;
+        let expected_dynamic = [batch, sequence_length, 2 * kernel_size * groups];
+        if input.dtype() != DType::BF16
+            || dynamic.dtype() != DType::BF16
+            || residual.dtype() != DType::BF16
+            || dynamic.dims() != expected_dynamic
+            || residual.dims() != input.dims()
+        {
+            return Err(Error::backend(format!(
+                "DFlash2 fused convolution residual requires matching BF16 input/residual and dynamic {expected_dynamic:?}; got input {:?} {:?}, dynamic {:?} {:?}, residual {:?} {:?}",
+                input.dtype(),
+                input.dims(),
+                dynamic.dtype(),
+                dynamic.dims(),
+                residual.dtype(),
+                residual.dims()
+            )));
+        }
+        let rows = batch
+            .checked_mul(sequence_length)
+            .ok_or_else(|| Error::backend("DFlash2 convolution row count overflow"))?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_dynamic_conv_residual(
+                &input.buffer,
+                &dynamic.buffer,
+                base_kernel,
+                &residual.buffer,
+                rows,
+                sequence_length,
+                hidden_size,
+                kernel_size,
+                group_size,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                input.dims().to_vec(),
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                input,
+                dynamic,
+                base_kernel,
+                residual,
+                kernel_size,
+                group_size,
+                rows,
+            );
+            Ok(None)
+        }
+    }
+
+    fn dflash_bf16_gate_up_swiglu_device(
+        &self,
+        gate: &DeviceQwenBf16Tensor,
+        up: &DeviceQwenBf16Tensor,
+        input: &DeviceValue,
+    ) -> Result<Option<DeviceValue>> {
+        if input.dtype() != DType::BF16 || gate.shape() != up.shape() {
+            return Err(Error::backend(
+                "DFlash2 gate/up requires BF16 input and matching matrices",
+            ));
+        }
+        let [out_features, in_features]: [usize; 2] = gate
+            .shape()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 gate/up weights must be rank 2"))?;
+        let (row_count, output_shape) = matvec_dims_shape(input.dims(), in_features, out_features)?;
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_gate_up_swiglu(
+                gate,
+                up,
+                &input.buffer,
+                input.element_count()?,
+                row_count,
+            )?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                output_shape,
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (gate, up, input, row_count, output_shape);
+            Ok(None)
+        }
+    }
+
+    fn create_dflash_attention_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+    ) -> Result<Option<DFlashAttentionCache>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            return native_metal
+                .create_dflash_attention_cache(batch, capacity_tokens)
+                .map(Some);
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (batch, capacity_tokens);
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_attention_device(
+        &self,
+        query: &DeviceValue,
+        context_key: &DeviceValue,
+        context_value: &DeviceValue,
+        proposal_key: &DeviceValue,
+        proposal_value: &DeviceValue,
+        query_norm: &DeviceQwenBf16Tensor,
+        key_norm: &DeviceQwenBf16Tensor,
+        cache: &mut DFlashAttentionCache,
+        context_position_start: usize,
+        rope_theta: f32,
+        sliding_window: usize,
+    ) -> Result<Option<DeviceValue>> {
+        const QUERY_WIDTH: usize = 4_096;
+        const KV_WIDTH: usize = 1_024;
+        let [batch, proposal_length, query_width]: [usize; 3] = query
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 query must be [B,T,4096]"))?;
+        let [context_batch, context_length, context_width]: [usize; 3] = context_key
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 context key must be [B,S,1024]"))?;
+        let expected_proposal = [batch, proposal_length, KV_WIDTH];
+        if query.dtype() != DType::BF16
+            || context_key.dtype() != DType::BF16
+            || context_value.dtype() != DType::BF16
+            || proposal_key.dtype() != DType::BF16
+            || proposal_value.dtype() != DType::BF16
+            || query_width != QUERY_WIDTH
+            || context_batch != batch
+            || context_width != KV_WIDTH
+            || context_value.dims() != context_key.dims()
+            || proposal_key.dims() != expected_proposal
+            || proposal_value.dims() != expected_proposal
+        {
+            return Err(Error::backend("invalid DFlash2 attention tensor shapes"));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_attention(
+                &query.buffer,
+                &context_key.buffer,
+                &context_value.buffer,
+                &proposal_key.buffer,
+                &proposal_value.buffer,
+                query_norm,
+                key_norm,
+                cache,
+                batch,
+                proposal_length,
+                context_length,
+                context_position_start,
+                rope_theta,
+                sliding_window,
+            )?;
+            cache.commit_context(context_position_start, context_length)?;
+            return Ok(Some(DeviceValue::new_with_dtype(
+                vec![batch, proposal_length, QUERY_WIDTH],
+                DType::BF16,
+                output,
+            )));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                query,
+                context_key,
+                context_value,
+                proposal_key,
+                proposal_value,
+                query_norm,
+                key_norm,
+                cache,
+                context_position_start,
+                rope_theta,
+                sliding_window,
+            );
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_select_candidates_device(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &DeviceValue,
+        projected_hidden: &DeviceValue,
+        predecessor_codebook: &DeviceQwenBf16Tensor,
+        successor_codebook: &DeviceQwenBf16Tensor,
+        anchor_token: u32,
+        top_k: usize,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const SELECTOR_RANK: usize = 256;
+        let [batch, row_count, hidden_size]: [usize; 3] = hidden_states
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 selector hidden states must be [1,T,5120]"))?;
+        if hidden_states.dtype() != DType::BF16
+            || batch != 1
+            || hidden_size != HIDDEN_SIZE
+            || projected_hidden.dtype() != DType::BF16
+            || projected_hidden.dims() != [batch, row_count, SELECTOR_RANK]
+        {
+            return Err(Error::backend(
+                "DFlash2 selector requires matching BF16 [1,T,5120] and [1,T,256] states",
+            ));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_select_candidates(
+                output_weight,
+                &hidden_states.buffer,
+                &projected_hidden.buffer,
+                predecessor_codebook,
+                successor_codebook,
+                row_count,
+                anchor_token,
+                top_k,
+            )?;
+            return Ok(Some(DeviceQwenTokenIds {
+                len: row_count,
+                buffer: output,
+            }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                output_weight,
+                hidden_states,
+                projected_hidden,
+                predecessor_codebook,
+                successor_codebook,
+                anchor_token,
+                top_k,
+            );
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_mlx_w4_select_candidates_device(
+        &self,
+        output_weight: &DeviceQwenMlxW4Matrix,
+        hidden_states: &DeviceValue,
+        projected_hidden: &DeviceValue,
+        predecessor_codebook: &DeviceQwenBf16Tensor,
+        successor_codebook: &DeviceQwenBf16Tensor,
+        anchor_token: u32,
+        top_k: usize,
+    ) -> Result<Option<DeviceQwenTokenIds>> {
+        const HIDDEN_SIZE: usize = 5_120;
+        const VOCAB_SIZE: usize = 248_320;
+        const SELECTOR_RANK: usize = 256;
+        let [batch, row_count, hidden_size]: [usize; 3] = hidden_states
+            .dims()
+            .try_into()
+            .map_err(|_| Error::backend("DFlash2 W4 selector hidden states must be [1,T,5120]"))?;
+        if hidden_states.dtype() != DType::BF16
+            || batch != 1
+            || hidden_size != HIDDEN_SIZE
+            || output_weight.rows != VOCAB_SIZE
+            || output_weight.columns != HIDDEN_SIZE
+            || projected_hidden.dtype() != DType::BF16
+            || projected_hidden.dims() != [batch, row_count, SELECTOR_RANK]
+        {
+            return Err(Error::backend(
+                "DFlash2 W4 selector requires matching BF16 [1,T,5120] and [1,T,256] states",
+            ));
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            let Some(native_metal) = self.native_metal() else {
+                return Ok(None);
+            };
+            let output = native_metal.batched_dflash_mlx_w4_select_candidates(
+                output_weight,
+                &hidden_states.buffer,
+                hidden_states.element_count()?,
+                &projected_hidden.buffer,
+                predecessor_codebook,
+                successor_codebook,
+                row_count,
+                anchor_token,
+                top_k,
+            )?;
+            return Ok(Some(DeviceQwenTokenIds {
+                len: row_count,
+                buffer: output,
+            }));
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (
+                output_weight,
+                hidden_states,
+                projected_hidden,
+                predecessor_codebook,
+                successor_codebook,
+                anchor_token,
+                top_k,
+            );
             Ok(None)
         }
     }
@@ -8904,6 +12001,31 @@ fn matvec_dims_shape(
             "native Q2_K matvec input rank must be 2 or 3, got {dims:?}"
         ))),
     }
+}
+
+fn validate_qwen_mlx_w4_output(
+    output_weight: &DeviceQwenMlxW4Matrix,
+    hidden_states: &DeviceValue,
+) -> Result<(usize, usize)> {
+    const HIDDEN_SIZE: usize = 5_120;
+    const VOCAB_SIZE: usize = 248_320;
+    if hidden_states.dtype() != DType::BF16
+        || hidden_states.dims().len() != 3
+        || hidden_states.dims()[2] != HIDDEN_SIZE
+    {
+        return Err(Error::backend(format!(
+            "Qwen W4 output requires BF16 [B,T,{HIDDEN_SIZE}], got {:?} {:?}",
+            hidden_states.dtype(),
+            hidden_states.dims()
+        )));
+    }
+    if output_weight.rows != VOCAB_SIZE || output_weight.columns != HIDDEN_SIZE {
+        return Err(Error::backend(format!(
+            "Qwen W4 output matrix must be [{VOCAB_SIZE},{HIDDEN_SIZE}], got [{},{}]",
+            output_weight.rows, output_weight.columns
+        )));
+    }
+    Ok((hidden_states.dims()[0], hidden_states.dims()[1]))
 }
 
 /// `require_f32_rank` for device-resident values.

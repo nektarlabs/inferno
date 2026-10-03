@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-//! GLM-5.2 model components for quantized inference.
+//! Model-specific components for quantized inference.
 
 /// Unwraps a `Result<Option<T>>` from a batched `*_device` backend op inside a
 /// function that itself returns `Result<Option<_>>`. `None` means the backend
@@ -46,6 +46,7 @@ mod mtp;
 mod output_head;
 mod policy;
 mod profile;
+mod qwen;
 mod rms_norm;
 mod sparse_block;
 mod weights;
@@ -113,6 +114,36 @@ pub use profile::{
     TokenModelProfile,
 };
 pub use profile::{enable_layer_profile, set_layer_profile_context};
+pub use qwen::forward_dflash_proposals_device;
+pub use qwen::{
+    draft_next_token_device_handle as draft_qwen_next_token_device_handle,
+    forward_full_attention_residual_device as forward_qwen_full_attention_residual_device,
+    forward_greedy_device as forward_qwen_greedy_device,
+    forward_hidden_device as forward_qwen_hidden_device,
+    forward_hidden_with_dflash_features_device as forward_qwen_hidden_with_dflash_features_device,
+    forward_layer_device as forward_qwen_layer_device,
+    forward_linear_attention_residual_device as forward_qwen_linear_attention_residual_device,
+    forward_mlp_device as forward_qwen_mlp_device,
+    forward_mlp_residual_device as forward_qwen_mlp_residual_device,
+    forward_mtp_hidden_device as forward_qwen_mtp_hidden_device,
+    forward_mtp_hidden_from_device_tokens as forward_qwen_mtp_hidden_from_device_tokens,
+    greedy_all_tokens_device as greedy_all_qwen_tokens_device,
+    greedy_next_tokens_device as greedy_qwen_next_tokens_device, DFlashAttentionWeights,
+    DFlashConvWeights, DFlashDeviceAttentionWeights, DFlashDeviceConvWeights,
+    DFlashDeviceLayerWeights, DFlashDeviceMlpWeights, DFlashDeviceWeights, DFlashLayerWeights,
+    DFlashMlpWeights, DFlashState, DFlashWeightIndex, DFlashWeights, QwenArtifactIndex,
+    QwenArtifactSummary, QwenAttentionWeights, QwenDeviceAttentionWeights,
+    QwenDeviceFullAttentionWeights, QwenDeviceLayerWeights, QwenDeviceLinearAttentionWeights,
+    QwenDeviceMlpWeights, QwenDeviceMtpLayerWeights, QwenDeviceMtpWeights, QwenDeviceRootWeights,
+    QwenDeviceWeightSummary, QwenDeviceWeights, QwenFullAttentionWeights, QwenLayerState,
+    QwenLayerWeights, QwenLinearAttentionWeights, QwenMlpWeights, QwenModelState,
+    QwenMtpLayerWeights, QwenMtpState, QwenMtpWeightIndex, QwenMtpWeights, QwenRootWeights,
+    QwenWeightIndex, QwenWeightSummary, DFLASH_MODEL_FILE, DFLASH_TENSOR_COUNT,
+    QWEN_MLX_W4_REPO_ID, QWEN_MLX_W4_REPO_URL, QWEN_MLX_W4_SHARD_COUNT, QWEN_MLX_W4_TENSOR_COUNT,
+    QWEN_MLX_W4_TEXT_TENSOR_COUNT, QWEN_MLX_W4_TOTAL_SHARD_BYTES, QWEN_MTP_DIRECTORY,
+    QWEN_MTP_W4_REPO_ID, QWEN_MTP_W4_REPO_URL, QWEN_MTP_W4_REVISION, QWEN_MTP_W4_TENSOR_COUNT,
+    QWEN_VISION_TENSOR_COUNT,
+};
 pub(crate) use rms_norm::RmsNorm;
 pub use rms_norm::RmsNormLoadReport;
 pub(crate) use sparse_block::SparseBlock;

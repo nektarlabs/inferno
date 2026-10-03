@@ -728,6 +728,7 @@ dependencies = [
  "io",
  "moe",
  "rayon",
+ "serde_json",
  "tracing",
 ]
 
@@ -978,6 +979,7 @@ dependencies = [
  "config",
  "gguf",
  "model",
+ "tokenizer",
  "tracing",
 ]
 

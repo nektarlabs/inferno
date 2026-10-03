@@ -39,6 +39,10 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 
+        /// Optional DFlash2 draft-model directory for Qwen3.8 Q4. Without it, the Q4 MTP companion is used.
+        #[arg(long)]
+        dflash_model: Option<PathBuf>,
+
         /// Page size for GLM's paged KV cache.
         #[arg(long, default_value_t = runtime::DEFAULT_KV_PAGE_SIZE)]
         page_size: usize,
@@ -233,6 +237,7 @@ fn main() -> Result<()> {
             model,
             config,
             tokenizer,
+            dflash_model,
             page_size,
             prompt,
             max_new_tokens,
@@ -254,6 +259,7 @@ fn main() -> Result<()> {
             model.as_path(),
             config.as_deref(),
             tokenizer.as_deref(),
+            dflash_model.as_deref(),
             page_size,
             &prompt,
             max_new_tokens,
@@ -482,6 +488,48 @@ mod tests {
             panic!("expected generate command");
         };
         assert!(skip_special_tokens);
+    }
+
+    #[test]
+    fn qwen_generate_leaves_dflash_disabled_by_default() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/qwen",
+            "--prompt",
+            "Hello Qwen",
+        ])
+        .unwrap();
+
+        let Command::Generate { dflash_model, .. } =
+            cli.command.expect("expected generate command")
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(dflash_model, None);
+    }
+
+    #[test]
+    fn qwen_generate_accepts_dflash_model_directory() {
+        let cli = Cli::try_parse_from([
+            "inferno",
+            "generate",
+            "--model",
+            "/tmp/qwen",
+            "--dflash-model",
+            "/tmp/dflash",
+            "--prompt",
+            "Hello Qwen",
+        ])
+        .unwrap();
+
+        let Command::Generate { dflash_model, .. } =
+            cli.command.expect("expected generate command")
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(dflash_model, Some(PathBuf::from("/tmp/dflash")));
     }
 
     #[test]

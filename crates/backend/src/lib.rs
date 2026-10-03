@@ -6,12 +6,13 @@ mod backend;
 mod device_value;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal;
-
 pub use backend::{
-    Backend, BackendCapabilities, BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView,
-    DeviceRopeTable, DeviceRoutedExperts, DeviceRouterTopK, DeviceSelectedKvView, DeviceW4Weight,
-    ExpertCacheMetrics, GgufExpertQuant, GgufKQuant, LagunaAttentionProjections,
-    LagunaF16DecodeStrategy, LagunaF16KvCache, LagunaFp8KvCache, LagunaKvRetention,
-    LagunaModelViewReport, MetalBackend, Q2ExpertSource, RouterTopK, W4ExpertGroup, W4WeightSource,
+    Backend, BackendCapabilities, BackendMemoryReport, DFlashAttentionCache, DeviceBf16Matrix,
+    DeviceDFlashW4Matrix, DevicePagedKvView, DeviceQwenBf16Tensor, DeviceQwenMatrix,
+    DeviceQwenMlxW4Matrix, DeviceQwenTokenIds, DeviceRopeTable, DeviceRoutedExperts,
+    DeviceRouterTopK, DeviceSelectedKvView, DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant,
+    GgufKQuant, LagunaAttentionProjections, LagunaF16DecodeStrategy, LagunaF16KvCache,
+    LagunaFp8KvCache, LagunaKvRetention, LagunaModelViewReport, MetalBackend, Q2ExpertSource,
+    QwenFullAttentionCache, QwenLinearAttentionCache, RouterTopK, W4ExpertGroup, W4WeightSource,
 };
 pub use device_value::DeviceValue;

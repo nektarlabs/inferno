@@ -24,6 +24,7 @@ mod memory;
 mod moe;
 mod pipeline;
 mod q2;
+mod qwen;
 mod rms_norm;
 mod rope;
 mod validation;

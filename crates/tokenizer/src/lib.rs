@@ -256,6 +256,26 @@ pub fn render_user_prompt(prompt: &str) -> ChatPrompt {
     render_chat_prompt(&[], prompt)
 }
 
+/// Renders one text-only Qwen3.8 user turn using the checkpoint's published
+/// chat template.
+pub fn render_qwen_user_prompt(prompt: &str, thinking: bool) -> ChatPrompt {
+    const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+    let mut rendered = String::with_capacity(prompt.len() + XHIGH.len() + 128);
+    if thinking {
+        rendered.push_str("<|im_start|>system\n");
+        rendered.push_str(XHIGH);
+        rendered.push_str("<|im_end|>\n");
+    }
+    rendered.push_str("<|im_start|>user\n");
+    rendered.push_str(prompt.trim());
+    rendered.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    if !thinking {
+        rendered.push_str("\n</think>\n\n");
+    }
+    ChatPrompt { rendered }
+}
+
 /// Renders one user turn with Laguna S 2.1's published chat template.
 pub fn render_laguna_user_prompt(prompt: &str, thinking_mode: LagunaThinkingMode) -> ChatPrompt {
     render_laguna_chat_prompt(&[], prompt, thinking_mode)
@@ -476,6 +496,28 @@ mod tests {
             rendered.rendered,
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello GLM<|assistant|><think>"
         );
+    }
+
+    #[test]
+    fn renders_qwen_text_prompt_with_thinking_closed() {
+        let rendered = render_qwen_user_prompt("Hello Qwen", false);
+
+        assert_eq!(
+            rendered.rendered,
+            "<|im_start|>user\nHello Qwen<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn renders_qwen_xhigh_prompt_with_thinking_open() {
+        let rendered = render_qwen_user_prompt("Hello Qwen", true);
+
+        assert!(rendered
+            .rendered
+            .starts_with("<|im_start|>system\nReasoning effort is set to xhigh."));
+        assert!(rendered
+            .rendered
+            .ends_with("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

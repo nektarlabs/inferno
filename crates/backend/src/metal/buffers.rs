@@ -176,6 +176,31 @@ pub(crate) fn read_f16_buffer_as_f32(buffer: &Buffer, len: usize) -> Result<Vec<
     Ok(values.iter().copied().map(f16_bits_to_f32).collect())
 }
 
+pub(crate) fn read_bf16_buffer_as_f32(buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
+    let bytes = len
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| Error::backend("Metal BF16 read byte length overflow"))?;
+    if buffer.length() < bytes as u64 {
+        return Err(Error::backend(format!(
+            "Metal BF16 output buffer is too small: expected at least {bytes} bytes, got {}",
+            buffer.length()
+        )));
+    }
+
+    let ptr = buffer.contents().cast::<u16>();
+    if ptr.is_null() {
+        return Err(Error::backend("Metal BF16 buffer contents pointer is null"));
+    }
+
+    // SAFETY: the shared buffer is at least `len * 2` bytes and all pending
+    // command buffers have completed before this function is called.
+    let values = unsafe { slice::from_raw_parts(ptr, len) };
+    Ok(values
+        .iter()
+        .map(|bits| f32::from_bits(u32::from(*bits) << 16))
+        .collect())
+}
+
 pub(crate) fn write_f32_buffer(buffer: &Buffer, values: &[f32]) -> Result<()> {
     write_buffer(buffer, 0, values)
 }

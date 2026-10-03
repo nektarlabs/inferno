@@ -64,23 +64,32 @@ pub fn run(
 ) -> Result<()> {
     let discovered_config = discover_config_path(model_path, config_path)?;
     let discovered_tokenizer = discover_tokenizer_path(model_path, tokenizer_path)?;
-    if detect_model_architecture(&discovered_config)? == ModelArchitecture::Laguna {
-        return run_laguna(
-            model_path,
-            &discovered_config,
-            &discovered_tokenizer,
-            page_size,
-            max_new_tokens,
-            thinking,
-            throughput_summary,
-            speculative_mtp,
-            enable_unified_memory_controller,
-            expert_cache_gb,
-            hot_kv_cache_gb,
-            enable_telemetry,
-            telemetry_file,
-            memory_controller_log,
-        );
+    match detect_model_architecture(&discovered_config)? {
+        ModelArchitecture::Laguna => {
+            return run_laguna(
+                model_path,
+                &discovered_config,
+                &discovered_tokenizer,
+                page_size,
+                max_new_tokens,
+                thinking,
+                throughput_summary,
+                speculative_mtp,
+                enable_unified_memory_controller,
+                expert_cache_gb,
+                hot_kv_cache_gb,
+                enable_telemetry,
+                telemetry_file,
+                memory_controller_log,
+            );
+        }
+        ModelArchitecture::Qwen38 => {
+            return Err(Error::runtime(
+                "Qwen3.8 configuration is recognized, but its Metal runtime is not complete",
+            )
+            .into());
+        }
+        ModelArchitecture::GlmMoeDsa => {}
     }
     if thinking {
         return Err(Error::runtime("--thinking currently applies only to Laguna models").into());

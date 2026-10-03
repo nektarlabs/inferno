@@ -15,6 +15,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 gguf = { path = "../gguf" }
+tokenizer = { path = "../tokenizer" }
 
 [[bench]]
 name = "ssd_kv"

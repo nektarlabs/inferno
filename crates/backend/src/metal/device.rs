@@ -1,14 +1,15 @@
 use std::{path::Path, sync::Arc};
 
 use crate::{
-    BackendMemoryReport, DeviceBf16Matrix, DevicePagedKvView, DeviceRopeTable, DeviceRouterTopK,
-    DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant, GgufKQuant, LagunaF16KvCache,
-    LagunaFp8KvCache, LagunaKvRetention, LagunaModelViewReport, Q2ExpertSource, W4ExpertGroup,
-    W4WeightSource,
+    BackendMemoryReport, DFlashAttentionCache, DeviceBf16Matrix, DeviceDFlashW4Matrix,
+    DevicePagedKvView, DeviceQwenBf16Tensor, DeviceQwenMlxW4Matrix, DeviceRopeTable,
+    DeviceRouterTopK, DeviceW4Weight, ExpertCacheMetrics, GgufExpertQuant, GgufKQuant,
+    LagunaF16KvCache, LagunaFp8KvCache, LagunaKvRetention, LagunaModelViewReport, Q2ExpertSource,
+    QwenFullAttentionCache, QwenLinearAttentionCache, W4ExpertGroup, W4WeightSource,
 };
-use ::metal::{Buffer, CommandQueue, Device};
+use ::metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use common::{DType, Error, PagedKvView, Result};
-use inferno_io::{ExpertPackHeader, MappedBytes};
+use inferno_io::{ExpertPackHeader, MappedBytes, SafeTensorHandle};
 
 use super::activation::MetalActivation;
 use super::arena::MetalArena;
@@ -17,7 +18,10 @@ use super::attention::{
 };
 use super::batch::BatchSlot;
 use super::bf16::MetalBf16;
-use super::buffers::{empty_f16_buffer, f32_buffer, read_f32_buffer, read_u32_buffer, u8_buffer};
+use super::buffers::{
+    empty_f16_buffer, f32_buffer, read_bf16_buffer_as_f32, read_f32_buffer, read_u32_buffer,
+    u8_buffer,
+};
 use super::cast::MetalCast;
 use super::command::{encode_element_copy, encode_f32_copy, Dispatch1d};
 use super::dsa::MetalDsa;
@@ -38,6 +42,7 @@ use super::q2::{
     MetalQ2Matvec, QuantMatvecKind, ReadyRoutedExperts, Q8_0_MMA_MIN_PREFILL_ROWS,
     Q8_0_MMA_OUTPUT_TILE,
 };
+use super::qwen::MetalQwen;
 use super::rms_norm::MetalRmsNorm;
 use super::rope::MetalRope;
 use super::w4::MetalW4;
@@ -55,6 +60,7 @@ pub struct Metal {
     layout: MetalLayout,
     matmul: MetalMatmul,
     q2_matvec: MetalQ2Matvec,
+    qwen: MetalQwen,
     w4: MetalW4,
     rms_norm: MetalRmsNorm,
     rope: MetalRope,
@@ -91,6 +97,7 @@ impl Metal {
         let matmul = MetalMatmul::new(&device, &library, arena.clone())?;
         let q2_matvec =
             MetalQ2Matvec::new(&device, &library, arena.clone(), Arc::clone(&laguna_views))?;
+        let qwen = MetalQwen::new(arena.clone());
         let w4 = MetalW4::new(&device, &library, arena.clone())?;
         let rms_norm = MetalRmsNorm::new(&device, &library, arena.clone())?;
         let rope = MetalRope::new(&device, &library, arena.clone())?;
@@ -121,6 +128,7 @@ impl Metal {
             layout,
             matmul,
             q2_matvec,
+            qwen,
             w4,
             rms_norm,
             rope,
@@ -194,6 +202,1000 @@ impl Metal {
 
     pub(crate) fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub(crate) fn prepare_qwen_bf16_tensor(
+        &self,
+        tensor: SafeTensorHandle,
+    ) -> Result<DeviceQwenBf16Tensor> {
+        self.qwen.prepare_bf16_tensor(&self.device, tensor)
+    }
+
+    pub(crate) fn prepare_qwen_bf16_tensor_resident(
+        &self,
+        tensor: SafeTensorHandle,
+    ) -> Result<DeviceQwenBf16Tensor> {
+        let mut tensor = self.qwen.prepare_bf16_tensor(&self.device, tensor)?;
+        let byte_len = tensor
+            .element_count()?
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| Error::backend("Qwen resident BF16 size overflow"))?;
+        tensor.buffer = self.copy_to_resident_buffer(
+            &tensor.buffer,
+            tensor.byte_offset,
+            byte_len,
+            "Qwen resident BF16 tensor",
+        )?;
+        tensor.byte_offset = 0;
+        Ok(tensor)
+    }
+
+    pub(crate) fn prepare_qwen_mlx_w4_matrix(
+        &self,
+        weight: SafeTensorHandle,
+        scales: SafeTensorHandle,
+        biases: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+    ) -> Result<DeviceQwenMlxW4Matrix> {
+        self.qwen
+            .prepare_mlx_w4_matrix(&self.device, weight, scales, biases, rows, columns)
+    }
+
+    pub(crate) fn prepare_qwen_mlx_w4_matrix_resident(
+        &self,
+        weight: SafeTensorHandle,
+        scales: SafeTensorHandle,
+        biases: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+    ) -> Result<DeviceQwenMlxW4Matrix> {
+        let mut matrix = self.prepare_qwen_mlx_w4_matrix(weight, scales, biases, rows, columns)?;
+        let weight_bytes = rows
+            .checked_mul(columns / 8)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .ok_or_else(|| Error::backend("Qwen resident MLX W4 weight size overflow"))?;
+        let parameter_bytes = rows
+            .checked_mul(columns / 64)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| Error::backend("Qwen resident MLX W4 parameter size overflow"))?;
+        matrix.weight = self.copy_to_resident_buffer(
+            &matrix.weight,
+            matrix.weight_byte_offset,
+            weight_bytes,
+            "Qwen resident MLX W4 weight",
+        )?;
+        matrix.scales = self.copy_to_resident_buffer(
+            &matrix.scales,
+            matrix.scale_byte_offset,
+            parameter_bytes,
+            "Qwen resident MLX W4 scales",
+        )?;
+        matrix.biases = self.copy_to_resident_buffer(
+            &matrix.biases,
+            matrix.bias_byte_offset,
+            parameter_bytes,
+            "Qwen resident MLX W4 biases",
+        )?;
+        matrix.weight_byte_offset = 0;
+        matrix.scale_byte_offset = 0;
+        matrix.bias_byte_offset = 0;
+        Ok(matrix)
+    }
+
+    fn copy_to_resident_buffer(
+        &self,
+        source: &Buffer,
+        source_byte_offset: usize,
+        byte_len: usize,
+        label: &str,
+    ) -> Result<Buffer> {
+        if byte_len == 0 {
+            return Err(Error::backend("Qwen resident buffer cannot be empty"));
+        }
+        let options = MTLResourceOptions::StorageModePrivate
+            .union(MTLResourceOptions::HazardTrackingModeUntracked);
+        let destination = self.device.new_buffer(byte_len as u64, options);
+        destination.set_label(label);
+        self.batch.encode(&self.queue, |command_buffer| {
+            encode_element_copy(
+                command_buffer,
+                source,
+                source_byte_offset,
+                &destination,
+                0,
+                byte_len,
+                1,
+            )
+        })?;
+        Ok(destination)
+    }
+
+    pub(crate) fn prepare_dflash_w4_matrix(
+        &self,
+        tensor: SafeTensorHandle,
+        rows: usize,
+        columns: usize,
+        group_size: usize,
+    ) -> Result<DeviceDFlashW4Matrix> {
+        let source = self.qwen.prepare_bf16_tensor(&self.device, tensor)?;
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_quantize_w4(
+                &self.device,
+                command_buffer,
+                &source,
+                rows,
+                columns,
+                group_size,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_linear(
+        &self,
+        matrix: &DeviceQwenMlxW4Matrix,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_linear(
+                &self.device,
+                command_buffer,
+                matrix,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_linear_add(
+        &self,
+        matrix: &DeviceQwenMlxW4Matrix,
+        input: &Buffer,
+        residual: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Option<Buffer>> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_linear_add(
+                &self.device,
+                command_buffer,
+                matrix,
+                input,
+                residual,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_gate_up(
+        &self,
+        gate: &DeviceQwenMlxW4Matrix,
+        up: &DeviceQwenMlxW4Matrix,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_gate_up(
+                &self.device,
+                command_buffer,
+                gate,
+                up,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_qkv(
+        &self,
+        query: &DeviceQwenMlxW4Matrix,
+        key: &DeviceQwenMlxW4Matrix,
+        value: &DeviceQwenMlxW4Matrix,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<(Buffer, Buffer, Buffer)> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_qkv(
+                &self.device,
+                command_buffer,
+                query,
+                key,
+                value,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_embedding(
+        &self,
+        embedding: &DeviceQwenMlxW4Matrix,
+        token_ids: &[u32],
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen
+                .encode_mlx_w4_embedding(&self.device, command_buffer, embedding, token_ids)
+        })
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_embedding_from_device(
+        &self,
+        embedding: &DeviceQwenMlxW4Matrix,
+        token_ids: &Buffer,
+        token_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_embedding_from_device(
+                &self.device,
+                command_buffer,
+                embedding,
+                token_ids,
+                token_count,
+            )
+        })
+    }
+
+    pub(crate) fn qwen_mlx_w4_last_token_argmax(
+        &self,
+        output: &DeviceQwenMlxW4Matrix,
+        hidden: &Buffer,
+        batch: usize,
+        sequence_length: usize,
+    ) -> Result<Vec<u32>> {
+        let ids = self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_last_argmax(
+                &self.device,
+                command_buffer,
+                output,
+                hidden,
+                batch,
+                sequence_length,
+            )
+        })?;
+        self.read_qwen_token_ids(&ids, batch)
+    }
+
+    pub(crate) fn batched_qwen_mlx_w4_last_token_argmax(
+        &self,
+        output: &DeviceQwenMlxW4Matrix,
+        hidden: &Buffer,
+        batch: usize,
+        sequence_length: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_last_argmax(
+                &self.device,
+                command_buffer,
+                output,
+                hidden,
+                batch,
+                sequence_length,
+            )
+        })
+    }
+
+    pub(crate) fn qwen_mlx_w4_all_token_argmax(
+        &self,
+        output: &DeviceQwenMlxW4Matrix,
+        hidden: &Buffer,
+        row_count: usize,
+    ) -> Result<Vec<u32>> {
+        let ids = self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_argmax(
+                &self.device,
+                command_buffer,
+                output,
+                hidden,
+                row_count * output.columns,
+                row_count,
+            )
+        })?;
+        if tracing::enabled!(
+            target: "inferno::metal::profile",
+            tracing::Level::TRACE
+        ) {
+            self.batch
+                .submit_profile_segment(&format!("qwen.output.rows{row_count}"))?;
+        }
+        self.read_qwen_token_ids(&ids, row_count)
+    }
+
+    pub(crate) fn batched_qwen_bf16_embedding(
+        &self,
+        embedding: &DeviceQwenBf16Tensor,
+        token_ids: &[u32],
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen
+                .encode_bf16_embedding(&self.device, command_buffer, embedding, token_ids)
+        })
+    }
+
+    pub(crate) fn batched_qwen_bf16_embedding_from_device(
+        &self,
+        embedding: &DeviceQwenBf16Tensor,
+        token_ids: &Buffer,
+        token_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_embedding_from_device(
+                &self.device,
+                command_buffer,
+                embedding,
+                token_ids,
+                token_count,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_qwen_bf16_rms_norm(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &DeviceQwenBf16Tensor,
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_rms_norm(
+                &self.device,
+                command_buffer,
+                input,
+                input_len,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_qwen_bf16_rms_norm_standard(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &DeviceQwenBf16Tensor,
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_rms_norm_standard(
+                &self.device,
+                command_buffer,
+                input,
+                input_len,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_bf16_linear(
+        &self,
+        matrix: &DeviceQwenBf16Tensor,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_linear(
+                &self.device,
+                command_buffer,
+                matrix,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_bf16_add(
+        &self,
+        left: &Buffer,
+        right: &Buffer,
+        element_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen
+                .encode_bf16_add(&self.device, command_buffer, left, right, element_count)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_qwen_bf16_concat_last(
+        &self,
+        left: &Buffer,
+        right: &Buffer,
+        row_count: usize,
+        left_width: usize,
+        right_width: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_concat_last(
+                &self.device,
+                command_buffer,
+                left,
+                right,
+                row_count,
+                left_width,
+                right_width,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_bf16_copy_row(
+        &self,
+        input: &Buffer,
+        row_count: usize,
+        row_width: usize,
+        row_index: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_copy_row(
+                &self.device,
+                command_buffer,
+                input,
+                row_count,
+                row_width,
+                row_index,
+            )
+        })
+    }
+
+    pub(crate) fn qwen_bf16_last_token_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &Buffer,
+        batch_size: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+    ) -> Result<Vec<u32>> {
+        let token_ids = self.batched_qwen_bf16_last_token_argmax(
+            output_weight,
+            hidden_states,
+            batch_size,
+            sequence_length,
+            hidden_size,
+        )?;
+        self.read_qwen_token_ids(&token_ids, batch_size)
+    }
+
+    pub(crate) fn batched_qwen_bf16_last_token_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &Buffer,
+        batch_size: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_last_token_argmax(
+                &self.device,
+                command_buffer,
+                output_weight,
+                hidden_states,
+                batch_size,
+                sequence_length,
+                hidden_size,
+            )
+        })
+    }
+
+    pub(crate) fn batched_qwen_bf16_compact_draft_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &Buffer,
+        batch_size: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_compact_draft_argmax(
+                &self.device,
+                command_buffer,
+                output_weight,
+                hidden_states,
+                batch_size,
+                sequence_length,
+                hidden_size,
+            )
+        })
+    }
+
+    pub(crate) fn read_qwen_token_ids(
+        &self,
+        token_ids: &Buffer,
+        token_count: usize,
+    ) -> Result<Vec<u32>> {
+        self.batch.flush()?;
+        read_u32_buffer(token_ids, token_count)
+    }
+
+    pub(crate) fn qwen_bf16_all_token_argmax(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &Buffer,
+        row_count: usize,
+        hidden_size: usize,
+    ) -> Result<Vec<u32>> {
+        let token_ids = self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_bf16_all_token_argmax(
+                &self.device,
+                command_buffer,
+                output_weight,
+                hidden_states,
+                row_count,
+                hidden_size,
+            )
+        })?;
+        if tracing::enabled!(
+            target: "inferno::metal::profile",
+            tracing::Level::TRACE
+        ) {
+            self.batch
+                .submit_profile_segment(&format!("qwen.output.rows{row_count}"))?;
+        }
+        self.batch.flush()?;
+        read_u32_buffer(&token_ids, row_count)
+    }
+
+    pub(crate) fn batched_dflash_pack_target_features(
+        &self,
+        features: [&Buffer; 5],
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen
+                .encode_dflash_pack_features(&self.device, command_buffer, features, row_count)
+        })
+    }
+
+    pub(crate) fn batched_dflash_copy_rows(
+        &self,
+        input: &Buffer,
+        row_start: usize,
+        row_count: usize,
+        row_width: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_copy_rows(
+                &self.device,
+                command_buffer,
+                input,
+                row_start,
+                row_count,
+                row_width,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_rms_norm(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &DeviceQwenBf16Tensor,
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_rms_norm(
+                &self.device,
+                command_buffer,
+                input,
+                input_len,
+                weight,
+                rows,
+                hidden_size,
+                eps,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_rms_norm_suffix(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        weight: &DeviceQwenBf16Tensor,
+        total_rows: usize,
+        suffix_rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_rms_norm_suffix(
+                &self.device,
+                command_buffer,
+                input,
+                input_len,
+                weight,
+                total_rows,
+                suffix_rows,
+                hidden_size,
+                eps,
+            )
+        })
+    }
+
+    pub(crate) fn batched_dflash_linear(
+        &self,
+        matrix: &DeviceQwenBf16Tensor,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_linear(
+                &self.device,
+                command_buffer,
+                matrix,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_dflash_w4_linear(
+        &self,
+        matrix: &DeviceDFlashW4Matrix,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_w4_linear(
+                &self.device,
+                command_buffer,
+                matrix,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn batched_dflash_w4_gate_up_swiglu(
+        &self,
+        gate: &DeviceDFlashW4Matrix,
+        up: &DeviceDFlashW4Matrix,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_w4_gate_up_swiglu(
+                &self.device,
+                command_buffer,
+                gate,
+                up,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_dynamic_conv(
+        &self,
+        input: &Buffer,
+        dynamic: &Buffer,
+        base_kernel: &DeviceQwenBf16Tensor,
+        rows: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+        stage: usize,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_dynamic_conv(
+                &self.device,
+                command_buffer,
+                input,
+                dynamic,
+                base_kernel,
+                rows,
+                sequence_length,
+                hidden_size,
+                stage,
+                kernel_size,
+                group_size,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_dynamic_conv_residual(
+        &self,
+        input: &Buffer,
+        dynamic: &Buffer,
+        base_kernel: &DeviceQwenBf16Tensor,
+        residual: &Buffer,
+        rows: usize,
+        sequence_length: usize,
+        hidden_size: usize,
+        kernel_size: usize,
+        group_size: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_dynamic_conv_residual(
+                &self.device,
+                command_buffer,
+                input,
+                dynamic,
+                base_kernel,
+                residual,
+                rows,
+                sequence_length,
+                hidden_size,
+                kernel_size,
+                group_size,
+            )
+        })
+    }
+
+    pub(crate) fn batched_dflash_gate_up_swiglu(
+        &self,
+        gate: &DeviceQwenBf16Tensor,
+        up: &DeviceQwenBf16Tensor,
+        input: &Buffer,
+        input_len: usize,
+        row_count: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_gate_up_swiglu(
+                &self.device,
+                command_buffer,
+                gate,
+                up,
+                input,
+                input_len,
+                row_count,
+            )
+        })
+    }
+
+    pub(crate) fn create_dflash_attention_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+    ) -> Result<DFlashAttentionCache> {
+        self.qwen
+            .create_dflash_attention_cache(&self.device, batch, capacity_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_attention(
+        &self,
+        query: &Buffer,
+        context_key: &Buffer,
+        context_value: &Buffer,
+        proposal_key: &Buffer,
+        proposal_value: &Buffer,
+        query_norm: &DeviceQwenBf16Tensor,
+        key_norm: &DeviceQwenBf16Tensor,
+        cache: &DFlashAttentionCache,
+        batch: usize,
+        proposal_length: usize,
+        context_length: usize,
+        context_position_start: usize,
+        rope_theta: f32,
+        sliding_window: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_attention(
+                &self.device,
+                command_buffer,
+                query,
+                context_key,
+                context_value,
+                proposal_key,
+                proposal_value,
+                query_norm,
+                key_norm,
+                cache,
+                batch,
+                proposal_length,
+                context_length,
+                context_position_start,
+                rope_theta,
+                sliding_window,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_select_candidates(
+        &self,
+        output_weight: &DeviceQwenBf16Tensor,
+        hidden_states: &Buffer,
+        projected_hidden: &Buffer,
+        predecessor_codebook: &DeviceQwenBf16Tensor,
+        successor_codebook: &DeviceQwenBf16Tensor,
+        row_count: usize,
+        anchor_token: u32,
+        top_k: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_select_candidates(
+                &self.device,
+                command_buffer,
+                output_weight,
+                hidden_states,
+                projected_hidden,
+                predecessor_codebook,
+                successor_codebook,
+                row_count,
+                anchor_token,
+                top_k,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_dflash_mlx_w4_select_candidates(
+        &self,
+        output_weight: &DeviceQwenMlxW4Matrix,
+        hidden_states: &Buffer,
+        hidden_len: usize,
+        projected_hidden: &Buffer,
+        predecessor_codebook: &DeviceQwenBf16Tensor,
+        successor_codebook: &DeviceQwenBf16Tensor,
+        row_count: usize,
+        anchor_token: u32,
+        top_k: usize,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_dflash_mlx_w4_select_candidates(
+                &self.device,
+                command_buffer,
+                output_weight,
+                hidden_states,
+                hidden_len,
+                projected_hidden,
+                predecessor_codebook,
+                successor_codebook,
+                row_count,
+                anchor_token,
+                top_k,
+            )
+        })
+    }
+
+    pub(crate) fn create_qwen_full_attention_cache(
+        &self,
+        batch: usize,
+        capacity_tokens: usize,
+    ) -> Result<QwenFullAttentionCache> {
+        self.qwen
+            .create_full_attention_cache(&self.device, batch, capacity_tokens)
+    }
+
+    pub(crate) fn create_qwen_linear_attention_cache(
+        &self,
+        batch: usize,
+    ) -> Result<QwenLinearAttentionCache> {
+        self.qwen.create_linear_attention_cache(&self.device, batch)
+    }
+
+    pub(crate) fn create_qwen_speculative_linear_attention_cache(
+        &self,
+        batch: usize,
+    ) -> Result<QwenLinearAttentionCache> {
+        self.qwen
+            .create_speculative_linear_attention_cache(&self.device, batch)
+    }
+
+    pub(crate) fn restore_qwen_linear_attention_checkpoint(
+        &self,
+        cache: &QwenLinearAttentionCache,
+        checkpoint_index: usize,
+    ) -> Result<()> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_restore_linear_attention_checkpoint(
+                &self.device,
+                command_buffer,
+                cache,
+                checkpoint_index,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_qwen_mlx_w4_linear_attention(
+        &self,
+        input: &Buffer,
+        input_len: usize,
+        qkv: &DeviceQwenMlxW4Matrix,
+        gate: &DeviceQwenMlxW4Matrix,
+        input_a: &DeviceQwenMlxW4Matrix,
+        input_b: &DeviceQwenMlxW4Matrix,
+        conv1d: &DeviceQwenBf16Tensor,
+        a_log: &DeviceQwenBf16Tensor,
+        dt_bias: &DeviceQwenBf16Tensor,
+        norm: &DeviceQwenBf16Tensor,
+        cache: &QwenLinearAttentionCache,
+        row_count: usize,
+        sequence_length: usize,
+        eps: f32,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_mlx_w4_linear_attention(
+                &self.device,
+                command_buffer,
+                input,
+                input_len,
+                qkv,
+                gate,
+                input_a,
+                input_b,
+                conv1d,
+                a_log,
+                dt_bias,
+                norm,
+                cache,
+                row_count,
+                sequence_length,
+                eps,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_qwen_full_attention(
+        &self,
+        query_gate: &Buffer,
+        key: &Buffer,
+        value: &Buffer,
+        query_norm: &DeviceQwenBf16Tensor,
+        key_norm: &DeviceQwenBf16Tensor,
+        cache: &QwenFullAttentionCache,
+        row_count: usize,
+        sequence_length: usize,
+        rope_theta: f32,
+        rotary_dim: usize,
+        norm_weight_has_unit_offset: bool,
+    ) -> Result<Buffer> {
+        self.batch.encode(&self.queue, |command_buffer| {
+            self.qwen.encode_full_attention(
+                &self.device,
+                command_buffer,
+                query_gate,
+                key,
+                value,
+                query_norm,
+                key_norm,
+                cache,
+                row_count,
+                sequence_length,
+                rope_theta,
+                rotary_dim,
+                norm_weight_has_unit_offset,
+            )
+        })
+    }
+
+    pub(crate) fn batch_read_bf16_as_f32(&self, buffer: &Buffer, len: usize) -> Result<Vec<f32>> {
+        self.batch.flush()?;
+        read_bf16_buffer_as_f32(buffer, len)
     }
 
     pub(crate) fn queue(&self) -> &CommandQueue {

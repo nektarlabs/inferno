@@ -325,16 +325,32 @@ pub(crate) fn encode_1d_threadgroups_args(
     threadgroup_count: usize,
     threads_per_group: usize,
 ) -> Result<()> {
-    validate_threadgroup_shape(pipeline, threadgroup_count, threads_per_group)?;
-
     let encoder = command_buffer.new_compute_command_encoder();
+    encode_1d_threadgroups_args_on_encoder(
+        encoder,
+        pipeline,
+        args,
+        threadgroup_count,
+        threads_per_group,
+    )?;
+    encoder.end_encoding();
+    Ok(())
+}
+
+pub(crate) fn encode_1d_threadgroups_args_on_encoder(
+    encoder: &::metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    args: &[KernelArg<'_>],
+    threadgroup_count: usize,
+    threads_per_group: usize,
+) -> Result<()> {
+    validate_threadgroup_shape(pipeline, threadgroup_count, threads_per_group)?;
     encoder.set_compute_pipeline_state(pipeline);
     bind_args(encoder, args)?;
     encoder.dispatch_thread_groups(
         MTLSize::new(threadgroup_count as NSUInteger, 1, 1),
         MTLSize::new(threads_per_group as NSUInteger, 1, 1),
     );
-    encoder.end_encoding();
     Ok(())
 }
 

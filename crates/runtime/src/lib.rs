@@ -5,6 +5,7 @@
 mod cache_budget;
 mod laguna;
 mod laguna_memory;
+mod qwen;
 mod telemetry;
 
 pub use cache_budget::{
@@ -27,6 +28,7 @@ pub use laguna_memory::{
     DEFAULT_LAGUNA_MEMORY_STABILIZATION_WINDOWS, DEFAULT_LAGUNA_MEMORY_TARGET_HEADROOM_BYTES,
     DEFAULT_LAGUNA_MEMORY_TRIAL_WARMUP_TOKENS,
 };
+pub use qwen::{QwenDraftMethod, QwenGenerationReport, QwenRuntime, QwenRuntimeSummary};
 
 use std::{
     cell::RefCell,

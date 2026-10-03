@@ -7,6 +7,7 @@ use serde::Deserialize;
 pub enum ModelArchitecture {
     GlmMoeDsa,
     Laguna,
+    Qwen38,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +30,7 @@ pub fn detect_model_architecture(path: &Path) -> Result<ModelArchitecture> {
     match probe.model_type.as_str() {
         "glm_moe_dsa" => Ok(ModelArchitecture::GlmMoeDsa),
         "laguna" => Ok(ModelArchitecture::Laguna),
+        "qwen3_5" => Ok(ModelArchitecture::Qwen38),
         other => Err(Error::config(format!(
             "unsupported model_type {other:?} in {}",
             path.display()
@@ -51,6 +53,7 @@ mod tests {
     fn detects_supported_architectures_without_parsing_their_full_config() {
         let glm = write_config(r#"{"model_type":"glm_moe_dsa"}"#);
         let laguna = write_config(r#"{"model_type":"laguna"}"#);
+        let qwen = write_config(r#"{"model_type":"qwen3_5"}"#);
 
         assert_eq!(
             detect_model_architecture(&glm).unwrap(),
@@ -59,6 +62,10 @@ mod tests {
         assert_eq!(
             detect_model_architecture(&laguna).unwrap(),
             ModelArchitecture::Laguna
+        );
+        assert_eq!(
+            detect_model_architecture(&qwen).unwrap(),
+            ModelArchitecture::Qwen38
         );
     }
 

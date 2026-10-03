@@ -115,6 +115,10 @@ pub fn run(
             telemetry_file,
             memory_controller_log,
         ),
+        ModelArchitecture::Qwen38 => Err(Error::runtime(
+            "Qwen3.8 configuration is recognized, but its Metal runtime is not complete",
+        )
+        .into()),
     }
 }
 

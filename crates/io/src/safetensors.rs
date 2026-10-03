@@ -9,22 +9,25 @@ use ::safetensors::{Dtype, SafeTensors};
 use common::{Error, Result};
 use serde::Deserialize;
 
-use crate::{MappedFile, MappedFileAdvice};
+use crate::{MappedBytes, MappedFile, MappedFileAdvice};
 
 pub const SAFETENSORS_INDEX_FILE: &str = "model.safetensors.index.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeTensorDtype {
     Bf16,
+    Fp8E4M3,
     F32,
     I32,
+    U32,
 }
 
 impl SafeTensorDtype {
     pub const fn byte_width(self) -> usize {
         match self {
+            Self::Fp8E4M3 => 1,
             Self::Bf16 => 2,
-            Self::F32 | Self::I32 => 4,
+            Self::F32 | Self::I32 | Self::U32 => 4,
         }
     }
 }
@@ -48,13 +51,14 @@ pub struct SafeTensorIndex {
 
 #[derive(Debug, Deserialize)]
 struct IndexDocument {
+    #[serde(default)]
     metadata: IndexMetadata,
     weight_map: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct IndexMetadata {
-    total_size: u64,
+    total_size: Option<u64>,
 }
 
 impl SafeTensorIndex {
@@ -71,7 +75,7 @@ impl SafeTensorIndex {
                 index_path.display()
             ))
         })?;
-        if document.metadata.total_size == 0 {
+        if document.metadata.total_size == Some(0) {
             return Err(Error::weights(
                 "safetensors index metadata.total_size must be positive",
             ));
@@ -90,9 +94,24 @@ impl SafeTensorIndex {
             weight_map.insert(tensor_name, shard_path);
         }
 
+        let total_size = match document.metadata.total_size {
+            Some(total_size) => total_size,
+            None => shard_paths.iter().try_fold(0_u64, |total, path| {
+                let byte_len = fs::metadata(path)
+                    .map_err(|source| Error::Io {
+                        path: path.clone(),
+                        source,
+                    })?
+                    .len();
+                total
+                    .checked_add(byte_len)
+                    .ok_or_else(|| Error::weights("safetensors shard byte count overflow"))
+            })?,
+        };
+
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
-            total_size: document.metadata.total_size,
+            total_size,
             weight_map,
             shard_paths: shard_paths.into_iter().collect(),
         })
@@ -206,6 +225,18 @@ impl SafeTensorShard {
         })
     }
 
+    /// Returns a typed handle into this standalone shard without copying its payload.
+    ///
+    /// This is used for auxiliary artifacts such as `mtp.safetensors`, whose tensors
+    /// intentionally do not appear in the base model's sharded index.
+    pub fn tensor(self: &Arc<Self>, name: &str) -> Result<SafeTensorHandle> {
+        let info = self.info(name)?.clone();
+        Ok(SafeTensorHandle {
+            shard: Arc::clone(self),
+            info,
+        })
+    }
+
     fn bytes(&self, info: &SafeTensorInfo) -> Result<&[u8]> {
         let byte_len = usize::try_from(info.byte_len)
             .map_err(|_| Error::weights("safetensors tensor length does not fit usize"))?;
@@ -243,6 +274,15 @@ impl SafeTensorHandle {
 
     pub fn bytes(&self) -> Result<&[u8]> {
         self.shard.bytes(&self.info)
+    }
+
+    /// Retains the complete shard mapping for a native zero-copy device view.
+    ///
+    /// Tensor bytes start at `info().file_offset` inside this mapping. Keeping
+    /// the returned owner alive guarantees that a Metal buffer created over
+    /// the mmap cannot outlive its backing virtual-memory range.
+    pub fn shared_mapping(&self) -> MappedBytes {
+        self.shard.mapped.shared_bytes()
     }
 
     /// Materializes a BF16 tensor as F32. Intended for small vectors such as
@@ -422,10 +462,12 @@ impl SafeTensorModel {
 fn supported_dtype(name: &str, dtype: Dtype) -> Result<SafeTensorDtype> {
     match dtype {
         Dtype::BF16 => Ok(SafeTensorDtype::Bf16),
+        Dtype::F8_E4M3 => Ok(SafeTensorDtype::Fp8E4M3),
         Dtype::F32 => Ok(SafeTensorDtype::F32),
         Dtype::I32 => Ok(SafeTensorDtype::I32),
+        Dtype::U32 => Ok(SafeTensorDtype::U32),
         other => Err(Error::weights(format!(
-            "safetensors tensor {name} uses unsupported dtype {other:?}; Laguna INT4 supports BF16, F32, and I32 storage"
+            "safetensors tensor {name} uses unsupported dtype {other:?}; supported storage is F8_E4M3, BF16, F32, I32, and U32"
         ))),
     }
 }
@@ -504,6 +546,51 @@ mod tests {
     }
 
     #[test]
+    fn index_infers_storage_size_when_official_metadata_is_empty() {
+        let model_dir = write_tiny_model_with_metadata(json!({}));
+        let shard_len = fs::metadata(model_dir.join("model-00001-of-00001.safetensors"))
+            .unwrap()
+            .len();
+
+        let index = SafeTensorIndex::open(model_dir).unwrap();
+        assert_eq!(index.total_size(), shard_len);
+    }
+
+    #[test]
+    fn opens_fp8_e4m3_payload_without_materializing_it() {
+        let model_dir = test_dir();
+        let shard_name = "model-00001-of-00001.safetensors";
+        let header = r#"{"weight":{"dtype":"F8_E4M3","shape":[4],"data_offsets":[0,4]}}"#;
+        let mut shard = Vec::new();
+        shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        shard.extend_from_slice(header.as_bytes());
+        shard.extend_from_slice(&[0x38, 0xb8, 0x00, 0x7e]);
+        fs::write(model_dir.join(shard_name), shard).unwrap();
+        fs::write(
+            model_dir.join(SAFETENSORS_INDEX_FILE),
+            json!({
+                "metadata": {},
+                "weight_map": {"weight": shard_name}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let model = SafeTensorModel::open(model_dir).unwrap();
+        let weight = model.tensor("weight").unwrap();
+        assert_eq!(weight.info().dtype, SafeTensorDtype::Fp8E4M3);
+        assert_eq!(weight.info().shape, vec![4]);
+        assert_eq!(weight.bytes().unwrap(), &[0x38, 0xb8, 0x00, 0x7e]);
+
+        let mapping = weight.shared_mapping();
+        let start = weight.info().file_offset as usize;
+        assert_eq!(
+            &mapping.as_slice()[start..start + 4],
+            weight.bytes().unwrap()
+        );
+    }
+
+    #[test]
     fn decodes_small_bf16_and_f32_tensors_without_touching_other_payloads() {
         let model_dir = test_dir();
         let shard_name = "model-00001-of-00001.safetensors";
@@ -555,6 +642,10 @@ mod tests {
     }
 
     fn write_tiny_model() -> PathBuf {
+        write_tiny_model_with_metadata(json!({"total_size": 8}))
+    }
+
+    fn write_tiny_model_with_metadata(metadata: serde_json::Value) -> PathBuf {
         let model_dir = test_dir();
         let shard_name = "model-00001-of-00001.safetensors";
         let header = r#"{"weight":{"dtype":"I32","shape":[1,2],"data_offsets":[0,8]}}"#;
@@ -566,7 +657,7 @@ mod tests {
         fs::write(
             model_dir.join(SAFETENSORS_INDEX_FILE),
             json!({
-                "metadata": {"total_size": 8},
+                "metadata": metadata,
                 "weight_map": {"weight": shard_name}
             })
             .to_string(),
