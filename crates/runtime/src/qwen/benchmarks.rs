@@ -89,6 +89,84 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+/// Isolates reserved KV capacity from prompt length and weight-loading time.
+#[test]
+#[ignore = "requires local Qwen Q4/DFlash2 weights and exclusive native Metal access"]
+fn benchmark_real_qwen_chat_capacity() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model = workspace.join("models/qwen3.8-27b-4bit");
+    let draft = workspace.join("models/qwen3.8-27b-dflash2");
+    let tokenizer = Tokenizer::from_file(&model.join("tokenizer.json")).unwrap();
+    let generation = load_generation_config(&model.join("generation_config.json")).unwrap();
+    let prompt = tokenizer
+        .encode(
+            &render_qwen_user_prompt(FIBONACCI_PROMPT, false).rendered,
+            false,
+        )
+        .unwrap()
+        .token_ids;
+    let backend = MetalBackend::new().unwrap();
+    let loaded = Instant::now();
+    let mut runtime =
+        QwenRuntime::open_with_dflash(&model, &model.join("config.json"), &draft, &backend, 1, 512)
+            .unwrap();
+    eprintln!(
+        "qwen_chat_capacity load_seconds={:.3}",
+        loaded.elapsed().as_secs_f64()
+    );
+    let mut expected = None;
+    let mut rates = [Vec::new(), Vec::new()];
+    for repetition in 0..4 {
+        let order = if repetition % 2 == 0 {
+            [512, 262_144]
+        } else {
+            [262_144, 512]
+        };
+        for capacity in order {
+            if runtime.state.capacity_tokens() != capacity {
+                runtime.state =
+                    QwenModelState::create_speculative(&backend, &runtime.config, 1, capacity)
+                        .unwrap();
+            }
+            let reset = Instant::now();
+            runtime.reset_sequence().unwrap();
+            backend.device_flush().unwrap();
+            let reset_ms = reset.elapsed().as_secs_f64() * 1000.0;
+            let mut sample = Sample::new();
+            let start = Instant::now();
+            let report = runtime
+                .generate(
+                    &prompt,
+                    Some(TOKEN_LIMIT),
+                    &generation.eos_token_ids,
+                    |id| {
+                        sample.push(id);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            sample.elapsed = start.elapsed();
+            let ttft = sample.first.unwrap().duration_since(start).as_secs_f64();
+            eprintln!("qwen_chat_capacity repetition={repetition} capacity={capacity} reset_ms={reset_ms:.3} ttft_s={ttft:.3} decode_tps={:.3} state_gib={:.3} accepted={} proposed={}",
+                sample.decode_tps(), runtime.summary().unwrap().state_bytes as f64 / 1073741824.0,
+                report.accepted_draft_tokens, report.draft_tokens);
+            if let Some(expected) = &expected {
+                assert_eq!(&sample.tokens, expected);
+            } else {
+                expected = Some(sample.tokens.clone());
+            }
+            if repetition > 0 {
+                rates[usize::from(capacity == 262_144)].push(sample.decode_tps());
+            }
+        }
+    }
+    eprintln!(
+        "qwen_chat_capacity median_small_tps={:.3} median_256k_tps={:.3}",
+        median(&mut rates[0]),
+        median(&mut rates[1])
+    );
+}
+
 /// Model loading and state allocation are outside the timer; prefill is included
 /// in total throughput. Decode uses first-to-last emitted token, like the CLI.
 #[test]

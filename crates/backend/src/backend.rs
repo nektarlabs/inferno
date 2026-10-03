@@ -287,13 +287,14 @@ impl DeviceQwenTokenIds {
 
 /// Device-resident BF16 K/V storage for one Qwen3.8 full-attention layer.
 ///
-/// Both buffers use token-major `[B, capacity, 4, 256]` layout. Qwen's other
+/// Both buffers use token-major `[B, allocated_tokens, 4, 256]` layout. Qwen's other
 /// 48 decoder layers use recurrent Gated DeltaNet state and do not allocate
 /// this cache.
 #[derive(Debug)]
 pub struct QwenFullAttentionCache {
     pub(crate) batch: usize,
     pub(crate) capacity_tokens: usize,
+    pub(crate) allocated_tokens: usize,
     pub(crate) length: usize,
     pub(crate) kv_heads: usize,
     pub(crate) head_dim: usize,
@@ -400,13 +401,17 @@ impl QwenFullAttentionCache {
         self.capacity_tokens
     }
 
+    pub fn allocated_tokens(&self) -> usize {
+        self.allocated_tokens
+    }
+
     pub fn length(&self) -> usize {
         self.length
     }
 
     pub fn storage_bytes(&self) -> Result<usize> {
         self.batch
-            .checked_mul(self.capacity_tokens)
+            .checked_mul(self.allocated_tokens)
             .and_then(|values| values.checked_mul(self.kv_heads))
             .and_then(|values| values.checked_mul(self.head_dim))
             .and_then(|values| values.checked_mul(2))

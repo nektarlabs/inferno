@@ -860,14 +860,16 @@ impl MetalQwen {
         value: &::metal::Buffer,
         query_norm: &DeviceQwenBf16Tensor,
         key_norm: &DeviceQwenBf16Tensor,
-        cache: &QwenFullAttentionCache,
+        cache: &mut QwenFullAttentionCache,
         row_count: usize,
         sequence_length: usize,
         rope_theta: f32,
         rotary_dim: usize,
         norm_weight_has_unit_offset: bool,
     ) -> Result<::metal::Buffer> {
-        self.attention(device)?.encode(
+        let attention = self.attention(device)?;
+        attention.reserve_cache(device, command_buffer, cache, sequence_length)?;
+        attention.encode(
             command_buffer,
             query_gate,
             key,

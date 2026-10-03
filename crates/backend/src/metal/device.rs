@@ -1188,7 +1188,7 @@ impl Metal {
         value: &Buffer,
         query_norm: &DeviceQwenBf16Tensor,
         key_norm: &DeviceQwenBf16Tensor,
-        cache: &QwenFullAttentionCache,
+        cache: &mut QwenFullAttentionCache,
         row_count: usize,
         sequence_length: usize,
         rope_theta: f32,

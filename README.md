@@ -360,9 +360,9 @@ not supported. Reasoning is off by default: use `--thinking` or request effort
 incomplete, and truncated tool calls are never dispatched.
 
 Use `--throughput-summary` for a single-line prefill/decode report in chat or
-generate, or a live display in serve. The new chat/server adapters have protocol
-tests; real-model multi-turn validation and full 256K-context validation remain
-pending.
+generate, or a live display in serve. Real-model tests cover multi-turn chat,
+independent server requests, function-tool round trips and cancellation recovery
+with MTP and DFlash. Full 256K-context inference has not yet been validated.
 
 Qwen uses dedicated prefill kernels to process prompt tokens in batches,
 reuse intermediate buffers, and fuse gate/up projections with activation.

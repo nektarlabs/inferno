@@ -22,6 +22,7 @@ const HEAD_DIM: usize = 256;
 const QUERY_GATE_WIDTH: usize = QUERY_HEADS * HEAD_DIM * 2;
 const KEY_VALUE_WIDTH: usize = KEY_VALUE_HEADS * HEAD_DIM;
 const SIMD_LANES: usize = 32;
+const INITIAL_CACHE_TOKENS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct Bf16Binding<'a> {
@@ -76,8 +77,9 @@ impl MetalQwenAttention {
                 "Qwen KV cache dimensions must be positive, got [{batch},{capacity_tokens}]"
             )));
         }
+        let allocated_tokens = capacity_tokens.min(INITIAL_CACHE_TOKENS);
         let values = batch
-            .checked_mul(capacity_tokens)
+            .checked_mul(allocated_tokens)
             .and_then(|count| count.checked_mul(KEY_VALUE_WIDTH))
             .ok_or_else(|| Error::cache("Qwen KV cache element count overflow"))?;
         let bytes = values
@@ -92,12 +94,61 @@ impl MetalQwenAttention {
         Ok(QwenFullAttentionCache {
             batch,
             capacity_tokens,
+            allocated_tokens,
             length: 0,
             kv_heads: KEY_VALUE_HEADS,
             head_dim: HEAD_DIM,
             key,
             value,
         })
+    }
+
+    pub(super) fn reserve_cache(
+        &self,
+        device: &Device,
+        command: &::metal::CommandBufferRef,
+        cache: &mut QwenFullAttentionCache,
+        sequence_length: usize,
+    ) -> Result<()> {
+        let required = cache
+            .length
+            .checked_add(sequence_length)
+            .ok_or_else(|| Error::cache("Qwen KV token count overflow"))?;
+        let capacity =
+            grown_cache_capacity(cache.allocated_tokens, required, cache.capacity_tokens)?;
+        if capacity == cache.allocated_tokens {
+            return Ok(());
+        }
+
+        let row_bytes = KEY_VALUE_WIDTH * std::mem::size_of::<u16>();
+        let bytes = cache
+            .batch
+            .checked_mul(capacity)
+            .and_then(|rows| rows.checked_mul(row_bytes))
+            .ok_or_else(|| Error::cache("Qwen KV allocation size overflow"))?;
+        let options = MTLResourceOptions::StorageModeShared
+            .union(MTLResourceOptions::HazardTrackingModeTracked);
+        let key = device.new_buffer(bytes as u64, options);
+        let value = device.new_buffer(bytes as u64, options);
+        key.set_label("qwen full-attention key cache");
+        value.set_label("qwen full-attention value cache");
+
+        if cache.length != 0 {
+            // Copy only live rows, on the GPU. Each batch acquires a new stride.
+            let encoder = command.new_blit_command_encoder();
+            for batch in 0..cache.batch {
+                let source = (batch * cache.allocated_tokens * row_bytes) as u64;
+                let destination = (batch * capacity * row_bytes) as u64;
+                let length = (cache.length * row_bytes) as u64;
+                encoder.copy_from_buffer(&cache.key, source, &key, destination, length);
+                encoder.copy_from_buffer(&cache.value, source, &value, destination, length);
+            }
+            encoder.end_encoding();
+        }
+        cache.key = key;
+        cache.value = value;
+        cache.allocated_tokens = capacity;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -183,7 +234,7 @@ impl MetalQwenAttention {
         let output = self.arena.empty_f16(query_values)?;
         let row_count = as_u32(row_count, "row count")?;
         let sequence_length = as_u32(sequence_length, "sequence length")?;
-        let capacity_tokens = as_u32(cache.capacity_tokens, "KV capacity")?;
+        let capacity_tokens = as_u32(cache.allocated_tokens, "allocated KV capacity")?;
         let position_start = as_u32(cache.length, "KV position")?;
 
         encode_1d_threadgroups_args(
@@ -265,6 +316,21 @@ impl MetalQwenAttention {
     }
 }
 
+fn grown_cache_capacity(allocated: usize, required: usize, limit: usize) -> Result<usize> {
+    if required > limit {
+        return Err(Error::cache(format!(
+            "Qwen KV length {required} exceeds context limit {limit}"
+        )));
+    }
+    if required <= allocated {
+        return Ok(allocated);
+    }
+    required
+        .checked_next_power_of_two()
+        .map(|capacity| capacity.min(limit))
+        .ok_or_else(|| Error::cache("Qwen KV capacity overflow"))
+}
+
 fn validate_execution(
     cache: &QwenFullAttentionCache,
     row_count: usize,
@@ -291,10 +357,14 @@ fn validate_execution(
             "Qwen KV cache has incompatible head dimensions",
         ));
     }
-    if cache.length + sequence_length > cache.capacity_tokens {
+    let required = cache
+        .length
+        .checked_add(sequence_length)
+        .ok_or_else(|| Error::cache("Qwen KV token count overflow"))?;
+    if required > cache.capacity_tokens || required > cache.allocated_tokens {
         return Err(Error::cache(format!(
-            "Qwen KV append {} + {sequence_length} exceeds capacity {}",
-            cache.length, cache.capacity_tokens
+            "Qwen KV append requires {required} tokens, allocated {}, context limit {}",
+            cache.allocated_tokens, cache.capacity_tokens
         )));
     }
     Ok(())
@@ -325,6 +395,77 @@ mod tests {
     use ::metal::{MTLCommandBufferStatus, MTLResourceOptions};
 
     use super::*;
+
+    #[test]
+    fn kv_growth_is_geometric_and_bounded_by_context() {
+        assert_eq!(grown_cache_capacity(512, 512, 262144).unwrap(), 512);
+        assert_eq!(grown_cache_capacity(512, 513, 262144).unwrap(), 1024);
+        assert_eq!(grown_cache_capacity(512, 4097, 262144).unwrap(), 8192);
+        assert_eq!(grown_cache_capacity(1024, 1025, 1500).unwrap(), 1500);
+        assert!(grown_cache_capacity(1024, 1501, 1500).is_err());
+        assert!(grown_cache_capacity(512, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn kv_growth_preserves_both_batches_across_queued_copies() {
+        let device = Device::system_default().expect("native Metal required");
+        let attention =
+            MetalQwenAttention::new(&device, MetalArena::new(&device).unwrap()).unwrap();
+        let mut cache = attention.create_cache(&device, 2, 1500).unwrap();
+        assert_eq!(cache.capacity_tokens(), 1500);
+        assert_eq!(cache.allocated_tokens(), 512);
+        assert_eq!(
+            cache.storage_bytes().unwrap(),
+            2 * 512 * KEY_VALUE_WIDTH * 4
+        );
+        cache.length = 510;
+        // Distinct K/V and batch patterns catch incorrect stride relocation.
+        for (buffer, offset) in [(&cache.key, 0_u16), (&cache.value, 1000_u16)] {
+            let data = unsafe {
+                slice::from_raw_parts_mut(
+                    buffer.contents().cast::<u16>(),
+                    2 * 512 * KEY_VALUE_WIDTH,
+                )
+            };
+            for batch in 0..2 {
+                for token in 0..510 {
+                    let start = (batch * 512 + token) * KEY_VALUE_WIDTH;
+                    data[start..start + KEY_VALUE_WIDTH]
+                        .fill(offset + (batch * 600 + token) as u16);
+                }
+            }
+        }
+        let queue = device.new_command_queue();
+        let command = queue.new_command_buffer();
+        attention
+            .reserve_cache(&device, command, &mut cache, 5)
+            .unwrap();
+        assert_eq!(cache.allocated_tokens(), 1024);
+        attention
+            .reserve_cache(&device, command, &mut cache, 700)
+            .unwrap();
+        assert_eq!(cache.allocated_tokens(), 1500);
+        assert!(attention
+            .reserve_cache(&device, command, &mut cache, 991)
+            .is_err());
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        for (buffer, offset) in [(&cache.key, 0_u16), (&cache.value, 1000_u16)] {
+            let data = unsafe {
+                slice::from_raw_parts(buffer.contents().cast::<u16>(), 2 * 1500 * KEY_VALUE_WIDTH)
+            };
+            for batch in 0..2 {
+                for token in 0..510 {
+                    let start = (batch * 1500 + token) * KEY_VALUE_WIDTH;
+                    assert!(data[start..start + KEY_VALUE_WIDTH]
+                        .iter()
+                        .all(|value| *value == offset + (batch * 600 + token) as u16));
+                }
+            }
+        }
+        assert_eq!(cache.length(), 510);
+    }
 
     #[test]
     fn one_token_full_attention_matches_exact_gated_value() {
