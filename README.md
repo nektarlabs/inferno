@@ -605,9 +605,11 @@ show different expert-locality and attention behavior.
 **Qwen weights and state.** Qwen3.8 27B is dense, so it has no routed-expert
 cache. Packed Q4 weights are loaded into persistent Metal buffers once.
 Recurrent attention state and full-attention KV stay on Metal; they do not use
-GLM's SSD KV store. At 262,144 tokens, the target's full-attention KV capacity
-alone is 16 GiB, excluding weights, draft state and temporary buffers. Reducing
-`--context-tokens` lowers this reservation. Long prompts use bounded prefill
+GLM's SSD KV store. The context limit does not reserve the entire KV cache:
+it starts at 512 tokens (32 MiB across the target's full-attention layers) and
+grows on demand, copying live rows directly on the GPU. At 262,144 tokens,
+target KV alone reaches 16 GiB, excluding weights, draft state and temporary
+buffers. `--context-tokens` bounds its growth. Long prompts use bounded prefill
 chunks and reusable GPU scratch buffers rather than whole-prompt intermediates.
 
 **Expert cache.** GLM selects eight experts and uses a per-layer SLRU cache.

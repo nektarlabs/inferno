@@ -89,6 +89,115 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+/// Long generation with opt-in, block-aligned decode diagnostics. EOS is honored.
+#[test]
+#[ignore = "requires local Qwen Q4/DFlash2 weights and exclusive native Metal access"]
+fn benchmark_real_qwen_decode_windows() {
+    run_decode_window_benchmark(None, None);
+}
+
+#[test]
+#[ignore = "records /tmp/inferno-qwen-decode-reference.bin; requires native Metal and local weights"]
+fn record_real_qwen_decode_reference() {
+    run_decode_window_benchmark(
+        Some(Path::new("/tmp/inferno-qwen-decode-reference.bin")),
+        None,
+    );
+}
+
+#[test]
+#[ignore = "compares /tmp/inferno-qwen-decode-reference.bin; requires native Metal and local weights"]
+fn compare_real_qwen_decode_reference() {
+    run_decode_window_benchmark(
+        None,
+        Some(Path::new("/tmp/inferno-qwen-decode-reference.bin")),
+    );
+}
+
+fn run_decode_window_benchmark(record: Option<&Path>, reference: Option<&Path>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "inferno::qwen::decode=debug,inferno::qwen::kv=debug".into()),
+        )
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model = workspace.join("models/qwen3.8-27b-4bit");
+    let draft = workspace.join("models/qwen3.8-27b-dflash2");
+    let tokenizer = Tokenizer::from_file(&model.join("tokenizer.json")).unwrap();
+    let generation = load_generation_config(&model.join("generation_config.json")).unwrap();
+    let text = "Write a complete, detailed tutorial on building a Rust HTTP server. Include routing, request parsing, error handling, tests, concurrency, graceful shutdown and examples. Explain each part thoroughly with code.";
+    let prompt = tokenizer
+        .encode(&render_qwen_user_prompt(text, false).rendered, false)
+        .unwrap()
+        .token_ids;
+    let backend = MetalBackend::new().unwrap();
+    let mut runtime = QwenRuntime::open_with_dflash(
+        &model,
+        &model.join("config.json"),
+        &draft,
+        &backend,
+        1,
+        262_144,
+    )
+    .unwrap();
+    // Warm pipelines and resident weights before collecting windows.
+    runtime
+        .generate(&prompt, Some(32), &generation.eos_token_ids, |_| Ok(()))
+        .unwrap();
+    let mut expected = None;
+    let mut rates = Vec::new();
+    for repetition in 0..3 {
+        runtime.reset_sequence().unwrap();
+        backend.device_flush().unwrap();
+        let mut sample = Sample::new();
+        let report = runtime
+            .generate(&prompt, Some(1024), &generation.eos_token_ids, |id| {
+                sample.push(id);
+                Ok(())
+            })
+            .unwrap();
+        eprintln!(
+            "qwen_decode_windows repetition={repetition} generated={} eos={} decode_tps={:.3} accepted={} proposed={}",
+            sample.tokens.len(), report.stopped_on_eos, sample.decode_tps(),
+            report.accepted_draft_tokens, report.draft_tokens
+        );
+        assert!(
+            sample.tokens.len() >= 256,
+            "prompt ended before two decode windows"
+        );
+        if let Some(expected) = &expected {
+            assert_eq!(&sample.tokens, expected);
+        } else {
+            // Test-only, explicit recording/comparison across separately built kernels.
+            let bytes = prompt
+                .iter()
+                .chain([&u32::MAX])
+                .chain(&sample.tokens)
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>();
+            if let Some(path) = record {
+                use std::io::Write;
+                std::fs::File::create_new(path)
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+            if let Some(path) = reference {
+                assert!(
+                    std::fs::read(path).unwrap() == bytes,
+                    "reference prompt/token IDs changed"
+                );
+            }
+            expected = Some(sample.tokens.clone());
+        }
+        rates.push(sample.decode_tps());
+    }
+    eprintln!("qwen_decode_windows median_tps={:.3}", median(&mut rates));
+}
+
 /// Isolates reserved KV capacity from prompt length and weight-loading time.
 #[test]
 #[ignore = "requires local Qwen Q4/DFlash2 weights and exclusive native Metal access"]

@@ -16,6 +16,9 @@ const QUERY_KERNEL: &str = "qwen_query_norm_rope_gate_kernel";
 const KEY_KERNEL: &str = "qwen_key_norm_rope_append_kernel";
 const VALUE_KERNEL: &str = "qwen_value_append_kernel";
 const ATTENTION_KERNEL: &str = "qwen_online_causal_gqa_kernel";
+const DECODE_KERNEL: &str = "qwen_decode_grouped_attention_kernel";
+const DECODE_SIMD_GROUPS: usize = 8;
+const DECODE_HEADS_PER_GROUP: usize = 2;
 const QUERY_HEADS: usize = 24;
 const KEY_VALUE_HEADS: usize = 4;
 const HEAD_DIM: usize = 256;
@@ -23,6 +26,10 @@ const QUERY_GATE_WIDTH: usize = QUERY_HEADS * HEAD_DIM * 2;
 const KEY_VALUE_WIDTH: usize = KEY_VALUE_HEADS * HEAD_DIM;
 const SIMD_LANES: usize = 32;
 const INITIAL_CACHE_TOKENS: usize = 512;
+
+#[cfg(test)]
+#[path = "attention_decode_tests.rs"]
+mod decode_tests;
 
 #[derive(Clone, Copy)]
 struct Bf16Binding<'a> {
@@ -36,6 +43,7 @@ pub(super) struct MetalQwenAttention {
     key: ComputePipelineState,
     value: ComputePipelineState,
     attention: ComputePipelineState,
+    decode: ComputePipelineState,
     arena: MetalArena,
 }
 
@@ -46,10 +54,14 @@ impl MetalQwenAttention {
         let key = compute_pipeline(device, &library, KEY_KERNEL)?;
         let value = compute_pipeline(device, &library, VALUE_KERNEL)?;
         let attention = compute_pipeline(device, &library, ATTENTION_KERNEL)?;
+        let decode_library =
+            MetalLibrary::compile_source(device, include_str!("kernels/decode_attention.metal"))?;
+        let decode = compute_pipeline(device, &decode_library, DECODE_KERNEL)?;
         for (pipeline, label) in [
             (&query, QUERY_KERNEL),
             (&key, KEY_KERNEL),
             (&attention, ATTENTION_KERNEL),
+            (&decode, DECODE_KERNEL),
         ] {
             if pipeline.thread_execution_width() as usize != SIMD_LANES {
                 return Err(Error::backend(format!(
@@ -57,11 +69,19 @@ impl MetalQwenAttention {
                 )));
             }
         }
+        if decode.max_total_threads_per_threadgroup()
+            < (DECODE_SIMD_GROUPS * DECODE_HEADS_PER_GROUP * SIMD_LANES) as u64
+        {
+            return Err(Error::backend(
+                "Qwen decode attention requires 512 threads per group",
+            ));
+        }
         Ok(Self {
             query,
             key,
             value,
             attention,
+            decode,
             arena,
         })
     }
@@ -119,6 +139,14 @@ impl MetalQwenAttention {
         if capacity == cache.allocated_tokens {
             return Ok(());
         }
+        tracing::debug!(
+            target: "inferno::qwen::kv",
+            live_tokens = cache.length,
+            old_capacity = cache.allocated_tokens,
+            new_capacity = capacity,
+            copied_bytes = cache.batch * cache.length * KEY_VALUE_WIDTH * 4,
+            "growing Qwen KV buffers on GPU"
+        );
 
         let row_bytes = KEY_VALUE_WIDTH * std::mem::size_of::<u16>();
         let bytes = cache
@@ -292,28 +320,41 @@ impl MetalQwenAttention {
             (row_count as usize * KEY_VALUE_WIDTH).div_ceil(256),
             256,
         )?;
+        let tiled = use_tiled_decode(sequence_length as usize, position_start as usize);
+        let attention_args = [
+            KernelArg::Buffer(&query),
+            KernelArg::Buffer(&gate),
+            KernelArg::Buffer(&cache.key),
+            KernelArg::Buffer(&cache.value),
+            KernelArg::Buffer(&output),
+            KernelArg::U32(row_count),
+            KernelArg::U32(sequence_length),
+            KernelArg::U32(QUERY_HEADS as u32),
+            KernelArg::U32(KEY_VALUE_HEADS as u32),
+            KernelArg::U32(HEAD_DIM as u32),
+            KernelArg::U32(capacity_tokens),
+            KernelArg::U32(position_start),
+            KernelArg::U32(DECODE_HEADS_PER_GROUP as u32),
+        ];
         encode_1d_threadgroups_args(
             command_buffer,
-            &self.attention,
-            &[
-                KernelArg::Buffer(&query),
-                KernelArg::Buffer(&gate),
-                KernelArg::Buffer(&cache.key),
-                KernelArg::Buffer(&cache.value),
-                KernelArg::Buffer(&output),
-                KernelArg::U32(row_count),
-                KernelArg::U32(sequence_length),
-                KernelArg::U32(QUERY_HEADS as u32),
-                KernelArg::U32(KEY_VALUE_HEADS as u32),
-                KernelArg::U32(HEAD_DIM as u32),
-                KernelArg::U32(capacity_tokens),
-                KernelArg::U32(position_start),
-            ],
-            row_count as usize * QUERY_HEADS,
-            SIMD_LANES,
+            if tiled { &self.decode } else { &self.attention },
+            &attention_args[..if tiled { 13 } else { 12 }],
+            row_count as usize * QUERY_HEADS / if tiled { DECODE_HEADS_PER_GROUP } else { 1 },
+            SIMD_LANES
+                * if tiled {
+                    DECODE_SIMD_GROUPS * DECODE_HEADS_PER_GROUP
+                } else {
+                    1
+                },
         )?;
         Ok(output)
     }
+}
+
+fn use_tiled_decode(sequence_length: usize, context: usize) -> bool {
+    // MTP/DFlash verification uses at most eight rows. Leave prefill unchanged.
+    (1..=8).contains(&sequence_length) && context >= 128
 }
 
 fn grown_cache_capacity(allocated: usize, required: usize, limit: usize) -> Result<usize> {
@@ -395,6 +436,17 @@ mod tests {
     use ::metal::{MTLCommandBufferStatus, MTLResourceOptions};
 
     use super::*;
+
+    #[test]
+    fn tiled_attention_is_limited_to_cached_decode_blocks() {
+        assert!(!use_tiled_decode(1, 127));
+        assert!(use_tiled_decode(1, 128));
+        assert!(use_tiled_decode(3, 512));
+        assert!(use_tiled_decode(8, 8192));
+        assert!(!use_tiled_decode(9, 8192));
+        assert!(!use_tiled_decode(2048, 8192));
+        assert!(!use_tiled_decode(0, 8192));
+    }
 
     #[test]
     fn kv_growth_is_geometric_and_bounded_by_context() {

@@ -29,6 +29,10 @@ const PREFILL_CHUNK_TOKENS: usize = 2_048;
 #[path = "qwen/benchmarks.rs"]
 mod benchmarks;
 
+#[path = "qwen/decode_profile.rs"]
+mod decode_profile;
+use decode_profile::DecodeProfile;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenDraftMethod {
     Mtp,
@@ -384,6 +388,7 @@ fn generate_mtp<B: Backend>(
     let mut stats = DraftStats::default();
     let mut generated = 0_usize;
     let mut stopped_on_eos = false;
+    let mut profile = DecodeProfile::new();
 
     while generated < generation_limit {
         on_token(primary)?;
@@ -472,6 +477,7 @@ fn generate_mtp<B: Backend>(
             &mut stopped_on_eos,
             &mut on_token,
         )?;
+        profile.record(generated, &stats, state, false)?;
         if stopped_on_eos || generated == generation_limit {
             break;
         }
@@ -485,6 +491,7 @@ fn generate_mtp<B: Backend>(
         pending_mtp_tokens.push(primary);
     }
 
+    profile.record(generated, &stats, state, true)?;
     log_draft_profile(QwenDraftMethod::Mtp, &stats);
     Ok(stats.report(
         prompt_tokens.len(),
@@ -553,6 +560,7 @@ fn generate_dflash<B: Backend>(
     let mut stats = DraftStats::default();
     let mut generated = 0_usize;
     let mut stopped_on_eos = false;
+    let mut profile = DecodeProfile::new();
 
     while generated < generation_limit {
         on_token(primary)?;
@@ -651,6 +659,7 @@ fn generate_dflash<B: Backend>(
             &mut stopped_on_eos,
             &mut on_token,
         )?;
+        profile.record(generated, &stats, target_state, false)?;
         if stopped_on_eos || generated == generation_limit {
             break;
         }
@@ -667,6 +676,7 @@ fn generate_dflash<B: Backend>(
             .ok_or_else(|| Error::runtime("DFlash2 target context length overflow"))?;
     }
 
+    profile.record(generated, &stats, target_state, true)?;
     log_draft_profile(QwenDraftMethod::DFlash2, &stats);
     Ok(stats.report(
         prompt_tokens.len(),
@@ -677,7 +687,7 @@ fn generate_dflash<B: Backend>(
     ))
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct DraftStats {
     verification_passes: usize,
     target_tokens: usize,
